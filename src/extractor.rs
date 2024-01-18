@@ -23,10 +23,10 @@ pub fn extract_crud_tables_cli(dialect_name: &str, subject: String) -> Result<Cr
 
 #[derive(Default, Debug, PartialEq)]
 pub struct CrudTables {
-    create_tables: Vec<String>,
-    read_tables: Vec<String>,
-    update_tables: Vec<String>,
-    delete_tables: Vec<String>,
+    pub create_tables: Vec<String>,
+    pub read_tables: Vec<String>,
+    pub update_tables: Vec<String>,
+    pub delete_tables: Vec<String>,
 }
 
 impl CrudTables {
