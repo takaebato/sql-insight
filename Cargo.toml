@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 thiserror = "1.0.56"
 sqlparser = { version = "0.41.0", features = ["visitor"] }
+tap = { version = "1.0.1" }
