@@ -1,6 +1,7 @@
 mod error;
-mod extractor;
-pub use extractor::{extract_crud_tables, CrudTables};
+pub mod extractor;
 pub mod normalizer;
-pub use normalizer::normalize;
-pub use sqlparser::dialect::*;
+
+pub use extractor::*;
+pub use normalizer::*;
+pub use sqlparser;
