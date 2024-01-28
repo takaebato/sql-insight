@@ -3,6 +3,26 @@ use sqlparser::dialect::MySqlDialect;
 use std::collections::HashMap;
 
 #[test]
+fn test_format() {
+    let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'";
+    let result = sql_insight::format(&MySqlDialect {}, sql.into()).unwrap();
+    assert_eq!(
+        result,
+        ["SELECT a FROM t1 WHERE b = 1 AND c IN (2, 3) AND d LIKE '%foo'"]
+    )
+}
+
+#[test]
+fn test_format_cli() {
+    let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'";
+    let result = sql_insight::format_cli("mysql", sql.into()).unwrap();
+    assert_eq!(
+        result,
+        ["SELECT a FROM t1 WHERE b = 1 AND c IN (2, 3) AND d LIKE '%foo'"]
+    )
+}
+
+#[test]
 fn test_normalize() {
     let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'";
     let result = sql_insight::normalize(&MySqlDialect {}, sql.into()).unwrap();
