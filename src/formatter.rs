@@ -2,13 +2,14 @@ use crate::error::Error;
 use sqlparser::dialect::{dialect_from_str, Dialect};
 use sqlparser::parser::Parser;
 
-pub fn format(dialect: &dyn Dialect, subject: String) -> Result<Vec<String>, Error> {
-    Formatter::format(dialect, subject)
+pub fn format(dialect: &dyn Dialect, sql: String) -> Result<Vec<String>, Error> {
+    Formatter::format(dialect, sql)
 }
 
-pub fn format_cli(dialect_name: &str, subject: String) -> Result<Vec<String>, Error> {
+pub fn format_from_cli(dialect_name: Option<&str>, sql: String) -> Result<Vec<String>, Error> {
+    let dialect_name = dialect_name.unwrap_or("generic");
     match dialect_from_str(dialect_name) {
-        Some(dialect) => Ok(format(dialect.as_ref(), subject)?),
+        Some(dialect) => Ok(format(dialect.as_ref(), sql)?),
         None => Err(Error::ArgumentError(format!(
             "Dialect not found: {}",
             dialect_name
@@ -19,8 +20,8 @@ pub fn format_cli(dialect_name: &str, subject: String) -> Result<Vec<String>, Er
 struct Formatter;
 
 impl Formatter {
-    pub fn format(dialect: &dyn Dialect, subject: String) -> Result<Vec<String>, Error> {
-        let statements = Parser::parse_sql(dialect, &subject)?;
+    pub fn format(dialect: &dyn Dialect, sql: String) -> Result<Vec<String>, Error> {
+        let statements = Parser::parse_sql(dialect, &sql)?;
         Ok(statements
             .into_iter()
             .map(|statement| statement.to_string())

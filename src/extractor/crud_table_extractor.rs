@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::ops::ControlFlow;
 
 use crate::error::Error;
@@ -10,17 +11,27 @@ use sqlparser::parser::Parser;
 
 pub fn extract_crud_tables(
     dialect: &dyn Dialect,
-    subject: String,
+    sql: String,
 ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
-    CrudTableExtractor::extract(dialect, subject)
+    CrudTableExtractor::extract(dialect, sql)
 }
 
-pub fn extract_crud_tables_cli(
-    dialect_name: &str,
-    subject: String,
-) -> Result<Vec<Result<CrudTables, Error>>, Error> {
+pub fn extract_crud_tables_from_cli(
+    dialect_name: Option<&str>,
+    sql: String,
+) -> Result<Vec<String>, Error> {
+    let dialect_name = dialect_name.unwrap_or("generic");
     match dialect_from_str(dialect_name) {
-        Some(dialect) => Ok(extract_crud_tables(dialect.as_ref(), subject)?),
+        Some(dialect) => {
+            let result = extract_crud_tables(dialect.as_ref(), sql)?;
+            Ok(result
+                .iter()
+                .map(|r| match r {
+                    Ok(crud_tables) => format!("{}", crud_tables),
+                    Err(e) => format!("Error: {}", e),
+                })
+                .collect())
+        }
         None => Err(Error::ArgumentError(format!(
             "Dialect not found: {}",
             dialect_name
@@ -34,6 +45,30 @@ pub struct CrudTables {
     pub read_tables: Vec<TableReference>,
     pub update_tables: Vec<TableReference>,
     pub delete_tables: Vec<TableReference>,
+}
+
+impl fmt::Display for CrudTables {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let create_tables = self.format_tables(&self.create_tables);
+        let read_tables = self.format_tables(&self.read_tables);
+        let update_tables = self.format_tables(&self.update_tables);
+        let delete_tables = self.format_tables(&self.delete_tables);
+        write!(
+            f,
+            "Create: [{}], Read: [{}], Update: [{}], Delete: [{}]",
+            create_tables, read_tables, update_tables, delete_tables
+        )
+    }
+}
+
+impl CrudTables {
+    fn format_tables(&self, tables: &[TableReference]) -> String {
+        tables
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<String>>()
+            .join(", ")
+    }
 }
 
 #[derive(Default, Debug)]
@@ -65,7 +100,7 @@ impl Visitor for CrudTableExtractor {
                 self.apply_difference_to_read_tables(self.update_tables.clone());
             }
             Statement::Delete { tables, from, .. } => {
-                // When tables are present, deletion subjects are these tables,
+                // When tables are present, deletion sqls are these tables,
                 // and from clause is used as a data source.
                 if !tables.is_empty() {
                     for table in tables {
@@ -99,9 +134,9 @@ impl Visitor for CrudTableExtractor {
 impl CrudTableExtractor {
     pub fn extract(
         dialect: &dyn Dialect,
-        subject: String,
+        sql: String,
     ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
-        let statements = Parser::parse_sql(dialect, &subject)?;
+        let statements = Parser::parse_sql(dialect, &sql)?;
         let results = statements
             .iter()
             .map(Self::extract_from_statement)
@@ -125,7 +160,7 @@ impl CrudTableExtractor {
         }
     }
 
-    // Deletion subjects can be specified as aliases, so convert them to real table names if possible.
+    // Deletion sqls can be specified as aliases, so convert them to real table names if possible.
     fn resolve_delete_tables(&mut self) -> Vec<TableReference> {
         self.possibly_aliased_delete_tables
             .iter()

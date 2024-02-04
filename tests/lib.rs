@@ -15,9 +15,9 @@ mod tests {
     }
 
     #[test]
-    fn test_format_cli() {
+    fn test_format_from_cli() {
         let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'";
-        let result = sql_insight::format_cli("mysql", sql.into()).unwrap();
+        let result = sql_insight::format_from_cli(Some("mysql"), sql.into()).unwrap();
         assert_eq!(
             result,
             ["SELECT a FROM t1 WHERE b = 1 AND c IN (2, 3) AND d LIKE '%foo'"]
@@ -35,9 +35,9 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_cli() {
+    fn test_normalize_from_cli() {
         let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'";
-        let result = sql_insight::normalize_cli("mysql", sql.into()).unwrap();
+        let result = sql_insight::normalize_from_cli(Some("mysql"), sql.into()).unwrap();
         assert_eq!(
             result,
             ["SELECT a FROM t1 WHERE b = ? AND c IN (?, ?) AND d LIKE ?"]
@@ -72,19 +72,19 @@ mod tests {
                     }],
                     update_tables: vec![],
                     delete_tables: vec![],
-                })
+                }),
             ]
         )
     }
 
     #[test]
-    fn test_extract_crud_tables_cli() {
+    fn test_extract_crud_tables_from_cli() {
         let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'; SELECT b FROM t2 WHERE c = 4";
-        let result = sql_insight::extract_crud_tables_cli("mysql", sql.into()).unwrap();
+        let result = sql_insight::extract_crud_tables_from_cli(Some("mysql"), sql.into()).unwrap();
         assert_eq!(
             result,
             vec![
-                Ok(CrudTables {
+                CrudTables {
                     create_tables: vec![],
                     read_tables: vec![TableReference {
                         catalog: None,
@@ -94,8 +94,9 @@ mod tests {
                     }],
                     update_tables: vec![],
                     delete_tables: vec![],
-                }),
-                Ok(CrudTables {
+                }
+                .to_string(),
+                CrudTables {
                     create_tables: vec![],
                     read_tables: vec![TableReference {
                         catalog: None,
@@ -105,7 +106,8 @@ mod tests {
                     }],
                     update_tables: vec![],
                     delete_tables: vec![],
-                })
+                }
+                .to_string(),
             ]
         )
     }
@@ -128,30 +130,32 @@ mod tests {
                     schema: None,
                     name: "t2".into(),
                     alias: None,
-                }]))
+                }])),
             ]
         )
     }
 
     #[test]
-    fn test_extract_tables_cli() {
+    fn test_extract_tables_from_cli() {
         let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'; SELECT b FROM t2 WHERE c = 4";
-        let result = sql_insight::extract_tables_cli("mysql", sql.into()).unwrap();
+        let result = sql_insight::extract_tables_from_cli(Some("mysql"), sql.into()).unwrap();
         assert_eq!(
             result,
             vec![
-                Ok(Tables(vec![TableReference {
+                Tables(vec![TableReference {
                     catalog: None,
                     schema: None,
                     name: "t1".into(),
                     alias: None,
-                }])),
-                Ok(Tables(vec![TableReference {
+                }])
+                .to_string(),
+                Tables(vec![TableReference {
                     catalog: None,
                     schema: None,
                     name: "t2".into(),
                     alias: None,
-                }])),
+                }])
+                .to_string(),
             ]
         )
     }

@@ -1,3 +1,4 @@
+use core::fmt;
 use std::ops::ControlFlow;
 
 use crate::error::Error;
@@ -12,12 +13,22 @@ pub fn extract_tables(
     TableExtractor::extract(dialect, sql)
 }
 
-pub fn extract_tables_cli(
-    dialect_name: &str,
+pub fn extract_tables_from_cli(
+    dialect_name: Option<&str>,
     sql: String,
-) -> Result<Vec<Result<Tables, Error>>, Error> {
+) -> Result<Vec<String>, Error> {
+    let dialect_name = dialect_name.unwrap_or("generic");
     match dialect_from_str(dialect_name) {
-        Some(dialect) => Ok(extract_tables(dialect.as_ref(), sql)?),
+        Some(dialect) => {
+            let result = extract_tables(dialect.as_ref(), sql)?;
+            Ok(result
+                .iter()
+                .map(|r| match r {
+                    Ok(crud_tables) => format!("{}", crud_tables),
+                    Err(e) => format!("Error: {}", e),
+                })
+                .collect())
+        }
         None => Err(Error::ArgumentError(format!(
             "Dialect not found: {}",
             dialect_name
@@ -39,6 +50,25 @@ impl TableReference {
     }
     pub fn has_qualifiers(&self) -> bool {
         self.catalog.is_some() || self.schema.is_some()
+    }
+}
+
+impl fmt::Display for TableReference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts = Vec::new();
+        if let Some(catalog) = &self.catalog {
+            parts.push(catalog.to_string());
+        }
+        if let Some(schema) = &self.schema {
+            parts.push(schema.to_string());
+        }
+        parts.push(self.name.to_string());
+        let table = parts.join(".");
+        if let Some(alias) = &self.alias {
+            write!(f, "{} AS {}", table, alias)
+        } else {
+            write!(f, "{}", table)
+        }
     }
 }
 
@@ -110,6 +140,18 @@ impl TryFrom<&ObjectName> for TableReference {
 
 #[derive(Debug, PartialEq)]
 pub struct Tables(pub Vec<TableReference>);
+
+impl fmt::Display for Tables {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tables = self
+            .0
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+        write!(f, "{}", tables)
+    }
+}
 
 #[derive(Default, Debug)]
 pub struct TableExtractor(Vec<TableReference>);

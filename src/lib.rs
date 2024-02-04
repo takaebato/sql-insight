@@ -1,4 +1,4 @@
-mod error;
+pub mod error;
 pub mod extractor;
 pub mod formatter;
 pub mod normalizer;
