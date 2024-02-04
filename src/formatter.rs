@@ -20,7 +20,7 @@ struct Formatter;
 
 impl Formatter {
     pub fn format(dialect: &dyn Dialect, subject: String) -> Result<Vec<String>, Error> {
-        let mut statements = Parser::parse_sql(dialect, &subject)?;
+        let statements = Parser::parse_sql(dialect, &subject)?;
         Ok(statements
             .into_iter()
             .map(|statement| statement.to_string())

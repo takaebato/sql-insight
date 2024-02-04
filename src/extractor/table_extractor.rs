@@ -1,18 +1,23 @@
-use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use crate::error::Error;
-use sqlparser::ast::{TableFactor, Visit, Visitor};
+use sqlparser::ast::{Ident, ObjectName, Statement, TableFactor, TableWithJoins, Visit, Visitor};
 use sqlparser::dialect::{dialect_from_str, Dialect};
 use sqlparser::parser::Parser;
 
-pub fn extract_tables(dialect: &dyn Dialect, subject: String) -> Result<Tables, Error> {
-    TableExtractor::extract(dialect, subject)
+pub fn extract_tables(
+    dialect: &dyn Dialect,
+    sql: String,
+) -> Result<Vec<Result<Tables, Error>>, Error> {
+    TableExtractor::extract(dialect, sql)
 }
 
-pub fn extract_tables_cli(dialect_name: &str, subject: String) -> Result<Tables, Error> {
+pub fn extract_tables_cli(
+    dialect_name: &str,
+    sql: String,
+) -> Result<Vec<Result<Tables, Error>>, Error> {
     match dialect_from_str(dialect_name) {
-        Some(dialect) => Ok(extract_tables(dialect.as_ref(), subject)?),
+        Some(dialect) => Ok(extract_tables(dialect.as_ref(), sql)?),
         None => Err(Error::ArgumentError(format!(
             "Dialect not found: {}",
             dialect_name
@@ -20,30 +25,103 @@ pub fn extract_tables_cli(dialect_name: &str, subject: String) -> Result<Tables,
     }
 }
 
-type Original = String;
-type Alias = String;
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TableReference {
+    pub catalog: Option<Ident>,
+    pub schema: Option<Ident>,
+    pub name: Ident,
+    pub alias: Option<Ident>,
+}
+
+impl TableReference {
+    pub fn has_alias(&self) -> bool {
+        self.alias.is_some()
+    }
+    pub fn has_qualifiers(&self) -> bool {
+        self.catalog.is_some() || self.schema.is_some()
+    }
+}
+
+impl TryFrom<&TableFactor> for TableReference {
+    type Error = Error;
+
+    fn try_from(table: &TableFactor) -> Result<Self, Self::Error> {
+        if let TableFactor::Table { name, alias, .. } = table {
+            match name.0.len() {
+                0 => Err(Error::AnalysisError("No identifiers provided".to_string())),
+                1 => Ok(TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: name.0[0].clone(),
+                    alias: alias.as_ref().map(|a| a.name.clone()),
+                }),
+                2 => Ok(TableReference {
+                    catalog: None,
+                    schema: Some(name.0[0].clone()),
+                    name: name.0[1].clone(),
+                    alias: alias.as_ref().map(|a| a.name.clone()),
+                }),
+                3 => Ok(TableReference {
+                    catalog: Some(name.0[0].clone()),
+                    schema: Some(name.0[1].clone()),
+                    name: name.0[2].clone(),
+                    alias: alias.as_ref().map(|a| a.name.clone()),
+                }),
+                _ => Err(Error::AnalysisError(
+                    "Too many identifiers provided".to_string(),
+                )),
+            }
+        } else {
+            Err(Error::AnalysisError("Not a table".to_string()))
+        }
+    }
+}
+
+impl TryFrom<&ObjectName> for TableReference {
+    type Error = Error;
+
+    fn try_from(obj_name: &ObjectName) -> Result<Self, Self::Error> {
+        match obj_name.0.len() {
+            0 => Err(Error::AnalysisError("No identifiers provided".to_string())),
+            1 => Ok(TableReference {
+                catalog: None,
+                schema: None,
+                name: obj_name.0[0].clone(),
+                alias: None,
+            }),
+            2 => Ok(TableReference {
+                catalog: None,
+                schema: Some(obj_name.0[0].clone()),
+                name: obj_name.0[1].clone(),
+                alias: None,
+            }),
+            3 => Ok(TableReference {
+                catalog: Some(obj_name.0[0].clone()),
+                schema: Some(obj_name.0[1].clone()),
+                name: obj_name.0[2].clone(),
+                alias: None,
+            }),
+            _ => Err(Error::AnalysisError(
+                "Too many identifiers provided".to_string(),
+            )),
+        }
+    }
+}
 
 #[derive(Debug, PartialEq)]
-pub struct Tables {
-    pub tables: Vec<Original>,
-    pub aliases: HashMap<Original, Alias>,
-}
+pub struct Tables(pub Vec<TableReference>);
 
 #[derive(Default, Debug)]
-pub struct TableExtractor {
-    tables: Vec<Original>,
-    aliases: HashMap<Original, Alias>,
-}
+pub struct TableExtractor(Vec<TableReference>);
 
 impl Visitor for TableExtractor {
-    type Break = ();
+    type Break = Error;
 
     fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
-        if let TableFactor::Table { name, alias, .. } = table_factor {
-            self.tables.push(name.0[0].value.clone());
-            if let Some(alias) = alias {
-                self.aliases
-                    .insert(name.0[0].value.clone(), alias.name.value.clone());
+        if let TableFactor::Table { .. } = table_factor {
+            match TableReference::try_from(table_factor) {
+                Ok(table) => self.0.push(table),
+                Err(e) => return ControlFlow::Break(e),
             }
         }
         ControlFlow::Continue(())
@@ -51,14 +129,34 @@ impl Visitor for TableExtractor {
 }
 
 impl TableExtractor {
-    pub fn extract(dialect: &dyn Dialect, subject: String) -> Result<Tables, Error> {
-        let statements = Parser::parse_sql(dialect, &subject)?;
+    pub fn extract(
+        dialect: &dyn Dialect,
+        sql: String,
+    ) -> Result<Vec<Result<Tables, Error>>, Error> {
+        let statements = Parser::parse_sql(dialect, &sql)?;
+        let results = statements
+            .iter()
+            .map(Self::extract_from_statement)
+            .collect::<Vec<Result<Tables, Error>>>();
+        Ok(results)
+    }
+
+    pub fn extract_from_statement(statement: &Statement) -> Result<Tables, Error> {
         let mut visitor = TableExtractor::default();
-        statements.visit(&mut visitor);
-        Ok(Tables {
-            tables: visitor.tables,
-            aliases: visitor.aliases,
-        })
+        match statement.visit(&mut visitor) {
+            ControlFlow::Break(e) => Err(e),
+            ControlFlow::Continue(()) => Ok(Tables(visitor.0)),
+        }
+    }
+
+    // `Visit` trait object cannot be used since method `visit` has generic type parameters.
+    // Concrete type `TableWithJoins` is used instead.
+    pub fn extract_from_table_node(table: &TableWithJoins) -> Result<Tables, Error> {
+        let mut visitor = TableExtractor::default();
+        match table.visit(&mut visitor) {
+            ControlFlow::Break(e) => Err(e),
+            ControlFlow::Continue(()) => Ok(Tables(visitor.0)),
+        }
     }
 }
 
@@ -68,31 +166,132 @@ mod tests {
     use sqlparser::dialect::MySqlDialect;
 
     #[test]
-    fn test_select_statement() {
-        let sql = "SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id WHERE b = ( SELECT c FROM t3 )";
+    fn test_single_statement() {
+        let sql = "SELECT a FROM t1";
         let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
         assert_eq!(
             result,
-            Tables {
-                tables: vec!["t1".into(), "t2".into(), "t3".into()],
-                aliases: HashMap::new(),
-            }
+            vec![Ok(Tables(vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },]))]
         )
     }
 
     #[test]
-    fn test_select_statement_with_aliases() {
-        let sql = "SELECT a FROM t1 AS t1_alias INNER JOIN t2 AS t2_alias ON t1_alias.id = t2_alias.id WHERE b = ( SELECT c FROM t3 )";
+    fn test_multiple_statements() {
+        let sql = "SELECT a FROM t1; SELECT b FROM t2";
         let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
         assert_eq!(
             result,
-            Tables {
-                tables: vec!["t1".into(), "t2".into(), "t3".into()],
-                aliases: HashMap::from([
-                    ("t1".into(), "t1_alias".into()),
-                    ("t2".into(), "t2_alias".into())
-                ]),
-            }
+            vec![
+                Ok(Tables(vec![TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                }])),
+                Ok(Tables(vec![TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
+                }])),
+            ]
+        )
+    }
+
+    #[test]
+    fn test_statement_with_alias() {
+        let sql = "SELECT a FROM t1 AS t1_alias";
+        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(Tables(vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: Some("t1_alias".into()),
+            },]))]
+        )
+    }
+
+    #[test]
+    fn test_statement_with_table_identifier() {
+        let sql = "SELECT a FROM catalog.schema.table";
+        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(Tables(vec![TableReference {
+                catalog: Some("catalog".into()),
+                schema: Some("schema".into()),
+                name: "table".into(),
+                alias: None,
+            }]))]
+        )
+    }
+
+    #[test]
+    fn test_statement_with_table_identifier_and_alias() {
+        let sql = "SELECT a FROM catalog.schema.table AS table_alias";
+        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(Tables(vec![TableReference {
+                catalog: Some("catalog".into()),
+                schema: Some("schema".into()),
+                name: "table".into(),
+                alias: Some("table_alias".into()),
+            }]))]
+        )
+    }
+
+    #[test]
+    fn test_statement_where_same_tables_appear_multiple_times() {
+        let sql = "SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id WHERE b = ( SELECT c FROM t3 INNER JOIN t1 ON t3.id = t1.id )";
+        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(Tables(vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t3".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                },
+            ]))]
+        )
+    }
+
+    #[test]
+    fn test_statement_error_with_too_many_identifiers() {
+        let sql = "SELECT a FROM catalog.schema.table.extra";
+        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
+        assert_eq!(
+            result,
+            vec![Err(Error::AnalysisError(
+                "Too many identifiers provided".to_string()
+            ))]
         )
     }
 
@@ -102,13 +301,20 @@ mod tests {
         let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
         assert_eq!(
             result,
-            Tables {
-                tables: vec!["t1".into(), "t2".into()],
-                aliases: HashMap::from([
-                    ("t1".into(), "t1_alias".into()),
-                    ("t2".into(), "t2_alias".into())
-                ]),
-            }
+            vec![Ok(Tables(vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: Some("t2_alias".into()),
+                },
+            ]))]
         )
     }
 
@@ -119,10 +325,26 @@ mod tests {
         let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
         assert_eq!(
             result,
-            Tables {
-                tables: vec!["t1".into(), "t2".into(), "t3".into()],
-                aliases: HashMap::new(),
-            }
+            vec![Ok(Tables(vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t3".into(),
+                    alias: None,
+                },
+            ]))]
         )
     }
 }
