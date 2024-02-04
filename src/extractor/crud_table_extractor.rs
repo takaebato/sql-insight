@@ -88,7 +88,7 @@ impl Visitor for CrudTableExtractor {
                         self.possibly_aliased_delete_tables.clone(),
                     );
                 }
-                self.resolve_delete_tables();
+                self.delete_tables = self.resolve_delete_tables();
             }
             _ => {}
         }
@@ -126,9 +126,8 @@ impl CrudTableExtractor {
     }
 
     // Deletion subjects can be specified as aliases, so convert them to real table names if possible.
-    fn resolve_delete_tables(&mut self) {
-        self.delete_tables = self
-            .possibly_aliased_delete_tables
+    fn resolve_delete_tables(&mut self) -> Vec<TableReference> {
+        self.possibly_aliased_delete_tables
             .iter()
             .map(|delete_table| {
                 if delete_table.has_qualifiers() || delete_table.has_alias() {
@@ -147,7 +146,7 @@ impl CrudTableExtractor {
                 }
                 delete_table.clone()
             })
-            .collect();
+            .collect()
     }
 
     fn apply_difference_to_read_tables(&mut self, exclude_tables: Vec<TableReference>) {
