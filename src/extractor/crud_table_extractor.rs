@@ -5,7 +5,7 @@ use std::ops::ControlFlow;
 use crate::error::Error;
 use crate::extractor::table_extractor::TableReference;
 use crate::TableExtractor;
-use sqlparser::ast::{Statement, Visit, Visitor};
+use sqlparser::ast::{MergeClause, Statement, Visit, Visitor};
 use sqlparser::dialect::{dialect_from_str, Dialect};
 use sqlparser::parser::Parser;
 
@@ -124,6 +124,28 @@ impl Visitor for CrudTableExtractor {
                     );
                 }
                 self.delete_tables = self.resolve_delete_tables();
+            }
+            Statement::Merge { table, clauses, .. } => {
+                let target_table = match TableReference::try_from(table) {
+                    Ok(table) => table,
+                    Err(e) => return ControlFlow::Break(e),
+                };
+                let (mut inserted, mut updated, mut deleted) = (false, false, false);
+                clauses.iter().for_each(|clause| match clause {
+                    MergeClause::MatchedUpdate { .. } => updated = true,
+                    MergeClause::MatchedDelete { .. } => deleted = true,
+                    MergeClause::NotMatched { .. } => inserted = true,
+                });
+                if inserted {
+                    self.create_tables.push(target_table.clone());
+                }
+                if updated {
+                    self.update_tables.push(target_table.clone());
+                }
+                if deleted {
+                    self.delete_tables.push(target_table.clone());
+                }
+                self.apply_difference_to_read_tables(vec![target_table]);
             }
             _ => {}
         }
@@ -623,6 +645,41 @@ mod tests {
                 },
             ],
             delete_tables: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_merge_statement() {
+        let sql = "MERGE INTO t1 AS t1_alias USING t2 AS t2_alias ON t1_alias.a = t2_alias.a \
+                         WHEN MATCHED AND t2_alias.b = 1 THEN DELETE \
+                         WHEN MATCHED AND t2_alias.b = 2 THEN UPDATE SET t1_alias.b = t2_alias.b \
+                         WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2_alias.a, t2_alias.b)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: Some("t1_alias".into()),
+            }],
+            read_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: Some("t2_alias".into()),
+            }],
+            update_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: Some("t1_alias".into()),
+            }],
+            delete_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: Some("t1_alias".into()),
+            }],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
     }
