@@ -11,14 +11,14 @@ use sqlparser::parser::Parser;
 
 pub fn extract_crud_tables(
     dialect: &dyn Dialect,
-    sql: String,
+    sql: &str,
 ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
     CrudTableExtractor::extract(dialect, sql)
 }
 
 pub fn extract_crud_tables_from_cli(
     dialect_name: Option<&str>,
-    sql: String,
+    sql: &str,
 ) -> Result<Vec<String>, Error> {
     let dialect_name = dialect_name.unwrap_or("generic");
     match dialect_from_str(dialect_name) {
@@ -134,9 +134,9 @@ impl Visitor for CrudTableExtractor {
 impl CrudTableExtractor {
     pub fn extract(
         dialect: &dyn Dialect,
-        sql: String,
+        sql: &str,
     ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
-        let statements = Parser::parse_sql(dialect, &sql)?;
+        let statements = Parser::parse_sql(dialect, sql)?;
         let results = statements
             .iter()
             .map(Self::extract_from_statement)
@@ -204,15 +204,42 @@ impl CrudTableExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::all_dialects;
     use sqlparser::dialect::MySqlDialect;
 
+    fn assert_crud_table_extraction(
+        sql: &str,
+        expected: Vec<Result<CrudTables, Error>>,
+        dialects: Vec<Box<dyn Dialect>>,
+    ) {
+        for dialect in dialects {
+            let result = CrudTableExtractor::extract(dialect.as_ref(), sql).unwrap();
+            assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
+        }
+    }
+
     #[test]
-    fn test_select_statement() {
+    fn test_single_statement() {
         let sql = "SELECT a FROM t1";
-        let result = CrudTableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![Ok(CrudTables {
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            }],
+            update_tables: vec![],
+            delete_tables: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_multiple_statements() {
+        let sql = "SELECT a FROM t1; SELECT b FROM t2";
+        let expected = vec![
+            Ok(CrudTables {
                 create_tables: vec![],
                 read_tables: vec![TableReference {
                     catalog: None,
@@ -222,34 +249,338 @@ mod tests {
                 }],
                 update_tables: vec![],
                 delete_tables: vec![],
-            }),]
-        )
+            }),
+            Ok(CrudTables {
+                create_tables: vec![],
+                read_tables: vec![TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
+                }],
+                update_tables: vec![],
+                delete_tables: vec![],
+            }),
+        ];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_alias() {
+        let sql = "SELECT a FROM t1 AS t1_alias";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: Some("t1_alias".into()),
+            }],
+            update_tables: vec![],
+            delete_tables: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_table_identifier() {
+        let sql = "SELECT a FROM catalog.schema.table";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![TableReference {
+                catalog: Some("catalog".into()),
+                schema: Some("schema".into()),
+                name: "table".into(),
+                alias: None,
+            }],
+            update_tables: vec![],
+            delete_tables: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_table_identifier_and_alias() {
+        let sql = "SELECT a FROM catalog.schema.table AS table_alias";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![TableReference {
+                catalog: Some("catalog".into()),
+                schema: Some("schema".into()),
+                name: "table".into(),
+                alias: Some("table_alias".into()),
+            }],
+            update_tables: vec![],
+            delete_tables: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_delete_statement() {
+        let sql = "DELETE FROM t1";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            }],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_delete_statement_with_table_identifier() {
+        let sql = "DELETE FROM catalog.schema.t1";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![TableReference {
+                catalog: Some("catalog".into()),
+                schema: Some("schema".into()),
+                name: "t1".into(),
+                alias: None,
+            }],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_delete_statement_with_alias() {
+        let sql = "DELETE FROM t1 AS t1_alias";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: Some("t1_alias".into()),
+            }],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_delete_multiple_tables_syntax() {
+        let sql = "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t3".into(),
+                    alias: None,
+                },
+            ],
+            update_tables: vec![],
+            delete_tables: vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
+                },
+            ],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_delete_multiple_tables_syntax_with_alias() {
+        let sql =
+            "DELETE t1_alias, t2_alias FROM t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: Some("t2_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t3".into(),
+                    alias: None,
+                },
+            ],
+            update_tables: vec![],
+            delete_tables: vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: Some("t2_alias".into()),
+                },
+            ],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_delete_multiple_tables_syntax_with_using() {
+        let sql = "DELETE FROM t1, t2 USING t1 INNER JOIN t2 INNER JOIN t3";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t3".into(),
+                alias: None,
+            }],
+            update_tables: vec![],
+            delete_tables: vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
+                },
+            ],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_delete_multiple_tables_syntax_with_using_with_alias() {
+        let sql = "DELETE FROM t1_alias, t2_alias USING t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: Some("t2_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t3".into(),
+                    alias: None,
+                },
+            ],
+            update_tables: vec![],
+            delete_tables: vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: Some("t2_alias".into()),
+                },
+            ],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_insert_statement() {
         let sql = "INSERT INTO t1 (a) VALUES (1)";
-        let result = CrudTableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![Ok(CrudTables {
-                create_tables: vec![TableReference {
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            }],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_insert_select_statement() {
+        let sql = "INSERT INTO t1 (a) SELECT a FROM t2 AS t2_alias INNER JOIN t3 USING (id)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            }],
+            read_tables: vec![
+                TableReference {
                     catalog: None,
                     schema: None,
-                    name: "t1".into(),
+                    name: "t2".into(),
+                    alias: Some("t2_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t3".into(),
                     alias: None,
-                }],
-                read_tables: vec![],
-                update_tables: vec![],
-                delete_tables: vec![],
-            }),]
-        )
+                },
+            ],
+            update_tables: vec![],
+            delete_tables: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_update_statement() {
         let sql = "UPDATE t1 SET a=1";
-        let result = CrudTableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
+        let result = CrudTableExtractor::extract(&MySqlDialect {}, sql).unwrap();
         assert_eq!(
             result,
             vec![Ok(CrudTables {
@@ -267,95 +598,56 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_statement() {
-        let sql = "DELETE FROM t1";
-        let result = CrudTableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![],
-                update_tables: vec![],
-                delete_tables: vec![TableReference {
+    fn test_update_statement_with_alias() {
+        let sql = "UPDATE t1 AS t1_alias INNER JOIN t2 ON t1_alias.a = t2.a SET t1_alias.b = t2.b WHERE t2.c = (SELECT c FROM t3)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t3".into(),
+                alias: None,
+            }],
+            update_tables: vec![
+                TableReference {
                     catalog: None,
                     schema: None,
                     name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
                     alias: None,
-                }],
-            }),]
-        )
+                },
+            ],
+            delete_tables: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
-    fn test_multiple_tables_update_statement_with_qualified_assignments() {
-        let sql =
-            "UPDATE t1 AS a JOIN t2 AS b USING (id) SET a.foo='bar', b.baz='bat' WHERE a.id=1";
-        match CrudTableExtractor::extract(&MySqlDialect {}, sql.into()) {
-            Ok(result) => assert_eq!(
-                result,
-                vec![Ok(CrudTables {
-                    create_tables: vec![],
-                    read_tables: vec![],
-                    update_tables: vec![
-                        TableReference {
-                            catalog: None,
-                            schema: None,
-                            name: "t1".into(),
-                            alias: Some("a".into()),
-                        },
-                        TableReference {
-                            catalog: None,
-                            schema: None,
-                            name: "t2".into(),
-                            alias: Some("b".into()),
-                        },
-                    ],
-                    delete_tables: vec![],
-                }),]
-            ),
-            Err(error) => unreachable!("Should not have errored: {}", error),
-        }
+    fn test_create_table_statement() {
+        let sql = "CREATE TABLE t1 (a INT)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
-    fn test_multiple_tables_update_statement_with_qualified_assignments2() {
-        let sql = "UPDATE t1 AS a JOIN t2 AS b USING (id) JOIN (select * from t3 JOIN t4) SET a.foo='bar', baz='bat' WHERE a.id=1";
-        match CrudTableExtractor::extract(&MySqlDialect {}, sql.into()) {
-            Ok(result) => assert_eq!(
-                result,
-                vec![Ok(CrudTables {
-                    create_tables: vec![],
-                    read_tables: vec![],
-                    update_tables: vec![
-                        TableReference {
-                            catalog: None,
-                            schema: None,
-                            name: "t1".into(),
-                            alias: Some("a".into()),
-                        },
-                        TableReference {
-                            catalog: None,
-                            schema: None,
-                            name: "t2".into(),
-                            alias: Some("b".into()),
-                        },
-                        TableReference {
-                            catalog: None,
-                            schema: None,
-                            name: "t3".into(),
-                            alias: None,
-                        },
-                        TableReference {
-                            catalog: None,
-                            schema: None,
-                            name: "t4".into(),
-                            alias: None,
-                        },
-                    ],
-                    delete_tables: vec![],
-                }),]
-            ),
-            Err(error) => unreachable!("Should not have errored: {}", error),
-        }
+    fn test_alters_table_statement() {
+        let sql = "ALTER TABLE t1 ADD COLUMN a INT";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
     }
 }

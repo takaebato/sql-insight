@@ -8,14 +8,14 @@ use sqlparser::parser::Parser;
 
 pub fn extract_tables(
     dialect: &dyn Dialect,
-    sql: String,
+    sql: &str,
 ) -> Result<Vec<Result<Tables, Error>>, Error> {
     TableExtractor::extract(dialect, sql)
 }
 
 pub fn extract_tables_from_cli(
     dialect_name: Option<&str>,
-    sql: String,
+    sql: &str,
 ) -> Result<Vec<String>, Error> {
     let dialect_name = dialect_name.unwrap_or("generic");
     match dialect_from_str(dialect_name) {
@@ -171,11 +171,8 @@ impl Visitor for TableExtractor {
 }
 
 impl TableExtractor {
-    pub fn extract(
-        dialect: &dyn Dialect,
-        sql: String,
-    ) -> Result<Vec<Result<Tables, Error>>, Error> {
-        let statements = Parser::parse_sql(dialect, &sql)?;
+    pub fn extract(dialect: &dyn Dialect, sql: &str) -> Result<Vec<Result<Tables, Error>>, Error> {
+        let statements = Parser::parse_sql(dialect, sql)?;
         let results = statements
             .iter()
             .map(Self::extract_from_statement)
@@ -205,188 +202,341 @@ impl TableExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlparser::dialect::MySqlDialect;
+    use crate::test_utils::all_dialects;
+
+    fn assert_table_extraction(
+        sql: &str,
+        expected: Vec<Result<Tables, Error>>,
+        dialects: Vec<Box<dyn Dialect>>,
+    ) {
+        for dialect in dialects {
+            let result = TableExtractor::extract(dialect.as_ref(), sql).unwrap();
+            assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
+        }
+    }
 
     #[test]
     fn test_single_statement() {
         let sql = "SELECT a FROM t1";
-        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![Ok(Tables(vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },]))]
-        )
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_multiple_statements() {
         let sql = "SELECT a FROM t1; SELECT b FROM t2";
-        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![
-                Ok(Tables(vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                }])),
-                Ok(Tables(vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: None,
-                }])),
-            ]
-        )
+        let expected = vec![
+            Ok(Tables(vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            }])),
+            Ok(Tables(vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            }])),
+        ];
+        assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_alias() {
         let sql = "SELECT a FROM t1 AS t1_alias";
-        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![Ok(Tables(vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: Some("t1_alias".into()),
-            },]))]
-        )
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: Some("t1_alias".into()),
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_table_identifier() {
         let sql = "SELECT a FROM catalog.schema.table";
-        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![Ok(Tables(vec![TableReference {
-                catalog: Some("catalog".into()),
-                schema: Some("schema".into()),
-                name: "table".into(),
-                alias: None,
-            }]))]
-        )
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: Some("catalog".into()),
+            schema: Some("schema".into()),
+            name: "table".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_table_identifier_and_alias() {
         let sql = "SELECT a FROM catalog.schema.table AS table_alias";
-        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![Ok(Tables(vec![TableReference {
-                catalog: Some("catalog".into()),
-                schema: Some("schema".into()),
-                name: "table".into(),
-                alias: Some("table_alias".into()),
-            }]))]
-        )
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: Some("catalog".into()),
+            schema: Some("schema".into()),
+            name: "table".into(),
+            alias: Some("table_alias".into()),
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_where_same_tables_appear_multiple_times() {
         let sql = "SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id WHERE b = ( SELECT c FROM t3 INNER JOIN t1 ON t3.id = t1.id )";
-        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![Ok(Tables(vec![
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t3".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                },
-            ]))]
-        )
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t3".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_error_with_too_many_identifiers() {
         let sql = "SELECT a FROM catalog.schema.table.extra";
-        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![Err(Error::AnalysisError(
-                "Too many identifiers provided".to_string()
-            ))]
-        )
+        let expected = vec![Err(Error::AnalysisError(
+            "Too many identifiers provided".to_string(),
+        ))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_delete_statement() {
+        let sql = "DELETE t1 FROM t1";
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_delete_statement_with_aliases() {
         let sql = "DELETE t1_alias FROM t1 AS t1_alias JOIN t2 AS t2_alias ON t1_alias.a = t2_alias.a WHERE t2_alias.b = 1";
-        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![Ok(Tables(vec![
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: Some("t1_alias".into()),
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: Some("t2_alias".into()),
-                },
-            ]))]
-        )
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: Some("t1_alias".into()),
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: Some("t2_alias".into()),
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_delete_multiple_tables_with_join() {
         let sql =
             "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3 WHERE t1.a = t2.a AND t2.a = t3.a";
-        let result = TableExtractor::extract(&MySqlDialect {}, sql.into()).unwrap();
-        assert_eq!(
-            result,
-            vec![Ok(Tables(vec![
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t3".into(),
-                    alias: None,
-                },
-            ]))]
-        )
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t3".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_delete_from_statement() {
+        let sql = "DELETE FROM t1";
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_delete_from_statement_with_alias() {
+        let sql = "DELETE FROM t1_alias USING t1 AS t1_alias";
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: Some("t1_alias".into()),
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_insert_statement() {
+        let sql = "INSERT INTO t1 (a, b) VALUES (1, 2)";
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_insert_select_statement() {
+        let sql = "INSERT INTO t1 SELECT * FROM t2";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_update_statement() {
+        let sql = "UPDATE t1 SET a = 1";
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_update_statement_with_alias() {
+        let sql = "UPDATE t1 AS t1_alias INNER JOIN t2 ON t1_alias.a = t2.a SET t1_alias.b = t2.b WHERE t2.c = (SELECT c FROM t3)";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: Some("t1_alias".into()),
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t3".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_merge_statement() {
+        let sql = "MERGE INTO t1 USING t2 ON t1.a = t2.a WHEN MATCHED THEN UPDATE SET t1.b = t2.b WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2.a, t2.b)";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+    #[test]
+    fn test_merge_statement_with_alias() {
+        let sql = "MERGE INTO t1 AS t1_alias USING (SELECT a, b FROM t2) AS t2_alias(a, b) ON t1_alias.a = t2_alias.a WHEN MATCHED THEN UPDATE SET t1_alias.b = t2_alias.b WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2_alias.a, t2_alias.b)";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: Some("t1_alias".into()),
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_create_table_statement() {
+        let sql = "CREATE TABLE t1 (a INT)";
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_alters_table_statement() {
+        let sql = "ALTER TABLE t1 ADD COLUMN a INT";
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
     }
 }

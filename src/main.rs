@@ -36,15 +36,17 @@ fn main() {
     let args = Cli::parse();
 
     let result = match args.command {
-        Commands::Format(opts) => sql_insight::format_from_cli(opts.dialect.as_deref(), opts.sql),
+        Commands::Format(opts) => {
+            sql_insight::format_from_cli(opts.dialect.as_deref(), opts.sql.as_str())
+        }
         Commands::Normalize(opts) => {
-            sql_insight::normalize_from_cli(opts.dialect.as_deref(), opts.sql)
+            sql_insight::normalize_from_cli(opts.dialect.as_deref(), opts.sql.as_str())
         }
         Commands::ExtractCrud(opts) => {
-            sql_insight::extract_crud_tables_from_cli(opts.dialect.as_deref(), opts.sql)
+            sql_insight::extract_crud_tables_from_cli(opts.dialect.as_deref(), opts.sql.as_str())
         }
         Commands::ExtractTables(opts) => {
-            sql_insight::extract_tables_from_cli(opts.dialect.as_deref(), opts.sql)
+            sql_insight::extract_tables_from_cli(opts.dialect.as_deref(), opts.sql.as_str())
         }
     };
 
