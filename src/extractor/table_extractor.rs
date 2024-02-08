@@ -2,6 +2,7 @@ use core::fmt;
 use std::ops::ControlFlow;
 
 use crate::error::Error;
+use crate::helper;
 use sqlparser::ast::{Ident, ObjectName, Statement, TableFactor, TableWithJoins, Visit, Visitor};
 use sqlparser::dialect::{dialect_from_str, Dialect};
 use sqlparser::parser::Parser;
@@ -154,16 +155,53 @@ impl fmt::Display for Tables {
 }
 
 #[derive(Default, Debug)]
-pub struct TableExtractor(Vec<TableReference>);
+pub struct TableExtractor {
+    all_tables: Vec<TableReference>,
+    original_tables: Vec<TableReference>,
+    relation_of_table: bool,
+}
 
 impl Visitor for TableExtractor {
     type Break = Error;
 
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
+        // Skip if relation is part of a TableFactor::Table
+        if self.relation_of_table {
+            self.relation_of_table = false;
+            return ControlFlow::Continue(());
+        }
+        match TableReference::try_from(relation) {
+            Ok(table) => {
+                self.all_tables.push(table.clone());
+                self.original_tables.push(table)
+            }
+            Err(e) => return ControlFlow::Break(e),
+        }
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
         if let TableFactor::Table { .. } = table_factor {
+            self.relation_of_table = true;
             match TableReference::try_from(table_factor) {
-                Ok(table) => self.0.push(table),
+                Ok(table) => {
+                    self.all_tables.push(table.clone());
+                    self.original_tables.push(table)
+                }
                 Err(e) => return ControlFlow::Break(e),
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
+        if let Statement::Delete { tables, .. } = statement {
+            // tables of delete statement are not visited by `pre_visit_table_factor` nor `pre_visit_relation`.
+            for table in tables {
+                match TableReference::try_from(table) {
+                    Ok(table) => self.all_tables.push(table),
+                    Err(e) => return ControlFlow::Break(e),
+                }
             }
         }
         ControlFlow::Continue(())
@@ -184,7 +222,10 @@ impl TableExtractor {
         let mut visitor = TableExtractor::default();
         match statement.visit(&mut visitor) {
             ControlFlow::Break(e) => Err(e),
-            ControlFlow::Continue(()) => Ok(Tables(visitor.0)),
+            ControlFlow::Continue(()) => Ok(Tables(helper::resolve_aliased_tables(
+                visitor.all_tables,
+                visitor.original_tables,
+            ))),
         }
     }
 
@@ -194,7 +235,10 @@ impl TableExtractor {
         let mut visitor = TableExtractor::default();
         match table.visit(&mut visitor) {
             ControlFlow::Break(e) => Err(e),
-            ControlFlow::Continue(()) => Ok(Tables(visitor.0)),
+            ControlFlow::Continue(()) => Ok(Tables(helper::resolve_aliased_tables(
+                visitor.all_tables,
+                visitor.original_tables,
+            ))),
         }
     }
 }
@@ -324,162 +368,228 @@ mod tests {
         assert_table_extraction(sql, expected, all_dialects());
     }
 
-    #[test]
-    fn test_delete_statement() {
-        let sql = "DELETE t1 FROM t1";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: None,
-        }]))];
-        assert_table_extraction(sql, expected, all_dialects());
-    }
+    mod delete_statement {
+        use super::*;
 
-    #[test]
-    fn test_delete_statement_with_aliases() {
-        let sql = "DELETE t1_alias FROM t1 AS t1_alias JOIN t2 AS t2_alias ON t1_alias.a = t2_alias.a WHERE t2_alias.b = 1";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: Some("t1_alias".into()),
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: Some("t2_alias".into()),
-            },
-        ]))];
-        assert_table_extraction(sql, expected, all_dialects());
-    }
+        #[test]
+        fn test_delete_statement() {
+            let sql = "DELETE t1 FROM t1";
+            let expected = vec![Ok(Tables(vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                },
+            ]))];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
 
-    #[test]
-    fn test_delete_multiple_tables_with_join() {
-        let sql =
-            "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3 WHERE t1.a = t2.a AND t2.a = t3.a";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t3".into(),
-                alias: None,
-            },
-        ]))];
-        assert_table_extraction(sql, expected, all_dialects());
-    }
+        #[test]
+        fn test_delete_statement_with_aliases() {
+            let sql = "DELETE t1_alias FROM t1 AS t1_alias JOIN t2 AS t2_alias ON t1_alias.a = t2_alias.a WHERE t2_alias.b = 1";
+            let expected = vec![Ok(Tables(vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: Some("t2_alias".into()),
+                },
+            ]))];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
 
-    #[test]
-    fn test_delete_from_statement() {
-        let sql = "DELETE FROM t1";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: None,
-        }]))];
-        assert_table_extraction(sql, expected, all_dialects());
-    }
+        #[test]
+        fn test_delete_multiple_tables_with_join() {
+            let sql =
+                "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3 WHERE t1.a = t2.a AND t2.a = t3.a";
+            let expected = vec![Ok(Tables(vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t3".into(),
+                    alias: None,
+                },
+            ]))];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
 
-    #[test]
-    fn test_delete_from_statement_with_alias() {
-        let sql = "DELETE FROM t1_alias USING t1 AS t1_alias";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: Some("t1_alias".into()),
-        }]))];
-        assert_table_extraction(sql, expected, all_dialects());
-    }
-
-    #[test]
-    fn test_insert_statement() {
-        let sql = "INSERT INTO t1 (a, b) VALUES (1, 2)";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: None,
-        }]))];
-        assert_table_extraction(sql, expected, all_dialects());
-    }
-
-    #[test]
-    fn test_insert_select_statement() {
-        let sql = "INSERT INTO t1 SELECT * FROM t2";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
+        #[test]
+        fn test_delete_from_statement() {
+            let sql = "DELETE FROM t1";
+            let expected = vec![Ok(Tables(vec![TableReference {
                 catalog: None,
                 schema: None,
                 name: "t1".into(),
                 alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-        ]))];
-        assert_table_extraction(sql, expected, all_dialects());
+            }]))];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
+
+        #[test]
+        fn test_delete_from_statement_with_alias() {
+            let sql = "DELETE FROM t1_alias, t2_alias USING t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
+            let expected = vec![Ok(Tables(vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: Some("t2_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: Some("t2_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t3".into(),
+                    alias: None,
+                },
+            ]))];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
     }
 
-    #[test]
-    fn test_update_statement() {
-        let sql = "UPDATE t1 SET a = 1";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: None,
-        }]))];
-        assert_table_extraction(sql, expected, all_dialects());
-    }
+    mod insert_statement {
+        use super::*;
 
-    #[test]
-    fn test_update_statement_with_alias() {
-        let sql = "UPDATE t1 AS t1_alias INNER JOIN t2 ON t1_alias.a = t2.a SET t1_alias.b = t2.b WHERE t2.c = (SELECT c FROM t3)";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
+        #[test]
+        fn test_insert_statement() {
+            let sql = "INSERT INTO t1 (a, b) VALUES (1, 2)";
+            let expected = vec![Ok(Tables(vec![TableReference {
                 catalog: None,
                 schema: None,
                 name: "t1".into(),
-                alias: Some("t1_alias".into()),
-            },
-            TableReference {
+                alias: None,
+            }]))];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
+
+        #[test]
+        fn test_insert_select_statement() {
+            let sql = "INSERT INTO t1 SELECT * FROM t2";
+            let expected = vec![Ok(Tables(vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
+                },
+            ]))];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
+    }
+
+    mod update_statement {
+        use super::*;
+
+        #[test]
+        fn test_update_statement() {
+            let sql = "UPDATE t1 SET a = 1";
+            let expected = vec![Ok(Tables(vec![TableReference {
                 catalog: None,
                 schema: None,
-                name: "t2".into(),
+                name: "t1".into(),
                 alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t3".into(),
-                alias: None,
-            },
-        ]))];
-        assert_table_extraction(sql, expected, all_dialects());
+            }]))];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
+
+        #[test]
+        fn test_update_statement_with_alias() {
+            let sql = "UPDATE t1 AS t1_alias INNER JOIN t2 ON t1_alias.a = t2.a SET t1_alias.b = t2.b WHERE t2.c = (SELECT c FROM t3)";
+            let expected = vec![Ok(Tables(vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t3".into(),
+                    alias: None,
+                },
+            ]))];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
     }
 
     #[test]
     fn test_merge_statement() {
-        let sql = "MERGE INTO t1 USING t2 ON t1.a = t2.a WHEN MATCHED THEN UPDATE SET t1.b = t2.b WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2.a, t2.b)";
+        let sql = "MERGE INTO t1 USING t2 ON t1.a = t2.a \
+                         WHEN MATCHED THEN UPDATE SET t1.b = t2.b \
+                         WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2.a, t2.b)";
         let expected = vec![Ok(Tables(vec![
             TableReference {
                 catalog: None,
@@ -496,9 +606,12 @@ mod tests {
         ]))];
         assert_table_extraction(sql, expected, all_dialects());
     }
+
     #[test]
     fn test_merge_statement_with_alias() {
-        let sql = "MERGE INTO t1 AS t1_alias USING (SELECT a, b FROM t2) AS t2_alias(a, b) ON t1_alias.a = t2_alias.a WHEN MATCHED THEN UPDATE SET t1_alias.b = t2_alias.b WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2_alias.a, t2_alias.b)";
+        let sql = "MERGE INTO t1 AS t1_alias USING (SELECT a, b FROM t2) AS t2_alias(a, b) ON t1_alias.a = t2_alias.a \
+                         WHEN MATCHED THEN UPDATE SET t1_alias.b = t2_alias.b \
+                         WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2_alias.a, t2_alias.b)";
         let expected = vec![Ok(Tables(vec![
             TableReference {
                 catalog: None,

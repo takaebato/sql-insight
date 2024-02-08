@@ -102,7 +102,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "t1, t2\nt2\n");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "t1, t2\nt1, t2\n");
         assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     }
 
