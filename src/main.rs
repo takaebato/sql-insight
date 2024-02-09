@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use sql_insight::NormalizerOptions;
 
 #[derive(Debug, Parser)]
 #[command(name = "sql-insight")]
@@ -14,22 +15,31 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Format SQL
-    Format(CommandOptions),
+    Format(CommonOptions),
     /// Normalize SQL
-    Normalize(CommandOptions),
+    Normalize(NormalizeCommandOptions),
     /// Extract CRUD operations from SQL
-    ExtractCrud(CommandOptions),
+    ExtractCrud(CommonOptions),
     /// Extract tables from SQL
-    ExtractTables(CommandOptions),
+    ExtractTables(CommonOptions),
 }
 
 #[derive(Parser, Debug)]
-struct CommandOptions {
+struct CommonOptions {
     /// The subject SQL to operate on
     sql: String,
     /// The dialect of the input SQL. Might be required for parsing dialect-specific syntax.
     #[clap(short, long)]
     dialect: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct NormalizeCommandOptions {
+    #[clap(flatten)]
+    common_options: CommonOptions,
+    /// Unify IN lists to a single form when all elements are literal values. For example, `IN (1, 2, 3)` becomes `IN (...)`.
+    #[clap(long)]
+    unify_in_list: bool,
 }
 
 fn main() {
@@ -39,9 +49,11 @@ fn main() {
         Commands::Format(opts) => {
             sql_insight::format_from_cli(opts.dialect.as_deref(), opts.sql.as_str())
         }
-        Commands::Normalize(opts) => {
-            sql_insight::normalize_from_cli(opts.dialect.as_deref(), opts.sql.as_str())
-        }
+        Commands::Normalize(opts) => sql_insight::normalize_from_cli(
+            opts.common_options.dialect.as_deref(),
+            opts.common_options.sql.as_str(),
+            NormalizerOptions::new().with_unify_in_list(opts.unify_in_list),
+        ),
         Commands::ExtractCrud(opts) => {
             sql_insight::extract_crud_tables_from_cli(opts.dialect.as_deref(), opts.sql.as_str())
         }
