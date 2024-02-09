@@ -17,7 +17,7 @@ pub fn format_from_cli(dialect_name: Option<&str>, sql: &str) -> Result<Vec<Stri
     }
 }
 
-struct Formatter;
+pub struct Formatter;
 
 impl Formatter {
     pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
@@ -58,6 +58,16 @@ mod tests {
             "INSERT INTO t2 (a) VALUES (4)".into(),
             "UPDATE t1 SET b = 2 WHERE a = 1".into(),
             "DELETE FROM t3 WHERE c = 3".into(),
+        ];
+        assert_format(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_sql_with_comments() {
+        let sql = "SELECT a FROM t1 WHERE b = 1; -- comment\nSELECT b FROM t2 WHERE c =  2  /* comment */";
+        let expected = vec![
+            "SELECT a FROM t1 WHERE b = 1".into(),
+            "SELECT b FROM t2 WHERE c = 2".into(),
         ];
         assert_format(sql, expected, all_dialects());
     }
