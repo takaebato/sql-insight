@@ -1,49 +1,13 @@
 use crate::error::Error;
-use crate::CliExecutable;
-use sqlparser::dialect::{dialect_from_str, Dialect};
+use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
 pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
     Formatter::format(dialect, sql)
 }
 
-pub fn format_from_cli(dialect_name: Option<&str>, sql: &str) -> Result<Vec<String>, Error> {
-    let dialect_name = dialect_name.unwrap_or("generic");
-    match dialect_from_str(dialect_name) {
-        Some(dialect) => Ok(format(dialect.as_ref(), sql)?),
-        None => Err(Error::ArgumentError(format!(
-            "Dialect not found: {}",
-            dialect_name
-        ))),
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct Formatter;
-
-pub struct FormatExecutor {
-    sql: String,
-    dialect: Option<String>,
-}
-
-impl FormatExecutor {
-    pub fn new(sql: String, dialect: Option<String>) -> Self {
-        Self { sql, dialect }
-    }
-}
-
-impl CliExecutable for FormatExecutor {
-    fn execute(&self) -> Result<Vec<String>, Error> {
-        let dialect_name = self.dialect.clone().unwrap_or("generic".into());
-        match dialect_from_str(&dialect_name) {
-            Some(dialect) => Ok(format(dialect.as_ref(), self.sql.as_ref())?),
-            None => Err(Error::ArgumentError(format!(
-                "Dialect not found: {}",
-                dialect_name
-            ))),
-        }
-    }
-}
 
 impl Formatter {
     pub fn new() -> Self {

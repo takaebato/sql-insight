@@ -2,9 +2,9 @@ use core::fmt;
 use std::ops::ControlFlow;
 
 use crate::error::Error;
-use crate::{helper, CliExecutable};
+use crate::helper;
 use sqlparser::ast::{Ident, ObjectName, Statement, TableFactor, TableWithJoins, Visit, Visitor};
-use sqlparser::dialect::{dialect_from_str, Dialect};
+use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
 pub fn extract_tables(
@@ -12,29 +12,6 @@ pub fn extract_tables(
     sql: &str,
 ) -> Result<Vec<Result<Tables, Error>>, Error> {
     TableExtractor::extract(dialect, sql)
-}
-
-pub fn extract_tables_from_cli(
-    dialect_name: Option<&str>,
-    sql: &str,
-) -> Result<Vec<String>, Error> {
-    let dialect_name = dialect_name.unwrap_or("generic");
-    match dialect_from_str(dialect_name) {
-        Some(dialect) => {
-            let result = extract_tables(dialect.as_ref(), sql)?;
-            Ok(result
-                .iter()
-                .map(|r| match r {
-                    Ok(crud_tables) => format!("{}", crud_tables),
-                    Err(e) => format!("Error: {}", e),
-                })
-                .collect())
-        }
-        None => Err(Error::ArgumentError(format!(
-            "Dialect not found: {}",
-            dialect_name
-        ))),
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -159,38 +136,6 @@ pub struct TableExtractor {
     all_tables: Vec<TableReference>,
     original_tables: Vec<TableReference>,
     relation_of_table: bool,
-}
-
-pub struct TableExtractExecutor {
-    pub sql: String,
-    pub dialect: Option<String>,
-}
-impl TableExtractExecutor {
-    pub fn new(sql: String, dialect: Option<String>) -> Self {
-        Self { sql, dialect }
-    }
-}
-
-impl CliExecutable for TableExtractExecutor {
-    fn execute(&self) -> Result<Vec<String>, Error> {
-        let dialect_name = self.dialect.clone().unwrap_or("generic".into());
-        match dialect_from_str(&dialect_name) {
-            Some(dialect) => {
-                let result = extract_tables(dialect.as_ref(), self.sql.as_ref())?;
-                Ok(result
-                    .iter()
-                    .map(|r| match r {
-                        Ok(crud_tables) => format!("{}", crud_tables),
-                        Err(e) => format!("Error: {}", e),
-                    })
-                    .collect())
-            }
-            None => Err(Error::ArgumentError(format!(
-                "Dialect not found: {}",
-                dialect_name
-            ))),
-        }
-    }
 }
 
 impl Visitor for TableExtractor {

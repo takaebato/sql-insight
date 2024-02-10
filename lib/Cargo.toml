@@ -1,0 +1,26 @@
+[package]
+name = "sql-insight"
+description = "SQL Insight is a tool to parse SQL queries and provide insight into the queries."
+documentation = "https://docs.rs/sql-insight/"
+keywords = ["sql", "query", "tool", "insight", "parser"]
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+]
+readme = "README.md"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+
+[lib]
+name = "sql_insight"
+path = "src/lib.rs"
+
+[dependencies]
+sqlparser = { version = "0.41.0", features = ["visitor"] }
+thiserror = "1.0.56"
+
+

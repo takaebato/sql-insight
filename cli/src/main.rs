@@ -1,10 +1,13 @@
+mod executor;
+
+use crate::executor::{
+    CliExecutable, CrudTableExtractExecutor, FormatExecutor, NormalizeExecutor,
+    TableExtractExecutor,
+};
 use clap::{ArgGroup, Parser, Subcommand};
 use sql_insight::error::Error;
-use sql_insight::{
-    CliExecutable, CrudTableExtractExecutor, FormatExecutor, NormalizeExecutor, NormalizerOptions, TableExtractExecutor,
-};
+use sql_insight::NormalizerOptions;
 use std::io::{self, Write};
-
 
 #[derive(Debug, Parser)]
 #[command(name = "sql-insight")]
@@ -46,29 +49,9 @@ enum ProcessType {
     Interactive,
 }
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Format SQL
-    Format(CommonOptions),
-    /// Normalize SQL
-    Normalize(NormalizeCommandOptions),
-    /// Extract CRUD operations from SQL
-    ExtractCrud(CommonOptions),
-    /// Extract tables from SQL
-    ExtractTables(CommonOptions),
-}
-
-impl Commands {
-    fn execute(&self) -> Result<Vec<String>, Error> {
-        match self.process_type() {
-            ProcessType::Sql(sql) => self.execute_sql(sql),
-            ProcessType::File(file) => self.execute_file(file),
-            ProcessType::Interactive => self.execute_interactive(),
-        }
-    }
-
-    fn process_type(&self) -> ProcessType {
-        match self {
+impl From<&Commands> for ProcessType {
+    fn from(command: &Commands) -> Self {
+        match command {
             Commands::Format(opts)
             | Commands::ExtractCrud(opts)
             | Commands::ExtractTables(opts) => {
@@ -91,6 +74,28 @@ impl Commands {
             }
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Format SQL
+    Format(CommonOptions),
+    /// Normalize SQL
+    Normalize(NormalizeCommandOptions),
+    /// Extract CRUD operations from SQL
+    ExtractCrud(CommonOptions),
+    /// Extract tables from SQL
+    ExtractTables(CommonOptions),
+}
+
+impl Commands {
+    fn execute(&self) -> Result<Vec<String>, Error> {
+        match ProcessType::from(self) {
+            ProcessType::Sql(sql) => self.execute_sql(sql),
+            ProcessType::File(file) => self.execute_file(file),
+            ProcessType::Interactive => self.execute_interactive(),
+        }
+    }
 
     fn execute_sql(&self, sql: String) -> Result<Vec<String>, Error> {
         self.executor(sql).execute()
@@ -107,7 +112,7 @@ impl Commands {
     }
 
     fn execute_interactive(&self) -> Result<Vec<String>, Error> {
-        let _ = self.entering_interactive_mode();
+        self.entering_interactive_mode()?;
         Ok(vec![])
     }
 
@@ -135,9 +140,18 @@ impl Commands {
             input_buffer.push_str(line);
             input_buffer.push('\n');
             if line.ends_with(';') {
-                new_input = true;
+                match self.executor(input_buffer.clone()).execute() {
+                    Ok(result) => {
+                        for r in result {
+                            println!("{}", r);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                    }
+                }
                 input_buffer.clear();
-                let _ = self.executor(input_buffer.clone()).execute();
+                new_input = true;
             } else {
                 new_input = false;
             }

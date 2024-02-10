@@ -97,6 +97,26 @@ mod tests {
                 )
                 .stderr("");
         }
+
+        #[test]
+        fn test_normalize_from_file() {
+            let mut temp_file = NamedTempFile::new().unwrap();
+            temp_file
+                .write_all(
+                    b"select * from t1 where a = 1 and b in (2, 3); insert into t2 (a) values (4);",
+                )
+                .unwrap();
+            sql_insight_cmd()
+                .arg("normalize")
+                .arg("--file")
+                .arg(temp_file.path())
+                .assert()
+                .success()
+                .stdout(
+                    "SELECT * FROM t1 WHERE a = ? AND b IN (?, ?)\nINSERT INTO t2 (a) VALUES (?)\n",
+                )
+                .stderr("");
+        }
     }
 
     mod extract_crud_tables {
@@ -125,6 +145,22 @@ mod tests {
                 .stdout("Create: [], Read: [t1, t2], Update: [], Delete: []\nCreate: [t1], Read: [t2], Update: [], Delete: []\n")
                 .stderr("");
         }
+
+        #[test]
+        fn test_extract_crud_tables_from_file() {
+            let mut temp_file = NamedTempFile::new().unwrap();
+            temp_file
+                .write_all(b"select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
+                .unwrap();
+            sql_insight_cmd()
+                .arg("extract-crud")
+                .arg("--file")
+                .arg(temp_file.path())
+                .assert()
+                .success()
+                .stdout("Create: [], Read: [t1, t2], Update: [], Delete: []\nCreate: [t1], Read: [t2], Update: [], Delete: []\n")
+                .stderr("");
+        }
     }
 
     mod extract_tables {
@@ -148,6 +184,22 @@ mod tests {
                 .arg("--dialect")
                 .arg("mysql")
                 .arg("select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
+                .assert()
+                .success()
+                .stdout("t1, t2\nt1, t2\n")
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_tables_from_file() {
+            let mut temp_file = NamedTempFile::new().unwrap();
+            temp_file
+                .write_all(b"select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
+                .unwrap();
+            sql_insight_cmd()
+                .arg("extract-tables")
+                .arg("--file")
+                .arg(temp_file.path())
                 .assert()
                 .success()
                 .stdout("t1, t2\nt1, t2\n")
