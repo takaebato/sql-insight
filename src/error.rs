@@ -9,4 +9,6 @@ pub enum Error {
     ParserError(#[from] ParserError),
     #[error("{0}")]
     AnalysisError(String),
+    #[error("{0}")]
+    IOError(String),
 }

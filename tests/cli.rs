@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod tests {
     use assert_cmd::Command;
+    use predicates::prelude::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     fn sql_insight_cmd() -> Command {
         Command::cargo_bin("sql-insight").unwrap()
@@ -27,6 +30,22 @@ mod tests {
                 .arg("--dialect")
                 .arg("mysql")
                 .arg("select  *  \n  from  t1; INSERT INTO t2 ( a )   VALUES  \n (1);")
+                .assert()
+                .success()
+                .stdout("SELECT * FROM t1\nINSERT INTO t2 (a) VALUES (1)\n")
+                .stderr("");
+        }
+
+        #[test]
+        fn test_format_from_file() {
+            let mut temp_file = NamedTempFile::new().unwrap();
+            temp_file
+                .write_all(b"select  *  \n  from  t1; INSERT INTO t2 ( a )   VALUES  \n (1);")
+                .unwrap();
+            sql_insight_cmd()
+                .arg("format")
+                .arg("--file")
+                .arg(temp_file.path())
                 .assert()
                 .success()
                 .stdout("SELECT * FROM t1\nINSERT INTO t2 (a) VALUES (1)\n")
@@ -133,6 +152,29 @@ mod tests {
                 .success()
                 .stdout("t1, t2\nt1, t2\n")
                 .stderr("");
+        }
+    }
+
+    mod invalid_cases {
+        use super::*;
+
+        #[test]
+        fn test_both_sql_and_file_provided() {
+            let mut temp_file = NamedTempFile::new().unwrap();
+            temp_file
+                .write_all(b"select  *  \n  from  t1; INSERT INTO t2 ( a )   VALUES  \n (1);")
+                .unwrap();
+            sql_insight_cmd()
+                .arg("format")
+                .arg("select  *  \n  from  t1; INSERT INTO t2 ( a )   VALUES  \n (1);")
+                .arg("--file")
+                .arg(temp_file.path())
+                .assert()
+                .failure()
+                .stdout("")
+                .stderr(predicate::str::contains(
+                    "the argument '[SQL]' cannot be used with '--file <FILE>'",
+                ));
         }
     }
 }

@@ -1,6 +1,7 @@
 use std::ops::ControlFlow;
 
 use crate::error::Error;
+use crate::CliExecutable;
 use sqlparser::ast::Value;
 use sqlparser::ast::{Expr, VisitMut, VisitorMut};
 use sqlparser::dialect::{dialect_from_str, Dialect};
@@ -48,6 +49,44 @@ impl NormalizerOptions {
 #[derive(Default)]
 pub struct Normalizer {
     pub options: NormalizerOptions,
+}
+
+pub struct NormalizeExecutor {
+    sql: String,
+    dialect: Option<String>,
+    options: NormalizerOptions,
+}
+
+impl NormalizeExecutor {
+    pub fn new(sql: String, dialect: Option<String>) -> Self {
+        Self {
+            sql,
+            dialect,
+            options: NormalizerOptions::new(),
+        }
+    }
+
+    pub fn with_options(mut self, options: NormalizerOptions) -> Self {
+        self.options = options;
+        self
+    }
+}
+
+impl CliExecutable for NormalizeExecutor {
+    fn execute(&self) -> Result<Vec<String>, Error> {
+        let dialect_name = self.dialect.clone().unwrap_or("generic".into());
+        match dialect_from_str(&dialect_name) {
+            Some(dialect) => Ok(normalize(
+                dialect.as_ref(),
+                self.sql.as_ref(),
+                self.options.clone(),
+            )?),
+            None => Err(Error::ArgumentError(format!(
+                "Dialect not found: {}",
+                dialect_name
+            ))),
+        }
+    }
 }
 
 impl VisitorMut for Normalizer {

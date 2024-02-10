@@ -2,7 +2,7 @@ use core::fmt;
 use std::ops::ControlFlow;
 
 use crate::error::Error;
-use crate::helper;
+use crate::{helper, CliExecutable};
 use sqlparser::ast::{Ident, ObjectName, Statement, TableFactor, TableWithJoins, Visit, Visitor};
 use sqlparser::dialect::{dialect_from_str, Dialect};
 use sqlparser::parser::Parser;
@@ -161,6 +161,38 @@ pub struct TableExtractor {
     relation_of_table: bool,
 }
 
+pub struct TableExtractExecutor {
+    pub sql: String,
+    pub dialect: Option<String>,
+}
+impl TableExtractExecutor {
+    pub fn new(sql: String, dialect: Option<String>) -> Self {
+        Self { sql, dialect }
+    }
+}
+
+impl CliExecutable for TableExtractExecutor {
+    fn execute(&self) -> Result<Vec<String>, Error> {
+        let dialect_name = self.dialect.clone().unwrap_or("generic".into());
+        match dialect_from_str(&dialect_name) {
+            Some(dialect) => {
+                let result = extract_tables(dialect.as_ref(), self.sql.as_ref())?;
+                Ok(result
+                    .iter()
+                    .map(|r| match r {
+                        Ok(crud_tables) => format!("{}", crud_tables),
+                        Err(e) => format!("Error: {}", e),
+                    })
+                    .collect())
+            }
+            None => Err(Error::ArgumentError(format!(
+                "Dialect not found: {}",
+                dialect_name
+            ))),
+        }
+    }
+}
+
 impl Visitor for TableExtractor {
     type Break = Error;
 
@@ -209,6 +241,10 @@ impl Visitor for TableExtractor {
 }
 
 impl TableExtractor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn extract(dialect: &dyn Dialect, sql: &str) -> Result<Vec<Result<Tables, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         let results = statements

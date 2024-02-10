@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 
 use crate::error::Error;
 use crate::extractor::table_extractor::TableReference;
-use crate::{helper, TableExtractor};
+use crate::{helper, CliExecutable, TableExtractor};
 use sqlparser::ast::{MergeClause, Statement, Visit, Visitor};
 use sqlparser::dialect::{dialect_from_str, Dialect};
 use sqlparser::parser::Parser;
@@ -77,6 +77,39 @@ pub struct CrudTableExtractor {
     update_tables: Vec<TableReference>,
     delete_tables: Vec<TableReference>,
     possibly_aliased_delete_tables: Vec<TableReference>,
+}
+
+pub struct CrudTableExtractExecutor {
+    sql: String,
+    dialect: Option<String>,
+}
+
+impl CrudTableExtractExecutor {
+    pub fn new(sql: String, dialect: Option<String>) -> Self {
+        Self { sql, dialect }
+    }
+}
+
+impl CliExecutable for CrudTableExtractExecutor {
+    fn execute(&self) -> Result<Vec<String>, Error> {
+        let dialect_name = self.dialect.clone().unwrap_or("generic".into());
+        match dialect_from_str(&dialect_name) {
+            Some(dialect) => {
+                let result = extract_crud_tables(dialect.as_ref(), self.sql.as_ref())?;
+                Ok(result
+                    .iter()
+                    .map(|r| match r {
+                        Ok(crud_tables) => format!("{}", crud_tables),
+                        Err(e) => format!("Error: {}", e),
+                    })
+                    .collect())
+            }
+            None => Err(Error::ArgumentError(format!(
+                "Dialect not found: {}",
+                dialect_name
+            ))),
+        }
+    }
 }
 
 impl Visitor for CrudTableExtractor {
@@ -169,6 +202,9 @@ impl Visitor for CrudTableExtractor {
 }
 
 impl CrudTableExtractor {
+    pub fn new() -> Self {
+        Self::default()
+    }
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,
