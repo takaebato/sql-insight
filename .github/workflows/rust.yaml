@@ -18,7 +18,7 @@ jobs:
         uses: hecrj/setup-rust-action@v2
         with:
           components: rustfmt
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - run: cargo fmt --check
 
   lint:
@@ -28,7 +28,7 @@ jobs:
         uses: hecrj/setup-rust-action@v2
         with:
           components: clippy
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   compile:
@@ -57,7 +57,7 @@ jobs:
         with:
           rust-version: stable
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Test
         run: cargo test --all-features
 
@@ -75,9 +75,9 @@ jobs:
           version: 0.27.3
           use-tool-cache: true
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Coverage
-        run: cargo tarpaulin -o Lcov --output-dir ./coverage
+        run: cargo tarpaulin --workspace --follow-exec -o Lcov --output-dir ./coverage
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v4.0.1
         with:
