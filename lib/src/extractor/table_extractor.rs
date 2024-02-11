@@ -54,9 +54,9 @@ impl TryFrom<&TableFactor> for TableReference {
     type Error = Error;
 
     fn try_from(table: &TableFactor) -> Result<Self, Self::Error> {
-        if let TableFactor::Table { name, alias, .. } = table {
-            match name.0.len() {
-                0 => Err(Error::AnalysisError("No identifiers provided".to_string())),
+        match table {
+            TableFactor::Table { name, alias, .. } => match name.0.len() {
+                0 => unreachable!("Parser should not allow empty identifiers"),
                 1 => Ok(TableReference {
                     catalog: None,
                     schema: None,
@@ -78,9 +78,8 @@ impl TryFrom<&TableFactor> for TableReference {
                 _ => Err(Error::AnalysisError(
                     "Too many identifiers provided".to_string(),
                 )),
-            }
-        } else {
-            Err(Error::AnalysisError("Not a table".to_string()))
+            },
+            _ => unreachable!("TableFactor::Table expected"),
         }
     }
 }
@@ -90,7 +89,7 @@ impl TryFrom<&ObjectName> for TableReference {
 
     fn try_from(obj_name: &ObjectName) -> Result<Self, Self::Error> {
         match obj_name.0.len() {
-            0 => Err(Error::AnalysisError("No identifiers provided".to_string())),
+            0 => unreachable!("Parser should not allow empty identifiers"),
             1 => Ok(TableReference {
                 catalog: None,
                 schema: None,
@@ -186,10 +185,6 @@ impl Visitor for TableExtractor {
 }
 
 impl TableExtractor {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn extract(dialect: &dyn Dialect, sql: &str) -> Result<Vec<Result<Tables, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         let results = statements
@@ -285,14 +280,43 @@ mod tests {
     }
 
     #[test]
-    fn test_statement_with_table_identifier() {
-        let sql = "SELECT a FROM catalog.schema.table";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: Some("catalog".into()),
-            schema: Some("schema".into()),
-            name: "table".into(),
-            alias: None,
-        }]))];
+    fn test_statement_with_schema_identifier() {
+        let sql = "SELECT a FROM schema.table; INSERT INTO schema.table (a) VALUES (1)";
+        let expected = vec![
+            Ok(Tables(vec![TableReference {
+                catalog: None,
+                schema: Some("schema".into()),
+                name: "table".into(),
+                alias: None,
+            }])),
+            Ok(Tables(vec![TableReference {
+                catalog: None,
+                schema: Some("schema".into()),
+                name: "table".into(),
+                alias: None,
+            }])),
+        ];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_full_identifier() {
+        let sql =
+            "SELECT a FROM catalog.schema.table; INSERT INTO catalog.schema.table (a) VALUES (1)";
+        let expected = vec![
+            Ok(Tables(vec![TableReference {
+                catalog: Some("catalog".into()),
+                schema: Some("schema".into()),
+                name: "table".into(),
+                alias: None,
+            }])),
+            Ok(Tables(vec![TableReference {
+                catalog: Some("catalog".into()),
+                schema: Some("schema".into()),
+                name: "table".into(),
+                alias: None,
+            }])),
+        ];
         assert_table_extraction(sql, expected, all_dialects());
     }
 

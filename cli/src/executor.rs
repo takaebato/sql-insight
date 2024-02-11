@@ -6,6 +6,12 @@ pub trait CliExecutable {
     fn execute(&self) -> Result<Vec<String>, Error>;
 }
 
+fn get_dialect(dialect_name: Option<&str>) -> Result<Box<dyn dialect::Dialect>, Error> {
+    let dialect_name = dialect_name.unwrap_or("generic");
+    dialect::dialect_from_str(dialect_name)
+        .ok_or_else(|| Error::ArgumentError(format!("Dialect not found: {}", dialect_name)))
+}
+
 pub struct FormatExecutor {
     sql: String,
     dialect_name: Option<String>,
@@ -109,10 +115,4 @@ impl CliExecutable for CrudTableExtractExecutor {
             })
             .collect())
     }
-}
-
-fn get_dialect(dialect_name: Option<&str>) -> Result<Box<dyn dialect::Dialect>, Error> {
-    let dialect_name = dialect_name.unwrap_or("generic");
-    dialect::dialect_from_str(dialect_name)
-        .ok_or_else(|| Error::ArgumentError(format!("Dialect not found: {}", dialect_name)))
 }

@@ -10,10 +10,6 @@ pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
 pub struct Formatter;
 
 impl Formatter {
-    pub fn new() -> Self {
-        Self
-    }
-
     pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         Ok(statements

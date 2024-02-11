@@ -8,6 +8,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 use sql_insight::error::Error;
 use sql_insight::NormalizerOptions;
 use std::io::{self, Write};
+use std::process::ExitCode;
 
 #[derive(Debug, Parser)]
 #[command(name = "sql-insight")]
@@ -117,7 +118,10 @@ impl Commands {
     }
 
     fn entering_interactive_mode(&self) -> Result<(), Error> {
-        println!("Entering interactive mode. Type sql statement end with `;` to execute.");
+        println!(
+            "Entering interactive mode. Type sql statement end with `;` to execute. \
+             Type `exit` or `quit` to exit."
+        );
         let stdin = io::stdin();
         let mut stdout = io::stdout();
         let mut input_buffer = String::new();
@@ -136,6 +140,10 @@ impl Commands {
             let line = line.trim();
             if line.is_empty() {
                 continue;
+            }
+            if line.to_lowercase() == "exit" || line.to_lowercase() == "quit" {
+                println!("Bye");
+                break Ok(());
             }
             input_buffer.push_str(line);
             input_buffer.push('\n');
@@ -175,7 +183,7 @@ impl Commands {
     }
 }
 
-fn main() {
+fn main() -> ExitCode {
     let args = Cli::parse();
     let result = args.command.execute();
     match result {
@@ -183,9 +191,11 @@ fn main() {
             for r in result {
                 println!("{}", r);
             }
+            ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("Error: {}", e);
+            ExitCode::FAILURE
         }
     }
 }

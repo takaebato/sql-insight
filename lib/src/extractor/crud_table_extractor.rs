@@ -146,9 +146,6 @@ impl Visitor for CrudTableExtractor {
 }
 
 impl CrudTableExtractor {
-    pub fn new() -> Self {
-        Self::default()
-    }
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,
@@ -290,6 +287,15 @@ mod tests {
             update_tables: vec![],
             delete_tables: vec![],
         })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_error_with_too_many_identifiers() {
+        let sql = "INSERT INTO catalog.schema.table.extra (a) VALUES (1)";
+        let expected = vec![Err(Error::AnalysisError(
+            "Too many identifiers provided".to_string(),
+        ))];
         assert_crud_table_extraction(sql, expected, all_dialects());
     }
 
