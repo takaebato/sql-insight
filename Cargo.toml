@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "lib"]
+members = ["sql-insight", "sql-insight-cli"]
 resolver = "2"
 
 [workspace.package]
