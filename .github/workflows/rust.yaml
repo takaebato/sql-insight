@@ -1,0 +1,87 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  codestyle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Rust
+        uses: hecrj/setup-rust-action@v2
+        with:
+          components: rustfmt
+      - uses: actions/checkout@v3
+      - run: cargo fmt --check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Rust
+        uses: hecrj/setup-rust-action@v2
+        with:
+          components: clippy
+      - uses: actions/checkout@v3
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Rust
+        uses: hecrj/setup-rust-action@v2
+      - uses: actions/checkout@master
+      - run: cargo check --all-targets --all-features
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-Dwarnings"
+    steps:
+      - name: Set up Rust
+        uses: hecrj/setup-rust-action@v2
+      - uses: actions/checkout@master
+      - run: cargo doc --document-private-items --no-deps --workspace --all-features
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Rust
+        uses: hecrj/setup-rust-action@v2
+        with:
+          rust-version: stable
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Test
+        run: cargo test --all-features
+
+  test-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Rust
+        uses: hecrj/setup-rust-action@v2
+        with:
+          rust-version: stable
+      - name: Install Tarpaulin
+        uses: actions-rs/install@v0.1
+        with:
+          crate: cargo-tarpaulin
+          version: 0.27.3
+          use-tool-cache: true
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Coverage
+        run: cargo tarpaulin -o Lcov --output-dir ./coverage
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v4.0.1
+        with:
+          files: ./coverage/lcov.info
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          slug: takaebato/sql-insight
