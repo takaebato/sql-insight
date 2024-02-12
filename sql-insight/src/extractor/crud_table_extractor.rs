@@ -1,3 +1,7 @@
+//! A Extractor that extracts CRUD tables from SQL queries.
+//!
+//! See [`extract_crud_tables`](crate::extract_crud_tables()) as the entry point for extracting CRUD tables from SQL.
+
 use std::fmt;
 use std::ops::ControlFlow;
 
@@ -8,6 +12,19 @@ use sqlparser::ast::{MergeClause, Statement, Visit, Visitor};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
+/// Convenience function to extract CRUD tables from SQL.
+///
+/// ## Example
+///
+/// ```rust
+/// use sqlparser::dialect::GenericDialect;
+///
+/// let dialect = GenericDialect {};
+/// let sql = "INSERT INTO t1 (a) SELECT a FROM t2";
+/// let result = sql_insight::extract_crud_tables(&dialect, sql).unwrap();
+/// println!("{:#?}", result);
+/// assert_eq!(result[0].as_ref().unwrap().to_string(), "Create: [t1], Read: [t2], Update: [], Delete: []");
+/// ```
 pub fn extract_crud_tables(
     dialect: &dyn Dialect,
     sql: &str,
@@ -15,6 +32,7 @@ pub fn extract_crud_tables(
     CrudTableExtractor::extract(dialect, sql)
 }
 
+/// [`CrudTables`] represents the tables involved in CRUD operations.
 #[derive(Default, Debug, PartialEq)]
 pub struct CrudTables {
     pub create_tables: Vec<TableReference>,
@@ -47,6 +65,7 @@ impl CrudTables {
     }
 }
 
+/// A visitor to extract CRUD tables from SQL.
 #[derive(Default, Debug)]
 pub struct CrudTableExtractor {
     create_tables: Vec<TableReference>,
@@ -146,6 +165,7 @@ impl Visitor for CrudTableExtractor {
 }
 
 impl CrudTableExtractor {
+    /// Extract CRUD tables from SQL.
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,

@@ -1,3 +1,7 @@
+//! A Extractor that extracts tables from SQL queries.
+//!
+//! See [`extract_tables`](crate::extract_tables()) as the entry point for extracting tables from SQL.
+
 use core::fmt;
 use std::ops::ControlFlow;
 
@@ -7,6 +11,19 @@ use sqlparser::ast::{Ident, ObjectName, Statement, TableFactor, TableWithJoins, 
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
+/// Convenience function to extract tables from SQL.
+///
+/// ## Example
+///
+/// ```rust
+/// use sqlparser::dialect::GenericDialect;
+///
+/// let dialect = GenericDialect {};
+/// let sql = "SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id";
+/// let result = sql_insight::extract_tables(&dialect, sql).unwrap();
+/// println!("{:#?}", result);
+/// assert_eq!(result[0].as_ref().unwrap().to_string(), "t1, t2");
+/// ```
 pub fn extract_tables(
     dialect: &dyn Dialect,
     sql: &str,
@@ -14,6 +31,9 @@ pub fn extract_tables(
     TableExtractor::extract(dialect, sql)
 }
 
+/// [`TableReference`] represents a qualified table with alias.
+/// In this crate, this is the canonical representation of a table.
+/// Tables found during analyzing an AST are stored as `TableReference`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TableReference {
     pub catalog: Option<Ident>,
@@ -115,6 +135,7 @@ impl TryFrom<&ObjectName> for TableReference {
     }
 }
 
+/// [`Tables`] represents a list of [`TableReference`] that found in SQL.
 #[derive(Debug, PartialEq)]
 pub struct Tables(pub Vec<TableReference>);
 
@@ -130,10 +151,14 @@ impl fmt::Display for Tables {
     }
 }
 
+/// A visitor to extract tables from SQL.
 #[derive(Default, Debug)]
 pub struct TableExtractor {
+    // All tables found in the SQL including aliases, must be resolved to original tables.
     all_tables: Vec<TableReference>,
+    // Original tables found in the SQL, used to resolve aliases.
     original_tables: Vec<TableReference>,
+    // Flag to indicate if the current relation is part of a `TableFactor::Table`
     relation_of_table: bool,
 }
 
@@ -185,6 +210,7 @@ impl Visitor for TableExtractor {
 }
 
 impl TableExtractor {
+    /// Extract tables from SQL.
     pub fn extract(dialect: &dyn Dialect, sql: &str) -> Result<Vec<Result<Tables, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         let results = statements
