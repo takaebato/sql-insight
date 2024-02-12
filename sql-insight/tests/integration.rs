@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+mod integration {
     use sql_insight::test_utils::all_dialects;
     use sql_insight::{CrudTables, NormalizerOptions};
     use sql_insight::{TableReference, Tables};
