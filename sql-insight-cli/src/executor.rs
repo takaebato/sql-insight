@@ -55,7 +55,7 @@ impl NormalizeExecutor {
 
 impl CliExecutable for NormalizeExecutor {
     fn execute(&self) -> Result<Vec<String>, Error> {
-        sql_insight::normalize(
+        sql_insight::normalize_with_options(
             get_dialect(self.dialect_name.as_deref())?.as_ref(),
             self.sql.as_ref(),
             self.options.clone(),

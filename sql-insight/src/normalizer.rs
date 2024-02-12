@@ -6,7 +6,11 @@ use sqlparser::ast::{Expr, VisitMut, VisitorMut};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
-pub fn normalize(
+pub fn normalize(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
+    Normalizer::normalize(dialect, sql, NormalizerOptions::new())
+}
+
+pub fn normalize_with_options(
     dialect: &dyn Dialect,
     sql: &str,
     options: NormalizerOptions,
