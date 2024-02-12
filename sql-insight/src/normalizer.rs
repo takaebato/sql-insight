@@ -1,3 +1,7 @@
+//! A Normalizer that converts SQL queries to a canonical form.
+//!
+//! See [`normalize`](crate::normalize) as the entry point for normalizing SQL.
+
 use std::ops::ControlFlow;
 
 use crate::error::Error;
@@ -6,10 +10,35 @@ use sqlparser::ast::{Expr, VisitMut, VisitorMut};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
+/// Convenience function to normalize SQL with default options.
+///
+/// ## Example
+///
+/// ```rust
+/// use sqlparser::dialect::GenericDialect;
+///
+/// let dialect = GenericDialect {};
+/// let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'";
+/// let result = sql_insight::normalize(&dialect, sql).unwrap();
+/// assert_eq!(result, ["SELECT a FROM t1 WHERE b = ? AND c IN (?, ?) AND d LIKE ?"]);
+/// ```
 pub fn normalize(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
     Normalizer::normalize(dialect, sql, NormalizerOptions::new())
 }
 
+/// Convenience function to normalize SQL with options.
+///
+/// ## Example
+///
+/// ```rust
+/// use sqlparser::dialect::GenericDialect;
+/// use sql_insight::NormalizerOptions;
+///
+/// let dialect = GenericDialect {};
+/// let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3, 4)";
+/// let result = sql_insight::normalize_with_options(&dialect, sql, NormalizerOptions::new().with_unify_in_list(true)).unwrap();
+/// assert_eq!(result, ["SELECT a FROM t1 WHERE b = ? AND c IN (...)"]);
+/// ```
 pub fn normalize_with_options(
     dialect: &dyn Dialect,
     sql: &str,
@@ -18,8 +47,11 @@ pub fn normalize_with_options(
     Normalizer::normalize(dialect, sql, options)
 }
 
+/// Options for normalizing SQL.
 #[derive(Default, Clone)]
 pub struct NormalizerOptions {
+    /// Unify IN lists to a single form when all elements are literal values.
+    /// For example, `IN (1, 2, 3)` becomes `IN (...)`.
     pub unify_in_list: bool,
 }
 
@@ -34,6 +66,7 @@ impl NormalizerOptions {
     }
 }
 
+/// A visitor for SQL AST nodes that normalizes SQL queries.
 #[derive(Default)]
 pub struct Normalizer {
     pub options: NormalizerOptions,
@@ -72,6 +105,7 @@ impl Normalizer {
         self
     }
 
+    /// Normalize SQL.
     pub fn normalize(
         dialect: &dyn Dialect,
         sql: &str,

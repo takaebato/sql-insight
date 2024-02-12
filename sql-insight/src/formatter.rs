@@ -1,15 +1,33 @@
+//! A Formatter that formats SQL into a standardized format.
+//!
+//! See [`format`](crate::format) as the entry point for formatting SQL.
+
 use crate::error::Error;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
+/// Convenience function to format SQL.
+///
+/// ## Example
+///
+/// ```rust
+/// use sqlparser::dialect::GenericDialect;
+///
+/// let dialect = GenericDialect {};
+/// let sql = "SELECT a FROM t1 \n WHERE b =   1";
+/// let result = sql_insight::format(&dialect, sql).unwrap();
+/// assert_eq!(result, ["SELECT a FROM t1 WHERE b = 1"]);
+/// ```
 pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
     Formatter::format(dialect, sql)
 }
 
+/// Formatter for SQL.
 #[derive(Debug, Default)]
 pub struct Formatter;
 
 impl Formatter {
+    /// Format SQL.
     pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         Ok(statements

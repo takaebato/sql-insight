@@ -34,7 +34,8 @@ Format SQL queries according to different dialects:
 ```rust
 use sqlparser::dialect::GenericDialect;
 
-let formatted_sql = sql_insight::format(GenericDialect {}, "SELECT * \n from users   WHERE id = 1").unwrap();
+let dialect = GenericDialect {};
+let formatted_sql = sql_insight::format(&dialect, "SELECT * \n from users   WHERE id = 1").unwrap();
 println!("{}", formatted_sql);
 ```
 

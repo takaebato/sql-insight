@@ -1,3 +1,28 @@
+//! # sql-insight
+//!
+//! `sql-insight` is a toolkit designed for SQL query analysis, formatting, and transformation.
+//!
+//! ## Main Functionalities
+//!
+//! - **SQL Formatting**: Format SQL queries into a standardized format. See the [`formatter`](crate::formatter) module for more information.
+//! - **SQL Normalization**: Normalize SQL queries by abstracting literals. See the [`normalizer`](crate::normalizer) module for more information.
+//! - **Table Extraction**: Extract tables within SQL queries. See the [`table_extractor`](crate::table_extractor) module for more information.
+//! - **CRUD Table Extraction**: Extract CRUD tables from SQL queries. See the [`crud_table_extractor`](crate::crud_table_extractor) module for more information.
+//!
+//! ## Quick Start
+//!
+//! Here's a quick example to get you started with SQL formatting:
+//!
+//! ```rust
+//! use sqlparser::dialect::GenericDialect;
+//!
+//! let dialect = GenericDialect {};
+//! let normalized_sql = sql_insight::format(&dialect, "SELECT * \n from users   WHERE id = 1").unwrap();
+//! println!("{}", normalized_sql);
+//! ```
+//!
+//! For more comprehensive examples and usage, refer to [crates.io](https://crates.io/crates/sql-insight) or the documentation of each module.
+
 pub mod error;
 pub mod extractor;
 pub mod formatter;
