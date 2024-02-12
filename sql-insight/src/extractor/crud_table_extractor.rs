@@ -128,8 +128,6 @@ impl Visitor for CrudTableExtractor {
                     self.possibly_aliased_delete_tables.clone(),
                     self.read_tables.clone(),
                 );
-                println!("delete_tables: {:?}", self.delete_tables);
-                println!("read_tables: {:?}", self.read_tables);
                 self.read_tables = helper::calc_difference_of_tables(
                     self.read_tables.clone(),
                     self.delete_tables.clone(),
