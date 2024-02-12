@@ -1,6 +1,6 @@
 //! A Extractor that extracts CRUD tables from SQL queries.
 //!
-//! See [`extract_crud_tables`](crate::extract_crud_tables) as the entry point for extracting CRUD tables from SQL.
+//! See [`extract_crud_tables`](crate::extract_crud_tables()) as the entry point for extracting CRUD tables from SQL.
 
 use std::fmt;
 use std::ops::ControlFlow;

@@ -1,6 +1,6 @@
 //! A Formatter that formats SQL into a standardized format.
 //!
-//! See [`format`](crate::format) as the entry point for formatting SQL.
+//! See [`format`](crate::format()) as the entry point for formatting SQL.
 
 use crate::error::Error;
 use sqlparser::dialect::Dialect;

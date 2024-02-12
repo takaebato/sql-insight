@@ -4,10 +4,10 @@
 //!
 //! ## Main Functionalities
 //!
-//! - **SQL Formatting**: Format SQL queries into a standardized format. See the [`formatter`](crate::formatter) module for more information.
-//! - **SQL Normalization**: Normalize SQL queries by abstracting literals. See the [`normalizer`](crate::normalizer) module for more information.
-//! - **Table Extraction**: Extract tables within SQL queries. See the [`table_extractor`](crate::table_extractor) module for more information.
-//! - **CRUD Table Extraction**: Extract CRUD tables from SQL queries. See the [`crud_table_extractor`](crate::crud_table_extractor) module for more information.
+//! - **SQL Formatting**: Format SQL queries into a standardized format. See the [`formatter`] module for more information.
+//! - **SQL Normalization**: Normalize SQL queries by abstracting literals. See the [`normalizer`] module for more information.
+//! - **Table Extraction**: Extract tables within SQL queries. See the [`table_extractor`] module for more information.
+//! - **CRUD Table Extraction**: Extract CRUD tables from SQL queries. See the [`crud_table_extractor`] module for more information.
 //!
 //! ## Quick Start
 //!

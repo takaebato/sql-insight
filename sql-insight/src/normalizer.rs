@@ -1,6 +1,6 @@
 //! A Normalizer that converts SQL queries to a canonical form.
 //!
-//! See [`normalize`](crate::normalize) as the entry point for normalizing SQL.
+//! See [`normalize`](crate::normalize()) as the entry point for normalizing SQL.
 
 use std::ops::ControlFlow;
 

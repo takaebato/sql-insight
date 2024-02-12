@@ -1,6 +1,6 @@
 //! A Extractor that extracts tables from SQL queries.
 //!
-//! See [`extract_tables`](crate::extract_tables) as the entry point for extracting tables from SQL.
+//! See [`extract_tables`](crate::extract_tables()) as the entry point for extracting tables from SQL.
 
 use core::fmt;
 use std::ops::ControlFlow;
