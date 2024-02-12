@@ -18,7 +18,7 @@
 //!
 //! let dialect = GenericDialect {};
 //! let normalized_sql = sql_insight::format(&dialect, "SELECT * \n from users   WHERE id = 1").unwrap();
-//! println!("{}", normalized_sql);
+//! assert_eq!(normalized_sql, ["SELECT * FROM users WHERE id = 1"]);
 //! ```
 //!
 //! For more comprehensive examples and usage, refer to [crates.io](https://crates.io/crates/sql-insight) or the documentation of each module.

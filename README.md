@@ -36,13 +36,7 @@ use sqlparser::dialect::GenericDialect;
 
 let dialect = GenericDialect {};
 let formatted_sql = sql_insight::format(&dialect, "SELECT * \n from users   WHERE id = 1").unwrap();
-println!("{}", formatted_sql);
-```
-
-This outputs:
-
-```sql
-SELECT * FROM users WHERE id = 1
+assert_eq!(formatted_sql, ["SELECT * FROM users WHERE id = 1"]);
 ```
 
 ### SQL Normalization
@@ -54,15 +48,8 @@ use sqlparser::dialect::GenericDialect;
 
 let dialect = GenericDialect {};
 let normalized_sql = sql_insight::normalize(&dialect, "SELECT * \n from users   WHERE id = 1").unwrap();
-println!("{}", normalized_sql);
+assert_eq!(normalized_sql, ["SELECT * FROM users WHERE id = ?"]);
 ```
-
-This outputs:
-
-```sql
-SELECT * FROM users WHERE id = ?
-```
-
 
 ### Table Extraction
 

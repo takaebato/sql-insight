@@ -21,7 +21,8 @@ use sqlparser::parser::Parser;
 /// let dialect = GenericDialect {};
 /// let sql = "SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id";
 /// let result = sql_insight::extract_tables(&dialect, sql).unwrap();
-/// assert_eq!(result.len(), 2);
+/// println!("{:#?}", result);
+/// assert_eq!(result[0].as_ref().unwrap().to_string(), "t1, t2");
 /// ```
 pub fn extract_tables(
     dialect: &dyn Dialect,

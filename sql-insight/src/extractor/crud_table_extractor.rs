@@ -22,8 +22,8 @@ use sqlparser::parser::Parser;
 /// let dialect = GenericDialect {};
 /// let sql = "INSERT INTO t1 (a) SELECT a FROM t2";
 /// let result = sql_insight::extract_crud_tables(&dialect, sql).unwrap();
-/// assert_eq!(result.len(), 1);
-/// assert_eq!(result[0].unwrap().to_string(), "Create: [t1], Read: [t2], Update: [], Delete: []");
+/// println!("{:#?}", result);
+/// assert_eq!(result[0].as_ref().unwrap().to_string(), "Create: [t1], Read: [t2], Update: [], Delete: []");
 /// ```
 pub fn extract_crud_tables(
     dialect: &dyn Dialect,
