@@ -3,7 +3,7 @@ members = ["sql-insight", "sql-insight-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Takahiro Ebato <takahiro.ebato@gmail.com>"]
 homepage = "https://github.com/takaebato/sql-insight"
 repository = "https://github.com/takaebato/sql-insight"
