@@ -1,6 +1,6 @@
 [package]
 name = "sql-insight-cli"
-description = "A CLI toolkit for SQL query analysis, formatting, and transformation.
+description = "A CLI toolkit for SQL query analysis, formatting, and transformation."
 documentation = "https://docs.rs/sql-insight-cli/"
 keywords = ["sql", "query", "cli", "toolkit", "insight"]
 include = [
