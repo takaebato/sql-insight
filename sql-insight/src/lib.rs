@@ -14,7 +14,7 @@
 //! Here's a quick example to get you started with SQL formatting:
 //!
 //! ```rust
-//! use sqlparser::dialect::GenericDialect;
+//! use sql_insight::sqlparser::dialect::GenericDialect;
 //!
 //! let dialect = GenericDialect {};
 //! let normalized_sql = sql_insight::format(&dialect, "SELECT * \n from users   WHERE id = 1").unwrap();

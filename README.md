@@ -32,7 +32,7 @@ sql-insight = { version = "0.1.0" }
 Format SQL queries according to different dialects:
 
 ```rust
-use sqlparser::dialect::GenericDialect;
+use sql_insight::sqlparser::dialect::GenericDialect;
 
 let dialect = GenericDialect {};
 let formatted_sql = sql_insight::format(&dialect, "SELECT * \n from users   WHERE id = 1").unwrap();
@@ -44,7 +44,7 @@ assert_eq!(formatted_sql, ["SELECT * FROM users WHERE id = 1"]);
 Normalize SQL queries to abstract away literals:
 
 ```rust
-use sqlparser::dialect::GenericDialect;
+use sql_insight::sqlparser::dialect::GenericDialect;
 
 let dialect = GenericDialect {};
 let normalized_sql = sql_insight::normalize(&dialect, "SELECT * \n from users   WHERE id = 1").unwrap();
@@ -56,7 +56,7 @@ assert_eq!(normalized_sql, ["SELECT * FROM users WHERE id = ?"]);
 Extract table references from SQL queries:
 
 ```rust
-use sqlparser::dialect::GenericDialect;
+use sql_insight::sqlparser::dialect::GenericDialect;
 
 let dialect = GenericDialect {};
 let tables = sql_insight::extract_tables(&dialect, "SELECT * FROM catalog.schema.`users` as users_alias").unwrap();
@@ -74,7 +74,7 @@ This outputs:
 Identify CRUD operations and the tables involved in each operation within SQL queries:
 
 ```rust
-use sqlparser::dialect::GenericDialect;
+use sql_insight::sqlparser::dialect::GenericDialect;
 
 let dialect = GenericDialect {};
 let crud_tables = sql_insight::extract_crud_tables(&dialect, "INSERT INTO users (name) SELECT name FROM employees").unwrap();

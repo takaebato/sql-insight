@@ -17,7 +17,7 @@ use sqlparser::parser::Parser;
 /// ## Example
 ///
 /// ```rust
-/// use sqlparser::dialect::GenericDialect;
+/// use sql_insight::sqlparser::dialect::GenericDialect;
 ///
 /// let dialect = GenericDialect {};
 /// let sql = "INSERT INTO t1 (a) SELECT a FROM t2";
