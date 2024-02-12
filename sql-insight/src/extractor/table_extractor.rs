@@ -16,7 +16,7 @@ use sqlparser::parser::Parser;
 /// ## Example
 ///
 /// ```rust
-/// use sqlparser::dialect::GenericDialect;
+/// use sql_insight::sqlparser::dialect::GenericDialect;
 ///
 /// let dialect = GenericDialect {};
 /// let sql = "SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id";

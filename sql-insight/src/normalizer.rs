@@ -15,7 +15,7 @@ use sqlparser::parser::Parser;
 /// ## Example
 ///
 /// ```rust
-/// use sqlparser::dialect::GenericDialect;
+/// use sql_insight::sqlparser::dialect::GenericDialect;
 ///
 /// let dialect = GenericDialect {};
 /// let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'";
@@ -31,7 +31,7 @@ pub fn normalize(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error>
 /// ## Example
 ///
 /// ```rust
-/// use sqlparser::dialect::GenericDialect;
+/// use sql_insight::sqlparser::dialect::GenericDialect;
 /// use sql_insight::NormalizerOptions;
 ///
 /// let dialect = GenericDialect {};
