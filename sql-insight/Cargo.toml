@@ -6,6 +6,8 @@ keywords = ["sql", "query", "tool", "insight", "parser"]
 include = [
     "src/**/*.rs",
     "Cargo.toml",
+    "README.md",
+    "LICENSE.txt",
 ]
 readme = "README.md"
 version = { workspace = true }
