@@ -1,6 +1,6 @@
 [package]
 name = "sql-insight"
-description = "SQL Insight is a tool to parse SQL queries and provide insight into the queries."
+description = "A toolkit for SQL query analysis, formatting, and transformation."
 documentation = "https://docs.rs/sql-insight/"
 keywords = ["sql", "query", "toolkit", "insight"]
 include = [
