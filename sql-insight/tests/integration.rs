@@ -28,12 +28,28 @@ mod integration {
         fn test_normalize() {
             let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'";
             for dialect in all_dialects() {
-                let result =
-                    sql_insight::normalize(dialect.as_ref(), sql, NormalizerOptions::new())
-                        .unwrap();
+                let result = sql_insight::normalize(dialect.as_ref(), sql).unwrap();
                 assert_eq!(
                     result,
                     ["SELECT a FROM t1 WHERE b = ? AND c IN (?, ?) AND d LIKE ?"],
+                    "Failed for dialect: {dialect:?}"
+                )
+            }
+        }
+
+        #[test]
+        fn test_normalize_with_options() {
+            let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3, 4)";
+            for dialect in all_dialects() {
+                let result = sql_insight::normalize_with_options(
+                    dialect.as_ref(),
+                    sql,
+                    NormalizerOptions::new().with_unify_in_list(true),
+                )
+                .unwrap();
+                assert_eq!(
+                    result,
+                    ["SELECT a FROM t1 WHERE b = ? AND c IN (...)"],
                     "Failed for dialect: {dialect:?}"
                 )
             }
