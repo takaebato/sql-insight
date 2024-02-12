@@ -2,7 +2,7 @@
 name = "sql-insight-cli"
 description = "SQL Insight is a tool to parse SQL queries and provide insight into the queries."
 documentation = "https://docs.rs/sql-insight-cli/"
-keywords = ["sql", "query", "cli", "insight", "parser"]
+keywords = ["sql", "query", "cli","toolkit", "insight"]
 include = [
     "src/**/*.rs",
     "Cargo.toml",
@@ -20,6 +20,7 @@ authors = { workspace = true }
 [[bin]]
 name = "sql-insight"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 sql-insight = { path = "../sql-insight", version = "0.1.0" }

@@ -2,7 +2,7 @@
 name = "sql-insight"
 description = "SQL Insight is a tool to parse SQL queries and provide insight into the queries."
 documentation = "https://docs.rs/sql-insight/"
-keywords = ["sql", "query", "tool", "insight", "parser"]
+keywords = ["sql", "query", "toolkit", "insight"]
 include = [
     "src/**/*.rs",
     "Cargo.toml",
