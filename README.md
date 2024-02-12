@@ -89,7 +89,7 @@ This outputs:
 
 ## Supported SQL Dialects
 
-`sql-insight` supports a comprehensive range of SQL dialects through [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs). For details on supported dialects, please refer to the documentation.
+`sql-insight` supports a comprehensive range of SQL dialects through [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs). For details on supported dialects, please refer to the [sqlparser-rs documentation](https://docs.rs/sqlparser/latest/sqlparser/dialect/index.html#structs).
 
 ## Contributing
 

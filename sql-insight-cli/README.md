@@ -92,7 +92,7 @@ Create: [users], Read: [employees], Update: [], Delete: []
 ```
 
 ## Supported SQL Dialects
-`sql-insight-cli` leverages [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs) for parsing, supporting a wide range of SQL dialects. For a detailed list, please refer to the sqlparser-rs documentation.
+`sql-insight-cli` leverages [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs) for parsing, supporting a wide range of SQL dialects. For a detailed list, please refer to the [sqlparser-rs documentation](https://docs.rs/sqlparser/latest/sqlparser/dialect/index.html#structs).
 
 ## Contributing
 Contributions to `sql-insight-cli` are welcome! Whether it's adding new features, fixing bugs, or improving documentation, feel free to fork the repository and submit a pull request.
