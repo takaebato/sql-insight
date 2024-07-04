@@ -5,10 +5,11 @@
 use std::ops::ControlFlow;
 
 use crate::error::Error;
-use sqlparser::ast::Value;
 use sqlparser::ast::{Expr, VisitMut, VisitorMut};
+use sqlparser::ast::{Query, SetExpr, Value};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
+use std::ops::DerefMut;
 
 /// Convenience function to normalize SQL with default options.
 ///
@@ -53,6 +54,9 @@ pub struct NormalizerOptions {
     /// Unify IN lists to a single form when all elements are literal values.
     /// For example, `IN (1, 2, 3)` becomes `IN (...)`.
     pub unify_in_list: bool,
+    /// Unify VALUES lists to a single form when all elements are literal values.
+    /// For example, `VALUES (1, 2, 3), (4, 5, 6)` becomes `VALUES (...)`.
+    pub unify_values: bool,
 }
 
 impl NormalizerOptions {
@@ -62,6 +66,11 @@ impl NormalizerOptions {
 
     pub fn with_unify_in_list(mut self, unify_in_list: bool) -> Self {
         self.unify_in_list = unify_in_list;
+        self
+    }
+
+    pub fn with_unify_values(mut self, unify_values: bool) -> Self {
+        self.unify_values = unify_values;
         self
     }
 }
@@ -74,6 +83,22 @@ pub struct Normalizer {
 
 impl VisitorMut for Normalizer {
     type Break = ();
+
+    fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        if let SetExpr::Values(values) = query.body.deref_mut() {
+            if self.options.unify_values {
+                let rows = &mut values.rows;
+                if rows.is_empty()
+                    || rows.iter().all(|row| {
+                        row.is_empty() || row.iter().all(|expr| matches!(expr, Expr::Value(_)))
+                    })
+                {
+                    *rows = vec![vec![Expr::Value(Value::Placeholder("...".into()))]];
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if let Expr::Value(value) = expr {
@@ -185,6 +210,50 @@ mod tests {
             expected,
             all_dialects(),
             NormalizerOptions::new().with_unify_in_list(true),
+        );
+    }
+
+    #[test]
+    fn test_sql_with_values_without_unify_values_option() {
+        let sql = "INSERT INTO t1 (a, b, c) VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)";
+        let expected =
+            vec!["INSERT INTO t1 (a, b, c) VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?)".into()];
+        assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
+    }
+
+    #[test]
+    fn test_sql_with_values_with_unify_values_option() {
+        let sql = "INSERT INTO t1 (a, b, c) VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)";
+        let expected = vec!["INSERT INTO t1 (a, b, c) VALUES (...)".into()];
+        assert_normalize(
+            sql,
+            expected,
+            all_dialects(),
+            NormalizerOptions::new().with_unify_values(true),
+        );
+    }
+
+    #[test]
+    fn test_sql_with_values_with_row_constructor_with_unify_values_option() {
+        let sql = "INSERT INTO t1 (a, b, c) VALUES ROW(1, 2, 3), ROW(4, 5, 6), ROW(7, 8, 9)";
+        let expected = vec!["INSERT INTO t1 (a, b, c) VALUES ROW(...)".into()];
+        assert_normalize(
+            sql,
+            expected,
+            all_dialects(),
+            NormalizerOptions::new().with_unify_values(true),
+        );
+    }
+
+    #[test]
+    fn test_sql_with_values_with_unify_values_option_when_not_all_elements_are_literal_values() {
+        let sql = "INSERT INTO t1 (a, b, c) VALUES (1, 2, 3), (4, 5, 6), (7, (SELECT * FROM t2 WHERE d = 9))";
+        let expected = vec!["INSERT INTO t1 (a, b, c) VALUES (?, ?, ?), (?, ?, ?), (?, (SELECT * FROM t2 WHERE d = ?))".into()];
+        assert_normalize(
+            sql,
+            expected,
+            all_dialects(),
+            NormalizerOptions::new().with_unify_values(true),
         );
     }
 }

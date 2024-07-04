@@ -44,6 +44,9 @@ struct NormalizeCommandOptions {
     /// Unify IN lists to a single form when all elements are literal values. For example, `IN (1, 2, 3)` becomes `IN (...)`.
     #[clap(long)]
     unify_in_list: bool,
+    /// Unify VALUES lists to a single form when all elements are literal values. For example, `VALUES (1, 2, 3), (4, 5, 6)` becomes `VALUES (...)`.
+    #[clap(long)]
+    unify_values: bool,
 }
 
 enum ProcessType {
@@ -172,8 +175,11 @@ impl Commands {
         match self {
             Commands::Format(opts) => Box::new(FormatExecutor::new(sql, opts.dialect.clone())),
             Commands::Normalize(opts) => Box::new(
-                NormalizeExecutor::new(sql, opts.common_options.dialect.clone())
-                    .with_options(NormalizerOptions::new().with_unify_in_list(opts.unify_in_list)),
+                NormalizeExecutor::new(sql, opts.common_options.dialect.clone()).with_options(
+                    NormalizerOptions::new()
+                        .with_unify_in_list(opts.unify_in_list)
+                        .with_unify_values(opts.unify_values),
+                ),
             ),
             Commands::ExtractCrud(opts) => {
                 Box::new(CrudTableExtractExecutor::new(sql, opts.dialect.clone()))

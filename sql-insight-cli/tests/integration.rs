@@ -85,6 +85,35 @@ mod integration {
         }
 
         #[test]
+        fn test_normalize_with_unify_values_option() {
+            sql_insight_cmd()
+                .arg("normalize")
+                .arg("--unify-values")
+                .arg("select * from t1 where a = 1 and b in (2, 3); insert into t2 (a) values (4), (5), (6);")
+                .assert()
+                .success()
+                .stdout(
+                    "SELECT * FROM t1 WHERE a = ? AND b IN (?, ?)\nINSERT INTO t2 (a) VALUES (...)\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_normalize_with_all_options() {
+            sql_insight_cmd()
+                .arg("normalize")
+                .arg("--unify-in-list")
+                .arg("--unify-values")
+                .arg("select * from t1 where a = 1 and b in (2, 3); insert into t2 (a) values (4), (5), (6);")
+                .assert()
+                .success()
+                .stdout(
+                    "SELECT * FROM t1 WHERE a = ? AND b IN (...)\nINSERT INTO t2 (a) VALUES (...)\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
         fn test_normalize_with_dialect() {
             sql_insight_cmd()
                 .arg("normalize")
