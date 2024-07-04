@@ -22,7 +22,7 @@ Add `sql_insight` to your `Cargo.toml` file:
 
 ```toml
 [dependencies]
-sql-insight = { version = "0.1.1" }
+sql-insight = { version = "0.2.0" }
 ```
 
 ## Usage
