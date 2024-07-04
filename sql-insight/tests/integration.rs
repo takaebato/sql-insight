@@ -39,17 +39,22 @@ mod integration {
 
         #[test]
         fn test_normalize_with_options() {
-            let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3, 4)";
+            let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3, 4); INSERT INTO t2 (a, b, c) VALUES (1, 2, 3), (4, 5, 6)";
             for dialect in all_dialects() {
                 let result = sql_insight::normalize_with_options(
                     dialect.as_ref(),
                     sql,
-                    NormalizerOptions::new().with_unify_in_list(true),
+                    NormalizerOptions::new()
+                        .with_unify_in_list(true)
+                        .with_unify_values(true),
                 )
                 .unwrap();
                 assert_eq!(
                     result,
-                    ["SELECT a FROM t1 WHERE b = ? AND c IN (...)"],
+                    [
+                        "SELECT a FROM t1 WHERE b = ? AND c IN (...)",
+                        "INSERT INTO t2 (a, b, c) VALUES (...)"
+                    ],
                     "Failed for dialect: {dialect:?}"
                 )
             }
