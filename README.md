@@ -1,6 +1,6 @@
 # sql-insight
 
-A toolkit for SQL query analysis, formatting, and transformation.
+A utility for SQL query analysis, formatting, and transformation.
 Leveraging the comprehensive parsing capabilities of [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs), it can handle various SQL dialects.
 
 [![Crates.io](https://img.shields.io/crates/v/sql-insight.svg)](https://crates.io/crates/sql-insight)

@@ -1,8 +1,8 @@
 [package]
 name = "sql-insight"
-description = "A toolkit for SQL query analysis, formatting, and transformation."
+description = "A utility for SQL query analysis, formatting, and transformation."
 documentation = "https://docs.rs/sql-insight/"
-keywords = ["sql", "query", "toolkit", "insight"]
+keywords = ["sql", "query", "utility", "insight"]
 include = [
     "src/**/*.rs",
     "Cargo.toml",

@@ -1,6 +1,6 @@
 //! # sql-insight
 //!
-//! `sql-insight` is a toolkit designed for SQL query analysis, formatting, and transformation.
+//! `sql-insight` is a utility designed for SQL query analysis, formatting, and transformation.
 //!
 //! ## Main Functionalities
 //!
