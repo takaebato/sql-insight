@@ -101,7 +101,11 @@ impl VisitorMut for Normalizer {
     }
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-        if let Expr::Value(value) = expr {
+        if let Expr::UnaryOp { op: _, expr: child } = expr {
+            if matches!(**child, Expr::Value(_)) {
+                *expr = Expr::Value(Value::Placeholder("?".into()));
+            }
+        } else if let Expr::Value(value) = expr {
             *value = Value::Placeholder("?".into());
         }
         ControlFlow::Continue(())
@@ -178,6 +182,15 @@ mod tests {
             "INSERT INTO t2 (a) VALUES (?)".into(),
             "UPDATE t1 SET a = ? WHERE b = ?".into(),
             "DELETE FROM t3 WHERE c = ?".into(),
+        ];
+        assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
+    }
+
+    #[test]
+    fn test_unary_operators_preceding_constants() {
+        let sql = "SELECT * FROM t1 WHERE a=-9 AND b=+ 9 AND c=TRUE AND d=NOT TRUE AND e=NOT(TRUE) AND f IS NULL";
+        let expected = vec![
+            "SELECT * FROM t1 WHERE a = ? AND b = ? AND c = ? AND d = ? AND e = NOT (?) AND f IS NULL".into(),
         ];
         assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
     }
