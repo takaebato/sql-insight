@@ -2,10 +2,10 @@
 //!
 //! See [`normalize`](crate::normalize()) as the entry point for normalizing SQL.
 
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Deref};
 
 use crate::error::Error;
-use sqlparser::ast::{Expr, VisitMut, VisitorMut};
+use sqlparser::ast::{Expr, Statement, VisitMut, VisitorMut};
 use sqlparser::ast::{Query, SetExpr, Value};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -57,6 +57,10 @@ pub struct NormalizerOptions {
     /// Unify VALUES lists to a single form when all elements are literal values.
     /// For example, `VALUES (1, 2, 3), (4, 5, 6)` becomes `VALUES (...)`.
     pub unify_values: bool,
+    /// Alphabetize column lists for INSERT statements with a VALUES expression
+    /// that gets unified.
+    /// For example, `INSERT INTO t(c, b, a)` becomes `INSERT INTO t(a, b, c)`.
+    pub alphabetize_insert_columns: bool,
 }
 
 impl NormalizerOptions {
@@ -71,6 +75,11 @@ impl NormalizerOptions {
 
     pub fn with_unify_values(mut self, unify_values: bool) -> Self {
         self.unify_values = unify_values;
+        self
+    }
+
+    pub fn with_alphabetize_insert_columns(mut self, alphabetize_insert_columns: bool) -> Self {
+        self.alphabetize_insert_columns = alphabetize_insert_columns;
         self
     }
 }
@@ -94,6 +103,26 @@ impl VisitorMut for Normalizer {
                     })
                 {
                     *rows = vec![vec![Expr::Value(Value::Placeholder("...".into()))]];
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_statement(&mut self, stmt: &mut sqlparser::ast::Statement) -> ControlFlow<Self::Break> {
+        if self.options.alphabetize_insert_columns {
+            if let Statement::Insert { columns, after_columns, source, .. } = stmt {
+                if let Some(Query{ body, .. }) = source.as_deref() {
+                    if let SetExpr::Values(v) = body.deref() {
+                        if v.rows == vec![vec![Expr::Value(Value::Placeholder("...".into()))]] {
+                            if columns.len() > 1 {
+                                columns.sort_by_key(|s| s.value.to_lowercase());
+                            }
+                            if after_columns.len() > 1 {
+                                after_columns.sort_by_key(|s| s.value.to_lowercase());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -288,6 +317,30 @@ mod tests {
             expected,
             all_dialects(),
             NormalizerOptions::new().with_unify_values(true),
+        );
+    }
+
+    #[test]
+    fn test_alphabetize_insert_columns() {
+        let sql = "INSERT INTO t1 (c, b, a) VALUES (1, 2, 3)";
+        let expected = vec!["INSERT INTO t1 (a, b, c) VALUES (...)".into()];
+        assert_normalize(
+            sql,
+            expected,
+            all_dialects(),
+            NormalizerOptions::new().with_unify_values(true).with_alphabetize_insert_columns(true),
+        );
+    }
+
+    #[test]
+    fn test_do_not_alphabetize_insert_columns_when_values_not_unified() {
+        let sql = "INSERT INTO t1 (c, b, a) SELECT x, y, z FROM t2";
+        let expected = vec!["INSERT INTO t1 (c, b, a) SELECT x, y, z FROM t2".into()];
+        assert_normalize(
+            sql,
+            expected,
+            all_dialects(),
+            NormalizerOptions::new().with_unify_values(true).with_alphabetize_insert_columns(true),
         );
     }
 }
