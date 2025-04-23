@@ -114,7 +114,7 @@ impl VisitorMut for Normalizer {
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         match expr {
             Expr::InList { list, .. } if self.options.unify_in_list => {
-                if list.is_empty() || list.iter().all(|expr| matches!(expr, Expr::Value(_))) {
+                if list.iter().all(|expr| Self::contains_only_tuples_of_values(expr)) {
                     *list = vec![Expr::Value(Value::Placeholder("...".into()))];
                 }
             }
@@ -146,6 +146,15 @@ impl Normalizer {
             .into_iter()
             .map(|statement| statement.to_string())
             .collect::<Vec<String>>())
+    }
+
+    /// Check if an expression contains only tuples of constants, recursively.
+    fn contains_only_tuples_of_values(expr: &Expr) -> bool {
+        match expr {
+            Expr::Value(_) => true,
+            Expr::Tuple(v) => v.iter().all(|child| Self::contains_only_tuples_of_values(child)),
+            _ => false,
+        }
     }
 }
 
@@ -206,6 +215,18 @@ mod tests {
     fn test_sql_with_in_list_with_unify_in_list_option() {
         let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3, NULL)";
         let expected = vec!["SELECT a FROM t1 WHERE b = ? AND c IN (...)".into()];
+        assert_normalize(
+            sql,
+            expected,
+            all_dialects(),
+            NormalizerOptions::new().with_unify_in_list(true),
+        );
+    }
+
+    #[test]
+    fn test_sql_with_in_list_with_unify_in_list_option_with_tuples() {
+        let sql = "SELECT a FROM t1 WHERE b = 1 AND (c, d) in ((2, 'a'), (3, 'b'), NULL)";
+        let expected = vec!["SELECT a FROM t1 WHERE b = ? AND (c, d) IN (...)".into()];
         assert_normalize(
             sql,
             expected,
