@@ -109,10 +109,19 @@ impl VisitorMut for Normalizer {
         ControlFlow::Continue(())
     }
 
-    fn post_visit_statement(&mut self, stmt: &mut sqlparser::ast::Statement) -> ControlFlow<Self::Break> {
+    fn post_visit_statement(
+        &mut self,
+        stmt: &mut sqlparser::ast::Statement,
+    ) -> ControlFlow<Self::Break> {
         if self.options.alphabetize_insert_columns {
-            if let Statement::Insert { columns, after_columns, source, .. } = stmt {
-                if let Some(Query{ body, .. }) = source.as_deref() {
+            if let Statement::Insert {
+                columns,
+                after_columns,
+                source,
+                ..
+            } = stmt
+            {
+                if let Some(Query { body, .. }) = source.as_deref() {
                     if let SetExpr::Values(v) = body.deref() {
                         if v.rows == vec![vec![Expr::Value(Value::Placeholder("...".into()))]] {
                             if columns.len() > 1 {
@@ -143,7 +152,10 @@ impl VisitorMut for Normalizer {
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         match expr {
             Expr::InList { list, .. } if self.options.unify_in_list => {
-                if list.iter().all(|expr| Self::contains_only_tuples_of_values(expr)) {
+                if list
+                    .iter()
+                    .all(|expr| Self::contains_only_tuples_of_values(expr))
+                {
                     *list = vec![Expr::Value(Value::Placeholder("...".into()))];
                 }
             }
@@ -181,7 +193,9 @@ impl Normalizer {
     fn contains_only_tuples_of_values(expr: &Expr) -> bool {
         match expr {
             Expr::Value(_) => true,
-            Expr::Tuple(v) => v.iter().all(|child| Self::contains_only_tuples_of_values(child)),
+            Expr::Tuple(v) => v
+                .iter()
+                .all(|child| Self::contains_only_tuples_of_values(child)),
             _ => false,
         }
     }
@@ -328,7 +342,9 @@ mod tests {
             sql,
             expected,
             all_dialects(),
-            NormalizerOptions::new().with_unify_values(true).with_alphabetize_insert_columns(true),
+            NormalizerOptions::new()
+                .with_unify_values(true)
+                .with_alphabetize_insert_columns(true),
         );
     }
 
@@ -340,7 +356,9 @@ mod tests {
             sql,
             expected,
             all_dialects(),
-            NormalizerOptions::new().with_unify_values(true).with_alphabetize_insert_columns(true),
+            NormalizerOptions::new()
+                .with_unify_values(true)
+                .with_alphabetize_insert_columns(true),
         );
     }
 }
