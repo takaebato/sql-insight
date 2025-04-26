@@ -2,10 +2,10 @@
 //!
 //! See [`normalize`](crate::normalize()) as the entry point for normalizing SQL.
 
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Deref};
 
 use crate::error::Error;
-use sqlparser::ast::{Expr, VisitMut, VisitorMut};
+use sqlparser::ast::{Expr, Statement, VisitMut, VisitorMut};
 use sqlparser::ast::{Query, SetExpr, Value};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -57,6 +57,10 @@ pub struct NormalizerOptions {
     /// Unify VALUES lists to a single form when all elements are literal values.
     /// For example, `VALUES (1, 2, 3), (4, 5, 6)` becomes `VALUES (...)`.
     pub unify_values: bool,
+    /// Alphabetize column lists for INSERT statements with a VALUES expression
+    /// that gets unified.
+    /// For example, `INSERT INTO t(c, b, a)` becomes `INSERT INTO t(a, b, c)`.
+    pub alphabetize_insert_columns: bool,
 }
 
 impl NormalizerOptions {
@@ -71,6 +75,11 @@ impl NormalizerOptions {
 
     pub fn with_unify_values(mut self, unify_values: bool) -> Self {
         self.unify_values = unify_values;
+        self
+    }
+
+    pub fn with_alphabetize_insert_columns(mut self, alphabetize_insert_columns: bool) -> Self {
+        self.alphabetize_insert_columns = alphabetize_insert_columns;
         self
     }
 }
@@ -100,8 +109,41 @@ impl VisitorMut for Normalizer {
         ControlFlow::Continue(())
     }
 
+    fn post_visit_statement(
+        &mut self,
+        stmt: &mut sqlparser::ast::Statement,
+    ) -> ControlFlow<Self::Break> {
+        if self.options.alphabetize_insert_columns {
+            if let Statement::Insert {
+                columns,
+                after_columns,
+                source,
+                ..
+            } = stmt
+            {
+                if let Some(Query { body, .. }) = source.as_deref() {
+                    if let SetExpr::Values(v) = body.deref() {
+                        if v.rows == vec![vec![Expr::Value(Value::Placeholder("...".into()))]] {
+                            if columns.len() > 1 {
+                                columns.sort_by_key(|s| s.value.to_lowercase());
+                            }
+                            if after_columns.len() > 1 {
+                                after_columns.sort_by_key(|s| s.value.to_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-        if let Expr::Value(value) = expr {
+        if let Expr::UnaryOp { op: _, expr: child } = expr {
+            if matches!(**child, Expr::Value(_)) {
+                *expr = Expr::Value(Value::Placeholder("?".into()));
+            }
+        } else if let Expr::Value(value) = expr {
             *value = Value::Placeholder("?".into());
         }
         ControlFlow::Continue(())
@@ -110,7 +152,7 @@ impl VisitorMut for Normalizer {
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         match expr {
             Expr::InList { list, .. } if self.options.unify_in_list => {
-                if list.is_empty() || list.iter().all(|expr| matches!(expr, Expr::Value(_))) {
+                if list.iter().all(Self::contains_only_tuples_of_values) {
                     *list = vec![Expr::Value(Value::Placeholder("...".into()))];
                 }
             }
@@ -142,6 +184,15 @@ impl Normalizer {
             .into_iter()
             .map(|statement| statement.to_string())
             .collect::<Vec<String>>())
+    }
+
+    /// Check if an expression contains only tuples of constants, recursively.
+    fn contains_only_tuples_of_values(expr: &Expr) -> bool {
+        match expr {
+            Expr::Value(_) => true,
+            Expr::Tuple(v) => v.iter().all(Self::contains_only_tuples_of_values),
+            _ => false,
+        }
     }
 }
 
@@ -183,6 +234,15 @@ mod tests {
     }
 
     #[test]
+    fn test_unary_operators_preceding_constants() {
+        let sql = "SELECT * FROM t1 WHERE a=-9 AND b=+ 9 AND c=TRUE AND d=NOT TRUE AND e=NOT(TRUE) AND f IS NULL";
+        let expected = vec![
+            "SELECT * FROM t1 WHERE a = ? AND b = ? AND c = ? AND d = ? AND e = NOT (?) AND f IS NULL".into(),
+        ];
+        assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
+    }
+
+    #[test]
     fn test_sql_with_in_list_without_unify_in_list_option() {
         let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3, 4)";
         let expected = vec!["SELECT a FROM t1 WHERE b = ? AND c IN (?, ?, ?)".into()];
@@ -193,6 +253,18 @@ mod tests {
     fn test_sql_with_in_list_with_unify_in_list_option() {
         let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3, NULL)";
         let expected = vec!["SELECT a FROM t1 WHERE b = ? AND c IN (...)".into()];
+        assert_normalize(
+            sql,
+            expected,
+            all_dialects(),
+            NormalizerOptions::new().with_unify_in_list(true),
+        );
+    }
+
+    #[test]
+    fn test_sql_with_in_list_with_unify_in_list_option_with_tuples() {
+        let sql = "SELECT a FROM t1 WHERE b = 1 AND (c, d) in ((2, 'a'), (3, 'b'), NULL)";
+        let expected = vec!["SELECT a FROM t1 WHERE b = ? AND (c, d) IN (...)".into()];
         assert_normalize(
             sql,
             expected,
@@ -254,6 +326,34 @@ mod tests {
             expected,
             all_dialects(),
             NormalizerOptions::new().with_unify_values(true),
+        );
+    }
+
+    #[test]
+    fn test_alphabetize_insert_columns() {
+        let sql = "INSERT INTO t1 (c, b, a) VALUES (1, 2, 3)";
+        let expected = vec!["INSERT INTO t1 (a, b, c) VALUES (...)".into()];
+        assert_normalize(
+            sql,
+            expected,
+            all_dialects(),
+            NormalizerOptions::new()
+                .with_unify_values(true)
+                .with_alphabetize_insert_columns(true),
+        );
+    }
+
+    #[test]
+    fn test_do_not_alphabetize_insert_columns_when_values_not_unified() {
+        let sql = "INSERT INTO t1 (c, b, a) SELECT x, y, z FROM t2";
+        let expected = vec!["INSERT INTO t1 (c, b, a) SELECT x, y, z FROM t2".into()];
+        assert_normalize(
+            sql,
+            expected,
+            all_dialects(),
+            NormalizerOptions::new()
+                .with_unify_values(true)
+                .with_alphabetize_insert_columns(true),
         );
     }
 }
