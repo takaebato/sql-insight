@@ -152,10 +152,7 @@ impl VisitorMut for Normalizer {
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         match expr {
             Expr::InList { list, .. } if self.options.unify_in_list => {
-                if list
-                    .iter()
-                    .all(|expr| Self::contains_only_tuples_of_values(expr))
-                {
+                if list.iter().all(Self::contains_only_tuples_of_values) {
                     *list = vec![Expr::Value(Value::Placeholder("...".into()))];
                 }
             }
@@ -193,9 +190,7 @@ impl Normalizer {
     fn contains_only_tuples_of_values(expr: &Expr) -> bool {
         match expr {
             Expr::Value(_) => true,
-            Expr::Tuple(v) => v
-                .iter()
-                .all(|child| Self::contains_only_tuples_of_values(child)),
+            Expr::Tuple(v) => v.iter().all(Self::contains_only_tuples_of_values),
             _ => false,
         }
     }
