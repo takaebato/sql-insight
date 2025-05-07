@@ -5,7 +5,7 @@
 use std::ops::{ControlFlow, Deref};
 
 use crate::error::Error;
-use sqlparser::ast::{Expr, Statement, VisitMut, VisitorMut};
+use sqlparser::ast::{Expr, Insert, Statement, VisitMut, VisitorMut};
 use sqlparser::ast::{Query, SetExpr, Value};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -102,7 +102,7 @@ impl VisitorMut for Normalizer {
                         row.is_empty() || row.iter().all(|expr| matches!(expr, Expr::Value(_)))
                     })
                 {
-                    *rows = vec![vec![Expr::Value(Value::Placeholder("...".into()))]];
+                    *rows = vec![vec![Expr::Value(Value::Placeholder("...".into()).with_empty_span())]];
                 }
             }
         }
@@ -114,16 +114,16 @@ impl VisitorMut for Normalizer {
         stmt: &mut sqlparser::ast::Statement,
     ) -> ControlFlow<Self::Break> {
         if self.options.alphabetize_insert_columns {
-            if let Statement::Insert {
+            if let Statement::Insert(Insert {
                 columns,
                 after_columns,
                 source,
                 ..
-            } = stmt
+            }) = stmt
             {
                 if let Some(Query { body, .. }) = source.as_deref() {
                     if let SetExpr::Values(v) = body.deref() {
-                        if v.rows == vec![vec![Expr::Value(Value::Placeholder("...".into()))]] {
+                        if v.rows == vec![vec![Expr::Value(Value::Placeholder("...".into()).with_empty_span())]] {
                             if columns.len() > 1 {
                                 columns.sort_by_key(|s| s.value.to_lowercase());
                             }
@@ -141,10 +141,10 @@ impl VisitorMut for Normalizer {
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if let Expr::UnaryOp { op: _, expr: child } = expr {
             if matches!(**child, Expr::Value(_)) {
-                *expr = Expr::Value(Value::Placeholder("?".into()));
+                *expr = Expr::Value(Value::Placeholder("?".into()).with_empty_span());
             }
         } else if let Expr::Value(value) = expr {
-            *value = Value::Placeholder("?".into());
+            *value = Value::Placeholder("?".into()).with_empty_span();
         }
         ControlFlow::Continue(())
     }
@@ -153,7 +153,7 @@ impl VisitorMut for Normalizer {
         match expr {
             Expr::InList { list, .. } if self.options.unify_in_list => {
                 if list.iter().all(Self::contains_only_tuples_of_values) {
-                    *list = vec![Expr::Value(Value::Placeholder("...".into()))];
+                    *list = vec![Expr::Value(Value::Placeholder("...".into()).with_empty_span())];
                 }
             }
             _ => {}
