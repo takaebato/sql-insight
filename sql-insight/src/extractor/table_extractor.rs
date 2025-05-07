@@ -251,7 +251,7 @@ mod tests {
         dialects: Vec<Box<dyn Dialect>>,
     ) {
         for dialect in dialects {
-            let result = TableExtractor::extract(dialect.as_ref(), sql).unwrap();
+            let result = TableExtractor::extract(dialect.as_ref(), sql).expect(&format!("parse failed for dialect: {dialect:?}"));
             assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
         }
     }
