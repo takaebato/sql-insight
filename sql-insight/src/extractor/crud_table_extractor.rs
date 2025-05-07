@@ -209,7 +209,8 @@ mod tests {
         dialects: Vec<Box<dyn Dialect>>,
     ) {
         for dialect in dialects {
-            let result = CrudTableExtractor::extract(dialect.as_ref(), sql).expect(&format!("parse failed for dialect: {dialect:?}"));
+            let result = CrudTableExtractor::extract(dialect.as_ref(), sql)
+                .expect(&format!("parse failed for dialect: {dialect:?}"));
             assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
         }
     }
@@ -419,7 +420,11 @@ mod tests {
                 ],
             })];
             // BigQuery and Generic do not support DELETE ... FROM
-            assert_crud_table_extraction(sql, expected, all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]));
+            assert_crud_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+            );
         }
 
         #[test]
@@ -465,7 +470,11 @@ mod tests {
                 ],
             })];
             // BigQuery and Generic do not support DELETE ... FROM
-            assert_crud_table_extraction(sql, expected, all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]));
+            assert_crud_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+            );
         }
 
         #[test]

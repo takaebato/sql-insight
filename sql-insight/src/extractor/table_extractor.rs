@@ -7,7 +7,10 @@ use std::ops::ControlFlow;
 
 use crate::error::Error;
 use crate::helper;
-use sqlparser::ast::{Delete, Ident, Insert, ObjectName, Statement, TableFactor, TableObject, TableWithJoins, Visit, Visitor};
+use sqlparser::ast::{
+    Delete, Ident, Insert, ObjectName, Statement, TableFactor, TableObject, TableWithJoins, Visit,
+    Visitor,
+};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
@@ -49,7 +52,10 @@ impl TableReference {
     pub fn has_qualifiers(&self) -> bool {
         self.catalog.is_some() || self.schema.is_some()
     }
-    pub fn try_from_name_and_alias(name: &ObjectName, alias: &Option<Ident>) -> Result<Self, Error> {
+    pub fn try_from_name_and_alias(
+        name: &ObjectName,
+        alias: &Option<Ident>,
+    ) -> Result<Self, Error> {
         match name.0.len() {
             0 => unreachable!("Parser should not allow empty identifiers"),
             1 => Ok(TableReference {
@@ -116,7 +122,9 @@ impl TryFrom<&TableFactor> for TableReference {
 
     fn try_from(table: &TableFactor) -> Result<Self, Self::Error> {
         match table {
-            TableFactor::Table { name, alias, .. } => Self::try_from_name_and_alias(name, &alias.as_ref().map(|a| a.name.clone())),
+            TableFactor::Table { name, alias, .. } => {
+                Self::try_from_name_and_alias(name, &alias.as_ref().map(|a| a.name.clone()))
+            }
             _ => unreachable!("TableFactor::Table expected"),
         }
     }
@@ -251,7 +259,8 @@ mod tests {
         dialects: Vec<Box<dyn Dialect>>,
     ) {
         for dialect in dialects {
-            let result = TableExtractor::extract(dialect.as_ref(), sql).expect(&format!("parse failed for dialect: {dialect:?}"));
+            let result = TableExtractor::extract(dialect.as_ref(), sql)
+                .expect(&format!("parse failed for dialect: {dialect:?}"));
             assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
         }
     }
@@ -417,7 +426,11 @@ mod tests {
                 },
             ]))];
             // BigQuery and Generic do not support DELETE ... FROM
-            assert_table_extraction(sql, expected, all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]));
+            assert_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+            );
         }
 
         #[test]
@@ -444,7 +457,11 @@ mod tests {
                 },
             ]))];
             // BigQuery and Generic do not support DELETE ... FROM
-            assert_table_extraction(sql, expected, all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]));
+            assert_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+            );
         }
 
         #[test]
@@ -484,7 +501,11 @@ mod tests {
                 },
             ]))];
             // BigQuery and Generic do not support DELETE ... FROM
-            assert_table_extraction(sql, expected, all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]));
+            assert_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+            );
         }
 
         #[test]

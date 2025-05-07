@@ -102,7 +102,9 @@ impl VisitorMut for Normalizer {
                         row.is_empty() || row.iter().all(|expr| matches!(expr, Expr::Value(_)))
                     })
                 {
-                    *rows = vec![vec![Expr::Value(Value::Placeholder("...".into()).with_empty_span())]];
+                    *rows = vec![vec![Expr::Value(
+                        Value::Placeholder("...".into()).with_empty_span(),
+                    )]];
                 }
             }
         }
@@ -123,7 +125,11 @@ impl VisitorMut for Normalizer {
             {
                 if let Some(Query { body, .. }) = source.as_deref() {
                     if let SetExpr::Values(v) = body.deref() {
-                        if v.rows == vec![vec![Expr::Value(Value::Placeholder("...".into()).with_empty_span())]] {
+                        if v.rows
+                            == vec![vec![Expr::Value(
+                                Value::Placeholder("...".into()).with_empty_span(),
+                            )]]
+                        {
                             if columns.len() > 1 {
                                 columns.sort_by_key(|s| s.value.to_lowercase());
                             }
@@ -153,7 +159,9 @@ impl VisitorMut for Normalizer {
         match expr {
             Expr::InList { list, .. } if self.options.unify_in_list => {
                 if list.iter().all(Self::contains_only_tuples_of_values) {
-                    *list = vec![Expr::Value(Value::Placeholder("...".into()).with_empty_span())];
+                    *list = vec![Expr::Value(
+                        Value::Placeholder("...".into()).with_empty_span(),
+                    )];
                 }
             }
             _ => {}
@@ -236,20 +244,21 @@ mod tests {
     #[test]
     fn test_unary_operators_preceding_constants() {
         let sql = "SELECT * FROM t1 WHERE a=-9 AND b=+ 9 AND c IS NULL";
-        let expected = vec![
-            "SELECT * FROM t1 WHERE a = ? AND b = ? AND c IS NULL".into(),
-        ];
+        let expected = vec!["SELECT * FROM t1 WHERE a = ? AND b = ? AND c IS NULL".into()];
         assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
     }
 
     #[test]
     fn test_unary_operators_preceding_booleans() {
         let sql = "SELECT * FROM t1 WHERE a=TRUE AND b=NOT TRUE AND c=NOT(TRUE)";
-        let expected = vec![
-            "SELECT * FROM t1 WHERE a = ? AND b = ? AND c = NOT (?)".into(),
-        ];
+        let expected = vec!["SELECT * FROM t1 WHERE a = ? AND b = ? AND c = NOT (?)".into()];
         // The MsSQL parser considers "TRUE" and "FALSE" to be identifiers rather than constants
-        assert_normalize(sql, expected, all_dialects_except(&vec!["MsSqlDialect"]), NormalizerOptions::new());
+        assert_normalize(
+            sql,
+            expected,
+            all_dialects_except(&vec!["MsSqlDialect"]),
+            NormalizerOptions::new(),
+        );
     }
 
     #[test]
