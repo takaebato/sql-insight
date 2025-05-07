@@ -260,7 +260,7 @@ mod tests {
     ) {
         for dialect in dialects {
             let result = TableExtractor::extract(dialect.as_ref(), sql)
-                .expect(&format!("parse failed for dialect: {dialect:?}"));
+                .unwrap_or_else(|_| panic!("parse failed for dialect: {dialect:?}"));
             assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
         }
     }
