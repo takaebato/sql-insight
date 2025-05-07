@@ -319,7 +319,7 @@ mod integration {
             write_to_stdin(stdin, "SELECT *  \n FROM t1 WHERE;\n").await?;
             let invalid_query_result = read_from_stderr(&mut stderr_reader).await?;
             assert!(
-                invalid_query_result.contains("Error: sql parser error: Expected an expression:"),
+                invalid_query_result.contains("Error: sql parser error: Expected: an expression,"),
                 "Invalid query result not as expected: {invalid_query_result:?}"
             );
 
