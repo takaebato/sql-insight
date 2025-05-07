@@ -199,7 +199,7 @@ impl Normalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::all_dialects;
+    use crate::test_utils::{all_dialects, all_dialects_except};
 
     fn assert_normalize(
         sql: &str,
@@ -235,11 +235,21 @@ mod tests {
 
     #[test]
     fn test_unary_operators_preceding_constants() {
-        let sql = "SELECT * FROM t1 WHERE a=-9 AND b=+ 9 AND c=TRUE AND d=NOT TRUE AND e=NOT(TRUE) AND f IS NULL";
+        let sql = "SELECT * FROM t1 WHERE a=-9 AND b=+ 9 AND c IS NULL";
         let expected = vec![
-            "SELECT * FROM t1 WHERE a = ? AND b = ? AND c = ? AND d = ? AND e = NOT (?) AND f IS NULL".into(),
+            "SELECT * FROM t1 WHERE a = ? AND b = ? AND c IS NULL".into(),
         ];
         assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
+    }
+
+    #[test]
+    fn test_unary_operators_preceding_booleans() {
+        let sql = "SELECT * FROM t1 WHERE a=TRUE AND b=NOT TRUE AND c=NOT(TRUE)";
+        let expected = vec![
+            "SELECT * FROM t1 WHERE a = ? AND b = ? AND c = NOT (?)".into(),
+        ];
+        // The MsSQL parser considers "TRUE" and "FALSE" to be identifiers rather than constants
+        assert_normalize(sql, expected, all_dialects_except(&vec!["MsSqlDialect"]), NormalizerOptions::new());
     }
 
     #[test]

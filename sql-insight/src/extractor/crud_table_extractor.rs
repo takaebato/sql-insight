@@ -322,6 +322,8 @@ mod tests {
     }
 
     mod delete_statement {
+        use crate::test_utils::all_dialects_except;
+
         use super::*;
 
         #[test]
@@ -416,7 +418,8 @@ mod tests {
                     },
                 ],
             })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
+            // BigQuery and Generic do not support DELETE ... FROM
+            assert_crud_table_extraction(sql, expected, all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]));
         }
 
         #[test]
@@ -461,7 +464,8 @@ mod tests {
                     },
                 ],
             })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
+            // BigQuery and Generic do not support DELETE ... FROM
+            assert_crud_table_extraction(sql, expected, all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]));
         }
 
         #[test]
