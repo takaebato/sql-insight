@@ -8,7 +8,7 @@ use std::ops::ControlFlow;
 use crate::error::Error;
 use crate::extractor::table_extractor::TableReference;
 use crate::{helper, TableExtractor};
-use sqlparser::ast::{MergeClause, Statement, Visit, Visitor};
+use sqlparser::ast::{Delete, MergeAction, Statement, Visit, Visitor};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
@@ -80,8 +80,8 @@ impl Visitor for CrudTableExtractor {
 
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
         match statement {
-            Statement::Insert { table_name, .. } => {
-                match TableReference::try_from(table_name) {
+            Statement::Insert(insert) => {
+                match TableReference::try_from(insert) {
                     Ok(table) => self.create_tables.push(table),
                     Err(e) => return ControlFlow::Break(e),
                 }
@@ -103,7 +103,7 @@ impl Visitor for CrudTableExtractor {
                     self.update_tables.clone(),
                 );
             }
-            Statement::Delete { tables, from, .. } => {
+            Statement::Delete(Delete { tables, from, .. }) => {
                 // When tables are present, deletion sqls are these tables,
                 // and from clause is used as a data source.
                 if !tables.is_empty() {
@@ -114,6 +114,10 @@ impl Visitor for CrudTableExtractor {
                         }
                     }
                 } else {
+                    let from = match from {
+                        sqlparser::ast::FromTable::WithFromKeyword(items) => items,
+                        sqlparser::ast::FromTable::WithoutKeyword(items) => items,
+                    };
                     for table_with_join in from {
                         match TableExtractor::extract_from_table_node(table_with_join) {
                             Ok(tables) => tables
@@ -139,10 +143,10 @@ impl Visitor for CrudTableExtractor {
                     Err(e) => return ControlFlow::Break(e),
                 };
                 let (mut inserted, mut updated, mut deleted) = (false, false, false);
-                clauses.iter().for_each(|clause| match clause {
-                    MergeClause::MatchedUpdate { .. } => updated = true,
-                    MergeClause::MatchedDelete { .. } => deleted = true,
-                    MergeClause::NotMatched { .. } => inserted = true,
+                clauses.iter().for_each(|clause| match clause.action {
+                    MergeAction::Update { .. } => updated = true,
+                    MergeAction::Delete => deleted = true,
+                    MergeAction::Insert(_) => inserted = true,
                 });
                 if inserted {
                     self.create_tables.push(target_table.clone());
@@ -205,7 +209,8 @@ mod tests {
         dialects: Vec<Box<dyn Dialect>>,
     ) {
         for dialect in dialects {
-            let result = CrudTableExtractor::extract(dialect.as_ref(), sql).unwrap();
+            let result = CrudTableExtractor::extract(dialect.as_ref(), sql)
+                .unwrap_or_else(|_| panic!("parse failed for dialect: {dialect:?}"));
             assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
         }
     }
@@ -318,6 +323,8 @@ mod tests {
     }
 
     mod delete_statement {
+        use crate::test_utils::all_dialects_except;
+
         use super::*;
 
         #[test]
@@ -412,7 +419,12 @@ mod tests {
                     },
                 ],
             })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
+            // BigQuery and Generic do not support DELETE ... FROM
+            assert_crud_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+            );
         }
 
         #[test]
@@ -457,7 +469,12 @@ mod tests {
                     },
                 ],
             })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
+            // BigQuery and Generic do not support DELETE ... FROM
+            assert_crud_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+            );
         }
 
         #[test]

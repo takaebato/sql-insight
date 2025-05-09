@@ -18,6 +18,13 @@ pub fn all_dialects() -> Vec<Box<dyn Dialect>> {
     ]
 }
 
+pub fn all_dialects_except(exclude: &Vec<&'static str>) -> Vec<Box<dyn Dialect>> {
+    all_dialects()
+        .into_iter()
+        .filter(|d| !exclude.contains(&format!("{:?}", d).as_str()))
+        .collect()
+}
+
 pub static ALL_DIALECT_NAMES: [&str; 12] = [
     "Generic",
     "MySQL",

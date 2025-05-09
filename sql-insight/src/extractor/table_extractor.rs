@@ -7,7 +7,10 @@ use std::ops::ControlFlow;
 
 use crate::error::Error;
 use crate::helper;
-use sqlparser::ast::{Ident, ObjectName, Statement, TableFactor, TableWithJoins, Visit, Visitor};
+use sqlparser::ast::{
+    Delete, Ident, Insert, ObjectName, Statement, TableFactor, TableObject, TableWithJoins, Visit,
+    Visitor,
+};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
@@ -49,6 +52,38 @@ impl TableReference {
     pub fn has_qualifiers(&self) -> bool {
         self.catalog.is_some() || self.schema.is_some()
     }
+    pub fn try_from_name_and_alias(
+        name: &ObjectName,
+        alias: &Option<Ident>,
+    ) -> Result<Self, Error> {
+        match name.0.len() {
+            0 => unreachable!("Parser should not allow empty identifiers"),
+            1 => Ok(TableReference {
+                catalog: None,
+                schema: None,
+                name: name.0[0].as_ident().unwrap().clone(),
+                alias: alias.clone(),
+            }),
+            2 => Ok(TableReference {
+                catalog: None,
+                schema: Some(name.0[0].as_ident().unwrap().clone()),
+                name: name.0[1].as_ident().unwrap().clone(),
+                alias: alias.clone(),
+            }),
+            3 => Ok(TableReference {
+                catalog: Some(name.0[0].as_ident().unwrap().clone()),
+                schema: Some(name.0[1].as_ident().unwrap().clone()),
+                name: name.0[2].as_ident().unwrap().clone(),
+                alias: alias.clone(),
+            }),
+            _ => Err(Error::AnalysisError(
+                "Too many identifiers provided".to_string(),
+            )),
+        }
+    }
+    pub fn try_from_name(name: &ObjectName) -> Result<Self, Error> {
+        Self::try_from_name_and_alias(name, &None)
+    }
 }
 
 impl fmt::Display for TableReference {
@@ -70,35 +105,26 @@ impl fmt::Display for TableReference {
     }
 }
 
+impl TryFrom<&Insert> for TableReference {
+    type Error = Error;
+
+    fn try_from(value: &Insert) -> Result<Self, Self::Error> {
+        let name = match &value.table {
+            TableObject::TableName(object_name) => object_name,
+            TableObject::TableFunction(function) => &function.name,
+        };
+        Self::try_from_name_and_alias(name, &value.table_alias)
+    }
+}
+
 impl TryFrom<&TableFactor> for TableReference {
     type Error = Error;
 
     fn try_from(table: &TableFactor) -> Result<Self, Self::Error> {
         match table {
-            TableFactor::Table { name, alias, .. } => match name.0.len() {
-                0 => unreachable!("Parser should not allow empty identifiers"),
-                1 => Ok(TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: name.0[0].clone(),
-                    alias: alias.as_ref().map(|a| a.name.clone()),
-                }),
-                2 => Ok(TableReference {
-                    catalog: None,
-                    schema: Some(name.0[0].clone()),
-                    name: name.0[1].clone(),
-                    alias: alias.as_ref().map(|a| a.name.clone()),
-                }),
-                3 => Ok(TableReference {
-                    catalog: Some(name.0[0].clone()),
-                    schema: Some(name.0[1].clone()),
-                    name: name.0[2].clone(),
-                    alias: alias.as_ref().map(|a| a.name.clone()),
-                }),
-                _ => Err(Error::AnalysisError(
-                    "Too many identifiers provided".to_string(),
-                )),
-            },
+            TableFactor::Table { name, alias, .. } => {
+                Self::try_from_name_and_alias(name, &alias.as_ref().map(|a| a.name.clone()))
+            }
             _ => unreachable!("TableFactor::Table expected"),
         }
     }
@@ -108,30 +134,7 @@ impl TryFrom<&ObjectName> for TableReference {
     type Error = Error;
 
     fn try_from(obj_name: &ObjectName) -> Result<Self, Self::Error> {
-        match obj_name.0.len() {
-            0 => unreachable!("Parser should not allow empty identifiers"),
-            1 => Ok(TableReference {
-                catalog: None,
-                schema: None,
-                name: obj_name.0[0].clone(),
-                alias: None,
-            }),
-            2 => Ok(TableReference {
-                catalog: None,
-                schema: Some(obj_name.0[0].clone()),
-                name: obj_name.0[1].clone(),
-                alias: None,
-            }),
-            3 => Ok(TableReference {
-                catalog: Some(obj_name.0[0].clone()),
-                schema: Some(obj_name.0[1].clone()),
-                name: obj_name.0[2].clone(),
-                alias: None,
-            }),
-            _ => Err(Error::AnalysisError(
-                "Too many identifiers provided".to_string(),
-            )),
-        }
+        Self::try_from_name(obj_name)
     }
 }
 
@@ -196,7 +199,7 @@ impl Visitor for TableExtractor {
     }
 
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
-        if let Statement::Delete { tables, .. } = statement {
+        if let Statement::Delete(Delete { tables, .. }) = statement {
             // tables of delete statement are not visited by `pre_visit_table_factor` nor `pre_visit_relation`.
             for table in tables {
                 match TableReference::try_from(table) {
@@ -256,7 +259,8 @@ mod tests {
         dialects: Vec<Box<dyn Dialect>>,
     ) {
         for dialect in dialects {
-            let result = TableExtractor::extract(dialect.as_ref(), sql).unwrap();
+            let result = TableExtractor::extract(dialect.as_ref(), sql)
+                .unwrap_or_else(|_| panic!("parse failed for dialect: {dialect:?}"));
             assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
         }
     }
@@ -400,6 +404,8 @@ mod tests {
     }
 
     mod delete_statement {
+        use crate::test_utils::all_dialects_except;
+
         use super::*;
 
         #[test]
@@ -419,7 +425,12 @@ mod tests {
                     alias: None,
                 },
             ]))];
-            assert_table_extraction(sql, expected, all_dialects());
+            // BigQuery and Generic do not support DELETE ... FROM
+            assert_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+            );
         }
 
         #[test]
@@ -445,7 +456,12 @@ mod tests {
                     alias: Some("t2_alias".into()),
                 },
             ]))];
-            assert_table_extraction(sql, expected, all_dialects());
+            // BigQuery and Generic do not support DELETE ... FROM
+            assert_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+            );
         }
 
         #[test]
@@ -484,7 +500,12 @@ mod tests {
                     alias: None,
                 },
             ]))];
-            assert_table_extraction(sql, expected, all_dialects());
+            // BigQuery and Generic do not support DELETE ... FROM
+            assert_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+            );
         }
 
         #[test]
