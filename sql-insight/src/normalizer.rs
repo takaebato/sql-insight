@@ -187,7 +187,7 @@ impl Normalizer {
         options: NormalizerOptions,
     ) -> Result<Vec<String>, Error> {
         let mut statements = Parser::parse_sql(dialect, sql)?;
-        statements.visit(&mut Self::new().with_options(options));
+        let _ = statements.visit(&mut Self::new().with_options(options));
         Ok(statements
             .into_iter()
             .map(|statement| statement.to_string())
