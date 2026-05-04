@@ -12,6 +12,7 @@ include = [
 readme = "README.md"
 version = { workspace = true }
 edition = { workspace = true }
+rust-version = "1.89.0"
 homepage = { workspace = true }
 repository = { workspace = true }
 license = { workspace = true }
@@ -24,5 +25,3 @@ path = "src/lib.rs"
 [dependencies]
 sqlparser = { version = "0.56.0", features = ["visitor"] }
 thiserror = "1.0.56"
-
-
