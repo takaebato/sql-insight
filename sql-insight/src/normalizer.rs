@@ -157,12 +157,13 @@ impl VisitorMut for Normalizer {
 
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         match expr {
-            Expr::InList { list, .. } if self.options.unify_in_list => {
-                if list.iter().all(Self::contains_only_tuples_of_values) {
-                    *list = vec![Expr::Value(
-                        Value::Placeholder("...".into()).with_empty_span(),
-                    )];
-                }
+            Expr::InList { list, .. }
+                if self.options.unify_in_list
+                    && list.iter().all(Self::contains_only_tuples_of_values) =>
+            {
+                *list = vec![Expr::Value(
+                    Value::Placeholder("...".into()).with_empty_span(),
+                )];
             }
             _ => {}
         }
