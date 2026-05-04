@@ -36,7 +36,7 @@ jobs:
     steps:
       - name: Set up Rust
         uses: hecrj/setup-rust-action@v2
-      - uses: actions/checkout@master
+      - uses: actions/checkout@v6
       - run: cargo check --all-targets --all-features
 
   docs:
@@ -46,7 +46,7 @@ jobs:
     steps:
       - name: Set up Rust
         uses: hecrj/setup-rust-action@v2
-      - uses: actions/checkout@master
+      - uses: actions/checkout@v6
       - run: cargo doc --document-private-items --no-deps --workspace --all-features
 
   test:
