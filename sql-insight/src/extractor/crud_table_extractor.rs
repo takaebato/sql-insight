@@ -90,8 +90,8 @@ impl Visitor for CrudTableExtractor {
                     self.create_tables.clone(),
                 );
             }
-            Statement::Update { table, .. } => {
-                match TableExtractor::extract_from_table_node(table) {
+            Statement::Update(update) => {
+                match TableExtractor::extract_from_table_node(&update.table) {
                     Ok(tables) => tables
                         .0
                         .into_iter()
@@ -137,15 +137,15 @@ impl Visitor for CrudTableExtractor {
                     self.delete_tables.clone(),
                 );
             }
-            Statement::Merge { table, clauses, .. } => {
-                let target_table = match TableReference::try_from(table) {
+            Statement::Merge(merge) => {
+                let target_table = match TableReference::try_from(&merge.table) {
                     Ok(table) => table,
                     Err(e) => return ControlFlow::Break(e),
                 };
                 let (mut inserted, mut updated, mut deleted) = (false, false, false);
-                clauses.iter().for_each(|clause| match clause.action {
+                merge.clauses.iter().for_each(|clause| match clause.action {
                     MergeAction::Update { .. } => updated = true,
-                    MergeAction::Delete => deleted = true,
+                    MergeAction::Delete { .. } => deleted = true,
                     MergeAction::Insert(_) => inserted = true,
                 });
                 if inserted {

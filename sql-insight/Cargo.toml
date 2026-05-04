@@ -23,5 +23,5 @@ name = "sql_insight"
 path = "src/lib.rs"
 
 [dependencies]
-sqlparser = { version = "0.56.0", features = ["visitor"] }
+sqlparser = { version = "0.61.0", features = ["visitor"] }
 thiserror = "1.0.56"
