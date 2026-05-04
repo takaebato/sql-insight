@@ -86,14 +86,13 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-      - name: Install Tarpaulin
-        uses: actions-rs/install@v0.1
-        with:
-          crate: cargo-tarpaulin
-          version: latest
-          use-tool-cache: true
       - name: Checkout
         uses: actions/checkout@v6
+      - name: Install Tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+          fallback: none
       - name: Coverage
         run: cargo tarpaulin --workspace --follow-exec --engine Llvm -o Lcov --output-dir ./coverage
       - name: Upload coverage reports to Codecov
