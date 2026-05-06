@@ -99,6 +99,29 @@ mod integration {
                 )
             }
         }
+
+        #[test]
+        fn test_extract_crud_tables_with_cte() {
+            let sql = "WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2";
+            for dialect in all_dialects() {
+                let result = sql_insight::extract_crud_tables(dialect.as_ref(), sql).unwrap();
+                assert_eq!(
+                    result,
+                    vec![Ok(CrudTables {
+                        create_tables: vec![],
+                        read_tables: vec![TableReference {
+                            catalog: None,
+                            schema: None,
+                            name: "t1".into(),
+                            alias: None,
+                        }],
+                        update_tables: vec![],
+                        delete_tables: vec![],
+                    })],
+                    "Failed for dialect: {dialect:?}"
+                )
+            }
+        }
     }
 
     mod extract_tables {
@@ -125,6 +148,24 @@ mod integration {
                             alias: None,
                         }])),
                     ],
+                    "Failed for dialect: {dialect:?}"
+                )
+            }
+        }
+
+        #[test]
+        fn test_extract_tables_with_cte() {
+            let sql = "WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2";
+            for dialect in all_dialects() {
+                let result = sql_insight::extract_tables(dialect.as_ref(), sql).unwrap();
+                assert_eq!(
+                    result,
+                    vec![Ok(Tables(vec![TableReference {
+                        catalog: None,
+                        schema: None,
+                        name: "t1".into(),
+                        alias: None,
+                    }]))],
                     "Failed for dialect: {dialect:?}"
                 )
             }

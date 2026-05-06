@@ -3,13 +3,11 @@
 //! See [`extract_tables`](crate::extract_tables()) as the entry point for extracting tables from SQL.
 
 use core::fmt;
-use std::ops::ControlFlow;
 
 use crate::error::Error;
-use crate::helper;
+use crate::extractor::relation_binder::RelationBinder;
 use sqlparser::ast::{
-    Delete, Ident, Insert, ObjectName, Statement, TableFactor, TableObject, TableWithJoins, Visit,
-    Visitor,
+    Ident, Insert, ObjectName, Statement, TableFactor, TableObject, TableWithJoins,
 };
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -156,61 +154,7 @@ impl fmt::Display for Tables {
 
 /// A visitor to extract tables from SQL.
 #[derive(Default, Debug)]
-pub struct TableExtractor {
-    // All tables found in the SQL including aliases, must be resolved to original tables.
-    all_tables: Vec<TableReference>,
-    // Original tables found in the SQL, used to resolve aliases.
-    original_tables: Vec<TableReference>,
-    // Flag to indicate if the current relation is part of a `TableFactor::Table`
-    relation_of_table: bool,
-}
-
-impl Visitor for TableExtractor {
-    type Break = Error;
-
-    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
-        // Skip if relation is part of a TableFactor::Table
-        if self.relation_of_table {
-            self.relation_of_table = false;
-            return ControlFlow::Continue(());
-        }
-        match TableReference::try_from(relation) {
-            Ok(table) => {
-                self.all_tables.push(table.clone());
-                self.original_tables.push(table)
-            }
-            Err(e) => return ControlFlow::Break(e),
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
-        if let TableFactor::Table { .. } = table_factor {
-            self.relation_of_table = true;
-            match TableReference::try_from(table_factor) {
-                Ok(table) => {
-                    self.all_tables.push(table.clone());
-                    self.original_tables.push(table)
-                }
-                Err(e) => return ControlFlow::Break(e),
-            }
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
-        if let Statement::Delete(Delete { tables, .. }) = statement {
-            // tables of delete statement are not visited by `pre_visit_table_factor` nor `pre_visit_relation`.
-            for table in tables {
-                match TableReference::try_from(table) {
-                    Ok(table) => self.all_tables.push(table),
-                    Err(e) => return ControlFlow::Break(e),
-                }
-            }
-        }
-        ControlFlow::Continue(())
-    }
-}
+pub struct TableExtractor;
 
 impl TableExtractor {
     /// Extract tables from SQL.
@@ -224,27 +168,17 @@ impl TableExtractor {
     }
 
     pub fn extract_from_statement(statement: &Statement) -> Result<Tables, Error> {
-        let mut visitor = TableExtractor::default();
-        match statement.visit(&mut visitor) {
-            ControlFlow::Break(e) => Err(e),
-            ControlFlow::Continue(()) => Ok(Tables(helper::resolve_aliased_tables(
-                visitor.all_tables,
-                visitor.original_tables,
-            ))),
-        }
+        Ok(Tables(
+            RelationBinder::bind_statement(statement)?.into_tables(),
+        ))
     }
 
     // `Visit` trait object cannot be used since method `visit` has generic type parameters.
     // Concrete type `TableWithJoins` is used instead.
     pub fn extract_from_table_node(table: &TableWithJoins) -> Result<Tables, Error> {
-        let mut visitor = TableExtractor::default();
-        match table.visit(&mut visitor) {
-            ControlFlow::Break(e) => Err(e),
-            ControlFlow::Continue(()) => Ok(Tables(helper::resolve_aliased_tables(
-                visitor.all_tables,
-                visitor.original_tables,
-            ))),
-        }
+        Ok(Tables(
+            RelationBinder::bind_table_node(table)?.into_tables(),
+        ))
     }
 }
 
@@ -388,6 +322,59 @@ mod tests {
                 catalog: None,
                 schema: None,
                 name: "t1".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_cte() {
+        let sql = "WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2";
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_cte_shadowing_base_table() {
+        let sql =
+            "WITH t1 AS (SELECT id FROM t2) SELECT * FROM t1 JOIN s1.t1 AS t3 ON t1.id = t3.id";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: Some("s1".into()),
+                name: "t1".into(),
+                alias: Some("t3".into()),
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_nested_statement_with_cte_scope() {
+        let sql = "WITH t1 AS (SELECT id FROM t2) SELECT * FROM (WITH t1 AS (SELECT id FROM t3) SELECT * FROM t1) AS t4 JOIN t1 ON t4.id = t1.id";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t3".into(),
                 alias: None,
             },
         ]))];

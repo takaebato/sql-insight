@@ -314,6 +314,23 @@ mod tests {
     }
 
     #[test]
+    fn test_statement_with_cte() {
+        let sql = "WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            }],
+            update_tables: vec![],
+            delete_tables: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
     fn test_statement_error_with_too_many_identifiers() {
         let sql = "INSERT INTO catalog.schema.table.extra (a) VALUES (1)";
         let expected = vec![Err(Error::AnalysisError(

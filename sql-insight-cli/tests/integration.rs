@@ -177,6 +177,17 @@ mod integration {
         }
 
         #[test]
+        fn test_extract_crud_tables_with_cte() {
+            sql_insight_cmd()
+                .arg("extract-crud")
+                .arg("with t2 as (select id from t1) select * from t2;")
+                .assert()
+                .success()
+                .stdout("Create: [], Read: [t1], Update: [], Delete: []\n")
+                .stderr("");
+        }
+
+        #[test]
         fn test_extract_crud_tables_from_file() {
             let mut temp_file = NamedTempFile::new().unwrap();
             temp_file
@@ -216,6 +227,17 @@ mod integration {
                 .assert()
                 .success()
                 .stdout("catalog.schema.t1 AS t1, catalog.schema.t2 AS t2\ncatalog.schema.t1, catalog.schema.t2\n")
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_tables_with_cte() {
+            sql_insight_cmd()
+                .arg("extract-tables")
+                .arg("with t2 as (select id from t1) select * from t2;")
+                .assert()
+                .success()
+                .stdout("t1\n")
                 .stderr("");
         }
 
