@@ -59,14 +59,14 @@ Extract table references from SQL queries:
 use sql_insight::sqlparser::dialect::GenericDialect;
 
 let dialect = GenericDialect {};
-let tables = sql_insight::extract_tables(&dialect, "SELECT * FROM catalog.schema.`users` as users_alias").unwrap();
-println!("{:?}", tables);
+let extractions = sql_insight::extract_tables(&dialect, "SELECT * FROM catalog.schema.`users` as users_alias").unwrap();
+println!("{:?}", extractions);
 ```
 
 This outputs:
 
 ```
-[Ok(Tables([TableReference { catalog: Some(Ident { value: "catalog", quote_style: None }), schema: Some(Ident { value: "schema", quote_style: None }), name: Ident { value: "users", quote_style: Some('`') }, alias: Some(Ident { value: "users_alias", quote_style: None }) }]))]
+[Ok(TableExtraction { tables: [TableReference { catalog: Some(Ident { value: "catalog", quote_style: None }), schema: Some(Ident { value: "schema", quote_style: None }), name: Ident { value: "users", quote_style: Some('`') }, alias: Some(Ident { value: "users_alias", quote_style: None }) }], diagnostics: [] })]
 ```
 
 ### CRUD Table Extraction

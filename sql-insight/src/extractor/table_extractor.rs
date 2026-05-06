@@ -4,15 +4,17 @@
 
 use core::fmt;
 
+use crate::diagnostic::Diagnostic;
 use crate::error::Error;
-use crate::extractor::relation_binder::RelationBinder;
-use sqlparser::ast::{
-    Ident, Insert, ObjectName, Statement, TableFactor, TableObject, TableWithJoins,
-};
+pub use crate::relation::TableReference;
+use crate::resolver::RelationBinder;
+use sqlparser::ast::{Statement, TableWithJoins};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
 /// Convenience function to extract tables from SQL.
+///
+/// Each statement returns extracted table references plus non-fatal diagnostics.
 ///
 /// ## Example
 ///
@@ -28,112 +30,8 @@ use sqlparser::parser::Parser;
 pub fn extract_tables(
     dialect: &dyn Dialect,
     sql: &str,
-) -> Result<Vec<Result<Tables, Error>>, Error> {
+) -> Result<Vec<Result<TableExtraction, Error>>, Error> {
     TableExtractor::extract(dialect, sql)
-}
-
-/// [`TableReference`] represents a qualified table with alias.
-/// In this crate, this is the canonical representation of a table.
-/// Tables found during analyzing an AST are stored as `TableReference`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TableReference {
-    pub catalog: Option<Ident>,
-    pub schema: Option<Ident>,
-    pub name: Ident,
-    pub alias: Option<Ident>,
-}
-
-impl TableReference {
-    pub fn has_alias(&self) -> bool {
-        self.alias.is_some()
-    }
-    pub fn has_qualifiers(&self) -> bool {
-        self.catalog.is_some() || self.schema.is_some()
-    }
-    pub fn try_from_name_and_alias(
-        name: &ObjectName,
-        alias: &Option<Ident>,
-    ) -> Result<Self, Error> {
-        match name.0.len() {
-            0 => unreachable!("Parser should not allow empty identifiers"),
-            1 => Ok(TableReference {
-                catalog: None,
-                schema: None,
-                name: name.0[0].as_ident().unwrap().clone(),
-                alias: alias.clone(),
-            }),
-            2 => Ok(TableReference {
-                catalog: None,
-                schema: Some(name.0[0].as_ident().unwrap().clone()),
-                name: name.0[1].as_ident().unwrap().clone(),
-                alias: alias.clone(),
-            }),
-            3 => Ok(TableReference {
-                catalog: Some(name.0[0].as_ident().unwrap().clone()),
-                schema: Some(name.0[1].as_ident().unwrap().clone()),
-                name: name.0[2].as_ident().unwrap().clone(),
-                alias: alias.clone(),
-            }),
-            _ => Err(Error::AnalysisError(
-                "Too many identifiers provided".to_string(),
-            )),
-        }
-    }
-    pub fn try_from_name(name: &ObjectName) -> Result<Self, Error> {
-        Self::try_from_name_and_alias(name, &None)
-    }
-}
-
-impl fmt::Display for TableReference {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut parts = Vec::new();
-        if let Some(catalog) = &self.catalog {
-            parts.push(catalog.to_string());
-        }
-        if let Some(schema) = &self.schema {
-            parts.push(schema.to_string());
-        }
-        parts.push(self.name.to_string());
-        let table = parts.join(".");
-        if let Some(alias) = &self.alias {
-            write!(f, "{} AS {}", table, alias)
-        } else {
-            write!(f, "{}", table)
-        }
-    }
-}
-
-impl TryFrom<&Insert> for TableReference {
-    type Error = Error;
-
-    fn try_from(value: &Insert) -> Result<Self, Self::Error> {
-        let name = match &value.table {
-            TableObject::TableName(object_name) => object_name,
-            TableObject::TableFunction(function) => &function.name,
-        };
-        Self::try_from_name_and_alias(name, &value.table_alias)
-    }
-}
-
-impl TryFrom<&TableFactor> for TableReference {
-    type Error = Error;
-
-    fn try_from(table: &TableFactor) -> Result<Self, Self::Error> {
-        match table {
-            TableFactor::Table { name, alias, .. } => {
-                Self::try_from_name_and_alias(name, &alias.as_ref().map(|a| a.name.clone()))
-            }
-            _ => unreachable!("TableFactor::Table expected"),
-        }
-    }
-}
-
-impl TryFrom<&ObjectName> for TableReference {
-    type Error = Error;
-
-    fn try_from(obj_name: &ObjectName) -> Result<Self, Self::Error> {
-        Self::try_from_name(obj_name)
-    }
 }
 
 /// [`Tables`] represents a list of [`TableReference`] that found in SQL.
@@ -152,30 +50,65 @@ impl fmt::Display for Tables {
     }
 }
 
-/// A visitor to extract tables from SQL.
+/// [`TableExtraction`] represents extracted tables and non-fatal diagnostics.
+#[derive(Debug, PartialEq)]
+pub struct TableExtraction {
+    pub tables: Vec<TableReference>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl TableExtraction {
+    pub fn into_tables(self) -> Tables {
+        Tables(self.tables)
+    }
+}
+
+impl fmt::Display for TableExtraction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tables = self
+            .tables
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+        write!(f, "{}", tables)
+    }
+}
+
+/// Extracts tables from SQL.
 #[derive(Default, Debug)]
 pub struct TableExtractor;
 
 impl TableExtractor {
     /// Extract tables from SQL.
-    pub fn extract(dialect: &dyn Dialect, sql: &str) -> Result<Vec<Result<Tables, Error>>, Error> {
+    ///
+    /// Each statement returns extracted table references plus non-fatal diagnostics.
+    pub fn extract(
+        dialect: &dyn Dialect,
+        sql: &str,
+    ) -> Result<Vec<Result<TableExtraction, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         let results = statements
             .iter()
             .map(Self::extract_from_statement)
-            .collect::<Vec<Result<Tables, Error>>>();
+            .collect::<Vec<Result<TableExtraction, Error>>>();
         Ok(results)
     }
 
-    pub fn extract_from_statement(statement: &Statement) -> Result<Tables, Error> {
-        Ok(Tables(
-            RelationBinder::bind_statement(statement)?.into_tables(),
-        ))
+    pub fn extract_from_statement(statement: &Statement) -> Result<TableExtraction, Error> {
+        let resolved = RelationBinder::bind_statement(statement)?;
+        Ok(TableExtraction {
+            tables: resolved.table_references,
+            diagnostics: resolved.diagnostics,
+        })
     }
 
-    // `Visit` trait object cannot be used since method `visit` has generic type parameters.
-    // Concrete type `TableWithJoins` is used instead.
-    pub fn extract_from_table_node(table: &TableWithJoins) -> Result<Tables, Error> {
+    pub(crate) fn extract_tables_from_statement(statement: &Statement) -> Result<Tables, Error> {
+        Ok(Self::extract_from_statement(statement)?.into_tables())
+    }
+
+    // Concrete type `TableWithJoins` exposes the table-node entry point needed by CRUD extraction.
+    pub(crate) fn extract_from_table_node(table: &TableWithJoins) -> Result<Tables, Error> {
         Ok(Tables(
             RelationBinder::bind_table_node(table)?.into_tables(),
         ))
@@ -186,6 +119,7 @@ impl TableExtractor {
 mod tests {
     use super::*;
     use crate::test_utils::all_dialects;
+    use sqlparser::dialect::GenericDialect;
 
     fn assert_table_extraction(
         sql: &str,
@@ -195,6 +129,10 @@ mod tests {
         for dialect in dialects {
             let result = TableExtractor::extract(dialect.as_ref(), sql)
                 .unwrap_or_else(|_| panic!("parse failed for dialect: {dialect:?}"));
+            let result = result
+                .into_iter()
+                .map(|result| result.map(TableExtraction::into_tables))
+                .collect::<Vec<Result<Tables, Error>>>();
             assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
         }
     }
@@ -229,6 +167,22 @@ mod tests {
             }])),
         ];
         assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_unsupported_statement_is_reported_as_diagnostic() {
+        let sql = "SET x = 1";
+        let result = TableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        let extraction = result.into_iter().next().unwrap().unwrap();
+        assert_eq!(extraction.tables, vec![]);
+        assert_eq!(extraction.diagnostics.len(), 1);
+        assert_eq!(
+            extraction.diagnostics[0].kind,
+            crate::DiagnosticKind::UnsupportedStatement
+        );
+        assert!(extraction.diagnostics[0]
+            .message
+            .contains("Unsupported statement while inspecting SQL"));
     }
 
     #[test]
@@ -322,6 +276,46 @@ mod tests {
                 catalog: None,
                 schema: None,
                 name: "t1".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_subquery_inside_function_expression() {
+        let sql = "SELECT COALESCE((SELECT b FROM t2), a) FROM t1";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_subquery_in_order_by() {
+        let sql = "SELECT a FROM t1 ORDER BY (SELECT b FROM t2)";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
                 alias: None,
             },
         ]))];

@@ -6,7 +6,7 @@ use std::fmt;
 use std::ops::ControlFlow;
 
 use crate::error::Error;
-use crate::extractor::table_extractor::TableReference;
+use crate::relation::TableReference;
 use crate::{helper, TableExtractor};
 use sqlparser::ast::{Delete, MergeAction, Statement, Visit, Visitor};
 use sqlparser::dialect::Dialect;
@@ -182,7 +182,7 @@ impl CrudTableExtractor {
 
     fn extract_from_statement(statement: &Statement) -> Result<CrudTables, Error> {
         let mut visitor = CrudTableExtractor {
-            read_tables: TableExtractor::extract_from_statement(statement)?.0,
+            read_tables: TableExtractor::extract_tables_from_statement(statement)?.0,
             ..Default::default()
         };
         match statement.visit(&mut visitor) {

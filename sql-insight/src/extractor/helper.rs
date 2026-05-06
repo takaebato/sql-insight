@@ -1,4 +1,4 @@
-use crate::TableReference;
+use crate::relation::TableReference;
 use std::collections::HashMap;
 
 pub(crate) fn resolve_aliased_tables(

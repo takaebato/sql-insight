@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod integration {
+    use sql_insight::sqlparser::dialect::GenericDialect;
     use sql_insight::test_utils::all_dialects;
+    use sql_insight::DiagnosticKind;
     use sql_insight::{CrudTables, NormalizerOptions};
     use sql_insight::{TableReference, Tables};
 
@@ -132,6 +134,10 @@ mod integration {
             let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'; SELECT b FROM t2 WHERE c = 4";
             for dialect in all_dialects() {
                 let result = sql_insight::extract_tables(dialect.as_ref(), sql).unwrap();
+                let result = result
+                    .into_iter()
+                    .map(|result| result.map(sql_insight::TableExtraction::into_tables))
+                    .collect::<Vec<Result<Tables, sql_insight::error::Error>>>();
                 assert_eq!(
                     result,
                     vec![
@@ -158,6 +164,10 @@ mod integration {
             let sql = "WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2";
             for dialect in all_dialects() {
                 let result = sql_insight::extract_tables(dialect.as_ref(), sql).unwrap();
+                let result = result
+                    .into_iter()
+                    .map(|result| result.map(sql_insight::TableExtraction::into_tables))
+                    .collect::<Vec<Result<Tables, sql_insight::error::Error>>>();
                 assert_eq!(
                     result,
                     vec![Ok(Tables(vec![TableReference {
@@ -169,6 +179,18 @@ mod integration {
                     "Failed for dialect: {dialect:?}"
                 )
             }
+        }
+
+        #[test]
+        fn test_extract_tables_reports_diagnostics() {
+            let result = sql_insight::extract_tables(&GenericDialect {}, "SET x = 1").unwrap();
+            let extraction = result.into_iter().next().unwrap().unwrap();
+            assert_eq!(extraction.tables, vec![]);
+            assert_eq!(extraction.diagnostics.len(), 1);
+            assert_eq!(
+                extraction.diagnostics[0].kind,
+                DiagnosticKind::UnsupportedStatement
+            );
         }
     }
 }
