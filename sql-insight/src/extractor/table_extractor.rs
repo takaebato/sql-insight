@@ -341,6 +341,167 @@ mod tests {
     }
 
     #[test]
+    fn test_statement_with_case_insensitive_cte_reference() {
+        let sql = "WITH T2 AS (SELECT id FROM t1) SELECT * FROM t2";
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_quoted_cte_does_not_match_unquoted_reference() {
+        let sql = r#"WITH "T2" AS (SELECT id FROM t1) SELECT * FROM t2"#;
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(
+            sql,
+            expected,
+            vec![Box::new(sqlparser::dialect::GenericDialect {})],
+        );
+    }
+
+    #[test]
+    fn test_statement_with_quoted_cte_exact_reference() {
+        let sql = r#"WITH "T2" AS (SELECT id FROM t1) SELECT * FROM "T2""#;
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(
+            sql,
+            expected,
+            vec![Box::new(sqlparser::dialect::GenericDialect {})],
+        );
+    }
+
+    #[test]
+    fn test_statement_with_cte_referencing_previous_cte() {
+        let sql = "WITH t2 AS (SELECT id FROM t1), t3 AS (SELECT id FROM t2) SELECT * FROM t3";
+        let expected = vec![Ok(Tables(vec![TableReference {
+            catalog: None,
+            schema: None,
+            name: "t1".into(),
+            alias: None,
+        }]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_cte_does_not_resolve_forward_reference() {
+        let sql = "WITH t2 AS (SELECT id FROM t3), t3 AS (SELECT id FROM t1) SELECT * FROM t2";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t3".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_cte_shadows_base_table_after_definition() {
+        let sql = "WITH t2 AS (SELECT id FROM t3), t3 AS (SELECT id FROM t1) SELECT * FROM t3";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t3".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_qualified_table_not_shadowed_by_cte() {
+        let sql = "WITH t2 AS (SELECT id FROM t4), t3 AS (SELECT id FROM t1) SELECT * FROM s.t3";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t4".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: Some("s".into()),
+                name: "t3".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_qualified_table_not_shadowed_by_previous_cte_inside_cte_body() {
+        let sql = "WITH t2 AS (SELECT id FROM t1), t3 AS (SELECT id FROM s.t2) SELECT * FROM t3";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: Some("s".into()),
+                name: "t2".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_statement_with_recursive_cte_self_reference() {
+        let sql = "WITH RECURSIVE t2 AS (SELECT id FROM t2) SELECT * FROM t2";
+        let expected = vec![Ok(Tables(vec![]))];
+        assert_table_extraction(
+            sql,
+            expected,
+            vec![Box::new(sqlparser::dialect::GenericDialect {})],
+        );
+    }
+
+    #[test]
     fn test_statement_with_cte_shadowing_base_table() {
         let sql =
             "WITH t1 AS (SELECT id FROM t2) SELECT * FROM t1 JOIN s1.t1 AS t3 ON t1.id = t3.id";
@@ -375,6 +536,46 @@ mod tests {
                 catalog: None,
                 schema: None,
                 name: "t3".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_nested_cte_does_not_leak_to_outer_query() {
+        let sql = "SELECT * FROM (WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2) AS t3 JOIN t2 ON t3.id = t2.id";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
+                alias: None,
+            },
+        ]))];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_insert_select_with_cte_source() {
+        let sql = "INSERT INTO t1 WITH t3 AS (SELECT id FROM t2) SELECT * FROM t3";
+        let expected = vec![Ok(Tables(vec![
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t1".into(),
+                alias: None,
+            },
+            TableReference {
+                catalog: None,
+                schema: None,
+                name: "t2".into(),
                 alias: None,
             },
         ]))];
@@ -441,6 +642,37 @@ mod tests {
                     schema: None,
                     name: "t2".into(),
                     alias: Some("t2_alias".into()),
+                },
+            ]))];
+            // BigQuery and Generic do not support DELETE ... FROM
+            assert_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+            );
+        }
+
+        #[test]
+        fn test_delete_statement_with_case_insensitive_alias_target() {
+            let sql = "DELETE T1_ALIAS FROM t1 AS t1_alias JOIN t2 ON t1_alias.a = t2.a";
+            let expected = vec![Ok(Tables(vec![
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t1".into(),
+                    alias: Some("t1_alias".into()),
+                },
+                TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t2".into(),
+                    alias: None,
                 },
             ]))];
             // BigQuery and Generic do not support DELETE ... FROM

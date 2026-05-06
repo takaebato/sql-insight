@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
 
 use crate::error::Error;
@@ -9,6 +9,22 @@ use sqlparser::ast::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ScopeId(usize);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RelationKey {
+    Unquoted(String),
+    Quoted(String),
+}
+
+impl RelationKey {
+    fn from_ident(ident: &Ident) -> Self {
+        if ident.quote_style.is_some() {
+            Self::Quoted(ident.value.clone())
+        } else {
+            Self::Unquoted(ident.value.to_ascii_lowercase())
+        }
+    }
+}
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -32,7 +48,7 @@ impl ResolvedStatement {
 pub(crate) struct RelationScope {
     pub(crate) id: ScopeId,
     pub(crate) parent: Option<ScopeId>,
-    bindings: HashMap<Ident, RelationBinding>,
+    bindings: HashMap<RelationKey, RelationBinding>,
 }
 
 impl RelationScope {
@@ -44,12 +60,12 @@ impl RelationScope {
         }
     }
 
-    fn bind(&mut self, name: Ident, binding: RelationBinding) {
-        self.bindings.insert(name, binding);
+    fn bind(&mut self, name: &Ident, binding: RelationBinding) {
+        self.bindings.insert(RelationKey::from_ident(name), binding);
     }
 
     fn resolve(&self, name: &Ident) -> Option<&RelationBinding> {
-        self.bindings.get(name)
+        self.bindings.get(&RelationKey::from_ident(name))
     }
 }
 
@@ -87,14 +103,9 @@ impl ScopeStack {
         self.scopes
     }
 
-    fn push_query_scope(&mut self, query: &Query) {
+    fn push_query_scope(&mut self) {
         let parent = self.stack.last().copied();
-        let scope_id = self.push_scope(parent);
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                self.scopes[scope_id.0].bind(cte.alias.name.clone(), RelationBinding::Cte);
-            }
-        }
+        self.push_scope(parent);
     }
 
     fn pop_scope(&mut self) {
@@ -102,7 +113,7 @@ impl ScopeStack {
     }
 
     fn bind_current(&mut self, name: Ident, binding: RelationBinding) {
-        self.current_scope_mut().bind(name, binding);
+        self.current_scope_mut().bind(&name, binding);
     }
 
     fn resolve_unqualified_relation(&self, relation: &ObjectName) -> Option<&RelationBinding> {
@@ -134,6 +145,67 @@ impl ScopeStack {
     fn current_scope_mut(&mut self) -> &mut RelationScope {
         let id = self.current_scope_id();
         &mut self.scopes[id.0]
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingCte {
+    query: *const Query,
+    alias: Ident,
+}
+
+#[derive(Default, Debug)]
+struct QueryFrame {
+    cte_alias_after_body: Option<Ident>,
+    pending_ctes: VecDeque<PendingCte>,
+}
+
+#[derive(Default, Debug)]
+struct CteVisibilityTracker {
+    frames: Vec<QueryFrame>,
+}
+
+impl CteVisibilityTracker {
+    fn begin_query(&mut self, query: &Query) {
+        let cte_alias_after_body = self.consume_pending_cte_body(query);
+        let pending_ctes = query
+            .with
+            .as_ref()
+            .filter(|with| !with.recursive)
+            .map(|with| {
+                with.cte_tables
+                    .iter()
+                    .map(|cte| PendingCte {
+                        query: cte.query.as_ref() as *const Query,
+                        alias: cte.alias.name.clone(),
+                    })
+                    .collect::<VecDeque<PendingCte>>()
+            })
+            .unwrap_or_default();
+        self.frames.push(QueryFrame {
+            cte_alias_after_body,
+            pending_ctes,
+        });
+    }
+
+    fn end_query(&mut self) -> Option<Ident> {
+        self.frames
+            .pop()
+            .and_then(|frame| frame.cte_alias_after_body)
+    }
+
+    fn consume_pending_cte_body(&mut self, query: &Query) -> Option<Ident> {
+        let frame = self.frames.last_mut()?;
+        let query = query as *const Query;
+        if frame
+            .pending_ctes
+            .front()
+            .is_some_and(|pending| pending.query == query)
+        {
+            frame.pending_ctes.pop_front().map(|pending| pending.alias)
+        } else {
+            None
+        }
     }
 }
 
@@ -187,13 +259,25 @@ impl DeleteTargetTracker {
         let Some(index) = self
             .skipped_relations
             .iter()
-            .position(|target| target == relation)
+            .position(|target| same_object_name(target, relation))
         else {
             return false;
         };
         self.skipped_relations.remove(index);
         true
     }
+}
+
+fn same_object_name(left: &ObjectName, right: &ObjectName) -> bool {
+    left.0.len() == right.0.len()
+        && left.0.iter().zip(&right.0).all(|(left, right)| {
+            match (left.as_ident(), right.as_ident()) {
+                (Some(left), Some(right)) => {
+                    RelationKey::from_ident(left) == RelationKey::from_ident(right)
+                }
+                _ => left == right,
+            }
+        })
 }
 
 pub(crate) struct RelationBinder;
@@ -221,6 +305,7 @@ struct BinderVisitor {
     references: TableReferenceCollector,
     relation_of_table: bool,
     scopes: ScopeStack,
+    ctes: CteVisibilityTracker,
     delete_targets: DeleteTargetTracker,
 }
 
@@ -283,6 +368,16 @@ impl BinderVisitor {
         self.scopes.bind_current(name, binding);
     }
 
+    fn bind_recursive_ctes(&mut self, query: &Query) {
+        if let Some(with) = &query.with {
+            if with.recursive {
+                for cte in &with.cte_tables {
+                    self.bind_relation(cte.alias.name.clone(), RelationBinding::Cte);
+                }
+            }
+        }
+    }
+
     fn resolve_delete_target(&self, relation: &ObjectName) -> Result<TableReference, Error> {
         if let Some(RelationBinding::BaseTable(table)) =
             self.scopes.resolve_unqualified_relation(relation)
@@ -298,12 +393,17 @@ impl Visitor for BinderVisitor {
     type Break = Error;
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-        self.scopes.push_query_scope(query);
+        self.ctes.begin_query(query);
+        self.scopes.push_query_scope();
+        self.bind_recursive_ctes(query);
         ControlFlow::Continue(())
     }
 
     fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
         self.scopes.pop_scope();
+        if let Some(alias) = self.ctes.end_query() {
+            self.bind_relation(alias, RelationBinding::Cte);
+        }
         ControlFlow::Continue(())
     }
 
