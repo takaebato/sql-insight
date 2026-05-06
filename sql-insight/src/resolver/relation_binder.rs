@@ -31,13 +31,13 @@ impl RelationKey {
 
 #[derive(Debug)]
 #[allow(dead_code)]
-pub(crate) struct ResolvedStatement {
+pub(crate) struct RelationResolution {
     pub(crate) table_references: Vec<TableReference>,
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) scopes: Vec<RelationScope>,
 }
 
-impl ResolvedStatement {
+impl RelationResolution {
     pub(crate) fn into_tables(self) -> Vec<TableReference> {
         let Self {
             table_references,
@@ -164,16 +164,16 @@ pub(crate) enum RelationBinding {
 pub(crate) struct RelationBinder;
 
 impl RelationBinder {
-    pub(crate) fn bind_statement(statement: &Statement) -> Result<ResolvedStatement, Error> {
+    pub(crate) fn bind_statement(statement: &Statement) -> Result<RelationResolution, Error> {
         let mut binder = Binder::default();
         binder.bind_statement(statement)?;
-        Ok(binder.into_resolved_statement())
+        Ok(binder.into_relation_resolution())
     }
 
-    pub(crate) fn bind_table_node(table: &TableWithJoins) -> Result<ResolvedStatement, Error> {
+    pub(crate) fn bind_table_node(table: &TableWithJoins) -> Result<RelationResolution, Error> {
         let mut binder = Binder::default();
         binder.bind_table_with_joins(table)?;
-        Ok(binder.into_resolved_statement())
+        Ok(binder.into_relation_resolution())
     }
 }
 
@@ -185,8 +185,8 @@ struct Binder {
 }
 
 impl Binder {
-    fn into_resolved_statement(self) -> ResolvedStatement {
-        ResolvedStatement {
+    fn into_relation_resolution(self) -> RelationResolution {
+        RelationResolution {
             table_references: self.references.into_tables(),
             diagnostics: self.diagnostics,
             scopes: self.scopes.into_scopes(),

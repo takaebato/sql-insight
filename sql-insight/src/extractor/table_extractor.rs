@@ -96,10 +96,10 @@ impl TableExtractor {
     }
 
     pub fn extract_from_statement(statement: &Statement) -> Result<TableExtraction, Error> {
-        let resolved = RelationBinder::bind_statement(statement)?;
+        let resolution = RelationBinder::bind_statement(statement)?;
         Ok(TableExtraction {
-            tables: resolved.table_references,
-            diagnostics: resolved.diagnostics,
+            tables: resolution.table_references,
+            diagnostics: resolution.diagnostics,
         })
     }
 
