@@ -103,7 +103,12 @@ impl Visitor for CrudTableExtractor {
                     self.update_tables.clone(),
                 );
             }
-            Statement::Delete(Delete { tables, from, .. }) => {
+            Statement::Delete(Delete {
+                tables,
+                from,
+                using,
+                ..
+            }) => {
                 // When tables are present, deletion sqls are these tables,
                 // and from clause is used as a data source.
                 if !tables.is_empty() {
@@ -132,10 +137,17 @@ impl Visitor for CrudTableExtractor {
                     self.possibly_aliased_delete_tables.clone(),
                     self.read_tables.clone(),
                 );
-                self.read_tables = helper::calc_difference_of_tables(
-                    self.read_tables.clone(),
-                    self.delete_tables.clone(),
-                );
+                // Only the bare `DELETE FROM target` form has its target sitting
+                // inside read_tables and needing to move out; explicit target
+                // lists (DELETE t1, t2 FROM ...) and USING-style deletes both
+                // keep the target tables in read_tables since they're genuine
+                // sources too.
+                if tables.is_empty() && using.is_none() {
+                    self.read_tables = helper::calc_difference_of_tables(
+                        self.read_tables.clone(),
+                        self.delete_tables.clone(),
+                    );
+                }
             }
             Statement::Merge(merge) => {
                 let target_table = match TableReference::try_from(&merge.table) {

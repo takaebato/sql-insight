@@ -68,7 +68,7 @@ impl RelationResolver {
                     return Ok(());
                 }
                 let table = TableReference::try_from(table_factor)?;
-                self.record_base_table(table);
+                self.bind_base_table(table);
                 if let Some(args) = args {
                     self.visit_table_function_args(&args.args)?;
                     if let Some(settings) = &args.settings {

@@ -96,7 +96,7 @@ impl RelationResolver {
             self.visit_select_item(item)?;
         }
         if let Some(into) = &select.into {
-            self.record_base_table(TableReference::try_from(&into.name)?);
+            self.bind_base_table(TableReference::try_from(&into.name)?);
         }
         for lateral_view in &select.lateral_views {
             self.visit_expr(&lateral_view.lateral_view)?;
@@ -156,7 +156,7 @@ impl RelationResolver {
         let Some(name) = &table.table_name else {
             return;
         };
-        self.record_base_table(TableReference {
+        self.bind_base_table(TableReference {
             catalog: None,
             schema: table
                 .schema_name

@@ -98,7 +98,7 @@ impl TableExtractor {
     pub fn extract_from_statement(statement: &Statement) -> Result<TableExtraction, Error> {
         let resolution = RelationResolver::resolve_statement(statement)?;
         Ok(TableExtraction {
-            tables: resolution.table_references,
+            tables: resolution.physical_tables(),
             diagnostics: resolution.diagnostics,
         })
     }
@@ -110,7 +110,7 @@ impl TableExtractor {
     // Concrete type `TableWithJoins` exposes the table-node entry point needed by CRUD extraction.
     pub(crate) fn extract_from_table_node(table: &TableWithJoins) -> Result<Tables, Error> {
         Ok(Tables(
-            RelationResolver::resolve_table_node(table)?.into_tables(),
+            RelationResolver::resolve_table_node(table)?.physical_tables(),
         ))
     }
 }
@@ -382,8 +382,10 @@ mod tests {
 
         #[test]
         fn test_derived_table_and_lateral_sources() {
+            // Outer scope's physical tables (t2 via JOIN) come before nested
+            // scopes (LATERAL subquery's t1).
             let sql = "SELECT * FROM LATERAL (SELECT id FROM t1) AS d JOIN t2 ON d.id = t2.id";
-            let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
+            let expected = vec![ok_tables(vec![table("t2"), table("t1")])];
             assert_table_extraction(sql, expected, generic_dialect());
         }
 
@@ -442,14 +444,17 @@ mod tests {
 
         #[test]
         fn test_dialect_specific_query_clauses_with_subqueries() {
+            // DISTINCT ON / TOP exprs are walked before FROM, but the outer
+            // scope's physical tables (t1) still come before the nested
+            // subquery's (t2) under scope-order traversal.
             assert_table_extraction(
                 "SELECT DISTINCT ON ((SELECT id FROM t2)) id FROM t1",
-                vec![ok_tables(vec![table("t2"), table("t1")])],
+                vec![ok_tables(vec![table("t1"), table("t2")])],
                 one_dialect(sqlparser::dialect::PostgreSqlDialect {}),
             );
             assert_table_extraction(
                 "SELECT TOP ((SELECT n FROM t2)) id FROM t1",
-                vec![ok_tables(vec![table("t2"), table("t1")])],
+                vec![ok_tables(vec![table("t1"), table("t2")])],
                 one_dialect(sqlparser::dialect::MsSqlDialect {}),
             );
             assert_table_extraction(
@@ -496,9 +501,11 @@ mod tests {
 
         #[test]
         fn test_pipe_operator_sources() {
+            // Outer scope's physical tables (t1 from FROM, t3 from |> JOIN) come
+            // before the WHERE subquery's nested scope (t2).
             let sql =
                 "SELECT * FROM t1 |> WHERE id IN (SELECT id FROM t2) |> JOIN t3 ON id = t3.id";
-            let expected = vec![ok_tables(vec![table("t1"), table("t2"), table("t3")])];
+            let expected = vec![ok_tables(vec![table("t1"), table("t3"), table("t2")])];
             assert_table_extraction(
                 sql,
                 expected,
@@ -590,7 +597,9 @@ mod tests {
     #[test]
     fn test_statement_with_quoted_cte_does_not_match_unquoted_reference() {
         let sql = r#"WITH "T2" AS (SELECT id FROM t1) SELECT * FROM t2"#;
-        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
+        // Outer scope's physical t2 (CTE didn't match the unquoted reference)
+        // precedes the nested CTE body's t1.
+        let expected = vec![ok_tables(vec![table("t2"), table("t1")])];
         assert_table_extraction(
             sql,
             expected,
@@ -633,10 +642,12 @@ mod tests {
     #[test]
     fn test_statement_with_qualified_table_not_shadowed_by_cte() {
         let sql = "WITH t2 AS (SELECT id FROM t4), t3 AS (SELECT id FROM t1) SELECT * FROM s.t3";
+        // Outer scope's s.t3 comes first; CTE bodies (t4, t1) follow in
+        // creation order.
         let expected = vec![ok_tables(vec![
+            schema_table("s", "t3"),
             table("t4"),
             table("t1"),
-            schema_table("s", "t3"),
         ])];
         assert_table_extraction(sql, expected, all_dialects());
     }
@@ -663,9 +674,11 @@ mod tests {
     fn test_statement_with_cte_shadowing_base_table() {
         let sql =
             "WITH t1 AS (SELECT id FROM t2) SELECT * FROM t1 JOIN s1.t1 AS t3 ON t1.id = t3.id";
+        // Outer scope's s1.t1 AS t3 (from JOIN) is recorded before the CTE
+        // body's t2 in the nested scope.
         let expected = vec![ok_tables(vec![
-            table("t2"),
             schema_table_alias("s1", "t1", "t3"),
+            table("t2"),
         ])];
         assert_table_extraction(sql, expected, all_dialects());
     }
@@ -680,7 +693,9 @@ mod tests {
     #[test]
     fn test_nested_cte_does_not_leak_to_outer_query() {
         let sql = "SELECT * FROM (WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2) AS t3 JOIN t2 ON t3.id = t2.id";
-        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
+        // Outer scope's t2 (from JOIN, base table) comes before the nested
+        // CTE body's t1.
+        let expected = vec![ok_tables(vec![table("t2"), table("t1")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
@@ -707,8 +722,10 @@ mod tests {
 
         #[test]
         fn test_delete_statement() {
+            // Targets used to be spliced into the output; now only scope-bound
+            // sources appear, so the target reference no longer duplicates.
             let sql = "DELETE t1 FROM t1";
-            let expected = vec![ok_tables(vec![table("t1"), table("t1")])];
+            let expected = vec![ok_tables(vec![table("t1")])];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
@@ -721,7 +738,6 @@ mod tests {
         fn test_delete_statement_with_aliases() {
             let sql = "DELETE t1_alias FROM t1 AS t1_alias JOIN t2 AS t2_alias ON t1_alias.a = t2_alias.a WHERE t2_alias.b = 1";
             let expected = vec![ok_tables(vec![
-                table_alias("t1", "t1_alias"),
                 table_alias("t1", "t1_alias"),
                 table_alias("t2", "t2_alias"),
             ])];
@@ -736,11 +752,7 @@ mod tests {
         #[test]
         fn test_delete_statement_with_case_insensitive_alias_target() {
             let sql = "DELETE T1_ALIAS FROM t1 AS t1_alias JOIN t2 ON t1_alias.a = t2.a";
-            let expected = vec![ok_tables(vec![
-                table_alias("t1", "t1_alias"),
-                table_alias("t1", "t1_alias"),
-                table("t2"),
-            ])];
+            let expected = vec![ok_tables(vec![table_alias("t1", "t1_alias"), table("t2")])];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
@@ -753,13 +765,7 @@ mod tests {
         fn test_delete_multiple_tables_with_join() {
             let sql =
                 "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3 WHERE t1.a = t2.a AND t2.a = t3.a";
-            let expected = vec![ok_tables(vec![
-                table("t1"),
-                table("t2"),
-                table("t1"),
-                table("t2"),
-                table("t3"),
-            ])];
+            let expected = vec![ok_tables(vec![table("t1"), table("t2"), table("t3")])];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
@@ -786,8 +792,6 @@ mod tests {
         fn test_delete_from_statement_with_alias() {
             let sql = "DELETE FROM t1_alias, t2_alias USING t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
             let expected = vec![ok_tables(vec![
-                table_alias("t1", "t1_alias"),
-                table_alias("t2", "t2_alias"),
                 table_alias("t1", "t1_alias"),
                 table_alias("t2", "t2_alias"),
                 table("t3"),

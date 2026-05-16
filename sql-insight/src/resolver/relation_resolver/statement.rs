@@ -2,8 +2,7 @@ use super::RelationResolver;
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
-    Delete, FromTable, Merge, ObjectName, ObjectType, Statement, TableFactor, TableWithJoins,
-    Update, UpdateTableFromKind,
+    Delete, FromTable, Merge, ObjectType, Statement, TableWithJoins, Update, UpdateTableFromKind,
 };
 
 impl RelationResolver {
@@ -17,30 +16,30 @@ impl RelationResolver {
             Statement::Delete(delete) => self.visit_delete(delete),
             Statement::Merge(merge) => self.visit_merge(merge),
             Statement::CreateTable(create_table) => {
-                self.record_base_table(TableReference::try_from(&create_table.name)?);
+                self.bind_base_table(TableReference::try_from(&create_table.name)?);
                 if let Some(query) = &create_table.query {
                     self.resolve_query(query)?;
                 }
                 Ok(())
             }
             Statement::CreateView(create_view) => {
-                self.record_base_table(TableReference::try_from(&create_view.name)?);
+                self.bind_base_table(TableReference::try_from(&create_view.name)?);
                 self.resolve_query(&create_view.query)?;
                 if let Some(to) = &create_view.to {
-                    self.record_base_table(TableReference::try_from(to)?);
+                    self.bind_base_table(TableReference::try_from(to)?);
                 }
                 Ok(())
             }
             Statement::AlterView { name, query, .. } => {
-                self.record_base_table(TableReference::try_from(name)?);
+                self.bind_base_table(TableReference::try_from(name)?);
                 self.resolve_query(query).map(|_| ())
             }
             Statement::CreateVirtualTable { name, .. } => {
-                self.record_base_table(TableReference::try_from(name)?);
+                self.bind_base_table(TableReference::try_from(name)?);
                 Ok(())
             }
             Statement::AlterTable(alter_table) => {
-                self.record_base_table(TableReference::try_from(&alter_table.name)?);
+                self.bind_base_table(TableReference::try_from(&alter_table.name)?);
                 Ok(())
             }
             Statement::Drop {
@@ -54,17 +53,17 @@ impl RelationResolver {
                     ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
                 ) {
                     for name in names {
-                        self.record_base_table(TableReference::try_from(name)?);
+                        self.bind_base_table(TableReference::try_from(name)?);
                     }
                 }
                 if let Some(table) = table {
-                    self.record_base_table(TableReference::try_from(table)?);
+                    self.bind_base_table(TableReference::try_from(table)?);
                 }
                 Ok(())
             }
             Statement::Truncate(truncate) => {
                 for table in &truncate.table_names {
-                    self.record_base_table(TableReference::try_from(&table.name)?);
+                    self.bind_base_table(TableReference::try_from(&table.name)?);
                 }
                 Ok(())
             }
@@ -190,7 +189,7 @@ impl RelationResolver {
     }
 
     fn visit_insert(&mut self, insert: &sqlparser::ast::Insert) -> Result<(), Error> {
-        self.record_base_table(TableReference::try_from(insert)?);
+        self.bind_base_table(TableReference::try_from(insert)?);
         if let Some(source) = &insert.source {
             self.resolve_query(source)?;
         }
@@ -222,38 +221,22 @@ impl RelationResolver {
     }
 
     fn visit_delete(&mut self, delete: &Delete) -> Result<(), Error> {
-        let insertion_index = self.references.len();
-        let target_names = if !delete.tables.is_empty() {
-            delete.tables.clone()
-        } else if delete.using.is_some() {
-            delete_from_table_names(delete)
-        } else {
-            Vec::new()
-        };
-
-        if delete.using.is_some() {
-            if let Some(using) = &delete.using {
-                for table in using {
-                    self.visit_table_with_joins(table)?;
-                }
+        if let Some(using) = &delete.using {
+            for table in using {
+                self.visit_table_with_joins(table)?;
             }
         } else {
             for table in from_table_items(&delete.from) {
                 self.visit_table_with_joins(table)?;
             }
         }
-
         if let Some(selection) = &delete.selection {
             self.visit_expr(selection)?;
         }
-
-        if !target_names.is_empty() {
-            let mut targets = Vec::new();
-            for target in &target_names {
-                targets.push(self.resolve_delete_target(target)?);
-            }
-            self.references.insert_many_at(insertion_index, targets);
-        }
+        // DELETE target names (delete.tables) used to be resolved to base
+        // tables and spliced into the output; the scope walk now picks up the
+        // same bindings via FROM/USING. Targets specifically belong to the
+        // forthcoming operations API as a TableOperation.kind = Delete.
         Ok(())
     }
 
@@ -270,50 +253,8 @@ impl RelationResolver {
     }
 }
 
-fn delete_from_table_names(delete: &Delete) -> Vec<ObjectName> {
-    let from = match &delete.from {
-        FromTable::WithFromKeyword(items) => items,
-        FromTable::WithoutKeyword(items) => items,
-    };
-    let mut names = Vec::new();
-    for table_with_joins in from {
-        collect_table_factor_names(&table_with_joins.relation, &mut names);
-        for join in &table_with_joins.joins {
-            collect_table_factor_names(&join.relation, &mut names);
-        }
-    }
-    names
-}
-
 fn from_table_items(from: &FromTable) -> &[TableWithJoins] {
     match from {
         FromTable::WithFromKeyword(items) | FromTable::WithoutKeyword(items) => items,
-    }
-}
-
-fn collect_table_factor_names(table_factor: &TableFactor, names: &mut Vec<ObjectName>) {
-    match table_factor {
-        TableFactor::Table { name, .. } => names.push(name.clone()),
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            collect_table_factor_names(&table_with_joins.relation, names);
-            for join in &table_with_joins.joins {
-                collect_table_factor_names(&join.relation, names);
-            }
-        }
-        TableFactor::Pivot { table, .. }
-        | TableFactor::Unpivot { table, .. }
-        | TableFactor::MatchRecognize { table, .. } => {
-            collect_table_factor_names(table, names);
-        }
-        TableFactor::Derived { .. }
-        | TableFactor::TableFunction { .. }
-        | TableFactor::Function { .. }
-        | TableFactor::UNNEST { .. }
-        | TableFactor::JsonTable { .. }
-        | TableFactor::OpenJsonTable { .. }
-        | TableFactor::XmlTable { .. }
-        | TableFactor::SemanticView { .. } => {}
     }
 }

@@ -3,7 +3,7 @@ mod query;
 mod statement;
 mod table;
 
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::error::Error;
@@ -32,19 +32,20 @@ impl RelationKey {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct RelationResolution {
-    pub(crate) table_references: Vec<TableReference>,
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) scopes: Vec<RelationScope>,
 }
 
 impl RelationResolution {
-    pub(crate) fn into_tables(self) -> Vec<TableReference> {
-        let Self {
-            table_references,
-            diagnostics: _,
-            scopes: _,
-        } = self;
-        table_references
+    pub(crate) fn physical_tables(&self) -> Vec<TableReference> {
+        self.scopes
+            .iter()
+            .flat_map(|scope| scope.iter_bindings())
+            .filter_map(|binding| match binding {
+                RelationBinding::PhysicalTable { table, .. } => Some(table.clone()),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -53,7 +54,7 @@ impl RelationResolution {
 pub(crate) struct RelationScope {
     pub(crate) id: ScopeId,
     pub(crate) parent: Option<ScopeId>,
-    bindings: HashMap<RelationKey, RelationBinding>,
+    bindings: IndexMap<RelationKey, RelationBinding>,
 }
 
 impl RelationScope {
@@ -61,7 +62,7 @@ impl RelationScope {
         Self {
             id,
             parent,
-            bindings: HashMap::new(),
+            bindings: IndexMap::new(),
         }
     }
 
@@ -72,28 +73,9 @@ impl RelationScope {
     fn resolve(&self, name: &Ident) -> Option<&RelationBinding> {
         self.bindings.get(&RelationKey::from_ident(name))
     }
-}
 
-#[derive(Default, Debug)]
-struct TableReferenceCollector {
-    references: Vec<TableReference>,
-}
-
-impl TableReferenceCollector {
-    fn len(&self) -> usize {
-        self.references.len()
-    }
-
-    fn push(&mut self, table: TableReference) {
-        self.references.push(table);
-    }
-
-    fn insert_many_at(&mut self, index: usize, tables: Vec<TableReference>) {
-        self.references.splice(index..index, tables);
-    }
-
-    fn into_tables(self) -> Vec<TableReference> {
-        self.references
+    fn iter_bindings(&self) -> impl Iterator<Item = &RelationBinding> {
+        self.bindings.values()
     }
 }
 
@@ -184,7 +166,6 @@ pub(crate) struct ResolvedQuery {
 
 #[derive(Default, Debug)]
 pub(crate) struct RelationResolver {
-    references: TableReferenceCollector,
     diagnostics: Vec<Diagnostic>,
     scopes: ScopeStack,
 }
@@ -208,7 +189,6 @@ impl RelationResolver {
 
     fn into_relation_resolution(self) -> RelationResolution {
         RelationResolution {
-            table_references: self.references.into_tables(),
             diagnostics: self.diagnostics,
             scopes: self.scopes.into_scopes(),
         }
@@ -219,11 +199,6 @@ impl RelationResolver {
             self.scopes.resolve_unqualified_relation(relation),
             Some(RelationBinding::Cte { .. })
         )
-    }
-
-    fn record_base_table(&mut self, table: TableReference) {
-        self.references.push(table.clone());
-        self.bind_base_table(table);
     }
 
     fn bind_base_table(&mut self, table: TableReference) {
@@ -274,15 +249,5 @@ impl RelationResolver {
 
     fn bind_relation(&mut self, name: Ident, binding: RelationBinding) {
         self.scopes.bind_current(name, binding);
-    }
-
-    fn resolve_delete_target(&self, relation: &ObjectName) -> Result<TableReference, Error> {
-        if let Some(RelationBinding::PhysicalTable { table, .. }) =
-            self.scopes.resolve_unqualified_relation(relation)
-        {
-            Ok(table.clone())
-        } else {
-            TableReference::try_from(relation)
-        }
     }
 }
