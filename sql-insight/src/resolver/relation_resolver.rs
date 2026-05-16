@@ -8,9 +8,18 @@ use indexmap::IndexMap;
 use crate::catalog::{Catalog, ColumnSchema};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::error::Error;
-use crate::operation::TableRole;
 use crate::relation::TableReference;
-use sqlparser::ast::{Ident, ObjectName, Statement, TableWithJoins};
+use sqlparser::ast::{Ident, ObjectName, Statement};
+
+/// Internal role a table binding carries within a statement. Surfaced to
+/// the operation extractor via [`RelationResolution::table_reads`] and
+/// [`RelationResolution::table_writes`]; the public API exposes two
+/// separate lists instead of this enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TableRole {
+    Read,
+    Write,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ScopeId(usize);
@@ -57,43 +66,39 @@ pub(crate) struct RelationResolution {
 }
 
 impl RelationResolution {
-    /// All tables touched by the statement, in scope-arena order.
-    /// Loses the per-binding role information; consumers that need it
-    /// (e.g. the operation extractor) should use [`table_bindings`]
-    /// instead.
+    /// All tables touched by the statement, in scope-arena order. The
+    /// union of [`read_tables`] and [`write_tables`] (with duplicates
+    /// when a single table carries both roles).
     pub(crate) fn tables(&self) -> Vec<TableReference> {
-        self.table_bindings().into_iter().map(|b| b.table).collect()
-    }
-
-    /// All table bindings paired with the roles they were bound under.
-    /// A single table can carry multiple roles when the same name is bound
-    /// from different positions of the same statement (e.g. `DELETE t1
-    /// FROM t1` → `roles = [Write, Read]`).
-    pub(crate) fn table_bindings(&self) -> Vec<TableBinding> {
         self.scopes
             .iter()
             .flat_map(|scope| scope.iter_bindings())
             .filter_map(|binding| match binding {
-                RelationBinding::Table { table, roles, .. } => Some(TableBinding {
-                    table: (**table).clone(),
-                    roles: roles.clone(),
-                }),
+                RelationBinding::Table { table, .. } => Some((**table).clone()),
                 _ => None,
             })
             .collect()
     }
 
-    /// Read-role table references whose scope chain contains no
-    /// `Predicate` ancestor — i.e. tables in a data-feeding position
-    /// relative to any enclosing write target. The basis for `TableFlow`
-    /// edge sources.
-    pub(crate) fn feeding_read_tables(&self) -> Vec<TableReference> {
+    /// Every table referenced as a Read source, in scope-arena order.
+    /// Includes tables inside predicate subqueries (e.g. `x` in `WHERE
+    /// id IN (SELECT id FROM x)`). Use [`feeding_read_tables`] for the
+    /// stricter "feeds the enclosing write target" filter.
+    pub(crate) fn read_tables(&self) -> Vec<TableReference> {
+        self.collect_tables_by_role(TableRole::Read)
+    }
+
+    /// Every table referenced as a Write target, in scope-arena order.
+    pub(crate) fn write_tables(&self) -> Vec<TableReference> {
+        self.collect_tables_by_role(TableRole::Write)
+    }
+
+    fn collect_tables_by_role(&self, role: TableRole) -> Vec<TableReference> {
         self.scopes
             .iter()
-            .filter(|scope| !self.has_predicate_ancestor(scope.id))
             .flat_map(|scope| scope.iter_bindings())
             .filter_map(|binding| match binding {
-                RelationBinding::Table { table, roles, .. } if roles.contains(&TableRole::Read) => {
+                RelationBinding::Table { table, roles, .. } if roles.contains(&role) => {
                     Some((**table).clone())
                 }
                 _ => None,
@@ -101,16 +106,16 @@ impl RelationResolution {
             .collect()
     }
 
-    /// Write-role table references, in scope-arena order. The basis for
-    /// `TableFlow` edge targets.
-    pub(crate) fn write_target_tables(&self) -> Vec<TableReference> {
+    /// Read-role tables in a data-feeding position — Read role plus no
+    /// `Predicate` ancestor in their scope chain. The basis for
+    /// `TableFlow` edge sources.
+    pub(crate) fn feeding_read_tables(&self) -> Vec<TableReference> {
         self.scopes
             .iter()
+            .filter(|scope| !self.has_predicate_ancestor(scope.id))
             .flat_map(|scope| scope.iter_bindings())
             .filter_map(|binding| match binding {
-                RelationBinding::Table { table, roles, .. }
-                    if roles.contains(&TableRole::Write) =>
-                {
+                RelationBinding::Table { table, roles, .. } if roles.contains(&TableRole::Read) => {
                     Some((**table).clone())
                 }
                 _ => None,
@@ -129,17 +134,6 @@ impl RelationResolution {
         }
         false
     }
-}
-
-/// A view of a `RelationBinding::Table` for downstream consumers
-/// (operation extractor). Carries just the fields needed to derive
-/// `TableOperation`s; the schema is excluded because no current consumer
-/// reads it from this side — it lives on the binding itself for catalog
-/// enrichment.
-#[derive(Debug, Clone)]
-pub(crate) struct TableBinding {
-    pub(crate) table: TableReference,
-    pub(crate) roles: Vec<TableRole>,
 }
 
 #[derive(Debug)]
@@ -175,7 +169,7 @@ impl RelationScope {
         {
             for role in new {
                 if !existing.contains(role) {
-                    existing.push(role.clone());
+                    existing.push(*role);
                 }
             }
             return;
@@ -337,17 +331,6 @@ impl<'a> RelationResolver<'a> {
     ) -> Result<RelationResolution, Error> {
         let mut resolver = Self::new(catalog);
         resolver.visit_statement(statement)?;
-        Ok(resolver.into_relation_resolution())
-    }
-
-    pub(crate) fn resolve_table_node(
-        catalog: Option<&'a dyn Catalog>,
-        table: &TableWithJoins,
-    ) -> Result<RelationResolution, Error> {
-        let mut resolver = Self::new(catalog);
-        // `resolve_table_node` is called for FROM-style table nodes from
-        // legacy extractors; treat them as reads.
-        resolver.visit_table_with_joins(table, TableRole::Read)?;
         Ok(resolver.into_relation_resolution())
     }
 

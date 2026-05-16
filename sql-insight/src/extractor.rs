@@ -1,5 +1,4 @@
 pub mod crud_table_extractor;
-pub mod helper;
 pub mod operation_extractor;
 pub mod table_extractor;
 

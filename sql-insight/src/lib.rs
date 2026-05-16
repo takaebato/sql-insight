@@ -29,7 +29,6 @@ pub mod error;
 pub mod extractor;
 pub mod formatter;
 pub mod normalizer;
-pub mod operation;
 pub mod relation;
 pub(crate) mod resolver;
 
@@ -38,7 +37,6 @@ pub use diagnostic::*;
 pub use extractor::*;
 pub use formatter::*;
 pub use normalizer::*;
-pub use operation::TableRole;
 pub use relation::*;
 pub use sqlparser;
 

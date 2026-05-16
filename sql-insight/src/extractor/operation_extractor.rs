@@ -9,13 +9,18 @@
 //! statement, since a single application call (e.g. an ORM `execute()`)
 //! typically corresponds to a single statement.
 //!
-//! This is the entry point for the operation-facts story laid out in the
-//! project roadmap; the MVP currently focuses on table-level operations.
-//! `usages` enrichment and richer `table_flows` arrive in later steps.
+//! Three parallel surfaces describe the statement:
+//! - `reads` — every table the statement reads from.
+//! - `writes` — every table the statement writes to.
+//! - `flows` — directed `source → target` edges for statements that
+//!   physically move data.
+//!
+//! A single table can appear in both `reads` and `writes` when it plays
+//! both roles (e.g. `DELETE t1 FROM t1` — t1 is the deletion target and
+//! a row source).
 
 use crate::catalog::Catalog;
 use crate::error::Error;
-use crate::operation::TableRole;
 use crate::relation::TableReference;
 use crate::resolver::RelationResolver;
 use sqlparser::ast::Statement;
@@ -33,14 +38,15 @@ use sqlparser::parser::Parser;
 ///
 /// ```rust
 /// use sql_insight::sqlparser::dialect::GenericDialect;
-/// use sql_insight::{extract_table_operations, StatementKind, TableRole};
+/// use sql_insight::{extract_table_operations, StatementKind};
 ///
 /// let dialect = GenericDialect {};
 /// let result = extract_table_operations(&dialect, "SELECT * FROM users", None).unwrap();
 /// let ops = result[0].as_ref().unwrap();
 /// assert_eq!(ops.statement_kind, StatementKind::Select);
-/// assert_eq!(ops.table_operations.len(), 1);
-/// assert_eq!(ops.table_operations[0].role, TableRole::Read);
+/// assert_eq!(ops.reads.len(), 1);
+/// assert_eq!(ops.reads[0].table.name.value, "users");
+/// assert!(ops.writes.is_empty());
 /// ```
 pub fn extract_table_operations(
     dialect: &dyn Dialect,
@@ -54,15 +60,16 @@ pub fn extract_table_operations(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementTableOperations {
     pub statement_kind: StatementKind,
-    pub table_operations: Vec<TableOperation>,
-    pub table_flows: Vec<TableFlow>,
+    pub reads: Vec<TableRead>,
+    pub writes: Vec<TableWrite>,
+    pub flows: Vec<TableFlow>,
     pub diagnostics: Vec<OperationDiagnostic>,
 }
 
 /// What a statement does, at a coarse level. The *verb* of the statement
-/// — INSERT vs CREATE TABLE vs MERGE vs … — combined with the per-table
-/// [`TableRole`] (`Read`/`Write`) recovers every distinction the project
-/// needs to make at table granularity.
+/// — INSERT vs CREATE TABLE vs MERGE vs … — combined with the
+/// `reads` / `writes` split recovers every distinction the project needs
+/// to make at table granularity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StatementKind {
@@ -82,25 +89,23 @@ pub enum StatementKind {
     Unsupported,
 }
 
-/// A single operation on a single table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableOperation {
+/// A table referenced as a Read source.
+///
+/// Carried in [`StatementTableOperations::reads`]. The struct exists to
+/// give future positional / usage enrichment (FROM vs Predicate vs Join)
+/// a natural home; the MVP carries only `table`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableRead {
     pub table: TableReference,
-    pub role: TableRole,
-    /// Contextual hints about where in the statement the table was touched.
-    /// Empty in the MVP; populated in later phases.
-    pub usages: Vec<TableUsage>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TableUsage {
-    Target,
-    From,
-    Projection,
-    Predicate,
-    Join,
-    WriteValue,
+/// A table referenced as a Write target (insert / update / delete /
+/// merge / create / drop / alter / truncate target).
+///
+/// Carried in [`StatementTableOperations::writes`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableWrite {
+    pub table: TableReference,
 }
 
 /// A source-to-target table flow inferred from the statement structure.
@@ -109,7 +114,8 @@ pub enum TableUsage {
 /// (`INSERT`, `UPDATE`, `MERGE`, `CREATE TABLE AS SELECT`, `CREATE VIEW`).
 /// `DELETE`, `DROP`, `TRUNCATE`, `ALTER`, and bare `SELECT` produce no
 /// flows even when they reference other tables — the touched tables are
-/// still visible through [`StatementTableOperations::table_operations`].
+/// still visible through [`StatementTableOperations::reads`] and
+/// [`StatementTableOperations::writes`].
 ///
 /// Each `TableFlow` is a single directed edge — a statement that derives
 /// `t` from `a JOIN b` emits two flows (`a → t`, `b → t`), not one entry
@@ -118,7 +124,7 @@ pub enum TableUsage {
 ///
 /// Tables referenced only inside a predicate subquery are excluded:
 /// `INSERT INTO t SELECT FROM s WHERE id IN (SELECT id FROM x)` emits
-/// `s → t` but not `x → t`. `x` remains visible via `table_operations`.
+/// `s → t` but not `x → t`. `x` remains visible via `reads`.
 ///
 /// CTE transitivity: `WITH cte AS (SELECT ... FROM s) INSERT INTO t
 /// SELECT ... FROM cte` emits `s → t` because `s` sits in a
@@ -174,7 +180,8 @@ impl TableOperationExtractor {
         let kind = classify_statement(statement);
         let resolution = RelationResolver::resolve_statement(catalog, statement)?;
 
-        let mut table_operations = Vec::new();
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
         let mut diagnostics = Vec::new();
 
         if matches!(kind, StatementKind::Unsupported) {
@@ -186,26 +193,27 @@ impl TableOperationExtractor {
                 ),
             });
         } else {
-            // Each table binding becomes one TableOperation. When a
-            // binding carries multiple roles (e.g. `DELETE t1 FROM t1`),
-            // Write wins over Read — fine-grained "Write *and* From"
-            // attribution belongs to the future `usages` enrichment.
-            for binding in resolution.table_bindings() {
-                let role = primary_role(&binding.roles);
-                table_operations.push(TableOperation {
-                    table: binding.table,
-                    role,
-                    usages: Vec::new(),
-                });
-            }
+            // A multi-role table (e.g. `DELETE t1 FROM t1` — t1 is both
+            // deletion target and row source) appears in both lists.
+            reads = resolution
+                .read_tables()
+                .into_iter()
+                .map(|table| TableRead { table })
+                .collect();
+            writes = resolution
+                .write_tables()
+                .into_iter()
+                .map(|table| TableWrite { table })
+                .collect();
         }
 
-        let table_flows = extract_table_flows(&resolution, &kind);
+        let flows = extract_table_flows(&resolution, &kind);
 
         Ok(StatementTableOperations {
             statement_kind: kind,
-            table_operations,
-            table_flows,
+            reads,
+            writes,
+            flows,
             diagnostics,
         })
     }
@@ -224,7 +232,7 @@ fn extract_table_flows(
     // Data-moving statements all carry exactly one write target. If
     // somehow zero or many appear (parser oddity, unsupported variant)
     // we conservatively emit no flows rather than guessing.
-    let mut targets = resolution.write_target_tables().into_iter();
+    let mut targets = resolution.write_tables().into_iter();
     let Some(target) = targets.next() else {
         return Vec::new();
     };
@@ -276,14 +284,6 @@ fn classify_statement(statement: &Statement) -> StatementKind {
     }
 }
 
-fn primary_role(roles: &[TableRole]) -> TableRole {
-    if roles.contains(&TableRole::Write) {
-        TableRole::Write
-    } else {
-        TableRole::Read
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,63 +322,68 @@ mod tests {
         }
     }
 
-    fn op(table: TableReference, role: TableRole) -> TableOperation {
-        TableOperation {
-            table,
-            role,
-            usages: vec![],
+    fn read(name: &str) -> TableRead {
+        TableRead { table: table(name) }
+    }
+    fn read_aliased(name: &str, alias: &str) -> TableRead {
+        TableRead {
+            table: table_alias(name, alias),
+        }
+    }
+    fn write(name: &str) -> TableWrite {
+        TableWrite { table: table(name) }
+    }
+    fn write_aliased(name: &str, alias: &str) -> TableWrite {
+        TableWrite {
+            table: table_alias(name, alias),
+        }
+    }
+    fn flow(source: &str, target: &str) -> TableFlow {
+        TableFlow {
+            source: table(source),
+            target: table(target),
         }
     }
 
     #[test]
-    fn select_emits_source_operations() {
+    fn select_emits_reads_only() {
         let ops = extract("SELECT * FROM users");
         assert_eq!(ops.statement_kind, StatementKind::Select);
-        assert_eq!(
-            ops.table_operations,
-            vec![op(table("users"), TableRole::Read)]
-        );
-        assert!(ops.table_flows.is_empty());
+        assert_eq!(ops.reads, vec![read("users")]);
+        assert!(ops.writes.is_empty());
+        assert!(ops.flows.is_empty());
         assert!(ops.diagnostics.is_empty());
     }
 
     #[test]
-    fn select_with_join_emits_one_source_per_table() {
+    fn select_with_join_emits_one_read_per_table() {
         let ops = extract("SELECT * FROM t1 JOIN t2 ON t1.id = t2.id");
         assert_eq!(ops.statement_kind, StatementKind::Select);
-        let tables: Vec<_> = ops.table_operations.iter().map(|op| &op.table).collect();
-        assert_eq!(tables, vec![&table("t1"), &table("t2")]);
-        assert!(ops
-            .table_operations
-            .iter()
-            .all(|op| op.role == TableRole::Read));
+        assert_eq!(ops.reads, vec![read("t1"), read("t2")]);
+        assert!(ops.writes.is_empty());
     }
 
     #[test]
-    fn select_with_subquery_emits_source_for_every_table() {
+    fn select_with_subquery_emits_read_for_every_table() {
         let ops = extract("SELECT * FROM t1 WHERE id IN (SELECT id FROM t2)");
         assert_eq!(ops.statement_kind, StatementKind::Select);
-        let tables: Vec<_> = ops.table_operations.iter().map(|op| &op.table).collect();
-        assert_eq!(tables, vec![&table("t1"), &table("t2")]);
+        assert_eq!(ops.reads, vec![read("t1"), read("t2")]);
     }
 
     #[test]
-    fn cte_body_tables_emit_sources_but_cte_name_does_not() {
+    fn cte_body_tables_emit_reads_but_cte_name_does_not() {
         let ops = extract("WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2");
         assert_eq!(ops.statement_kind, StatementKind::Select);
         // Only t1 is a table reference; t2 is the CTE binding and stays out.
-        let tables: Vec<_> = ops.table_operations.iter().map(|op| &op.table).collect();
-        assert_eq!(tables, vec![&table("t1")]);
+        assert_eq!(ops.reads, vec![read("t1")]);
     }
 
     #[test]
     fn unsupported_statement_reports_diagnostic() {
-        // `CREATE INDEX` doesn't fit the operation vocabulary — no Table-level
-        // operation, just an index attached to a table — so it still falls
-        // through to Unsupported.
         let ops = extract("CREATE INDEX idx ON t1 (a)");
         assert_eq!(ops.statement_kind, StatementKind::Unsupported);
-        assert!(ops.table_operations.is_empty());
+        assert!(ops.reads.is_empty());
+        assert!(ops.writes.is_empty());
         assert_eq!(ops.diagnostics.len(), 1);
         assert_eq!(
             ops.diagnostics[0].code,
@@ -392,79 +397,57 @@ mod tests {
         let result =
             extract_table_operations(&dialect, "SELECT * FROM t1; SELECT * FROM t2", None).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(
-            result[0].as_ref().unwrap().table_operations[0].table,
-            table("t1")
-        );
-        assert_eq!(
-            result[1].as_ref().unwrap().table_operations[0].table,
-            table("t2")
-        );
+        assert_eq!(result[0].as_ref().unwrap().reads, vec![read("t1")]);
+        assert_eq!(result[1].as_ref().unwrap().reads, vec![read("t2")]);
     }
 
     #[test]
-    fn insert_values_emits_target_only() {
+    fn insert_values_emits_write_only() {
         let ops = extract("INSERT INTO t1 (a, b) VALUES (1, 2)");
         assert_eq!(ops.statement_kind, StatementKind::Insert);
-        assert_eq!(
-            ops.table_operations,
-            vec![op(table("t1"), TableRole::Write)]
-        );
+        assert_eq!(ops.writes, vec![write("t1")]);
+        assert!(ops.reads.is_empty());
     }
 
     #[test]
-    fn insert_select_emits_target_then_source() {
+    fn insert_select_emits_write_and_read() {
         let ops = extract("INSERT INTO t1 SELECT * FROM t2");
         assert_eq!(ops.statement_kind, StatementKind::Insert);
-        assert_eq!(
-            ops.table_operations,
-            vec![
-                op(table("t1"), TableRole::Write),
-                op(table("t2"), TableRole::Read),
-            ]
-        );
+        assert_eq!(ops.writes, vec![write("t1")]);
+        assert_eq!(ops.reads, vec![read("t2")]);
     }
 
     #[test]
-    fn update_basic_emits_target_only() {
+    fn update_basic_emits_write_only() {
         let ops = extract("UPDATE t1 SET a = 1");
         assert_eq!(ops.statement_kind, StatementKind::Update);
-        assert_eq!(
-            ops.table_operations,
-            vec![op(table("t1"), TableRole::Write)]
-        );
+        assert_eq!(ops.writes, vec![write("t1")]);
+        assert!(ops.reads.is_empty());
     }
 
     #[test]
-    fn update_with_subquery_predicate_emits_target_plus_source() {
+    fn update_with_subquery_predicate_emits_write_plus_read() {
         let ops = extract("UPDATE t1 SET a = 1 WHERE id IN (SELECT id FROM t2)");
         assert_eq!(ops.statement_kind, StatementKind::Update);
-        assert_eq!(
-            ops.table_operations,
-            vec![
-                op(table("t1"), TableRole::Write),
-                op(table("t2"), TableRole::Read),
-            ]
-        );
+        assert_eq!(ops.writes, vec![write("t1")]);
+        assert_eq!(ops.reads, vec![read("t2")]);
     }
 
     #[test]
-    fn update_with_from_clause_treats_from_as_source() {
+    fn update_with_from_clause_treats_from_as_read() {
         let ops = extract_with(
             "UPDATE t1 SET a = (SELECT b FROM t3) FROM t2 WHERE t1.id IN (SELECT id FROM t4)",
             &PostgreSqlDialect {},
         );
         assert_eq!(ops.statement_kind, StatementKind::Update);
-        let roles: Vec<_> = ops
-            .table_operations
+        assert_eq!(ops.writes, vec![write("t1")]);
+        let read_names: std::collections::HashSet<_> = ops
+            .reads
             .iter()
-            .map(|op| (op.table.name.value.as_str(), op.role.clone()))
+            .map(|r| r.table.name.value.as_str())
             .collect();
-        assert_eq!(roles[0], ("t1", TableRole::Write));
-        let source_names: std::collections::HashSet<_> =
-            roles[1..].iter().map(|(n, _)| *n).collect();
         assert_eq!(
-            source_names,
+            read_names,
             ["t2", "t3", "t4"]
                 .into_iter()
                 .collect::<std::collections::HashSet<_>>(),
@@ -472,66 +455,40 @@ mod tests {
     }
 
     #[test]
-    fn delete_from_emits_target_only() {
+    fn delete_from_emits_write_only() {
         let ops = extract("DELETE FROM t1");
         assert_eq!(ops.statement_kind, StatementKind::Delete);
-        assert_eq!(
-            ops.table_operations,
-            vec![op(table("t1"), TableRole::Write)]
-        );
+        assert_eq!(ops.writes, vec![write("t1")]);
+        assert!(ops.reads.is_empty());
     }
 
     #[test]
-    fn delete_from_with_subquery_predicate_emits_target_plus_source() {
+    fn delete_from_with_subquery_predicate_emits_write_plus_read() {
         let ops = extract("DELETE FROM t1 WHERE id IN (SELECT id FROM t2)");
         assert_eq!(ops.statement_kind, StatementKind::Delete);
-        assert_eq!(
-            ops.table_operations,
-            vec![
-                op(table("t1"), TableRole::Write),
-                op(table("t2"), TableRole::Read),
-            ]
-        );
+        assert_eq!(ops.writes, vec![write("t1")]);
+        assert_eq!(ops.reads, vec![read("t2")]);
     }
 
     #[test]
-    fn delete_with_target_list_separates_targets_from_sources() {
+    fn delete_with_target_list_overlaps_writes_and_reads() {
+        // `DELETE t1, t2 FROM t1 JOIN t2 JOIN t3` — t1 and t2 are both
+        // deletion targets (writes) AND row sources (reads via FROM).
         let ops = extract_with(
             "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3",
             &MySqlDialect {},
         );
         assert_eq!(ops.statement_kind, StatementKind::Delete);
-        assert_eq!(
-            ops.table_operations,
-            vec![
-                op(table("t1"), TableRole::Write),
-                op(table("t2"), TableRole::Write),
-                op(table("t3"), TableRole::Read),
-            ]
-        );
+        assert_eq!(ops.writes, vec![write("t1"), write("t2")]);
+        assert_eq!(ops.reads, vec![read("t1"), read("t2"), read("t3")]);
     }
 
     #[test]
-    fn delete_with_using_classifies_from_as_targets_and_using_as_sources() {
+    fn delete_with_using_lists_target_in_writes_and_source_in_reads() {
         let ops = extract("DELETE FROM t1, t2 USING t1 INNER JOIN t2 INNER JOIN t3");
         assert_eq!(ops.statement_kind, StatementKind::Delete);
-        let roles: Vec<_> = ops
-            .table_operations
-            .iter()
-            .map(|op| (op.table.name.value.as_str(), op.role.clone()))
-            .collect();
-        let targets: Vec<_> = roles
-            .iter()
-            .filter(|(_, r)| *r == TableRole::Write)
-            .map(|(n, _)| *n)
-            .collect();
-        let sources: Vec<_> = roles
-            .iter()
-            .filter(|(_, r)| *r == TableRole::Read)
-            .map(|(n, _)| *n)
-            .collect();
-        assert_eq!(targets, vec!["t1", "t2"]);
-        assert_eq!(sources, vec!["t3"]);
+        assert_eq!(ops.writes, vec![write("t1"), write("t2")]);
+        assert_eq!(ops.reads, vec![read("t1"), read("t2"), read("t3")]);
     }
 
     #[test]
@@ -541,157 +498,112 @@ mod tests {
             &MySqlDialect {},
         );
         assert_eq!(ops.statement_kind, StatementKind::Delete);
-        assert_eq!(
-            ops.table_operations,
-            vec![
-                op(table_alias("t1", "t1_alias"), TableRole::Write),
-                op(table("t2"), TableRole::Read),
-            ]
-        );
+        assert_eq!(ops.writes, vec![write_aliased("t1", "t1_alias")]);
+        assert_eq!(ops.reads, vec![read_aliased("t1", "t1_alias"), read("t2")]);
     }
 
     #[test]
-    fn merge_emits_target_and_source() {
+    fn merge_emits_write_target_and_read_source() {
         let ops = extract(
             "MERGE INTO t1 USING t2 ON t1.id = t2.id \
              WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
         );
         assert_eq!(ops.statement_kind, StatementKind::Merge);
-        assert_eq!(
-            ops.table_operations,
-            vec![
-                op(table("t1"), TableRole::Write),
-                op(table("t2"), TableRole::Read),
-            ]
-        );
+        assert_eq!(ops.writes, vec![write("t1")]);
+        assert_eq!(ops.reads, vec![read("t2")]);
     }
 
     #[test]
-    fn create_table_emits_target_only() {
+    fn create_table_emits_write_only() {
         let ops = extract("CREATE TABLE t1 (a INT)");
         assert_eq!(ops.statement_kind, StatementKind::CreateTable);
-        assert_eq!(
-            ops.table_operations,
-            vec![op(table("t1"), TableRole::Write)]
-        );
+        assert_eq!(ops.writes, vec![write("t1")]);
+        assert!(ops.reads.is_empty());
     }
 
     #[test]
-    fn create_table_as_select_emits_target_then_source() {
+    fn create_table_as_select_emits_write_and_read() {
         let ops = extract("CREATE TABLE t1 AS SELECT * FROM t2");
         assert_eq!(ops.statement_kind, StatementKind::CreateTable);
-        assert_eq!(
-            ops.table_operations,
-            vec![
-                op(table("t1"), TableRole::Write),
-                op(table("t2"), TableRole::Read),
-            ]
-        );
+        assert_eq!(ops.writes, vec![write("t1")]);
+        assert_eq!(ops.reads, vec![read("t2")]);
     }
 
     #[test]
-    fn create_view_emits_target_then_source() {
+    fn create_view_emits_write_and_read() {
         let ops = extract("CREATE VIEW v1 AS SELECT * FROM t1");
         assert_eq!(ops.statement_kind, StatementKind::CreateView);
-        assert_eq!(
-            ops.table_operations,
-            vec![
-                op(table("v1"), TableRole::Write),
-                op(table("t1"), TableRole::Read),
-            ]
-        );
+        assert_eq!(ops.writes, vec![write("v1")]);
+        assert_eq!(ops.reads, vec![read("t1")]);
     }
 
     #[test]
-    fn alter_table_emits_target_only() {
+    fn alter_table_emits_write_only() {
         let ops = extract("ALTER TABLE t1 ADD COLUMN a INT");
         assert_eq!(ops.statement_kind, StatementKind::AlterTable);
-        assert_eq!(
-            ops.table_operations,
-            vec![op(table("t1"), TableRole::Write)]
-        );
+        assert_eq!(ops.writes, vec![write("t1")]);
+        assert!(ops.reads.is_empty());
     }
 
     #[test]
-    fn drop_table_emits_target_per_name() {
+    fn drop_table_emits_one_write_per_name() {
         let ops = extract("DROP TABLE t1, t2");
         assert_eq!(ops.statement_kind, StatementKind::Drop);
-        assert_eq!(
-            ops.table_operations,
-            vec![
-                op(table("t1"), TableRole::Write),
-                op(table("t2"), TableRole::Write),
-            ]
-        );
+        assert_eq!(ops.writes, vec![write("t1"), write("t2")]);
     }
 
     #[test]
-    fn truncate_emits_target_per_name() {
+    fn truncate_emits_one_write_per_name() {
         let ops = extract("TRUNCATE TABLE t1, t2");
         assert_eq!(ops.statement_kind, StatementKind::Truncate);
-        assert_eq!(
-            ops.table_operations,
-            vec![
-                op(table("t1"), TableRole::Write),
-                op(table("t2"), TableRole::Write),
-            ]
-        );
+        assert_eq!(ops.writes, vec![write("t1"), write("t2")]);
     }
 
     #[test]
     fn drop_function_still_unsupported() {
-        // DROP variants that target non-relation objects (functions,
-        // schemas, etc.) don't carry a meaningful Table-level operation.
+        // DROP variants that target non-relation objects don't carry a
+        // meaningful table-level operation.
         let ops = extract("DROP FUNCTION my_fn");
         assert_eq!(ops.statement_kind, StatementKind::Unsupported);
     }
 
-    // ─────────────────────── table_flows ───────────────────────
-
-    fn flow(source: &str, target: &str) -> TableFlow {
-        TableFlow {
-            source: table(source),
-            target: table(target),
-        }
-    }
+    // ─────────────────────── flows ───────────────────────
 
     #[test]
     fn insert_select_emits_flow_from_source_to_target() {
         let ops = extract("INSERT INTO t1 SELECT * FROM t2");
-        assert_eq!(ops.table_flows, vec![flow("t2", "t1")]);
+        assert_eq!(ops.flows, vec![flow("t2", "t1")]);
     }
 
     #[test]
     fn insert_select_join_emits_one_flow_per_source() {
         let ops = extract("INSERT INTO t1 SELECT * FROM t2 JOIN t3 ON t2.id = t3.id");
-        assert_eq!(ops.table_flows, vec![flow("t2", "t1"), flow("t3", "t1")]);
+        assert_eq!(ops.flows, vec![flow("t2", "t1"), flow("t3", "t1")]);
     }
 
     #[test]
     fn predicate_subquery_does_not_feed_flow() {
         // t3 is referenced only inside `WHERE id IN (SELECT id FROM t3)`,
         // so it must not appear as a flow source even though it does
-        // appear in `table_operations`.
+        // appear in `reads`.
         let ops = extract("INSERT INTO t1 SELECT * FROM t2 WHERE id IN (SELECT id FROM t3)");
-        assert_eq!(ops.table_flows, vec![flow("t2", "t1")]);
+        assert_eq!(ops.flows, vec![flow("t2", "t1")]);
         // ...but t3 is still visible as a touched table.
-        let touched: Vec<_> = ops
-            .table_operations
+        let read_names: Vec<_> = ops
+            .reads
             .iter()
-            .map(|op| op.table.name.value.as_str())
+            .map(|r| r.table.name.value.as_str())
             .collect();
-        assert!(touched.contains(&"t3"));
+        assert!(read_names.contains(&"t3"));
     }
 
     #[test]
     fn join_on_predicate_does_not_promote_to_flow() {
-        // The ON-clause subquery's t3 is a predicate dependency, not a
-        // data source. Only t2 should appear in flows.
         let ops = extract(
             "INSERT INTO t1 SELECT * FROM t2 JOIN t3 ON t2.id = t3.id \
              AND t2.id IN (SELECT id FROM t4)",
         );
-        let flows: std::collections::HashSet<_> = ops.table_flows.into_iter().collect();
+        let flows: std::collections::HashSet<_> = ops.flows.into_iter().collect();
         assert!(flows.contains(&flow("t2", "t1")));
         assert!(flows.contains(&flow("t3", "t1")));
         assert!(!flows.contains(&flow("t4", "t1")));
@@ -700,25 +612,25 @@ mod tests {
     #[test]
     fn update_scalar_subquery_in_set_feeds_flow() {
         let ops = extract("UPDATE t1 SET col = (SELECT v FROM t2)");
-        assert_eq!(ops.table_flows, vec![flow("t2", "t1")]);
+        assert_eq!(ops.flows, vec![flow("t2", "t1")]);
     }
 
     #[test]
     fn update_predicate_subquery_does_not_feed_flow() {
         let ops = extract("UPDATE t1 SET col = 1 WHERE id IN (SELECT id FROM t2)");
-        assert!(ops.table_flows.is_empty());
+        assert!(ops.flows.is_empty());
     }
 
     #[test]
     fn create_table_as_select_emits_flow() {
         let ops = extract("CREATE TABLE t1 AS SELECT * FROM t2");
-        assert_eq!(ops.table_flows, vec![flow("t2", "t1")]);
+        assert_eq!(ops.flows, vec![flow("t2", "t1")]);
     }
 
     #[test]
     fn create_view_emits_flow() {
         let ops = extract("CREATE VIEW v1 AS SELECT * FROM t1");
-        assert_eq!(ops.table_flows, vec![flow("t1", "v1")]);
+        assert_eq!(ops.flows, vec![flow("t1", "v1")]);
     }
 
     #[test]
@@ -727,41 +639,36 @@ mod tests {
             "MERGE INTO t1 USING t2 ON t1.id = t2.id \
              WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
         );
-        assert_eq!(ops.table_flows, vec![flow("t2", "t1")]);
+        assert_eq!(ops.flows, vec![flow("t2", "t1")]);
     }
 
     #[test]
     fn cte_data_flows_through_to_write_target() {
-        // CTE name itself is not a physical table, but its body's source
-        // (s) sits in a Body-chain from CTE → outer SELECT → INSERT
-        // target, so the flow s → t1 should be emitted.
         let ops = extract("INSERT INTO t1 WITH cte AS (SELECT * FROM s) SELECT * FROM cte");
-        assert!(ops.table_flows.contains(&flow("s", "t1")));
+        assert!(ops.flows.contains(&flow("s", "t1")));
     }
 
     #[test]
     fn cte_predicate_subquery_does_not_leak_into_flow() {
-        // Inside the CTE body, x sits in a Predicate scope; it must not
-        // feed t even though the CTE itself feeds t.
         let ops = extract(
             "INSERT INTO t1 WITH cte AS (\
                  SELECT * FROM s WHERE id IN (SELECT id FROM x)\
              ) SELECT * FROM cte",
         );
-        assert!(ops.table_flows.contains(&flow("s", "t1")));
-        assert!(!ops.table_flows.contains(&flow("x", "t1")));
+        assert!(ops.flows.contains(&flow("s", "t1")));
+        assert!(!ops.flows.contains(&flow("x", "t1")));
     }
 
     #[test]
     fn select_only_statement_emits_no_flows() {
         let ops = extract("SELECT * FROM t1 JOIN t2 ON t1.id = t2.id");
-        assert!(ops.table_flows.is_empty());
+        assert!(ops.flows.is_empty());
     }
 
     #[test]
     fn insert_values_emits_no_flow() {
         let ops = extract("INSERT INTO t1 VALUES (1, 2)");
-        assert!(ops.table_flows.is_empty());
+        assert!(ops.flows.is_empty());
     }
 
     #[test]
@@ -769,12 +676,12 @@ mod tests {
         // DELETE doesn't move data — no flow, even when a subquery
         // references another table.
         let ops = extract("DELETE FROM t1 WHERE id IN (SELECT id FROM t2)");
-        assert!(ops.table_flows.is_empty());
+        assert!(ops.flows.is_empty());
     }
 
     #[test]
     fn truncate_emits_no_flow() {
         let ops = extract("TRUNCATE TABLE t1");
-        assert!(ops.table_flows.is_empty());
+        assert!(ops.flows.is_empty());
     }
 }

@@ -1,6 +1,5 @@
-use super::{RelationResolver, ScopeKind};
+use super::{RelationResolver, ScopeKind, TableRole};
 use crate::error::Error;
-use crate::operation::TableRole;
 use crate::relation::TableReference;
 use sqlparser::ast::{
     Delete, FromTable, Merge, ObjectType, Statement, TableWithJoins, Update, UpdateTableFromKind,
@@ -257,7 +256,7 @@ impl<'a> RelationResolver<'a> {
             TableRole::Read
         };
         for table in from_table_items(&delete.from) {
-            self.visit_table_with_joins(table, from_role.clone())?;
+            self.visit_table_with_joins(table, from_role)?;
         }
         for name in &delete.tables {
             self.bind_base_table(TableReference::try_from_name(name)?, TableRole::Write);

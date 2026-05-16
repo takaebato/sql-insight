@@ -8,7 +8,7 @@ use crate::diagnostic::Diagnostic;
 use crate::error::Error;
 pub use crate::relation::TableReference;
 use crate::resolver::RelationResolver;
-use sqlparser::ast::{Statement, TableWithJoins};
+use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
@@ -103,17 +103,6 @@ impl TableExtractor {
             tables: resolution.tables(),
             diagnostics: resolution.diagnostics,
         })
-    }
-
-    pub(crate) fn extract_tables_from_statement(statement: &Statement) -> Result<Tables, Error> {
-        Ok(Self::extract_from_statement(statement)?.into_tables())
-    }
-
-    // Concrete type `TableWithJoins` exposes the table-node entry point needed by CRUD extraction.
-    pub(crate) fn extract_from_table_node(table: &TableWithJoins) -> Result<Tables, Error> {
-        Ok(Tables(
-            RelationResolver::resolve_table_node(None, table)?.tables(),
-        ))
     }
 }
 

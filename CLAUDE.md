@@ -30,11 +30,18 @@ on `sqlparser-rs`; always work against its AST, never re-parse SQL by hand.
 
 ## Vocabulary
 
-- `TableRole` (`Read` / `Write`) — the role a table plays in a statement.
-- `TableUsage` (`Target` / `From` / `Projection` / `Predicate` / `Join` /
-  `WriteValue`) — finer position-axis enrichment (mostly future).
-- `StatementKind` — the verb of the statement; combined with `TableRole`
-  recovers every table-granularity distinction.
+- `StatementTableOperations` carries three parallel surfaces:
+  - `reads: Vec<TableRead>` — every table the statement reads from.
+  - `writes: Vec<TableWrite>` — every table the statement writes to.
+  - `flows: Vec<TableFlow>` — directed `source → target` edges, only for
+    statements that physically move data (INSERT / UPDATE / MERGE / CTAS
+    / CREATE VIEW). A table that plays both roles (e.g. `DELETE t1 FROM
+    t1`) appears in both `reads` and `writes`.
+- `StatementKind` — the verb of the statement; combined with the
+  `reads` / `writes` split recovers every table-granularity distinction.
+- Internal-only `TableRole` (Read / Write) lives inside the resolver
+  for binding metadata. It is not exposed via the public API — surface
+  it through `reads` / `writes` instead.
 
 ## Conventions
 

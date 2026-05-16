@@ -1,6 +1,5 @@
-use super::{Column, RelationResolver, RelationSchema, ResolvedQuery, ScopeKind};
+use super::{Column, RelationResolver, RelationSchema, ResolvedQuery, ScopeKind, TableRole};
 use crate::error::Error;
-use crate::operation::TableRole;
 use crate::relation::TableReference;
 use sqlparser::ast::{
     ConnectByKind, Distinct, Expr, GroupByExpr, GroupByWithModifier, NamedWindowExpr, Query,

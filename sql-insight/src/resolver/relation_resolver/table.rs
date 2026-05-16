@@ -1,6 +1,5 @@
-use super::{RelationResolver, RelationSchema, ScopeKind};
+use super::{RelationResolver, RelationSchema, ScopeKind, TableRole};
 use crate::error::Error;
-use crate::operation::TableRole;
 use crate::relation::TableReference;
 use sqlparser::ast::{
     FunctionArg, Join, JoinConstraint, JoinOperator, PivotValueSource, TableFactor, TableSample,
