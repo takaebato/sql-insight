@@ -7,7 +7,7 @@ use core::fmt;
 use crate::diagnostic::Diagnostic;
 use crate::error::Error;
 pub use crate::relation::TableReference;
-use crate::resolver::RelationBinder;
+use crate::resolver::RelationResolver;
 use sqlparser::ast::{Statement, TableWithJoins};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -96,7 +96,7 @@ impl TableExtractor {
     }
 
     pub fn extract_from_statement(statement: &Statement) -> Result<TableExtraction, Error> {
-        let resolution = RelationBinder::bind_statement(statement)?;
+        let resolution = RelationResolver::resolve_statement(statement)?;
         Ok(TableExtraction {
             tables: resolution.table_references,
             diagnostics: resolution.diagnostics,
@@ -110,7 +110,7 @@ impl TableExtractor {
     // Concrete type `TableWithJoins` exposes the table-node entry point needed by CRUD extraction.
     pub(crate) fn extract_from_table_node(table: &TableWithJoins) -> Result<Tables, Error> {
         Ok(Tables(
-            RelationBinder::bind_table_node(table)?.into_tables(),
+            RelationResolver::resolve_table_node(table)?.into_tables(),
         ))
     }
 }
@@ -121,14 +121,80 @@ mod tests {
     use crate::test_utils::all_dialects;
     use sqlparser::dialect::GenericDialect;
 
+    fn table(name: &str) -> TableReference {
+        TableReference {
+            catalog: None,
+            schema: None,
+            name: name.into(),
+            alias: None,
+        }
+    }
+
+    fn table_alias(name: &str, alias: &str) -> TableReference {
+        TableReference {
+            alias: Some(alias.into()),
+            ..table(name)
+        }
+    }
+
+    fn schema_table(schema: &str, name: &str) -> TableReference {
+        TableReference {
+            catalog: None,
+            schema: Some(schema.into()),
+            name: name.into(),
+            alias: None,
+        }
+    }
+
+    fn schema_table_alias(schema: &str, name: &str, alias: &str) -> TableReference {
+        TableReference {
+            alias: Some(alias.into()),
+            ..schema_table(schema, name)
+        }
+    }
+
+    fn catalog_schema_table(catalog: &str, schema: &str, name: &str) -> TableReference {
+        TableReference {
+            catalog: Some(catalog.into()),
+            schema: Some(schema.into()),
+            name: name.into(),
+            alias: None,
+        }
+    }
+
+    fn catalog_schema_table_alias(
+        catalog: &str,
+        schema: &str,
+        name: &str,
+        alias: &str,
+    ) -> TableReference {
+        TableReference {
+            alias: Some(alias.into()),
+            ..catalog_schema_table(catalog, schema, name)
+        }
+    }
+
+    fn ok_tables(tables: Vec<TableReference>) -> Result<Tables, Error> {
+        Ok(Tables(tables))
+    }
+
+    fn generic_dialect() -> Vec<Box<dyn Dialect>> {
+        vec![Box::new(GenericDialect {})]
+    }
+
+    fn one_dialect(dialect: impl Dialect + 'static) -> Vec<Box<dyn Dialect>> {
+        vec![Box::new(dialect)]
+    }
+
     fn assert_table_extraction(
         sql: &str,
         expected: Vec<Result<Tables, Error>>,
         dialects: Vec<Box<dyn Dialect>>,
     ) {
         for dialect in dialects {
-            let result = TableExtractor::extract(dialect.as_ref(), sql)
-                .unwrap_or_else(|_| panic!("parse failed for dialect: {dialect:?}"));
+            let result = TableExtractor::extract(dialect.as_ref(), sql).unwrap_or_else(|e| {
+                panic!("parse failed for dialect: {dialect:?}, sql: {sql}, error: {e}")
+            });
             let result = result
                 .into_iter()
                 .map(|result| result.map(TableExtraction::into_tables))
@@ -140,38 +206,38 @@ mod tests {
     #[test]
     fn test_single_statement() {
         let sql = "SELECT a FROM t1";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: None,
-        }]))];
+        let expected = vec![ok_tables(vec![table("t1")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_multiple_statements() {
         let sql = "SELECT a FROM t1; SELECT b FROM t2";
-        let expected = vec![
-            Ok(Tables(vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            }])),
-            Ok(Tables(vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            }])),
-        ];
+        let expected = vec![ok_tables(vec![table("t1")]), ok_tables(vec![table("t2")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
-    fn test_unsupported_statement_is_reported_as_diagnostic() {
-        let sql = "SET x = 1";
+    fn test_tables_display() {
+        let tables = Tables(vec![
+            catalog_schema_table_alias("c1", "s1", "t1", "a1"),
+            table("t2"),
+        ]);
+
+        assert_eq!(tables.to_string(), "c1.s1.t1 AS a1, t2");
+    }
+
+    #[test]
+    fn test_table_extraction_display() {
+        let extraction = TableExtraction {
+            tables: vec![schema_table("s1", "t1"), table_alias("t2", "a2")],
+            diagnostics: Vec::new(),
+        };
+
+        assert_eq!(extraction.to_string(), "s1.t1, t2 AS a2");
+    }
+
+    fn assert_unsupported_statement(sql: &str) {
         let result = TableExtractor::extract(&GenericDialect {}, sql).unwrap();
         let extraction = result.into_iter().next().unwrap().unwrap();
         assert_eq!(extraction.tables, vec![]);
@@ -186,14 +252,265 @@ mod tests {
     }
 
     #[test]
+    fn test_unsupported_statements_are_reported_as_diagnostics() {
+        for sql in [
+            "SET x = 1",
+            "ANALYZE TABLE t1",
+            "SHOW TABLES",
+            "SHOW COLUMNS FROM t1",
+            "SHOW DATABASES",
+            "SHOW SCHEMAS",
+            "USE mydb",
+            "START TRANSACTION",
+            "COMMIT",
+            "ROLLBACK",
+            "EXPLAIN SELECT * FROM t1",
+            "CREATE INDEX idx ON t1 (a)",
+            "CREATE SCHEMA s",
+            "CREATE DATABASE db",
+            "DEALLOCATE PREPARE stmt",
+            "PREPARE stmt AS SELECT 1",
+            "SAVEPOINT sp",
+            "RELEASE SAVEPOINT sp",
+            "RESET ALL",
+        ] {
+            assert_unsupported_statement(sql);
+        }
+    }
+
+    mod resolver_traversal {
+        use super::*;
+
+        #[test]
+        fn test_subqueries_inside_predicate_expressions() {
+            for (sql, expected_tables) in [
+                (
+                    "SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2)",
+                    vec![table("t1"), table("t2")],
+                ),
+                (
+                    "SELECT * FROM t1 WHERE a IN (SELECT a FROM t2)",
+                    vec![table("t1"), table("t2")],
+                ),
+                (
+                    "SELECT * FROM t1 WHERE a BETWEEN (SELECT b FROM t2) AND (SELECT c FROM t3)",
+                    vec![table("t1"), table("t2"), table("t3")],
+                ),
+                (
+                    "SELECT * FROM t1 WHERE a LIKE (SELECT pattern FROM t2)",
+                    vec![table("t1"), table("t2")],
+                ),
+            ] {
+                assert_table_extraction(sql, vec![ok_tables(expected_tables)], generic_dialect());
+            }
+        }
+
+        #[test]
+        fn test_subqueries_inside_projection_expressions() {
+            for (sql, expected_tables) in [
+                (
+                    "SELECT CASE WHEN a > 0 THEN (SELECT b FROM t2) ELSE (SELECT c FROM t3) END FROM t1",
+                    vec![table("t1"), table("t2"), table("t3")],
+                ),
+                (
+                    "SELECT CAST((SELECT b FROM t2) AS INT) FROM t1",
+                    vec![table("t1"), table("t2")],
+                ),
+                (
+                    "SELECT ((SELECT b FROM t2)) FROM t1",
+                    vec![table("t1"), table("t2")],
+                ),
+                (
+                    "SELECT ARRAY[(SELECT b FROM t2)] FROM t1",
+                    vec![table("t1"), table("t2")],
+                ),
+                (
+                    "SELECT STRUCT((SELECT b FROM t2) AS b) FROM t1",
+                    vec![table("t1"), table("t2")],
+                ),
+            ] {
+                assert_table_extraction(sql, vec![ok_tables(expected_tables)], generic_dialect());
+            }
+        }
+
+        #[test]
+        fn test_subqueries_inside_query_clauses() {
+            for (sql, expected_tables) in [
+                (
+                    "SELECT a FROM t1 GROUP BY (SELECT b FROM t2)",
+                    vec![table("t1"), table("t2")],
+                ),
+                (
+                    "SELECT a FROM t1 HAVING (SELECT b FROM t2) > 0",
+                    vec![table("t1"), table("t2")],
+                ),
+                (
+                    "SELECT a FROM t1 ORDER BY (SELECT b FROM t2)",
+                    vec![table("t1"), table("t2")],
+                ),
+            ] {
+                assert_table_extraction(sql, vec![ok_tables(expected_tables)], generic_dialect());
+            }
+        }
+
+        #[test]
+        fn test_subqueries_inside_function_clauses() {
+            for (sql, expected_tables) in [
+                (
+                    "SELECT COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM t2)) FROM t1",
+                    vec![table("t1"), table("t2")],
+                ),
+                (
+                    "SELECT ARRAY_AGG(a ORDER BY (SELECT b FROM t2)) FROM t1",
+                    vec![table("t1"), table("t2")],
+                ),
+                (
+                    "SELECT SUM(a) OVER (PARTITION BY (SELECT b FROM t2) ORDER BY (SELECT c FROM t3)) FROM t1",
+                    vec![table("t1"), table("t2"), table("t3")],
+                ),
+            ] {
+                assert_table_extraction(sql, vec![ok_tables(expected_tables)], generic_dialect());
+            }
+        }
+
+        #[test]
+        fn test_nested_join_and_join_constraints() {
+            let sql = "SELECT * FROM (t1 JOIN t2 ON t1.id = t2.id) AS t12 JOIN t3 USING (id)";
+            let expected = vec![ok_tables(vec![table("t1"), table("t2"), table("t3")])];
+            assert_table_extraction(sql, expected, generic_dialect());
+        }
+
+        #[test]
+        fn test_derived_table_and_lateral_sources() {
+            let sql = "SELECT * FROM LATERAL (SELECT id FROM t1) AS d JOIN t2 ON d.id = t2.id";
+            let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
+            assert_table_extraction(sql, expected, generic_dialect());
+        }
+
+        #[test]
+        fn test_table_function_sources() {
+            for (sql, expected_tables) in [
+                (
+                    "SELECT * FROM UNNEST(ARRAY[(SELECT id FROM t1)]) AS u",
+                    vec![table("t1")],
+                ),
+                (
+                    "SELECT * FROM generate_series((SELECT min_id FROM t1), 10) AS g",
+                    vec![table_alias("generate_series", "g"), table("t1")],
+                ),
+            ] {
+                assert_table_extraction(sql, vec![ok_tables(expected_tables)], generic_dialect());
+            }
+        }
+
+        #[test]
+        fn test_query_set_expr_forms() {
+            for (sql, expected_tables) in [
+                (
+                    "SELECT * FROM t1 UNION SELECT * FROM t2",
+                    vec![table("t1"), table("t2")],
+                ),
+                ("VALUES ((SELECT id FROM t1))", vec![table("t1")]),
+                (
+                    "CREATE TABLE t2 AS TABLE t1",
+                    vec![table("t2"), table("t1")],
+                ),
+            ] {
+                assert_table_extraction(sql, vec![ok_tables(expected_tables)], generic_dialect());
+            }
+        }
+
+        #[test]
+        fn test_query_clauses_with_subqueries() {
+            for (sql, expected_tables) in [
+                (
+                    "SELECT * FROM t1 LIMIT (SELECT n FROM t2)",
+                    vec![table("t1"), table("t2")],
+                ),
+                (
+                    "SELECT * FROM t1 FETCH FIRST 10 ROWS ONLY",
+                    vec![table("t1")],
+                ),
+                (
+                    "SELECT SUM(a) OVER w FROM t1 WINDOW w AS (PARTITION BY (SELECT b FROM t2))",
+                    vec![table("t1"), table("t2")],
+                ),
+            ] {
+                assert_table_extraction(sql, vec![ok_tables(expected_tables)], generic_dialect());
+            }
+        }
+
+        #[test]
+        fn test_dialect_specific_query_clauses_with_subqueries() {
+            assert_table_extraction(
+                "SELECT DISTINCT ON ((SELECT id FROM t2)) id FROM t1",
+                vec![ok_tables(vec![table("t2"), table("t1")])],
+                one_dialect(sqlparser::dialect::PostgreSqlDialect {}),
+            );
+            assert_table_extraction(
+                "SELECT TOP ((SELECT n FROM t2)) id FROM t1",
+                vec![ok_tables(vec![table("t2"), table("t1")])],
+                one_dialect(sqlparser::dialect::MsSqlDialect {}),
+            );
+            assert_table_extraction(
+                "SELECT * INTO t2 FROM t1",
+                vec![ok_tables(vec![table("t1"), table("t2")])],
+                one_dialect(sqlparser::dialect::MsSqlDialect {}),
+            );
+            assert_table_extraction(
+                "SELECT * FROM t1 SETTINGS max_threads = (SELECT n FROM t2)",
+                vec![ok_tables(vec![table("t1"), table("t2")])],
+                one_dialect(sqlparser::dialect::ClickHouseDialect {}),
+            );
+        }
+
+        #[test]
+        fn test_join_variants() {
+            for sql in [
+                "SELECT * FROM t1 LEFT JOIN t2 ON t1.id = t2.id",
+                "SELECT * FROM t1 RIGHT JOIN t2 ON t1.id = t2.id",
+                "SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.id = t2.id",
+                "SELECT * FROM t1 CROSS JOIN t2",
+            ] {
+                assert_table_extraction(
+                    sql,
+                    vec![ok_tables(vec![table("t1"), table("t2")])],
+                    generic_dialect(),
+                );
+            }
+        }
+
+        #[test]
+        fn test_table_factor_extensions() {
+            assert_table_extraction(
+                "SELECT * FROM t1 TABLESAMPLE (10)",
+                vec![ok_tables(vec![table("t1")])],
+                generic_dialect(),
+            );
+            assert_table_extraction(
+                "SELECT * FROM monthly_sales PIVOT(SUM(amount) FOR month IN ('JAN')) AS p",
+                vec![ok_tables(vec![table("monthly_sales")])],
+                generic_dialect(),
+            );
+        }
+
+        #[test]
+        fn test_pipe_operator_sources() {
+            let sql =
+                "SELECT * FROM t1 |> WHERE id IN (SELECT id FROM t2) |> JOIN t3 ON id = t3.id";
+            let expected = vec![ok_tables(vec![table("t1"), table("t2"), table("t3")])];
+            assert_table_extraction(
+                sql,
+                expected,
+                one_dialect(sqlparser::dialect::BigQueryDialect {}),
+            );
+        }
+    }
+
+    #[test]
     fn test_statement_with_alias() {
         let sql = "SELECT a FROM t1 AS t1_alias";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: Some("t1_alias".into()),
-        }]))];
+        let expected = vec![ok_tables(vec![table_alias("t1", "t1_alias")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
@@ -201,18 +518,8 @@ mod tests {
     fn test_statement_with_schema_identifier() {
         let sql = "SELECT a FROM schema.table; INSERT INTO schema.table (a) VALUES (1)";
         let expected = vec![
-            Ok(Tables(vec![TableReference {
-                catalog: None,
-                schema: Some("schema".into()),
-                name: "table".into(),
-                alias: None,
-            }])),
-            Ok(Tables(vec![TableReference {
-                catalog: None,
-                schema: Some("schema".into()),
-                name: "table".into(),
-                alias: None,
-            }])),
+            ok_tables(vec![schema_table("schema", "table")]),
+            ok_tables(vec![schema_table("schema", "table")]),
         ];
         assert_table_extraction(sql, expected, all_dialects());
     }
@@ -222,18 +529,8 @@ mod tests {
         let sql =
             "SELECT a FROM catalog.schema.table; INSERT INTO catalog.schema.table (a) VALUES (1)";
         let expected = vec![
-            Ok(Tables(vec![TableReference {
-                catalog: Some("catalog".into()),
-                schema: Some("schema".into()),
-                name: "table".into(),
-                alias: None,
-            }])),
-            Ok(Tables(vec![TableReference {
-                catalog: Some("catalog".into()),
-                schema: Some("schema".into()),
-                name: "table".into(),
-                alias: None,
-            }])),
+            ok_tables(vec![catalog_schema_table("catalog", "schema", "table")]),
+            ok_tables(vec![catalog_schema_table("catalog", "schema", "table")]),
         ];
         assert_table_extraction(sql, expected, all_dialects());
     }
@@ -241,128 +538,59 @@ mod tests {
     #[test]
     fn test_statement_with_table_identifier_and_alias() {
         let sql = "SELECT a FROM catalog.schema.table AS table_alias";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: Some("catalog".into()),
-            schema: Some("schema".into()),
-            name: "table".into(),
-            alias: Some("table_alias".into()),
-        }]))];
+        let expected = vec![ok_tables(vec![catalog_schema_table_alias(
+            "catalog",
+            "schema",
+            "table",
+            "table_alias",
+        )])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_where_same_tables_appear_multiple_times() {
         let sql = "SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id WHERE b = ( SELECT c FROM t3 INNER JOIN t1 ON t3.id = t1.id )";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t3".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![
+            table("t1"),
+            table("t2"),
+            table("t3"),
+            table("t1"),
+        ])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_subquery_inside_function_expression() {
         let sql = "SELECT COALESCE((SELECT b FROM t2), a) FROM t1";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_subquery_in_order_by() {
         let sql = "SELECT a FROM t1 ORDER BY (SELECT b FROM t2)";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_cte() {
         let sql = "WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: None,
-        }]))];
+        let expected = vec![ok_tables(vec![table("t1")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_case_insensitive_cte_reference() {
         let sql = "WITH T2 AS (SELECT id FROM t1) SELECT * FROM t2";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: None,
-        }]))];
+        let expected = vec![ok_tables(vec![table("t1")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_quoted_cte_does_not_match_unquoted_reference() {
         let sql = r#"WITH "T2" AS (SELECT id FROM t1) SELECT * FROM t2"#;
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
         assert_table_extraction(
             sql,
             expected,
@@ -373,12 +601,7 @@ mod tests {
     #[test]
     fn test_statement_with_quoted_cte_exact_reference() {
         let sql = r#"WITH "T2" AS (SELECT id FROM t1) SELECT * FROM "T2""#;
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: None,
-        }]))];
+        let expected = vec![ok_tables(vec![table("t1")])];
         assert_table_extraction(
             sql,
             expected,
@@ -389,105 +612,46 @@ mod tests {
     #[test]
     fn test_statement_with_cte_referencing_previous_cte() {
         let sql = "WITH t2 AS (SELECT id FROM t1), t3 AS (SELECT id FROM t2) SELECT * FROM t3";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: None,
-        }]))];
+        let expected = vec![ok_tables(vec![table("t1")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_cte_does_not_resolve_forward_reference() {
         let sql = "WITH t2 AS (SELECT id FROM t3), t3 AS (SELECT id FROM t1) SELECT * FROM t2";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t3".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![table("t3"), table("t1")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_cte_shadows_base_table_after_definition() {
         let sql = "WITH t2 AS (SELECT id FROM t3), t3 AS (SELECT id FROM t1) SELECT * FROM t3";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t3".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![table("t3"), table("t1")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_qualified_table_not_shadowed_by_cte() {
         let sql = "WITH t2 AS (SELECT id FROM t4), t3 AS (SELECT id FROM t1) SELECT * FROM s.t3";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t4".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: Some("s".into()),
-                name: "t3".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![
+            table("t4"),
+            table("t1"),
+            schema_table("s", "t3"),
+        ])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_qualified_table_not_shadowed_by_previous_cte_inside_cte_body() {
         let sql = "WITH t2 AS (SELECT id FROM t1), t3 AS (SELECT id FROM s.t2) SELECT * FROM t3";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: Some("s".into()),
-                name: "t2".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![table("t1"), schema_table("s", "t2")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_statement_with_recursive_cte_self_reference() {
         let sql = "WITH RECURSIVE t2 AS (SELECT id FROM t2) SELECT * FROM t2";
-        let expected = vec![Ok(Tables(vec![]))];
+        let expected = vec![ok_tables(vec![])];
         assert_table_extraction(
             sql,
             expected,
@@ -499,80 +663,31 @@ mod tests {
     fn test_statement_with_cte_shadowing_base_table() {
         let sql =
             "WITH t1 AS (SELECT id FROM t2) SELECT * FROM t1 JOIN s1.t1 AS t3 ON t1.id = t3.id";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: Some("s1".into()),
-                name: "t1".into(),
-                alias: Some("t3".into()),
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![
+            table("t2"),
+            schema_table_alias("s1", "t1", "t3"),
+        ])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_nested_statement_with_cte_scope() {
         let sql = "WITH t1 AS (SELECT id FROM t2) SELECT * FROM (WITH t1 AS (SELECT id FROM t3) SELECT * FROM t1) AS t4 JOIN t1 ON t4.id = t1.id";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t3".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![table("t2"), table("t3")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_nested_cte_does_not_leak_to_outer_query() {
         let sql = "SELECT * FROM (WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2) AS t3 JOIN t2 ON t3.id = t2.id";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
     #[test]
     fn test_insert_select_with_cte_source() {
         let sql = "INSERT INTO t1 WITH t3 AS (SELECT id FROM t2) SELECT * FROM t3";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
@@ -593,20 +708,7 @@ mod tests {
         #[test]
         fn test_delete_statement() {
             let sql = "DELETE t1 FROM t1";
-            let expected = vec![Ok(Tables(vec![
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                },
-            ]))];
+            let expected = vec![ok_tables(vec![table("t1"), table("t1")])];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
@@ -618,26 +720,11 @@ mod tests {
         #[test]
         fn test_delete_statement_with_aliases() {
             let sql = "DELETE t1_alias FROM t1 AS t1_alias JOIN t2 AS t2_alias ON t1_alias.a = t2_alias.a WHERE t2_alias.b = 1";
-            let expected = vec![Ok(Tables(vec![
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: Some("t1_alias".into()),
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: Some("t1_alias".into()),
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: Some("t2_alias".into()),
-                },
-            ]))];
+            let expected = vec![ok_tables(vec![
+                table_alias("t1", "t1_alias"),
+                table_alias("t1", "t1_alias"),
+                table_alias("t2", "t2_alias"),
+            ])];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
@@ -649,26 +736,11 @@ mod tests {
         #[test]
         fn test_delete_statement_with_case_insensitive_alias_target() {
             let sql = "DELETE T1_ALIAS FROM t1 AS t1_alias JOIN t2 ON t1_alias.a = t2.a";
-            let expected = vec![Ok(Tables(vec![
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: Some("t1_alias".into()),
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: Some("t1_alias".into()),
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: None,
-                },
-            ]))];
+            let expected = vec![ok_tables(vec![
+                table_alias("t1", "t1_alias"),
+                table_alias("t1", "t1_alias"),
+                table("t2"),
+            ])];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
@@ -681,38 +753,13 @@ mod tests {
         fn test_delete_multiple_tables_with_join() {
             let sql =
                 "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3 WHERE t1.a = t2.a AND t2.a = t3.a";
-            let expected = vec![Ok(Tables(vec![
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t3".into(),
-                    alias: None,
-                },
-            ]))];
+            let expected = vec![ok_tables(vec![
+                table("t1"),
+                table("t2"),
+                table("t1"),
+                table("t2"),
+                table("t3"),
+            ])];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
@@ -724,50 +771,27 @@ mod tests {
         #[test]
         fn test_delete_from_statement() {
             let sql = "DELETE FROM t1";
-            let expected = vec![Ok(Tables(vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            }]))];
+            let expected = vec![ok_tables(vec![table("t1")])];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
+
+        #[test]
+        fn test_delete_from_statement_with_selection() {
+            let sql = "DELETE FROM t1 WHERE id IN (SELECT id FROM t2)";
+            let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
             assert_table_extraction(sql, expected, all_dialects());
         }
 
         #[test]
         fn test_delete_from_statement_with_alias() {
             let sql = "DELETE FROM t1_alias, t2_alias USING t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
-            let expected = vec![Ok(Tables(vec![
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: Some("t1_alias".into()),
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: Some("t2_alias".into()),
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: Some("t1_alias".into()),
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: Some("t2_alias".into()),
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t3".into(),
-                    alias: None,
-                },
-            ]))];
+            let expected = vec![ok_tables(vec![
+                table_alias("t1", "t1_alias"),
+                table_alias("t2", "t2_alias"),
+                table_alias("t1", "t1_alias"),
+                table_alias("t2", "t2_alias"),
+                table("t3"),
+            ])];
             assert_table_extraction(sql, expected, all_dialects());
         }
     }
@@ -778,33 +802,37 @@ mod tests {
         #[test]
         fn test_insert_statement() {
             let sql = "INSERT INTO t1 (a, b) VALUES (1, 2)";
-            let expected = vec![Ok(Tables(vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            }]))];
+            let expected = vec![ok_tables(vec![table("t1")])];
             assert_table_extraction(sql, expected, all_dialects());
         }
 
         #[test]
         fn test_insert_select_statement() {
             let sql = "INSERT INTO t1 SELECT * FROM t2";
-            let expected = vec![Ok(Tables(vec![
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: None,
-                },
-            ]))];
+            let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
             assert_table_extraction(sql, expected, all_dialects());
+        }
+
+        #[test]
+        fn test_insert_set_statement() {
+            let sql = "INSERT INTO t1 SET a = (SELECT b FROM t2)";
+            let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
+            assert_table_extraction(
+                sql,
+                expected,
+                one_dialect(sqlparser::dialect::MySqlDialect {}),
+            );
+        }
+
+        #[test]
+        fn test_insert_table_function_statement() {
+            let sql = "INSERT INTO FUNCTION remote('localhost', default.t1) SELECT * FROM t2";
+            let expected = vec![ok_tables(vec![table("remote"), table("t2")])];
+            assert_table_extraction(
+                sql,
+                expected,
+                one_dialect(sqlparser::dialect::ClickHouseDialect {}),
+            );
         }
     }
 
@@ -814,39 +842,36 @@ mod tests {
         #[test]
         fn test_update_statement() {
             let sql = "UPDATE t1 SET a = 1";
-            let expected = vec![Ok(Tables(vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            }]))];
+            let expected = vec![ok_tables(vec![table("t1")])];
             assert_table_extraction(sql, expected, all_dialects());
         }
 
         #[test]
         fn test_update_statement_with_alias() {
             let sql = "UPDATE t1 AS t1_alias INNER JOIN t2 ON t1_alias.a = t2.a SET t1_alias.b = t2.b WHERE t2.c = (SELECT c FROM t3)";
-            let expected = vec![Ok(Tables(vec![
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: Some("t1_alias".into()),
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: None,
-                },
-                TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t3".into(),
-                    alias: None,
-                },
-            ]))];
+            let expected = vec![ok_tables(vec![
+                table_alias("t1", "t1_alias"),
+                table("t2"),
+                table("t3"),
+            ])];
             assert_table_extraction(sql, expected, all_dialects());
+        }
+
+        #[test]
+        fn test_update_statement_with_from_and_subqueries() {
+            let sql =
+                "UPDATE t1 SET a = (SELECT b FROM t3) FROM t2 WHERE t1.id IN (SELECT id FROM t4)";
+            let expected = vec![ok_tables(vec![
+                table("t1"),
+                table("t2"),
+                table("t3"),
+                table("t4"),
+            ])];
+            assert_table_extraction(
+                sql,
+                expected,
+                one_dialect(sqlparser::dialect::PostgreSqlDialect {}),
+            );
         }
     }
 
@@ -855,20 +880,7 @@ mod tests {
         let sql = "MERGE INTO t1 USING t2 ON t1.a = t2.a \
                          WHEN MATCHED THEN UPDATE SET t1.b = t2.b \
                          WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2.a, t2.b)";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
@@ -877,44 +889,75 @@ mod tests {
         let sql = "MERGE INTO t1 AS t1_alias USING (SELECT a, b FROM t2) AS t2_alias(a, b) ON t1_alias.a = t2_alias.a \
                          WHEN MATCHED THEN UPDATE SET t1_alias.b = t2_alias.b \
                          WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2_alias.a, t2_alias.b)";
-        let expected = vec![Ok(Tables(vec![
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: Some("t1_alias".into()),
-            },
-            TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: None,
-            },
-        ]))];
+        let expected = vec![ok_tables(vec![table_alias("t1", "t1_alias"), table("t2")])];
         assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_merge_statement_with_clause_predicate() {
+        let sql = "MERGE INTO t1 USING t2 ON t1.id = t2.id \
+                         WHEN MATCHED AND EXISTS (SELECT 1 FROM t3) THEN DELETE";
+        let expected = vec![ok_tables(vec![table("t1"), table("t2"), table("t3")])];
+        assert_table_extraction(sql, expected, generic_dialect());
     }
 
     #[test]
     fn test_create_table_statement() {
         let sql = "CREATE TABLE t1 (a INT)";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: None,
-        }]))];
+        let expected = vec![ok_tables(vec![table("t1")])];
         assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_create_table_as_select_statement() {
+        let sql = "CREATE TABLE t1 AS SELECT * FROM t2";
+        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
+        assert_table_extraction(sql, expected, generic_dialect());
+    }
+
+    #[test]
+    fn test_create_view_statement() {
+        let sql = "CREATE VIEW t1 AS SELECT * FROM t2";
+        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
+        assert_table_extraction(sql, expected, generic_dialect());
+    }
+
+    #[test]
+    fn test_create_virtual_table_statement() {
+        let sql = "CREATE VIRTUAL TABLE t1 USING fts5(a)";
+        let expected = vec![ok_tables(vec![table("t1")])];
+        assert_table_extraction(
+            sql,
+            expected,
+            one_dialect(sqlparser::dialect::SQLiteDialect {}),
+        );
     }
 
     #[test]
     fn test_alters_table_statement() {
         let sql = "ALTER TABLE t1 ADD COLUMN a INT";
-        let expected = vec![Ok(Tables(vec![TableReference {
-            catalog: None,
-            schema: None,
-            name: "t1".into(),
-            alias: None,
-        }]))];
+        let expected = vec![ok_tables(vec![table("t1")])];
         assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_drop_table_statement() {
+        let sql = "DROP TABLE t1, t2";
+        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
+        assert_table_extraction(sql, expected, generic_dialect());
+    }
+
+    #[test]
+    fn test_drop_index_statement_records_parent_table() {
+        let sql = "DROP INDEX idx1 ON t1";
+        let expected = vec![ok_tables(vec![table("t1")])];
+        assert_table_extraction(sql, expected, generic_dialect());
+    }
+
+    #[test]
+    fn test_truncate_table_statement() {
+        let sql = "TRUNCATE TABLE t1, t2";
+        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
+        assert_table_extraction(sql, expected, generic_dialect());
     }
 }

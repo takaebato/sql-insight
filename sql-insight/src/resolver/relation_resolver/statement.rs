@@ -1,4 +1,4 @@
-use super::Binder;
+use super::RelationResolver;
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
@@ -6,26 +6,26 @@ use sqlparser::ast::{
     Update, UpdateTableFromKind,
 };
 
-impl Binder {
-    pub(super) fn bind_statement(&mut self, statement: &Statement) -> Result<(), Error> {
+impl RelationResolver {
+    pub(super) fn visit_statement(&mut self, statement: &Statement) -> Result<(), Error> {
         // Keep this match exhaustive. Unsupported variants are listed explicitly so sqlparser
         // Statement additions become compile errors instead of silent misses.
         match statement {
-            Statement::Query(query) => self.bind_query(query),
-            Statement::Insert(insert) => self.bind_insert(insert),
-            Statement::Update(update) => self.bind_update(update),
-            Statement::Delete(delete) => self.bind_delete(delete),
-            Statement::Merge(merge) => self.bind_merge(merge),
+            Statement::Query(query) => self.resolve_query(query).map(|_| ()),
+            Statement::Insert(insert) => self.visit_insert(insert),
+            Statement::Update(update) => self.visit_update(update),
+            Statement::Delete(delete) => self.visit_delete(delete),
+            Statement::Merge(merge) => self.visit_merge(merge),
             Statement::CreateTable(create_table) => {
                 self.record_base_table(TableReference::try_from(&create_table.name)?);
                 if let Some(query) = &create_table.query {
-                    self.bind_query(query)?;
+                    self.resolve_query(query)?;
                 }
                 Ok(())
             }
             Statement::CreateView(create_view) => {
                 self.record_base_table(TableReference::try_from(&create_view.name)?);
-                self.bind_query(&create_view.query)?;
+                self.resolve_query(&create_view.query)?;
                 if let Some(to) = &create_view.to {
                     self.record_base_table(TableReference::try_from(to)?);
                 }
@@ -33,7 +33,7 @@ impl Binder {
             }
             Statement::AlterView { name, query, .. } => {
                 self.record_base_table(TableReference::try_from(name)?);
-                self.bind_query(query)
+                self.resolve_query(query).map(|_| ())
             }
             Statement::CreateVirtualTable { name, .. } => {
                 self.record_base_table(TableReference::try_from(name)?);
@@ -189,19 +189,19 @@ impl Binder {
         }
     }
 
-    fn bind_insert(&mut self, insert: &sqlparser::ast::Insert) -> Result<(), Error> {
+    fn visit_insert(&mut self, insert: &sqlparser::ast::Insert) -> Result<(), Error> {
         self.record_base_table(TableReference::try_from(insert)?);
         if let Some(source) = &insert.source {
-            self.bind_query(source)?;
+            self.resolve_query(source)?;
         }
         for assignment in &insert.assignments {
-            self.bind_expr(&assignment.value)?;
+            self.visit_expr(&assignment.value)?;
         }
         Ok(())
     }
 
-    fn bind_update(&mut self, update: &Update) -> Result<(), Error> {
-        self.bind_table_with_joins(&update.table)?;
+    fn visit_update(&mut self, update: &Update) -> Result<(), Error> {
+        self.visit_table_with_joins(&update.table)?;
         if let Some(from) = &update.from {
             let tables = match from {
                 UpdateTableFromKind::BeforeSet(tables) | UpdateTableFromKind::AfterSet(tables) => {
@@ -209,19 +209,19 @@ impl Binder {
                 }
             };
             for table in tables {
-                self.bind_table_with_joins(table)?;
+                self.visit_table_with_joins(table)?;
             }
         }
         for assignment in &update.assignments {
-            self.bind_expr(&assignment.value)?;
+            self.visit_expr(&assignment.value)?;
         }
         if let Some(selection) = &update.selection {
-            self.bind_expr(selection)?;
+            self.visit_expr(selection)?;
         }
         Ok(())
     }
 
-    fn bind_delete(&mut self, delete: &Delete) -> Result<(), Error> {
+    fn visit_delete(&mut self, delete: &Delete) -> Result<(), Error> {
         let insertion_index = self.references.len();
         let target_names = if !delete.tables.is_empty() {
             delete.tables.clone()
@@ -234,17 +234,17 @@ impl Binder {
         if delete.using.is_some() {
             if let Some(using) = &delete.using {
                 for table in using {
-                    self.bind_table_with_joins(table)?;
+                    self.visit_table_with_joins(table)?;
                 }
             }
         } else {
             for table in from_table_items(&delete.from) {
-                self.bind_table_with_joins(table)?;
+                self.visit_table_with_joins(table)?;
             }
         }
 
         if let Some(selection) = &delete.selection {
-            self.bind_expr(selection)?;
+            self.visit_expr(selection)?;
         }
 
         if !target_names.is_empty() {
@@ -257,13 +257,13 @@ impl Binder {
         Ok(())
     }
 
-    fn bind_merge(&mut self, merge: &Merge) -> Result<(), Error> {
-        self.bind_table_factor(&merge.table)?;
-        self.bind_table_factor(&merge.source)?;
-        self.bind_expr(&merge.on)?;
+    fn visit_merge(&mut self, merge: &Merge) -> Result<(), Error> {
+        self.visit_table_factor(&merge.table)?;
+        self.visit_table_factor(&merge.source)?;
+        self.visit_expr(&merge.on)?;
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
-                self.bind_expr(predicate)?;
+                self.visit_expr(predicate)?;
             }
         }
         Ok(())

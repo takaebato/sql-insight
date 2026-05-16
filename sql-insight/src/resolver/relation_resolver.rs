@@ -108,9 +108,9 @@ impl ScopeStack {
         self.scopes
     }
 
-    fn push_query_scope(&mut self) {
+    fn push_query_scope(&mut self) -> ScopeId {
         let parent = self.stack.last().copied();
-        self.push_scope(parent);
+        self.push_scope(parent)
     }
 
     fn pop_scope(&mut self) {
@@ -154,37 +154,58 @@ impl ScopeStack {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RelationBinding {
-    BaseTable(Box<TableReference>),
-    Cte,
-    DerivedTable,
-    TableFunction,
+#[allow(dead_code)]
+pub(crate) enum Schema {
+    Known(Vec<Column>),
+    Unknown,
 }
 
-pub(crate) struct RelationBinder;
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct Column {
+    pub(crate) name: Ident,
+}
 
-impl RelationBinder {
-    pub(crate) fn bind_statement(statement: &Statement) -> Result<RelationResolution, Error> {
-        let mut binder = Binder::default();
-        binder.bind_statement(statement)?;
-        Ok(binder.into_relation_resolution())
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum RelationBinding {
+    PhysicalTable { table: TableReference, schema: Schema },
+    Cte { name: Ident, schema: Schema },
+    DerivedTable { alias: Ident, schema: Schema },
+    TableFunction { alias: Ident, schema: Schema },
+}
 
-    pub(crate) fn bind_table_node(table: &TableWithJoins) -> Result<RelationResolution, Error> {
-        let mut binder = Binder::default();
-        binder.bind_table_with_joins(table)?;
-        Ok(binder.into_relation_resolution())
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ResolvedQuery {
+    pub(crate) scope_id: ScopeId,
+    pub(crate) output_schema: Schema,
 }
 
 #[derive(Default, Debug)]
-struct Binder {
+pub(crate) struct RelationResolver {
     references: TableReferenceCollector,
     diagnostics: Vec<Diagnostic>,
     scopes: ScopeStack,
 }
 
-impl Binder {
+impl RelationResolver {
+    pub(crate) fn resolve_statement(
+        statement: &Statement,
+    ) -> Result<RelationResolution, Error> {
+        let mut resolver = Self::default();
+        resolver.visit_statement(statement)?;
+        Ok(resolver.into_relation_resolution())
+    }
+
+    pub(crate) fn resolve_table_node(
+        table: &TableWithJoins,
+    ) -> Result<RelationResolution, Error> {
+        let mut resolver = Self::default();
+        resolver.visit_table_with_joins(table)?;
+        Ok(resolver.into_relation_resolution())
+    }
+
     fn into_relation_resolution(self) -> RelationResolution {
         RelationResolution {
             table_references: self.references.into_tables(),
@@ -196,7 +217,7 @@ impl Binder {
     fn is_cte_reference(&self, relation: &ObjectName) -> bool {
         matches!(
             self.scopes.resolve_unqualified_relation(relation),
-            Some(RelationBinding::Cte)
+            Some(RelationBinding::Cte { .. })
         )
     }
 
@@ -207,11 +228,43 @@ impl Binder {
 
     fn bind_base_table(&mut self, table: TableReference) {
         let binding_name = table.alias.clone().unwrap_or_else(|| table.name.clone());
-        self.bind_relation(binding_name, RelationBinding::BaseTable(Box::new(table)));
+        self.bind_relation(
+            binding_name,
+            RelationBinding::PhysicalTable {
+                table,
+                schema: Schema::Unknown,
+            },
+        );
     }
 
     fn bind_cte(&mut self, name: Ident) {
-        self.bind_relation(name, RelationBinding::Cte);
+        self.bind_relation(
+            name.clone(),
+            RelationBinding::Cte {
+                name,
+                schema: Schema::Unknown,
+            },
+        );
+    }
+
+    fn bind_derived_table(&mut self, alias: Ident) {
+        self.bind_relation(
+            alias.clone(),
+            RelationBinding::DerivedTable {
+                alias,
+                schema: Schema::Unknown,
+            },
+        );
+    }
+
+    fn bind_table_function(&mut self, alias: Ident) {
+        self.bind_relation(
+            alias.clone(),
+            RelationBinding::TableFunction {
+                alias,
+                schema: Schema::Unknown,
+            },
+        );
     }
 
     fn record_diagnostic(&mut self, diagnostic: Diagnostic) {
@@ -230,10 +283,10 @@ impl Binder {
     }
 
     fn resolve_delete_target(&self, relation: &ObjectName) -> Result<TableReference, Error> {
-        if let Some(RelationBinding::BaseTable(table)) =
+        if let Some(RelationBinding::PhysicalTable { table, .. }) =
             self.scopes.resolve_unqualified_relation(relation)
         {
-            Ok((**table).clone())
+            Ok(table.clone())
         } else {
             TableReference::try_from(relation)
         }
