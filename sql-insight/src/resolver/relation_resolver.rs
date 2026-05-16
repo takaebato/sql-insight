@@ -237,23 +237,17 @@ impl RelationResolver {
         );
     }
 
-    fn bind_cte(&mut self, name: Ident) {
+    fn bind_cte(&mut self, name: Ident, schema: Schema) {
         self.bind_relation(
             name.clone(),
-            RelationBinding::Cte {
-                name,
-                schema: Schema::Unknown,
-            },
+            RelationBinding::Cte { name, schema },
         );
     }
 
-    fn bind_derived_table(&mut self, alias: Ident) {
+    fn bind_derived_table(&mut self, alias: Ident, schema: Schema) {
         self.bind_relation(
             alias.clone(),
-            RelationBinding::DerivedTable {
-                alias,
-                schema: Schema::Unknown,
-            },
+            RelationBinding::DerivedTable { alias, schema },
         );
     }
 

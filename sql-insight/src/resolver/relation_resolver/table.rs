@@ -1,4 +1,4 @@
-use super::RelationResolver;
+use super::{RelationResolver, Schema};
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
@@ -63,7 +63,7 @@ impl RelationResolver {
             } => {
                 if self.is_cte_reference(name) {
                     if let Some(alias) = alias {
-                        self.bind_cte(alias.name.clone());
+                        self.bind_cte(alias.name.clone(), Schema::Unknown);
                     }
                     return Ok(());
                 }
@@ -88,9 +88,9 @@ impl RelationResolver {
                 sample,
                 ..
             } => {
-                self.resolve_query(subquery)?;
+                let resolved = self.resolve_query(subquery)?;
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone());
+                    self.bind_derived_table(alias.name.clone(), resolved.output_schema);
                 }
                 if let Some(sample) = sample {
                     self.visit_table_sample_kind(sample)?;
@@ -102,7 +102,7 @@ impl RelationResolver {
             } => {
                 self.visit_table_with_joins(table_with_joins)?;
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone());
+                    self.bind_derived_table(alias.name.clone(), Schema::Unknown);
                 }
             }
             TableFactor::Pivot {
@@ -124,7 +124,7 @@ impl RelationResolver {
                     self.visit_expr(expr)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone());
+                    self.bind_derived_table(alias.name.clone(), Schema::Unknown);
                 }
             }
             TableFactor::Unpivot {
@@ -140,7 +140,7 @@ impl RelationResolver {
                     self.visit_expr(&expr.expr)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone());
+                    self.bind_derived_table(alias.name.clone(), Schema::Unknown);
                 }
             }
             TableFactor::MatchRecognize {
@@ -164,7 +164,7 @@ impl RelationResolver {
                     self.visit_expr(&symbol.definition)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone());
+                    self.bind_derived_table(alias.name.clone(), Schema::Unknown);
                 }
             }
             TableFactor::TableFunction { expr, alias } => {
