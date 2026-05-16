@@ -150,10 +150,6 @@ pub struct OperationDiagnostic {
 #[non_exhaustive]
 pub enum OperationDiagnosticCode {
     UnsupportedStatement,
-    UnsupportedTableFactor,
-    AmbiguousColumn,
-    CatalogRequired,
-    DynamicSql,
 }
 
 /// Extracts operations from SQL.
