@@ -103,21 +103,29 @@ pub enum TableUsage {
     WriteValue,
 }
 
-/// A source-to-target table flow inferred from the statement structure,
-/// for cases that clearly imply derivation (e.g. `INSERT INTO t SELECT
-/// ... FROM s`). Statements with no clear derivation produce no flows.
+/// A source-to-target table flow inferred from the statement structure.
+///
+/// Emitted only for statements that physically move data into a target
+/// (`INSERT`, `UPDATE`, `MERGE`, `CREATE TABLE AS SELECT`, `CREATE VIEW`).
+/// `DELETE`, `DROP`, `TRUNCATE`, `ALTER`, and bare `SELECT` produce no
+/// flows even when they reference other tables — the touched tables are
+/// still visible through [`StatementTableOperations::table_operations`].
 ///
 /// Each `TableFlow` is a single directed edge — a statement that derives
 /// `t` from `a JOIN b` emits two flows (`a → t`, `b → t`), not one entry
 /// with both sources. This keeps equality and aggregation across
 /// statements simple (set-union over edges).
 ///
-/// **Note:** `StatementTableOperations::table_flows` is currently always empty.
-/// Flow extraction needs a scope-kind distinction between data-feeding and
-/// predicate subqueries (so `INSERT INTO t SELECT FROM s WHERE id IN
-/// (SELECT id FROM x)` correctly emits `s → t` only, not `x → t`); that
-/// piece lands in a follow-up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Tables referenced only inside a predicate subquery are excluded:
+/// `INSERT INTO t SELECT FROM s WHERE id IN (SELECT id FROM x)` emits
+/// `s → t` but not `x → t`. `x` remains visible via `table_operations`.
+///
+/// CTE transitivity: `WITH cte AS (SELECT ... FROM s) INSERT INTO t
+/// SELECT ... FROM cte` emits `s → t` because `s` sits in a
+/// data-feeding chain from the CTE body up through the INSERT target.
+/// Deeper transitivity (recursive CTEs, multi-hop indirection) is
+/// intentionally out of scope for the MVP.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableFlow {
     pub source: TableReference,
     pub target: TableReference,
@@ -192,13 +200,53 @@ impl TableOperationExtractor {
             }
         }
 
+        let table_flows = extract_table_flows(&resolution, &kind);
+
         Ok(StatementTableOperations {
             statement_kind: kind,
             table_operations,
-            table_flows: Vec::new(),
+            table_flows,
             diagnostics,
         })
     }
+}
+
+/// Emit one `TableFlow` edge per (feeding source × write target) pair
+/// for statements that physically move data. Statements without a write
+/// target or without any data-feeding source produce no flows.
+fn extract_table_flows(
+    resolution: &crate::resolver::RelationResolution,
+    kind: &StatementKind,
+) -> Vec<TableFlow> {
+    if !is_data_moving(kind) {
+        return Vec::new();
+    }
+    // Data-moving statements all carry exactly one write target. If
+    // somehow zero or many appear (parser oddity, unsupported variant)
+    // we conservatively emit no flows rather than guessing.
+    let mut targets = resolution.write_target_tables().into_iter();
+    let Some(target) = targets.next() else {
+        return Vec::new();
+    };
+    resolution
+        .feeding_read_tables()
+        .into_iter()
+        .map(|source| TableFlow {
+            source,
+            target: target.clone(),
+        })
+        .collect()
+}
+
+fn is_data_moving(kind: &StatementKind) -> bool {
+    matches!(
+        kind,
+        StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Merge
+            | StatementKind::CreateTable
+            | StatementKind::CreateView
+    )
 }
 
 fn classify_statement(statement: &Statement) -> StatementKind {
@@ -216,8 +264,7 @@ fn classify_statement(statement: &Statement) -> StatementKind {
         Statement::AlterTable(_) => StatementKind::AlterTable,
         Statement::AlterView { .. } => StatementKind::AlterView,
         Statement::Drop {
-            object_type:
-                ObjectType::Table | ObjectType::View | ObjectType::MaterializedView,
+            object_type: ObjectType::Table | ObjectType::View | ObjectType::MaterializedView,
             ..
         } => StatementKind::Drop,
         Statement::Truncate(_) => StatementKind::Truncate,
@@ -342,12 +389,8 @@ mod tests {
     #[test]
     fn multiple_statements_produce_multiple_results() {
         let dialect = GenericDialect {};
-        let result = extract_table_operations(
-            &dialect,
-            "SELECT * FROM t1; SELECT * FROM t2",
-            None,
-        )
-        .unwrap();
+        let result =
+            extract_table_operations(&dialect, "SELECT * FROM t1; SELECT * FROM t2", None).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(
             result[0].as_ref().unwrap().table_operations[0].table,
@@ -418,10 +461,8 @@ mod tests {
             .map(|op| (op.table.name.value.as_str(), op.role.clone()))
             .collect();
         assert_eq!(roles[0], ("t1", TableRole::Write));
-        let source_names: std::collections::HashSet<_> = roles[1..]
-            .iter()
-            .map(|(n, _)| *n)
-            .collect();
+        let source_names: std::collections::HashSet<_> =
+            roles[1..].iter().map(|(n, _)| *n).collect();
         assert_eq!(
             source_names,
             ["t2", "t3", "t4"]
@@ -603,5 +644,137 @@ mod tests {
         // schemas, etc.) don't carry a meaningful Table-level operation.
         let ops = extract("DROP FUNCTION my_fn");
         assert_eq!(ops.statement_kind, StatementKind::Unsupported);
+    }
+
+    // ─────────────────────── table_flows ───────────────────────
+
+    fn flow(source: &str, target: &str) -> TableFlow {
+        TableFlow {
+            source: table(source),
+            target: table(target),
+        }
+    }
+
+    #[test]
+    fn insert_select_emits_flow_from_source_to_target() {
+        let ops = extract("INSERT INTO t1 SELECT * FROM t2");
+        assert_eq!(ops.table_flows, vec![flow("t2", "t1")]);
+    }
+
+    #[test]
+    fn insert_select_join_emits_one_flow_per_source() {
+        let ops = extract("INSERT INTO t1 SELECT * FROM t2 JOIN t3 ON t2.id = t3.id");
+        assert_eq!(ops.table_flows, vec![flow("t2", "t1"), flow("t3", "t1")]);
+    }
+
+    #[test]
+    fn predicate_subquery_does_not_feed_flow() {
+        // t3 is referenced only inside `WHERE id IN (SELECT id FROM t3)`,
+        // so it must not appear as a flow source even though it does
+        // appear in `table_operations`.
+        let ops = extract("INSERT INTO t1 SELECT * FROM t2 WHERE id IN (SELECT id FROM t3)");
+        assert_eq!(ops.table_flows, vec![flow("t2", "t1")]);
+        // ...but t3 is still visible as a touched table.
+        let touched: Vec<_> = ops
+            .table_operations
+            .iter()
+            .map(|op| op.table.name.value.as_str())
+            .collect();
+        assert!(touched.contains(&"t3"));
+    }
+
+    #[test]
+    fn join_on_predicate_does_not_promote_to_flow() {
+        // The ON-clause subquery's t3 is a predicate dependency, not a
+        // data source. Only t2 should appear in flows.
+        let ops = extract(
+            "INSERT INTO t1 SELECT * FROM t2 JOIN t3 ON t2.id = t3.id \
+             AND t2.id IN (SELECT id FROM t4)",
+        );
+        let flows: std::collections::HashSet<_> = ops.table_flows.into_iter().collect();
+        assert!(flows.contains(&flow("t2", "t1")));
+        assert!(flows.contains(&flow("t3", "t1")));
+        assert!(!flows.contains(&flow("t4", "t1")));
+    }
+
+    #[test]
+    fn update_scalar_subquery_in_set_feeds_flow() {
+        let ops = extract("UPDATE t1 SET col = (SELECT v FROM t2)");
+        assert_eq!(ops.table_flows, vec![flow("t2", "t1")]);
+    }
+
+    #[test]
+    fn update_predicate_subquery_does_not_feed_flow() {
+        let ops = extract("UPDATE t1 SET col = 1 WHERE id IN (SELECT id FROM t2)");
+        assert!(ops.table_flows.is_empty());
+    }
+
+    #[test]
+    fn create_table_as_select_emits_flow() {
+        let ops = extract("CREATE TABLE t1 AS SELECT * FROM t2");
+        assert_eq!(ops.table_flows, vec![flow("t2", "t1")]);
+    }
+
+    #[test]
+    fn create_view_emits_flow() {
+        let ops = extract("CREATE VIEW v1 AS SELECT * FROM t1");
+        assert_eq!(ops.table_flows, vec![flow("t1", "v1")]);
+    }
+
+    #[test]
+    fn merge_emits_flow_from_source_to_target() {
+        let ops = extract(
+            "MERGE INTO t1 USING t2 ON t1.id = t2.id \
+             WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
+        );
+        assert_eq!(ops.table_flows, vec![flow("t2", "t1")]);
+    }
+
+    #[test]
+    fn cte_data_flows_through_to_write_target() {
+        // CTE name itself is not a physical table, but its body's source
+        // (s) sits in a Body-chain from CTE → outer SELECT → INSERT
+        // target, so the flow s → t1 should be emitted.
+        let ops = extract("INSERT INTO t1 WITH cte AS (SELECT * FROM s) SELECT * FROM cte");
+        assert!(ops.table_flows.contains(&flow("s", "t1")));
+    }
+
+    #[test]
+    fn cte_predicate_subquery_does_not_leak_into_flow() {
+        // Inside the CTE body, x sits in a Predicate scope; it must not
+        // feed t even though the CTE itself feeds t.
+        let ops = extract(
+            "INSERT INTO t1 WITH cte AS (\
+                 SELECT * FROM s WHERE id IN (SELECT id FROM x)\
+             ) SELECT * FROM cte",
+        );
+        assert!(ops.table_flows.contains(&flow("s", "t1")));
+        assert!(!ops.table_flows.contains(&flow("x", "t1")));
+    }
+
+    #[test]
+    fn select_only_statement_emits_no_flows() {
+        let ops = extract("SELECT * FROM t1 JOIN t2 ON t1.id = t2.id");
+        assert!(ops.table_flows.is_empty());
+    }
+
+    #[test]
+    fn insert_values_emits_no_flow() {
+        let ops = extract("INSERT INTO t1 VALUES (1, 2)");
+        assert!(ops.table_flows.is_empty());
+    }
+
+    #[test]
+    fn delete_with_subquery_predicate_emits_no_flow() {
+        // DELETE doesn't move data — no flow, even when a subquery
+        // references another table.
+        let ops = extract("DELETE FROM t1 WHERE id IN (SELECT id FROM t2)");
+        assert!(ops.table_flows.is_empty());
+    }
+
+    #[test]
+    fn truncate_emits_no_flow() {
+        let ops = extract("TRUNCATE TABLE t1");
+        assert!(ops.table_flows.is_empty());
     }
 }

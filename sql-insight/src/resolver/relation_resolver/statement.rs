@@ -1,4 +1,4 @@
-use super::RelationResolver;
+use super::{RelationResolver, ScopeKind};
 use crate::error::Error;
 use crate::operation::TableRole;
 use crate::relation::TableReference;
@@ -33,25 +33,16 @@ impl<'a> RelationResolver<'a> {
                 );
                 self.resolve_query(&create_view.query)?;
                 if let Some(to) = &create_view.to {
-                    self.bind_base_table(
-                        TableReference::try_from(to)?,
-                        TableRole::Write,
-                    );
+                    self.bind_base_table(TableReference::try_from(to)?, TableRole::Write);
                 }
                 Ok(())
             }
             Statement::AlterView { name, query, .. } => {
-                self.bind_base_table(
-                    TableReference::try_from(name)?,
-                    TableRole::Write,
-                );
+                self.bind_base_table(TableReference::try_from(name)?, TableRole::Write);
                 self.resolve_query(query).map(|_| ())
             }
             Statement::CreateVirtualTable { name, .. } => {
-                self.bind_base_table(
-                    TableReference::try_from(name)?,
-                    TableRole::Write,
-                );
+                self.bind_base_table(TableReference::try_from(name)?, TableRole::Write);
                 Ok(())
             }
             Statement::AlterTable(alter_table) => {
@@ -72,26 +63,17 @@ impl<'a> RelationResolver<'a> {
                     ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
                 ) {
                     for name in names {
-                        self.bind_base_table(
-                            TableReference::try_from(name)?,
-                            TableRole::Write,
-                        );
+                        self.bind_base_table(TableReference::try_from(name)?, TableRole::Write);
                     }
                 }
                 if let Some(table) = table {
-                    self.bind_base_table(
-                        TableReference::try_from(table)?,
-                        TableRole::Write,
-                    );
+                    self.bind_base_table(TableReference::try_from(table)?, TableRole::Write);
                 }
                 Ok(())
             }
             Statement::Truncate(truncate) => {
                 for table in &truncate.table_names {
-                    self.bind_base_table(
-                        TableReference::try_from(&table.name)?,
-                        TableRole::Write,
-                    );
+                    self.bind_base_table(TableReference::try_from(&table.name)?, TableRole::Write);
                 }
                 Ok(())
             }
@@ -245,7 +227,7 @@ impl<'a> RelationResolver<'a> {
             self.visit_expr(&assignment.value)?;
         }
         if let Some(selection) = &update.selection {
-            self.visit_expr(selection)?;
+            self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(selection))?;
         }
         Ok(())
     }
@@ -278,13 +260,10 @@ impl<'a> RelationResolver<'a> {
             self.visit_table_with_joins(table, from_role.clone())?;
         }
         for name in &delete.tables {
-            self.bind_base_table(
-                TableReference::try_from_name(name)?,
-                TableRole::Write,
-            );
+            self.bind_base_table(TableReference::try_from_name(name)?, TableRole::Write);
         }
         if let Some(selection) = &delete.selection {
-            self.visit_expr(selection)?;
+            self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(selection))?;
         }
         Ok(())
     }
@@ -292,10 +271,10 @@ impl<'a> RelationResolver<'a> {
     fn visit_merge(&mut self, merge: &Merge) -> Result<(), Error> {
         self.visit_table_factor(&merge.table, TableRole::Write)?;
         self.visit_table_factor(&merge.source, TableRole::Read)?;
-        self.visit_expr(&merge.on)?;
+        self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(&merge.on))?;
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
-                self.visit_expr(predicate)?;
+                self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(predicate))?;
             }
         }
         Ok(())

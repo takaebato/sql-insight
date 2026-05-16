@@ -1,4 +1,4 @@
-use super::{Column, RelationResolver, RelationSchema, ResolvedQuery};
+use super::{Column, RelationResolver, RelationSchema, ResolvedQuery, ScopeKind};
 use crate::error::Error;
 use crate::operation::TableRole;
 use crate::relation::TableReference;
@@ -9,7 +9,7 @@ use sqlparser::ast::{
 
 impl<'a> RelationResolver<'a> {
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
-        let scope_id = self.scopes.push_query_scope();
+        let scope_id = self.scopes.push_query_scope(self.pending_scope_kind);
         if let Some(with) = &query.with {
             if with.recursive {
                 for cte in &with.cte_tables {
@@ -98,10 +98,7 @@ impl<'a> RelationResolver<'a> {
         }
         if let Some(into) = &select.into {
             // SELECT ... INTO new_table acts like CTAS — INTO is the write target.
-            self.bind_base_table(
-                TableReference::try_from(&into.name)?,
-                TableRole::Write,
-            );
+            self.bind_base_table(TableReference::try_from(&into.name)?, TableRole::Write);
         }
         for lateral_view in &select.lateral_views {
             self.visit_expr(&lateral_view.lateral_view)?;
@@ -115,17 +112,16 @@ impl<'a> RelationResolver<'a> {
         .into_iter()
         .flatten()
         {
-            self.visit_expr(expr)?;
+            self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(expr))?;
         }
         for connect_by in &select.connect_by {
-            match connect_by {
-                ConnectByKind::ConnectBy { relationships, .. } => {
-                    self.visit_exprs(relationships)?;
-                }
-                ConnectByKind::StartWith { condition, .. } => {
-                    self.visit_expr(condition)?;
-                }
-            }
+            // CONNECT BY / START WITH are predicate-style hierarchical
+            // join conditions (Oracle / Snowflake) — subqueries nested
+            // here do not feed the enclosing write target.
+            self.with_scope_kind(ScopeKind::Predicate, |r| match connect_by {
+                ConnectByKind::ConnectBy { relationships, .. } => r.visit_exprs(relationships),
+                ConnectByKind::StartWith { condition, .. } => r.visit_expr(condition),
+            })?;
         }
         self.visit_group_by(&select.group_by)?;
         self.visit_exprs(&select.cluster_by)?;
@@ -233,10 +229,7 @@ fn column_from_expr(expr: &Expr) -> Option<Column> {
         Expr::Identifier(ident) => Some(Column {
             name: ident.clone(),
         }),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .cloned()
-            .map(|name| Column { name }),
+        Expr::CompoundIdentifier(parts) => parts.last().cloned().map(|name| Column { name }),
         _ => None,
     }
 }

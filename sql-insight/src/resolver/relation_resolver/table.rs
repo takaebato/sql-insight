@@ -1,4 +1,4 @@
-use super::{RelationResolver, RelationSchema};
+use super::{RelationResolver, RelationSchema, ScopeKind};
 use crate::error::Error;
 use crate::operation::TableRole;
 use crate::relation::TableReference;
@@ -45,7 +45,7 @@ impl<'a> RelationResolver<'a> {
                 match_condition,
                 constraint,
             } => {
-                self.visit_expr(match_condition)?;
+                self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(match_condition))?;
                 self.visit_join_constraint(constraint)
             }
             JoinOperator::CrossApply | JoinOperator::OuterApply => Ok(()),
@@ -54,7 +54,9 @@ impl<'a> RelationResolver<'a> {
 
     fn visit_join_constraint(&mut self, constraint: &JoinConstraint) -> Result<(), Error> {
         match constraint {
-            JoinConstraint::On(expr) => self.visit_expr(expr),
+            JoinConstraint::On(expr) => {
+                self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(expr))
+            }
             JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
         }
     }

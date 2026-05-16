@@ -15,6 +15,24 @@ use sqlparser::ast::{Ident, ObjectName, Statement, TableWithJoins};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ScopeId(usize);
 
+/// Whether a scope contributes data to its enclosing write target.
+///
+/// - `Body`: data flows through — query bodies, CTE bodies, derived
+///   tables, INSERT/MERGE sources, scalar subqueries in projection or
+///   SET. Tables bound here participate in `TableFlow` edges when the
+///   statement has a write target.
+/// - `Predicate`: scope is referenced only in a constraint — WHERE,
+///   HAVING, JOIN ON, EXISTS, IN, QUALIFY. Tables bound under any
+///   Predicate ancestor are filtered out of `TableFlow` regardless of
+///   their own kind, so `INSERT INTO t SELECT FROM s WHERE id IN
+///   (SELECT id FROM x)` emits `s → t` but not `x → t`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub(crate) enum ScopeKind {
+    Body,
+    Predicate,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum RelationKey {
     Unquoted(String),
@@ -44,10 +62,7 @@ impl RelationResolution {
     /// (e.g. the operation extractor) should use [`table_bindings`]
     /// instead.
     pub(crate) fn tables(&self) -> Vec<TableReference> {
-        self.table_bindings()
-            .into_iter()
-            .map(|b| b.table)
-            .collect()
+        self.table_bindings().into_iter().map(|b| b.table).collect()
     }
 
     /// All table bindings paired with the roles they were bound under.
@@ -59,17 +74,60 @@ impl RelationResolution {
             .iter()
             .flat_map(|scope| scope.iter_bindings())
             .filter_map(|binding| match binding {
-                RelationBinding::Table {
-                    table,
-                    roles,
-                    ..
-                } => Some(TableBinding {
+                RelationBinding::Table { table, roles, .. } => Some(TableBinding {
                     table: (**table).clone(),
                     roles: roles.clone(),
                 }),
                 _ => None,
             })
             .collect()
+    }
+
+    /// Read-role table references whose scope chain contains no
+    /// `Predicate` ancestor — i.e. tables in a data-feeding position
+    /// relative to any enclosing write target. The basis for `TableFlow`
+    /// edge sources.
+    pub(crate) fn feeding_read_tables(&self) -> Vec<TableReference> {
+        self.scopes
+            .iter()
+            .filter(|scope| !self.has_predicate_ancestor(scope.id))
+            .flat_map(|scope| scope.iter_bindings())
+            .filter_map(|binding| match binding {
+                RelationBinding::Table { table, roles, .. } if roles.contains(&TableRole::Read) => {
+                    Some((**table).clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Write-role table references, in scope-arena order. The basis for
+    /// `TableFlow` edge targets.
+    pub(crate) fn write_target_tables(&self) -> Vec<TableReference> {
+        self.scopes
+            .iter()
+            .flat_map(|scope| scope.iter_bindings())
+            .filter_map(|binding| match binding {
+                RelationBinding::Table { table, roles, .. }
+                    if roles.contains(&TableRole::Write) =>
+                {
+                    Some((**table).clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_predicate_ancestor(&self, scope_id: ScopeId) -> bool {
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let scope = &self.scopes[id.0];
+            if scope.kind == ScopeKind::Predicate {
+                return true;
+            }
+            current = scope.parent;
+        }
+        false
     }
 }
 
@@ -89,14 +147,16 @@ pub(crate) struct TableBinding {
 pub(crate) struct RelationScope {
     pub(crate) id: ScopeId,
     pub(crate) parent: Option<ScopeId>,
+    pub(crate) kind: ScopeKind,
     bindings: IndexMap<RelationKey, RelationBinding>,
 }
 
 impl RelationScope {
-    fn new(id: ScopeId, parent: Option<ScopeId>) -> Self {
+    fn new(id: ScopeId, parent: Option<ScopeId>, kind: ScopeKind) -> Self {
         Self {
             id,
             parent,
+            kind,
             bindings: IndexMap::new(),
         }
     }
@@ -143,9 +203,9 @@ impl ScopeStack {
         self.scopes
     }
 
-    fn push_query_scope(&mut self) -> ScopeId {
+    fn push_query_scope(&mut self, kind: ScopeKind) -> ScopeId {
         let parent = self.stack.last().copied();
-        self.push_scope(parent)
+        self.push_scope(parent, kind)
     }
 
     fn pop_scope(&mut self) {
@@ -167,9 +227,9 @@ impl ScopeStack {
             .find_map(|scope_id| self.scopes[scope_id.0].resolve(name))
     }
 
-    fn push_scope(&mut self, parent: Option<ScopeId>) -> ScopeId {
+    fn push_scope(&mut self, parent: Option<ScopeId>, kind: ScopeKind) -> ScopeId {
         let id = ScopeId(self.scopes.len());
-        self.scopes.push(RelationScope::new(id, parent));
+        self.scopes.push(RelationScope::new(id, parent, kind));
         self.stack.push(id);
         id
     }
@@ -178,7 +238,7 @@ impl ScopeStack {
         if let Some(id) = self.stack.last() {
             *id
         } else {
-            self.push_scope(None)
+            self.push_scope(None, ScopeKind::Body)
         }
     }
 
@@ -211,9 +271,18 @@ pub(crate) enum RelationBinding {
         schema: RelationSchema,
         roles: Vec<TableRole>,
     },
-    Cte { name: Ident, schema: RelationSchema },
-    DerivedTable { alias: Ident, schema: RelationSchema },
-    TableFunction { alias: Ident, schema: RelationSchema },
+    Cte {
+        name: Ident,
+        schema: RelationSchema,
+    },
+    DerivedTable {
+        alias: Ident,
+        schema: RelationSchema,
+    },
+    TableFunction {
+        alias: Ident,
+        schema: RelationSchema,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +299,11 @@ pub(crate) struct RelationResolver<'a> {
     catalog: Option<&'a dyn Catalog>,
     diagnostics: Vec<Diagnostic>,
     scopes: ScopeStack,
+    /// Kind stamped on the next pushed scope. Defaults to `Body`; clause
+    /// walkers (WHERE, HAVING, JOIN ON, …) flip it to `Predicate` via
+    /// [`with_scope_kind`] for the duration of their child walk so that
+    /// subqueries nested inside those clauses inherit the right kind.
+    pending_scope_kind: ScopeKind,
 }
 
 impl<'a> RelationResolver<'a> {
@@ -238,7 +312,23 @@ impl<'a> RelationResolver<'a> {
             catalog,
             diagnostics: Vec::new(),
             scopes: ScopeStack::default(),
+            pending_scope_kind: ScopeKind::Body,
         }
+    }
+
+    /// Temporarily set the kind to stamp on subquery scopes pushed inside
+    /// `f`, then restore. Use around walks of predicate-position clauses
+    /// (WHERE, HAVING, JOIN ON, etc.) so that nested subqueries are
+    /// classified as `Predicate`.
+    pub(crate) fn with_scope_kind<R>(
+        &mut self,
+        kind: ScopeKind,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let prev = std::mem::replace(&mut self.pending_scope_kind, kind);
+        let r = f(self);
+        self.pending_scope_kind = prev;
+        r
     }
 
     pub(crate) fn resolve_statement(
@@ -310,10 +400,7 @@ impl<'a> RelationResolver<'a> {
     }
 
     fn bind_cte(&mut self, name: Ident, schema: RelationSchema) {
-        self.bind_relation(
-            name.clone(),
-            RelationBinding::Cte { name, schema },
-        );
+        self.bind_relation(name.clone(), RelationBinding::Cte { name, schema });
     }
 
     fn bind_derived_table(&mut self, alias: Ident, schema: RelationSchema) {
@@ -372,10 +459,15 @@ mod tests {
         fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
             // Catalogs key by the catalog/schema/name triplet; the resolver
             // is responsible for stripping alias before calling. Verify that.
-            assert!(table.alias.is_none(), "resolver must strip alias before catalog lookup");
+            assert!(
+                table.alias.is_none(),
+                "resolver must strip alias before catalog lookup"
+            );
             self.tables.get(table.name.value.as_str()).map(|cols| {
                 cols.iter()
-                    .map(|c| ColumnSchema { name: Ident::new(*c) })
+                    .map(|c| ColumnSchema {
+                        name: Ident::new(*c),
+                    })
                     .collect()
             })
         }
@@ -416,13 +508,19 @@ mod tests {
     fn catalog_miss_keeps_schema_unknown() {
         let catalog = TestCatalog::default();
         let resolution = resolve("SELECT * FROM users", Some(&catalog));
-        assert!(matches!(first_table_schema(&resolution), Some(RelationSchema::Unknown)));
+        assert!(matches!(
+            first_table_schema(&resolution),
+            Some(RelationSchema::Unknown)
+        ));
     }
 
     #[test]
     fn no_catalog_keeps_schema_unknown() {
         let resolution = resolve("SELECT * FROM users", None);
-        assert!(matches!(first_table_schema(&resolution), Some(RelationSchema::Unknown)));
+        assert!(matches!(
+            first_table_schema(&resolution),
+            Some(RelationSchema::Unknown)
+        ));
     }
 
     #[test]
@@ -432,6 +530,9 @@ mod tests {
         // holds. The Known schema also confirms the catalog matched on name.
         let catalog = TestCatalog::default().with("users", vec!["id"]);
         let resolution = resolve("SELECT * FROM users AS u", Some(&catalog));
-        assert!(matches!(first_table_schema(&resolution), Some(RelationSchema::Known(_))));
+        assert!(matches!(
+            first_table_schema(&resolution),
+            Some(RelationSchema::Known(_))
+        ));
     }
 }
