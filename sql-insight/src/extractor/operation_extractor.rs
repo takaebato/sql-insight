@@ -5,7 +5,7 @@
 //! answers it in CRUD buckets, this module answers "what operations does
 //! this SQL perform, on which tables, and how do those tables relate?".
 //!
-//! The output is per-statement: one [`StatementOperations`] per parsed
+//! The output is per-statement: one [`StatementTableOperations`] per parsed
 //! statement, since a single application call (e.g. an ORM `execute()`)
 //! typically corresponds to a single statement.
 //!
@@ -13,6 +13,7 @@
 //! project roadmap; the MVP currently focuses on table-level operations.
 //! `usages` enrichment and richer `table_flows` arrive in later steps.
 
+use crate::catalog::Catalog;
 use crate::error::Error;
 use crate::operation::TableRole;
 use crate::relation::TableReference;
@@ -21,31 +22,37 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
-/// Convenience function to extract operations from SQL.
+/// Convenience function to extract table-level operations from SQL.
+///
+/// `catalog` is consulted opportunistically for relation-level enrichment
+/// (table schema lookup, future view expansion and synonym resolution).
+/// Pass `None` for the lightest path — table-level extraction works
+/// purely from the AST and never requires a catalog.
 ///
 /// ## Example
 ///
 /// ```rust
 /// use sql_insight::sqlparser::dialect::GenericDialect;
-/// use sql_insight::{extract_operations, StatementKind, TableRole};
+/// use sql_insight::{extract_table_operations, StatementKind, TableRole};
 ///
 /// let dialect = GenericDialect {};
-/// let result = extract_operations(&dialect, "SELECT * FROM users").unwrap();
+/// let result = extract_table_operations(&dialect, "SELECT * FROM users", None).unwrap();
 /// let ops = result[0].as_ref().unwrap();
 /// assert_eq!(ops.statement_kind, StatementKind::Select);
 /// assert_eq!(ops.table_operations.len(), 1);
 /// assert_eq!(ops.table_operations[0].role, TableRole::Read);
 /// ```
-pub fn extract_operations(
+pub fn extract_table_operations(
     dialect: &dyn Dialect,
     sql: &str,
-) -> Result<Vec<Result<StatementOperations, Error>>, Error> {
-    OperationExtractor::extract(dialect, sql)
+    catalog: Option<&dyn Catalog>,
+) -> Result<Vec<Result<StatementTableOperations, Error>>, Error> {
+    TableOperationExtractor::extract(dialect, sql, catalog)
 }
 
 /// Operations performed by a single SQL statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatementOperations {
+pub struct StatementTableOperations {
     pub statement_kind: StatementKind,
     pub table_operations: Vec<TableOperation>,
     pub table_flows: Vec<TableFlow>,
@@ -105,7 +112,7 @@ pub enum TableUsage {
 /// with both sources. This keeps equality and aggregation across
 /// statements simple (set-union over edges).
 ///
-/// **Note:** `StatementOperations::table_flows` is currently always empty.
+/// **Note:** `StatementTableOperations::table_flows` is currently always empty.
 /// Flow extraction needs a scope-kind distinction between data-feeding and
 /// predicate subqueries (so `INSERT INTO t SELECT FROM s WHERE id IN
 /// (SELECT id FROM x)` correctly emits `s → t` only, not `x → t`); that
@@ -137,25 +144,27 @@ pub enum OperationDiagnosticCode {
 
 /// Extracts operations from SQL.
 #[derive(Default, Debug)]
-pub struct OperationExtractor;
+pub struct TableOperationExtractor;
 
-impl OperationExtractor {
+impl TableOperationExtractor {
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,
-    ) -> Result<Vec<Result<StatementOperations, Error>>, Error> {
+        catalog: Option<&dyn Catalog>,
+    ) -> Result<Vec<Result<StatementTableOperations, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         Ok(statements
             .iter()
-            .map(Self::extract_from_statement)
+            .map(|s| Self::extract_from_statement(s, catalog))
             .collect())
     }
 
     pub fn extract_from_statement(
         statement: &Statement,
-    ) -> Result<StatementOperations, Error> {
+        catalog: Option<&dyn Catalog>,
+    ) -> Result<StatementTableOperations, Error> {
         let kind = classify_statement(statement);
-        let resolution = RelationResolver::resolve_statement(None, statement)?;
+        let resolution = RelationResolver::resolve_statement(catalog, statement)?;
 
         let mut table_operations = Vec::new();
         let mut diagnostics = Vec::new();
@@ -183,7 +192,7 @@ impl OperationExtractor {
             }
         }
 
-        Ok(StatementOperations {
+        Ok(StatementTableOperations {
             statement_kind: kind,
             table_operations,
             table_flows: Vec::new(),
@@ -233,12 +242,20 @@ mod tests {
     use super::*;
     use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
 
-    fn extract(sql: &str) -> StatementOperations {
+    fn extract(sql: &str) -> StatementTableOperations {
         extract_with(sql, &GenericDialect {})
     }
 
-    fn extract_with(sql: &str, dialect: &dyn Dialect) -> StatementOperations {
-        let mut result = extract_operations(dialect, sql).unwrap();
+    fn extract_with(sql: &str, dialect: &dyn Dialect) -> StatementTableOperations {
+        extract_with_catalog(sql, dialect, None)
+    }
+
+    fn extract_with_catalog(
+        sql: &str,
+        dialect: &dyn Dialect,
+        catalog: Option<&dyn Catalog>,
+    ) -> StatementTableOperations {
+        let mut result = extract_table_operations(dialect, sql, catalog).unwrap();
         result.remove(0).unwrap()
     }
 
@@ -325,8 +342,12 @@ mod tests {
     #[test]
     fn multiple_statements_produce_multiple_results() {
         let dialect = GenericDialect {};
-        let result =
-            extract_operations(&dialect, "SELECT * FROM t1; SELECT * FROM t2").unwrap();
+        let result = extract_table_operations(
+            &dialect,
+            "SELECT * FROM t1; SELECT * FROM t2",
+            None,
+        )
+        .unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(
             result[0].as_ref().unwrap().table_operations[0].table,
