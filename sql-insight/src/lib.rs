@@ -23,18 +23,22 @@
 //!
 //! For more comprehensive examples and usage, refer to [crates.io](https://crates.io/crates/sql-insight) or the documentation of each module.
 
+pub mod catalog;
 pub mod diagnostic;
 pub mod error;
 pub mod extractor;
 pub mod formatter;
 pub mod normalizer;
+pub mod operation;
 pub mod relation;
 pub(crate) mod resolver;
 
+pub use catalog::{Catalog, ColumnSchema};
 pub use diagnostic::*;
 pub use extractor::*;
 pub use formatter::*;
 pub use normalizer::*;
+pub use operation::TableRole;
 pub use relation::*;
 pub use sqlparser;
 

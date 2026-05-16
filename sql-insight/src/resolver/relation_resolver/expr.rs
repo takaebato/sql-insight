@@ -7,7 +7,7 @@ use sqlparser::ast::{
     WildcardAdditionalOptions, WindowFrameBound, WindowSpec, WindowType,
 };
 
-impl RelationResolver {
+impl<'a> RelationResolver<'a> {
     pub(super) fn visit_expr(&mut self, expr: &Expr) -> Result<(), Error> {
         // Keep this match exhaustive so sqlparser Expr additions are reviewed here.
         match expr {

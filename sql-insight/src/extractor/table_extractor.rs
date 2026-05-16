@@ -96,9 +96,11 @@ impl TableExtractor {
     }
 
     pub fn extract_from_statement(statement: &Statement) -> Result<TableExtraction, Error> {
-        let resolution = RelationResolver::resolve_statement(statement)?;
+        // The legacy table-extraction API does not surface columns, so a
+        // catalog would not influence its output; pass `None`.
+        let resolution = RelationResolver::resolve_statement(None, statement)?;
         Ok(TableExtraction {
-            tables: resolution.physical_tables(),
+            tables: resolution.tables(),
             diagnostics: resolution.diagnostics,
         })
     }
@@ -110,7 +112,7 @@ impl TableExtractor {
     // Concrete type `TableWithJoins` exposes the table-node entry point needed by CRUD extraction.
     pub(crate) fn extract_from_table_node(table: &TableWithJoins) -> Result<Tables, Error> {
         Ok(Tables(
-            RelationResolver::resolve_table_node(table)?.physical_tables(),
+            RelationResolver::resolve_table_node(None, table)?.tables(),
         ))
     }
 }
@@ -382,7 +384,7 @@ mod tests {
 
         #[test]
         fn test_derived_table_and_lateral_sources() {
-            // Outer scope's physical tables (t2 via JOIN) come before nested
+            // Outer scope's tables (t2 via JOIN) come before nested
             // scopes (LATERAL subquery's t1).
             let sql = "SELECT * FROM LATERAL (SELECT id FROM t1) AS d JOIN t2 ON d.id = t2.id";
             let expected = vec![ok_tables(vec![table("t2"), table("t1")])];
@@ -445,7 +447,7 @@ mod tests {
         #[test]
         fn test_dialect_specific_query_clauses_with_subqueries() {
             // DISTINCT ON / TOP exprs are walked before FROM, but the outer
-            // scope's physical tables (t1) still come before the nested
+            // scope's tables (t1) still come before the nested
             // subquery's (t2) under scope-order traversal.
             assert_table_extraction(
                 "SELECT DISTINCT ON ((SELECT id FROM t2)) id FROM t1",
@@ -501,7 +503,7 @@ mod tests {
 
         #[test]
         fn test_pipe_operator_sources() {
-            // Outer scope's physical tables (t1 from FROM, t3 from |> JOIN) come
+            // Outer scope's tables (t1 from FROM, t3 from |> JOIN) come
             // before the WHERE subquery's nested scope (t2).
             let sql =
                 "SELECT * FROM t1 |> WHERE id IN (SELECT id FROM t2) |> JOIN t3 ON id = t3.id";
@@ -597,7 +599,7 @@ mod tests {
     #[test]
     fn test_statement_with_quoted_cte_does_not_match_unquoted_reference() {
         let sql = r#"WITH "T2" AS (SELECT id FROM t1) SELECT * FROM t2"#;
-        // Outer scope's physical t2 (CTE didn't match the unquoted reference)
+        // Outer scope's t2 (CTE didn't match the unquoted reference)
         // precedes the nested CTE body's t1.
         let expected = vec![ok_tables(vec![table("t2"), table("t1")])];
         assert_table_extraction(

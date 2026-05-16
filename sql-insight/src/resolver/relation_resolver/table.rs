@@ -1,14 +1,22 @@
-use super::{RelationResolver, Schema};
+use super::{RelationResolver, RelationSchema};
 use crate::error::Error;
+use crate::operation::TableRole;
 use crate::relation::TableReference;
 use sqlparser::ast::{
     FunctionArg, Join, JoinConstraint, JoinOperator, PivotValueSource, TableFactor, TableSample,
     TableSampleKind, TableWithJoins,
 };
 
-impl RelationResolver {
-    pub(super) fn visit_table_with_joins(&mut self, table: &TableWithJoins) -> Result<(), Error> {
-        self.visit_table_factor(&table.relation)?;
+impl<'a> RelationResolver<'a> {
+    /// Visit a `TableWithJoins`. `role` applies only to the head relation;
+    /// joined tables are always read-position (a write target makes no
+    /// sense in a JOIN for any of our statement kinds).
+    pub(super) fn visit_table_with_joins(
+        &mut self,
+        table: &TableWithJoins,
+        role: TableRole,
+    ) -> Result<(), Error> {
+        self.visit_table_factor(&table.relation, role)?;
         for join in &table.joins {
             self.visit_join(join)?;
         }
@@ -16,7 +24,7 @@ impl RelationResolver {
     }
 
     pub(super) fn visit_join(&mut self, join: &Join) -> Result<(), Error> {
-        self.visit_table_factor(&join.relation)?;
+        self.visit_table_factor(&join.relation, TableRole::Read)?;
         match &join.join_operator {
             JoinOperator::Join(constraint)
             | JoinOperator::Inner(constraint)
@@ -51,7 +59,16 @@ impl RelationResolver {
         }
     }
 
-    pub(super) fn visit_table_factor(&mut self, table_factor: &TableFactor) -> Result<(), Error> {
+    /// Visit a `TableFactor`. `role` is consumed only by the `Table`
+    /// variant where it controls how the resulting binding is stamped;
+    /// the other variants (Derived, NestedJoin, Pivot, ...) only bind
+    /// aliases that are `DerivedTable` / `TableFunction` — they don't
+    /// carry a table role.
+    pub(super) fn visit_table_factor(
+        &mut self,
+        table_factor: &TableFactor,
+        role: TableRole,
+    ) -> Result<(), Error> {
         match table_factor {
             TableFactor::Table {
                 name,
@@ -63,12 +80,12 @@ impl RelationResolver {
             } => {
                 if self.is_cte_reference(name) {
                     if let Some(alias) = alias {
-                        self.bind_cte(alias.name.clone(), Schema::Unknown);
+                        self.bind_cte(alias.name.clone(), RelationSchema::Unknown);
                     }
                     return Ok(());
                 }
                 let table = TableReference::try_from(table_factor)?;
-                self.bind_base_table(table);
+                self.bind_base_table(table, role);
                 if let Some(args) = args {
                     self.visit_table_function_args(&args.args)?;
                     if let Some(settings) = &args.settings {
@@ -100,9 +117,9 @@ impl RelationResolver {
                 table_with_joins,
                 alias,
             } => {
-                self.visit_table_with_joins(table_with_joins)?;
+                self.visit_table_with_joins(table_with_joins, TableRole::Read)?;
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone(), Schema::Unknown);
+                    self.bind_derived_table(alias.name.clone(), RelationSchema::Unknown);
                 }
             }
             TableFactor::Pivot {
@@ -114,7 +131,7 @@ impl RelationResolver {
                 alias,
                 ..
             } => {
-                self.visit_table_factor(table)?;
+                self.visit_table_factor(table, TableRole::Read)?;
                 for expr in aggregate_functions {
                     self.visit_expr(&expr.expr)?;
                 }
@@ -124,7 +141,7 @@ impl RelationResolver {
                     self.visit_expr(expr)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone(), Schema::Unknown);
+                    self.bind_derived_table(alias.name.clone(), RelationSchema::Unknown);
                 }
             }
             TableFactor::Unpivot {
@@ -134,13 +151,13 @@ impl RelationResolver {
                 alias,
                 ..
             } => {
-                self.visit_table_factor(table)?;
+                self.visit_table_factor(table, TableRole::Read)?;
                 self.visit_expr(value)?;
                 for expr in columns {
                     self.visit_expr(&expr.expr)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone(), Schema::Unknown);
+                    self.bind_derived_table(alias.name.clone(), RelationSchema::Unknown);
                 }
             }
             TableFactor::MatchRecognize {
@@ -152,7 +169,7 @@ impl RelationResolver {
                 alias,
                 ..
             } => {
-                self.visit_table_factor(table)?;
+                self.visit_table_factor(table, TableRole::Read)?;
                 self.visit_exprs(partition_by)?;
                 for order_by in order_by {
                     self.visit_order_by_expr(order_by)?;
@@ -164,7 +181,7 @@ impl RelationResolver {
                     self.visit_expr(&symbol.definition)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone(), Schema::Unknown);
+                    self.bind_derived_table(alias.name.clone(), RelationSchema::Unknown);
                 }
             }
             TableFactor::TableFunction { expr, alias } => {

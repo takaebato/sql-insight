@@ -1,11 +1,12 @@
 use super::RelationResolver;
 use crate::error::Error;
+use crate::operation::TableRole;
 use crate::relation::TableReference;
 use sqlparser::ast::{
     Delete, FromTable, Merge, ObjectType, Statement, TableWithJoins, Update, UpdateTableFromKind,
 };
 
-impl RelationResolver {
+impl<'a> RelationResolver<'a> {
     pub(super) fn visit_statement(&mut self, statement: &Statement) -> Result<(), Error> {
         // Keep this match exhaustive. Unsupported variants are listed explicitly so sqlparser
         // Statement additions become compile errors instead of silent misses.
@@ -16,30 +17,48 @@ impl RelationResolver {
             Statement::Delete(delete) => self.visit_delete(delete),
             Statement::Merge(merge) => self.visit_merge(merge),
             Statement::CreateTable(create_table) => {
-                self.bind_base_table(TableReference::try_from(&create_table.name)?);
+                self.bind_base_table(
+                    TableReference::try_from(&create_table.name)?,
+                    TableRole::Write,
+                );
                 if let Some(query) = &create_table.query {
                     self.resolve_query(query)?;
                 }
                 Ok(())
             }
             Statement::CreateView(create_view) => {
-                self.bind_base_table(TableReference::try_from(&create_view.name)?);
+                self.bind_base_table(
+                    TableReference::try_from(&create_view.name)?,
+                    TableRole::Write,
+                );
                 self.resolve_query(&create_view.query)?;
                 if let Some(to) = &create_view.to {
-                    self.bind_base_table(TableReference::try_from(to)?);
+                    self.bind_base_table(
+                        TableReference::try_from(to)?,
+                        TableRole::Write,
+                    );
                 }
                 Ok(())
             }
             Statement::AlterView { name, query, .. } => {
-                self.bind_base_table(TableReference::try_from(name)?);
+                self.bind_base_table(
+                    TableReference::try_from(name)?,
+                    TableRole::Write,
+                );
                 self.resolve_query(query).map(|_| ())
             }
             Statement::CreateVirtualTable { name, .. } => {
-                self.bind_base_table(TableReference::try_from(name)?);
+                self.bind_base_table(
+                    TableReference::try_from(name)?,
+                    TableRole::Write,
+                );
                 Ok(())
             }
             Statement::AlterTable(alter_table) => {
-                self.bind_base_table(TableReference::try_from(&alter_table.name)?);
+                self.bind_base_table(
+                    TableReference::try_from(&alter_table.name)?,
+                    TableRole::Write,
+                );
                 Ok(())
             }
             Statement::Drop {
@@ -53,17 +72,26 @@ impl RelationResolver {
                     ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
                 ) {
                     for name in names {
-                        self.bind_base_table(TableReference::try_from(name)?);
+                        self.bind_base_table(
+                            TableReference::try_from(name)?,
+                            TableRole::Write,
+                        );
                     }
                 }
                 if let Some(table) = table {
-                    self.bind_base_table(TableReference::try_from(table)?);
+                    self.bind_base_table(
+                        TableReference::try_from(table)?,
+                        TableRole::Write,
+                    );
                 }
                 Ok(())
             }
             Statement::Truncate(truncate) => {
                 for table in &truncate.table_names {
-                    self.bind_base_table(TableReference::try_from(&table.name)?);
+                    self.bind_base_table(
+                        TableReference::try_from(&table.name)?,
+                        TableRole::Write,
+                    );
                 }
                 Ok(())
             }
@@ -189,7 +217,7 @@ impl RelationResolver {
     }
 
     fn visit_insert(&mut self, insert: &sqlparser::ast::Insert) -> Result<(), Error> {
-        self.bind_base_table(TableReference::try_from(insert)?);
+        self.bind_base_table(TableReference::try_from(insert)?, TableRole::Write);
         if let Some(source) = &insert.source {
             self.resolve_query(source)?;
         }
@@ -200,7 +228,9 @@ impl RelationResolver {
     }
 
     fn visit_update(&mut self, update: &Update) -> Result<(), Error> {
-        self.visit_table_with_joins(&update.table)?;
+        // The head of update.table is the write target; joined tables
+        // (inside visit_table_with_joins) are reads by definition.
+        self.visit_table_with_joins(&update.table, TableRole::Write)?;
         if let Some(from) = &update.from {
             let tables = match from {
                 UpdateTableFromKind::BeforeSet(tables) | UpdateTableFromKind::AfterSet(tables) => {
@@ -208,7 +238,7 @@ impl RelationResolver {
                 }
             };
             for table in tables {
-                self.visit_table_with_joins(table)?;
+                self.visit_table_with_joins(table, TableRole::Read)?;
             }
         }
         for assignment in &update.assignments {
@@ -221,28 +251,47 @@ impl RelationResolver {
     }
 
     fn visit_delete(&mut self, delete: &Delete) -> Result<(), Error> {
+        // Visit in alias-defining order so that later Write binds merge
+        // onto already-resolved `TableReference`s rather than overwriting
+        // them with bare names.
+        //
+        // The FROM clause's role depends on the shape of the DELETE:
+        //   bare `DELETE FROM t`               → FROM is write target
+        //   `DELETE FROM target USING source`  → FROM is write target, USING is read-and-alias-source
+        //   `DELETE target FROM source`        → FROM is read-and-alias-source, tables list is write target
+        //
+        // In the USING shape the alias-defining clause is USING, so visit
+        // USING first. In the explicit-target-list shape the
+        // alias-defining clause is FROM, which we also want visited before
+        // the tables list is merged on top.
         if let Some(using) = &delete.using {
             for table in using {
-                self.visit_table_with_joins(table)?;
+                self.visit_table_with_joins(table, TableRole::Read)?;
             }
+        }
+        let from_role = if delete.tables.is_empty() {
+            TableRole::Write
         } else {
-            for table in from_table_items(&delete.from) {
-                self.visit_table_with_joins(table)?;
-            }
+            TableRole::Read
+        };
+        for table in from_table_items(&delete.from) {
+            self.visit_table_with_joins(table, from_role.clone())?;
+        }
+        for name in &delete.tables {
+            self.bind_base_table(
+                TableReference::try_from_name(name)?,
+                TableRole::Write,
+            );
         }
         if let Some(selection) = &delete.selection {
             self.visit_expr(selection)?;
         }
-        // DELETE target names (delete.tables) used to be resolved to base
-        // tables and spliced into the output; the scope walk now picks up the
-        // same bindings via FROM/USING. Targets specifically belong to the
-        // forthcoming operations API as a TableOperation.kind = Delete.
         Ok(())
     }
 
     fn visit_merge(&mut self, merge: &Merge) -> Result<(), Error> {
-        self.visit_table_factor(&merge.table)?;
-        self.visit_table_factor(&merge.source)?;
+        self.visit_table_factor(&merge.table, TableRole::Write)?;
+        self.visit_table_factor(&merge.source, TableRole::Read)?;
         self.visit_expr(&merge.on)?;
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {

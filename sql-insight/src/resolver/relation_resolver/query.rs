@@ -1,18 +1,19 @@
-use super::{Column, RelationResolver, ResolvedQuery, Schema};
+use super::{Column, RelationResolver, RelationSchema, ResolvedQuery};
 use crate::error::Error;
+use crate::operation::TableRole;
 use crate::relation::TableReference;
 use sqlparser::ast::{
     ConnectByKind, Distinct, Expr, GroupByExpr, GroupByWithModifier, NamedWindowExpr, Query,
     Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Table, TopQuantity, Values,
 };
 
-impl RelationResolver {
+impl<'a> RelationResolver<'a> {
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
         let scope_id = self.scopes.push_query_scope();
         if let Some(with) = &query.with {
             if with.recursive {
                 for cte in &with.cte_tables {
-                    self.bind_cte(cte.alias.name.clone(), Schema::Unknown);
+                    self.bind_cte(cte.alias.name.clone(), RelationSchema::Unknown);
                 }
                 for cte in &with.cte_tables {
                     // Body's output_schema is discarded for recursive CTEs;
@@ -51,7 +52,7 @@ impl RelationResolver {
         })
     }
 
-    fn visit_set_expr(&mut self, set_expr: &SetExpr) -> Result<Schema, Error> {
+    fn visit_set_expr(&mut self, set_expr: &SetExpr) -> Result<RelationSchema, Error> {
         match set_expr {
             SetExpr::Select(select) => self.visit_select(select),
             SetExpr::Query(query) => self.resolve_query(query).map(|r| r.output_schema),
@@ -67,20 +68,20 @@ impl RelationResolver {
             | SetExpr::Delete(statement)
             | SetExpr::Merge(statement) => {
                 self.visit_statement(statement)?;
-                Ok(Schema::Unknown)
+                Ok(RelationSchema::Unknown)
             }
             SetExpr::Table(table) => {
                 self.visit_table_command(table);
-                Ok(Schema::Unknown)
+                Ok(RelationSchema::Unknown)
             }
             SetExpr::Values(values) => {
                 self.visit_values(values)?;
-                Ok(Schema::Unknown)
+                Ok(RelationSchema::Unknown)
             }
         }
     }
 
-    fn visit_select(&mut self, select: &Select) -> Result<Schema, Error> {
+    fn visit_select(&mut self, select: &Select) -> Result<RelationSchema, Error> {
         if let Some(Distinct::On(exprs)) = &select.distinct {
             self.visit_exprs(exprs)?;
         }
@@ -90,13 +91,17 @@ impl RelationResolver {
             }
         }
         for table in &select.from {
-            self.visit_table_with_joins(table)?;
+            self.visit_table_with_joins(table, TableRole::Read)?;
         }
         for item in &select.projection {
             self.visit_select_item(item)?;
         }
         if let Some(into) = &select.into {
-            self.bind_base_table(TableReference::try_from(&into.name)?);
+            // SELECT ... INTO new_table acts like CTAS — INTO is the write target.
+            self.bind_base_table(
+                TableReference::try_from(&into.name)?,
+                TableRole::Write,
+            );
         }
         for lateral_view in &select.lateral_views {
             self.visit_expr(&lateral_view.lateral_view)?;
@@ -156,15 +161,19 @@ impl RelationResolver {
         let Some(name) = &table.table_name else {
             return;
         };
-        self.bind_base_table(TableReference {
-            catalog: None,
-            schema: table
-                .schema_name
-                .as_ref()
-                .map(|schema| schema.as_str().into()),
-            name: name.as_str().into(),
-            alias: None,
-        });
+        // `TABLE foo` is sugar for `SELECT * FROM foo` — foo is read.
+        self.bind_base_table(
+            TableReference {
+                catalog: None,
+                schema: table
+                    .schema_name
+                    .as_ref()
+                    .map(|schema| schema.as_str().into()),
+                name: name.as_str().into(),
+                alias: None,
+            },
+            TableRole::Read,
+        );
     }
 
     fn visit_values(&mut self, values: &Values) -> Result<(), Error> {
@@ -194,19 +203,19 @@ impl RelationResolver {
     }
 }
 
-/// Derive an output `Schema` from a `SELECT` projection, structurally only.
-/// Wildcards and computed expressions fall back to `Schema::Unknown`; that
+/// Derive an output `RelationSchema` from a `SELECT` projection, structurally only.
+/// Wildcards and computed expressions fall back to `RelationSchema::Unknown`; that
 /// gap is filled in later phases once catalog and in-scope relation schemas
 /// can drive expansion.
-fn projection_schema(projection: &[SelectItem]) -> Schema {
+fn projection_schema(projection: &[SelectItem]) -> RelationSchema {
     let mut columns = Vec::with_capacity(projection.len());
     for item in projection {
         match column_from_select_item(item) {
             Some(column) => columns.push(column),
-            None => return Schema::Unknown,
+            None => return RelationSchema::Unknown,
         }
     }
-    Schema::Known(columns)
+    RelationSchema::Known(columns)
 }
 
 fn column_from_select_item(item: &SelectItem) -> Option<Column> {

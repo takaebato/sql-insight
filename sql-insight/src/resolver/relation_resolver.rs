@@ -5,8 +5,10 @@ mod table;
 
 use indexmap::IndexMap;
 
+use crate::catalog::{Catalog, ColumnSchema};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::error::Error;
+use crate::operation::TableRole;
 use crate::relation::TableReference;
 use sqlparser::ast::{Ident, ObjectName, Statement, TableWithJoins};
 
@@ -37,16 +39,49 @@ pub(crate) struct RelationResolution {
 }
 
 impl RelationResolution {
-    pub(crate) fn physical_tables(&self) -> Vec<TableReference> {
+    /// All tables touched by the statement, in scope-arena order.
+    /// Loses the per-binding role information; consumers that need it
+    /// (e.g. the operation extractor) should use [`table_bindings`]
+    /// instead.
+    pub(crate) fn tables(&self) -> Vec<TableReference> {
+        self.table_bindings()
+            .into_iter()
+            .map(|b| b.table)
+            .collect()
+    }
+
+    /// All table bindings paired with the roles they were bound under.
+    /// A single table can carry multiple roles when the same name is bound
+    /// from different positions of the same statement (e.g. `DELETE t1
+    /// FROM t1` → `roles = [Write, Read]`).
+    pub(crate) fn table_bindings(&self) -> Vec<TableBinding> {
         self.scopes
             .iter()
             .flat_map(|scope| scope.iter_bindings())
             .filter_map(|binding| match binding {
-                RelationBinding::PhysicalTable { table, .. } => Some(table.clone()),
+                RelationBinding::Table {
+                    table,
+                    roles,
+                    ..
+                } => Some(TableBinding {
+                    table: (**table).clone(),
+                    roles: roles.clone(),
+                }),
                 _ => None,
             })
             .collect()
     }
+}
+
+/// A view of a `RelationBinding::Table` for downstream consumers
+/// (operation extractor). Carries just the fields needed to derive
+/// `TableOperation`s; the schema is excluded because no current consumer
+/// reads it from this side — it lives on the binding itself for catalog
+/// enrichment.
+#[derive(Debug, Clone)]
+pub(crate) struct TableBinding {
+    pub(crate) table: TableReference,
+    pub(crate) roles: Vec<TableRole>,
 }
 
 #[derive(Debug)]
@@ -67,7 +102,25 @@ impl RelationScope {
     }
 
     fn bind(&mut self, name: &Ident, binding: RelationBinding) {
-        self.bindings.insert(RelationKey::from_ident(name), binding);
+        let key = RelationKey::from_ident(name);
+        // Re-binding the same name as a Table merges roles rather
+        // than replacing — this captures the `DELETE t1 FROM t1` style
+        // case where a single name plays multiple roles in one statement.
+        if let (
+            Some(RelationBinding::Table {
+                roles: existing, ..
+            }),
+            RelationBinding::Table { roles: new, .. },
+        ) = (self.bindings.get_mut(&key), &binding)
+        {
+            for role in new {
+                if !existing.contains(role) {
+                    existing.push(role.clone());
+                }
+            }
+            return;
+        }
+        self.bindings.insert(key, binding);
     }
 
     fn resolve(&self, name: &Ident) -> Option<&RelationBinding> {
@@ -137,7 +190,7 @@ impl ScopeStack {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum Schema {
+pub(crate) enum RelationSchema {
     Known(Vec<Column>),
     Unknown,
 }
@@ -151,39 +204,60 @@ pub(crate) struct Column {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum RelationBinding {
-    PhysicalTable { table: TableReference, schema: Schema },
-    Cte { name: Ident, schema: Schema },
-    DerivedTable { alias: Ident, schema: Schema },
-    TableFunction { alias: Ident, schema: Schema },
+    // `table` is boxed because the variant otherwise dwarfs the others
+    // (TableReference is ~300B) and inflates the entire enum's size.
+    Table {
+        table: Box<TableReference>,
+        schema: RelationSchema,
+        roles: Vec<TableRole>,
+    },
+    Cte { name: Ident, schema: RelationSchema },
+    DerivedTable { alias: Ident, schema: RelationSchema },
+    TableFunction { alias: Ident, schema: RelationSchema },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct ResolvedQuery {
     pub(crate) scope_id: ScopeId,
-    pub(crate) output_schema: Schema,
+    pub(crate) output_schema: RelationSchema,
 }
 
-#[derive(Default, Debug)]
-pub(crate) struct RelationResolver {
+#[derive(Debug)]
+pub(crate) struct RelationResolver<'a> {
+    // `None` means the resolver runs without external schema enrichment;
+    // table schemas stay `RelationSchema::Unknown` in that case.
+    catalog: Option<&'a dyn Catalog>,
     diagnostics: Vec<Diagnostic>,
     scopes: ScopeStack,
 }
 
-impl RelationResolver {
+impl<'a> RelationResolver<'a> {
+    fn new(catalog: Option<&'a dyn Catalog>) -> Self {
+        Self {
+            catalog,
+            diagnostics: Vec::new(),
+            scopes: ScopeStack::default(),
+        }
+    }
+
     pub(crate) fn resolve_statement(
+        catalog: Option<&'a dyn Catalog>,
         statement: &Statement,
     ) -> Result<RelationResolution, Error> {
-        let mut resolver = Self::default();
+        let mut resolver = Self::new(catalog);
         resolver.visit_statement(statement)?;
         Ok(resolver.into_relation_resolution())
     }
 
     pub(crate) fn resolve_table_node(
+        catalog: Option<&'a dyn Catalog>,
         table: &TableWithJoins,
     ) -> Result<RelationResolution, Error> {
-        let mut resolver = Self::default();
-        resolver.visit_table_with_joins(table)?;
+        let mut resolver = Self::new(catalog);
+        // `resolve_table_node` is called for FROM-style table nodes from
+        // legacy extractors; treat them as reads.
+        resolver.visit_table_with_joins(table, TableRole::Read)?;
         Ok(resolver.into_relation_resolution())
     }
 
@@ -201,25 +275,48 @@ impl RelationResolver {
         )
     }
 
-    fn bind_base_table(&mut self, table: TableReference) {
+    fn bind_base_table(&mut self, table: TableReference, role: TableRole) {
         let binding_name = table.alias.clone().unwrap_or_else(|| table.name.clone());
+        let schema = self.lookup_table_schema(&table);
         self.bind_relation(
             binding_name,
-            RelationBinding::PhysicalTable {
-                table,
-                schema: Schema::Unknown,
+            RelationBinding::Table {
+                table: Box::new(table),
+                schema,
+                roles: vec![role],
             },
         );
     }
 
-    fn bind_cte(&mut self, name: Ident, schema: Schema) {
+    /// Query the optional catalog for a table's columns. The alias is
+    /// stripped before the lookup because catalogs key tables by their
+    /// catalog/schema/name triplet; the alias is a callsite concern.
+    fn lookup_table_schema(&self, table: &TableReference) -> RelationSchema {
+        let Some(catalog) = self.catalog else {
+            return RelationSchema::Unknown;
+        };
+        let lookup_key = TableReference {
+            alias: None,
+            ..table.clone()
+        };
+        match catalog.columns(&lookup_key) {
+            Some(cols) => RelationSchema::Known(
+                cols.into_iter()
+                    .map(|ColumnSchema { name }| Column { name })
+                    .collect(),
+            ),
+            None => RelationSchema::Unknown,
+        }
+    }
+
+    fn bind_cte(&mut self, name: Ident, schema: RelationSchema) {
         self.bind_relation(
             name.clone(),
             RelationBinding::Cte { name, schema },
         );
     }
 
-    fn bind_derived_table(&mut self, alias: Ident, schema: Schema) {
+    fn bind_derived_table(&mut self, alias: Ident, schema: RelationSchema) {
         self.bind_relation(
             alias.clone(),
             RelationBinding::DerivedTable { alias, schema },
@@ -231,7 +328,7 @@ impl RelationResolver {
             alias.clone(),
             RelationBinding::TableFunction {
                 alias,
-                schema: Schema::Unknown,
+                schema: RelationSchema::Unknown,
             },
         );
     }
@@ -249,5 +346,92 @@ impl RelationResolver {
 
     fn bind_relation(&mut self, name: Ident, binding: RelationBinding) {
         self.scopes.bind_current(name, binding);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    use std::collections::HashMap;
+
+    #[derive(Debug, Default)]
+    struct TestCatalog {
+        tables: HashMap<String, Vec<&'static str>>,
+    }
+
+    impl TestCatalog {
+        fn with(mut self, name: &str, cols: Vec<&'static str>) -> Self {
+            self.tables.insert(name.to_string(), cols);
+            self
+        }
+    }
+
+    impl Catalog for TestCatalog {
+        fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
+            // Catalogs key by the catalog/schema/name triplet; the resolver
+            // is responsible for stripping alias before calling. Verify that.
+            assert!(table.alias.is_none(), "resolver must strip alias before catalog lookup");
+            self.tables.get(table.name.value.as_str()).map(|cols| {
+                cols.iter()
+                    .map(|c| ColumnSchema { name: Ident::new(*c) })
+                    .collect()
+            })
+        }
+    }
+
+    fn resolve(sql: &str, catalog: Option<&dyn Catalog>) -> RelationResolution {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        RelationResolver::resolve_statement(catalog, &statements[0]).unwrap()
+    }
+
+    fn first_table_schema(resolution: &RelationResolution) -> Option<&RelationSchema> {
+        resolution
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.bindings.values())
+            .find_map(|binding| match binding {
+                RelationBinding::Table { schema, .. } => Some(schema),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn catalog_hit_populates_table_schema() {
+        let catalog = TestCatalog::default().with("users", vec!["id", "email"]);
+        let resolution = resolve("SELECT * FROM users", Some(&catalog));
+        match first_table_schema(&resolution) {
+            Some(RelationSchema::Known(cols)) => {
+                assert_eq!(cols.len(), 2);
+                assert_eq!(cols[0].name.value, "id");
+                assert_eq!(cols[1].name.value, "email");
+            }
+            other => panic!("expected RelationSchema::Known(...), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn catalog_miss_keeps_schema_unknown() {
+        let catalog = TestCatalog::default();
+        let resolution = resolve("SELECT * FROM users", Some(&catalog));
+        assert!(matches!(first_table_schema(&resolution), Some(RelationSchema::Unknown)));
+    }
+
+    #[test]
+    fn no_catalog_keeps_schema_unknown() {
+        let resolution = resolve("SELECT * FROM users", None);
+        assert!(matches!(first_table_schema(&resolution), Some(RelationSchema::Unknown)));
+    }
+
+    #[test]
+    fn catalog_lookup_ignores_alias() {
+        // The assert in TestCatalog::columns enforces that the resolver strips
+        // the alias before calling, so this test passes only if that contract
+        // holds. The Known schema also confirms the catalog matched on name.
+        let catalog = TestCatalog::default().with("users", vec!["id"]);
+        let resolution = resolve("SELECT * FROM users AS u", Some(&catalog));
+        assert!(matches!(first_table_schema(&resolution), Some(RelationSchema::Known(_))));
     }
 }
