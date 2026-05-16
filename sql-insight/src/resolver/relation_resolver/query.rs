@@ -97,7 +97,11 @@ impl<'a> RelationResolver<'a> {
         }
         if let Some(into) = &select.into {
             // SELECT ... INTO new_table acts like CTAS — INTO is the write target.
-            self.bind_base_table(TableReference::try_from(&into.name)?, TableRole::Write);
+            self.bind_base_table(
+                TableReference::try_from(&into.name)?,
+                None,
+                TableRole::Write,
+            );
         }
         for lateral_view in &select.lateral_views {
             self.visit_expr(&lateral_view.lateral_view)?;
@@ -165,8 +169,8 @@ impl<'a> RelationResolver<'a> {
                     .as_ref()
                     .map(|schema| schema.as_str().into()),
                 name: name.as_str().into(),
-                alias: None,
             },
+            None,
             TableRole::Read,
         );
     }

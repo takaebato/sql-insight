@@ -226,7 +226,7 @@ mod integration {
                       insert into catalog.schema.t1 (a) select b from catalog.schema.t2;")
                 .assert()
                 .success()
-                .stdout("catalog.schema.t1 AS t1, catalog.schema.t2 AS t2\ncatalog.schema.t1, catalog.schema.t2\n")
+                .stdout("catalog.schema.t1, catalog.schema.t2\ncatalog.schema.t1, catalog.schema.t2\n")
                 .stderr("");
         }
 

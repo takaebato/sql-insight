@@ -117,14 +117,6 @@ mod tests {
             catalog: None,
             schema: None,
             name: name.into(),
-            alias: None,
-        }
-    }
-
-    fn table_alias(name: &str, alias: &str) -> TableReference {
-        TableReference {
-            alias: Some(alias.into()),
-            ..table(name)
         }
     }
 
@@ -133,14 +125,6 @@ mod tests {
             catalog: None,
             schema: Some(schema.into()),
             name: name.into(),
-            alias: None,
-        }
-    }
-
-    fn schema_table_alias(schema: &str, name: &str, alias: &str) -> TableReference {
-        TableReference {
-            alias: Some(alias.into()),
-            ..schema_table(schema, name)
         }
     }
 
@@ -149,19 +133,6 @@ mod tests {
             catalog: Some(catalog.into()),
             schema: Some(schema.into()),
             name: name.into(),
-            alias: None,
-        }
-    }
-
-    fn catalog_schema_table_alias(
-        catalog: &str,
-        schema: &str,
-        name: &str,
-        alias: &str,
-    ) -> TableReference {
-        TableReference {
-            alias: Some(alias.into()),
-            ..catalog_schema_table(catalog, schema, name)
         }
     }
 
@@ -210,22 +181,19 @@ mod tests {
 
     #[test]
     fn test_tables_display() {
-        let tables = Tables(vec![
-            catalog_schema_table_alias("c1", "s1", "t1", "a1"),
-            table("t2"),
-        ]);
+        let tables = Tables(vec![catalog_schema_table("c1", "s1", "t1"), table("t2")]);
 
-        assert_eq!(tables.to_string(), "c1.s1.t1 AS a1, t2");
+        assert_eq!(tables.to_string(), "c1.s1.t1, t2");
     }
 
     #[test]
     fn test_table_extraction_display() {
         let extraction = TableExtraction {
-            tables: vec![schema_table("s1", "t1"), table_alias("t2", "a2")],
+            tables: vec![schema_table("s1", "t1"), table("t2")],
             diagnostics: Vec::new(),
         };
 
-        assert_eq!(extraction.to_string(), "s1.t1, t2 AS a2");
+        assert_eq!(extraction.to_string(), "s1.t1, t2");
     }
 
     fn assert_unsupported_statement(sql: &str) {
@@ -389,7 +357,7 @@ mod tests {
                 ),
                 (
                     "SELECT * FROM generate_series((SELECT min_id FROM t1), 10) AS g",
-                    vec![table_alias("generate_series", "g"), table("t1")],
+                    vec![table("generate_series"), table("t1")],
                 ),
             ] {
                 assert_table_extraction(sql, vec![ok_tables(expected_tables)], generic_dialect());
@@ -508,7 +476,7 @@ mod tests {
     #[test]
     fn test_statement_with_alias() {
         let sql = "SELECT a FROM t1 AS t1_alias";
-        let expected = vec![ok_tables(vec![table_alias("t1", "t1_alias")])];
+        let expected = vec![ok_tables(vec![table("t1")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
@@ -536,11 +504,8 @@ mod tests {
     #[test]
     fn test_statement_with_table_identifier_and_alias() {
         let sql = "SELECT a FROM catalog.schema.table AS table_alias";
-        let expected = vec![ok_tables(vec![catalog_schema_table_alias(
-            "catalog",
-            "schema",
-            "table",
-            "table_alias",
+        let expected = vec![ok_tables(vec![catalog_schema_table(
+            "catalog", "schema", "table",
         )])];
         assert_table_extraction(sql, expected, all_dialects());
     }
@@ -667,10 +632,7 @@ mod tests {
             "WITH t1 AS (SELECT id FROM t2) SELECT * FROM t1 JOIN s1.t1 AS t3 ON t1.id = t3.id";
         // Outer scope's s1.t1 AS t3 (from JOIN) is recorded before the CTE
         // body's t2 in the nested scope.
-        let expected = vec![ok_tables(vec![
-            schema_table_alias("s1", "t1", "t3"),
-            table("t2"),
-        ])];
+        let expected = vec![ok_tables(vec![schema_table("s1", "t1"), table("t2")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 
@@ -728,10 +690,7 @@ mod tests {
         #[test]
         fn test_delete_statement_with_aliases() {
             let sql = "DELETE t1_alias FROM t1 AS t1_alias JOIN t2 AS t2_alias ON t1_alias.a = t2_alias.a WHERE t2_alias.b = 1";
-            let expected = vec![ok_tables(vec![
-                table_alias("t1", "t1_alias"),
-                table_alias("t2", "t2_alias"),
-            ])];
+            let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
@@ -743,7 +702,7 @@ mod tests {
         #[test]
         fn test_delete_statement_with_case_insensitive_alias_target() {
             let sql = "DELETE T1_ALIAS FROM t1 AS t1_alias JOIN t2 ON t1_alias.a = t2.a";
-            let expected = vec![ok_tables(vec![table_alias("t1", "t1_alias"), table("t2")])];
+            let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
@@ -782,11 +741,7 @@ mod tests {
         #[test]
         fn test_delete_from_statement_with_alias() {
             let sql = "DELETE FROM t1_alias, t2_alias USING t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
-            let expected = vec![ok_tables(vec![
-                table_alias("t1", "t1_alias"),
-                table_alias("t2", "t2_alias"),
-                table("t3"),
-            ])];
+            let expected = vec![ok_tables(vec![table("t1"), table("t2"), table("t3")])];
             assert_table_extraction(sql, expected, all_dialects());
         }
     }
@@ -844,11 +799,7 @@ mod tests {
         #[test]
         fn test_update_statement_with_alias() {
             let sql = "UPDATE t1 AS t1_alias INNER JOIN t2 ON t1_alias.a = t2.a SET t1_alias.b = t2.b WHERE t2.c = (SELECT c FROM t3)";
-            let expected = vec![ok_tables(vec![
-                table_alias("t1", "t1_alias"),
-                table("t2"),
-                table("t3"),
-            ])];
+            let expected = vec![ok_tables(vec![table("t1"), table("t2"), table("t3")])];
             assert_table_extraction(sql, expected, all_dialects());
         }
 
@@ -884,7 +835,7 @@ mod tests {
         let sql = "MERGE INTO t1 AS t1_alias USING (SELECT a, b FROM t2) AS t2_alias(a, b) ON t1_alias.a = t2_alias.a \
                          WHEN MATCHED THEN UPDATE SET t1_alias.b = t2_alias.b \
                          WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2_alias.a, t2_alias.b)";
-        let expected = vec![ok_tables(vec![table_alias("t1", "t1_alias"), table("t2")])];
+        let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
 

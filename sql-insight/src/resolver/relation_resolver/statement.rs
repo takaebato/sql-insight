@@ -18,6 +18,7 @@ impl<'a> RelationResolver<'a> {
             Statement::CreateTable(create_table) => {
                 self.bind_base_table(
                     TableReference::try_from(&create_table.name)?,
+                    None,
                     TableRole::Write,
                 );
                 if let Some(query) = &create_table.query {
@@ -28,25 +29,27 @@ impl<'a> RelationResolver<'a> {
             Statement::CreateView(create_view) => {
                 self.bind_base_table(
                     TableReference::try_from(&create_view.name)?,
+                    None,
                     TableRole::Write,
                 );
                 self.resolve_query(&create_view.query)?;
                 if let Some(to) = &create_view.to {
-                    self.bind_base_table(TableReference::try_from(to)?, TableRole::Write);
+                    self.bind_base_table(TableReference::try_from(to)?, None, TableRole::Write);
                 }
                 Ok(())
             }
             Statement::AlterView { name, query, .. } => {
-                self.bind_base_table(TableReference::try_from(name)?, TableRole::Write);
+                self.bind_base_table(TableReference::try_from(name)?, None, TableRole::Write);
                 self.resolve_query(query).map(|_| ())
             }
             Statement::CreateVirtualTable { name, .. } => {
-                self.bind_base_table(TableReference::try_from(name)?, TableRole::Write);
+                self.bind_base_table(TableReference::try_from(name)?, None, TableRole::Write);
                 Ok(())
             }
             Statement::AlterTable(alter_table) => {
                 self.bind_base_table(
                     TableReference::try_from(&alter_table.name)?,
+                    None,
                     TableRole::Write,
                 );
                 Ok(())
@@ -62,17 +65,25 @@ impl<'a> RelationResolver<'a> {
                     ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
                 ) {
                     for name in names {
-                        self.bind_base_table(TableReference::try_from(name)?, TableRole::Write);
+                        self.bind_base_table(
+                            TableReference::try_from(name)?,
+                            None,
+                            TableRole::Write,
+                        );
                     }
                 }
                 if let Some(table) = table {
-                    self.bind_base_table(TableReference::try_from(table)?, TableRole::Write);
+                    self.bind_base_table(TableReference::try_from(table)?, None, TableRole::Write);
                 }
                 Ok(())
             }
             Statement::Truncate(truncate) => {
                 for table in &truncate.table_names {
-                    self.bind_base_table(TableReference::try_from(&table.name)?, TableRole::Write);
+                    self.bind_base_table(
+                        TableReference::try_from(&table.name)?,
+                        None,
+                        TableRole::Write,
+                    );
                 }
                 Ok(())
             }
@@ -198,7 +209,8 @@ impl<'a> RelationResolver<'a> {
     }
 
     fn visit_insert(&mut self, insert: &sqlparser::ast::Insert) -> Result<(), Error> {
-        self.bind_base_table(TableReference::try_from(insert)?, TableRole::Write);
+        let (table, alias) = TableReference::from_insert_with_alias(insert)?;
+        self.bind_base_table(table, alias, TableRole::Write);
         if let Some(source) = &insert.source {
             self.resolve_query(source)?;
         }
@@ -259,7 +271,7 @@ impl<'a> RelationResolver<'a> {
             self.visit_table_with_joins(table, from_role)?;
         }
         for name in &delete.tables {
-            self.bind_base_table(TableReference::try_from_name(name)?, TableRole::Write);
+            self.bind_base_table(TableReference::try_from_name(name)?, None, TableRole::Write);
         }
         if let Some(selection) = &delete.selection {
             self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(selection))?;

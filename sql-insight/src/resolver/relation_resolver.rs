@@ -262,6 +262,10 @@ pub(crate) enum RelationBinding {
     // (TableReference is ~300B) and inflates the entire enum's size.
     Table {
         table: Box<TableReference>,
+        /// Alias given at this use-site, if any. Kept separately so
+        /// `TableReference` stays alias-free for catalog lookup and
+        /// cross-statement comparison.
+        alias: Option<Ident>,
         schema: RelationSchema,
         roles: Vec<TableRole>,
     },
@@ -348,30 +352,27 @@ impl<'a> RelationResolver<'a> {
         )
     }
 
-    fn bind_base_table(&mut self, table: TableReference, role: TableRole) {
-        let binding_name = table.alias.clone().unwrap_or_else(|| table.name.clone());
+    fn bind_base_table(&mut self, table: TableReference, alias: Option<Ident>, role: TableRole) {
+        let binding_name = alias.clone().unwrap_or_else(|| table.name.clone());
         let schema = self.lookup_table_schema(&table);
         self.bind_relation(
             binding_name,
             RelationBinding::Table {
                 table: Box::new(table),
+                alias,
                 schema,
                 roles: vec![role],
             },
         );
     }
 
-    /// Query the optional catalog for a table's columns. The alias is
-    /// stripped before the lookup because catalogs key tables by their
-    /// catalog/schema/name triplet; the alias is a callsite concern.
+    /// Query the optional catalog for a table's columns. `TableReference`
+    /// is already alias-free, so it is a valid catalog key as-is.
     fn lookup_table_schema(&self, table: &TableReference) -> RelationSchema {
         let Some(catalog) = self.catalog else {
             return RelationSchema::Unknown;
         };
-        let lookup_key = TableReference {
-            alias: None,
-            ..table.clone()
-        };
+        let lookup_key = table.clone();
         match catalog.columns(&lookup_key) {
             Some(cols) => RelationSchema::Known(
                 cols.into_iter()
@@ -440,12 +441,8 @@ mod tests {
 
     impl Catalog for TestCatalog {
         fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
-            // Catalogs key by the catalog/schema/name triplet; the resolver
-            // is responsible for stripping alias before calling. Verify that.
-            assert!(
-                table.alias.is_none(),
-                "resolver must strip alias before catalog lookup"
-            );
+            // TableReference is alias-free by construction now; this
+            // catalog just keys by table.name for the test.
             self.tables.get(table.name.value.as_str()).map(|cols| {
                 cols.iter()
                     .map(|c| ColumnSchema {

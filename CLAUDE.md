@@ -42,6 +42,11 @@ on `sqlparser-rs`; always work against its AST, never re-parse SQL by hand.
 - Internal-only `TableRole` (Read / Write) lives inside the resolver
   for binding metadata. It is not exposed via the public API — surface
   it through `reads` / `writes` instead.
+- `TableReference` is identity-only (`catalog` / `schema` / `name`).
+  Alias is a use-site decoration, not part of a table's identity, so
+  `HashSet<TableReference>` dedup and cross-statement comparison
+  behave intuitively. Resolver bindings carry alias as a separate
+  field; the public API does not currently surface it.
 
 ## Conventions
 

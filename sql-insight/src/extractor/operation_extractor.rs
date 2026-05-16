@@ -311,32 +311,14 @@ mod tests {
             catalog: None,
             schema: None,
             name: name.into(),
-            alias: None,
-        }
-    }
-
-    fn table_alias(name: &str, alias: &str) -> TableReference {
-        TableReference {
-            alias: Some(alias.into()),
-            ..table(name)
         }
     }
 
     fn read(name: &str) -> TableRead {
         TableRead { table: table(name) }
     }
-    fn read_aliased(name: &str, alias: &str) -> TableRead {
-        TableRead {
-            table: table_alias(name, alias),
-        }
-    }
     fn write(name: &str) -> TableWrite {
         TableWrite { table: table(name) }
-    }
-    fn write_aliased(name: &str, alias: &str) -> TableWrite {
-        TableWrite {
-            table: table_alias(name, alias),
-        }
     }
     fn flow(source: &str, target: &str) -> TableFlow {
         TableFlow {
@@ -498,8 +480,8 @@ mod tests {
             &MySqlDialect {},
         );
         assert_eq!(ops.statement_kind, StatementKind::Delete);
-        assert_eq!(ops.writes, vec![write_aliased("t1", "t1_alias")]);
-        assert_eq!(ops.reads, vec![read_aliased("t1", "t1_alias"), read("t2")]);
+        assert_eq!(ops.writes, vec![write("t1")]);
+        assert_eq!(ops.reads, vec![read("t1"), read("t2")]);
     }
 
     #[test]

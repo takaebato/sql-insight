@@ -80,7 +80,6 @@ mod integration {
                                 catalog: None,
                                 schema: None,
                                 name: "t1".into(),
-                                alias: None,
                             }],
                             update_tables: vec![],
                             delete_tables: vec![],
@@ -91,7 +90,6 @@ mod integration {
                                 catalog: None,
                                 schema: None,
                                 name: "t2".into(),
-                                alias: None,
                             }],
                             update_tables: vec![],
                             delete_tables: vec![],
@@ -115,7 +113,6 @@ mod integration {
                             catalog: None,
                             schema: None,
                             name: "t1".into(),
-                            alias: None,
                         }],
                         update_tables: vec![],
                         delete_tables: vec![],
@@ -145,13 +142,11 @@ mod integration {
                             catalog: None,
                             schema: None,
                             name: "t1".into(),
-                            alias: None,
                         }])),
                         Ok(Tables(vec![TableReference {
                             catalog: None,
                             schema: None,
                             name: "t2".into(),
-                            alias: None,
                         }])),
                     ],
                     "Failed for dialect: {dialect:?}"
@@ -174,7 +169,6 @@ mod integration {
                         catalog: None,
                         schema: None,
                         name: "t1".into(),
-                        alias: None,
                     }]))],
                     "Failed for dialect: {dialect:?}"
                 )

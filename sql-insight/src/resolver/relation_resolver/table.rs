@@ -85,8 +85,9 @@ impl<'a> RelationResolver<'a> {
                     }
                     return Ok(());
                 }
-                let table = TableReference::try_from(table_factor)?;
-                self.bind_base_table(table, role);
+                let (table, alias_ident) =
+                    TableReference::from_table_factor_with_alias(table_factor)?;
+                self.bind_base_table(table, alias_ident, role);
                 if let Some(args) = args {
                     self.visit_table_function_args(&args.args)?;
                     if let Some(settings) = &args.settings {
