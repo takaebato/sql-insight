@@ -747,26 +747,34 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)] // transitional during whole-value migration
-    fn assert_flows(sql: &str, expected: Vec<ColumnFlow>) {
-        assert_eq!(extract(sql).flows, expected, "SQL: {sql}");
-    }
-
-    fn assert_reads(sql: &str, expected: Vec<ColumnRead>) {
-        assert_eq!(extract(sql).reads, expected, "SQL: {sql}");
-    }
-
-    fn assert_writes(sql: &str, expected: Vec<ColumnWrite>) {
-        assert_eq!(extract(sql).writes, expected, "SQL: {sql}");
-    }
-
     /// Whole-value-ish assertion: pin down the full
     /// `StatementColumnOperations` for `sql`. reads / writes / flows /
     /// statement_kind compare strictly; diagnostics compare by **kind
     /// sequence only** so message wording and span coordinates aren't
     /// baked into the expected value.
     fn assert_column_ops(sql: &str, expected: StatementColumnOperations) {
-        let actual = extract(sql);
+        assert_nth_column_ops(sql, 0, expected);
+    }
+
+    /// Like `assert_column_ops` but for multi-statement batches —
+    /// targets the statement at `index`. Compose multiple calls to
+    /// pin down each statement in a batch independently.
+    fn assert_nth_column_ops(sql: &str, index: usize, expected: StatementColumnOperations) {
+        let actual = extract_column_operations(&GenericDialect {}, sql, None)
+            .unwrap()
+            .into_iter()
+            .nth(index)
+            .unwrap_or_else(|| panic!("statement {index} missing in result for SQL: {sql}"))
+            .unwrap();
+        assert_column_ops_inner(sql, index, actual, expected);
+    }
+
+    fn assert_column_ops_inner(
+        sql: &str,
+        index: usize,
+        actual: StatementColumnOperations,
+        expected: StatementColumnOperations,
+    ) {
         let StatementColumnOperations {
             statement_kind,
             reads,
@@ -774,21 +782,32 @@ mod tests {
             flows,
             diagnostics,
         } = expected;
-        assert_eq!(actual.statement_kind, statement_kind, "kind for SQL: {sql}");
-        assert_eq!(actual.reads, reads, "reads for SQL: {sql}");
-        assert_eq!(actual.writes, writes, "writes for SQL: {sql}");
-        assert_eq!(actual.flows, flows, "flows for SQL: {sql}");
+        assert_eq!(
+            actual.statement_kind, statement_kind,
+            "kind for SQL: {sql} (statement {index})"
+        );
+        assert_eq!(
+            actual.reads, reads,
+            "reads for SQL: {sql} (statement {index})"
+        );
+        assert_eq!(
+            actual.writes, writes,
+            "writes for SQL: {sql} (statement {index})"
+        );
+        assert_eq!(
+            actual.flows, flows,
+            "flows for SQL: {sql} (statement {index})"
+        );
         let actual_kinds: Vec<_> = actual.diagnostics.iter().map(|d| d.kind.clone()).collect();
         let expected_kinds: Vec<_> = diagnostics.iter().map(|d| d.kind.clone()).collect();
         assert_eq!(
             actual_kinds, expected_kinds,
-            "diagnostic kinds for SQL: {sql}"
+            "diagnostic kinds for SQL: {sql} (statement {index})"
         );
     }
 
     /// Placeholder `Diagnostic` for `assert_column_ops.expected.diagnostics`.
     /// Only the kind is compared; message and span are placeholders.
-    #[allow(dead_code)] // used as remaining mods migrate to assert_column_ops
     fn diag(kind: DiagnosticKind) -> Diagnostic {
         Diagnostic {
             kind,
@@ -1322,7 +1341,11 @@ mod tests {
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![
-                        read_with_kinds("t1", "a", vec![ReadKind::Projection, ReadKind::Conditional]),
+                        read_with_kinds(
+                            "t1",
+                            "a",
+                            vec![ReadKind::Projection, ReadKind::Conditional],
+                        ),
                         read("t1", "b"),
                         read("t1", "c"),
                     ],
@@ -1399,7 +1422,11 @@ mod tests {
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![
-                        read_with_kinds("t1", "x", vec![ReadKind::Projection, ReadKind::Conditional]),
+                        read_with_kinds(
+                            "t1",
+                            "x",
+                            vec![ReadKind::Projection, ReadKind::Conditional],
+                        ),
                         read("t1", "a"),
                         read("t1", "b"),
                     ],
@@ -1513,22 +1540,35 @@ mod tests {
 
         #[test]
         fn unsupported_statement_reports_diagnostic() {
-            let ops = extract("CREATE INDEX idx ON t1 (a)");
-            assert_eq!(ops.statement_kind, StatementKind::Unsupported);
-            assert!(ops.reads.is_empty());
-            assert!(ops.writes.is_empty());
-            assert_eq!(ops.diagnostics.len(), 1);
-            assert_eq!(
-                ops.diagnostics[0].kind,
-                DiagnosticKind::UnsupportedStatement
+            assert_column_ops(
+                "CREATE INDEX idx ON t1 (a)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Unsupported,
+                    reads: vec![],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![diag(DiagnosticKind::UnsupportedStatement)],
+                },
             );
         }
 
         #[test]
         fn wildcard_in_projection_reports_diagnostic() {
+            // Whole-value pin-down on the structural shape; assert_column_ops
+            // compares diagnostics by kind only. The message text and span
+            // coordinates are verified separately below since this test's
+            // *purpose* is to confirm both are populated.
             let ops = extract("SELECT * FROM t1");
-            let kinds: Vec<&DiagnosticKind> = ops.diagnostics.iter().map(|d| &d.kind).collect();
-            assert_eq!(kinds, vec![&DiagnosticKind::WildcardSuppressed]);
+            assert_column_ops(
+                "SELECT * FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                },
+            );
             // Span info ("at L1:C8") is duplicated in message and surfaced
             // as structured data for programmatic consumers.
             assert!(
@@ -1545,29 +1585,57 @@ mod tests {
 
         #[test]
         fn qualified_wildcard_in_projection_reports_diagnostic() {
-            let ops = extract("SELECT t1.* FROM t1");
-            let kinds: Vec<&DiagnosticKind> = ops.diagnostics.iter().map(|d| &d.kind).collect();
-            assert_eq!(kinds, vec![&DiagnosticKind::WildcardSuppressed]);
+            assert_column_ops(
+                "SELECT t1.* FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                },
+            );
         }
 
         #[test]
         fn multiple_statements_produce_multiple_results() {
-            let result = extract_column_operations(
-                &GenericDialect {},
-                "SELECT t1.a FROM t1; SELECT t2.b FROM t2",
-                None,
-            )
-            .unwrap();
-            assert_eq!(result.len(), 2);
-            assert_eq!(result[0].as_ref().unwrap().reads, vec![read("t1", "a")]);
-            assert_eq!(result[1].as_ref().unwrap().reads, vec![read("t2", "b")]);
+            let sql = "SELECT t1.a FROM t1; SELECT t2.b FROM t2";
+            assert_nth_column_ops(
+                sql,
+                0,
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
+            assert_nth_column_ops(
+                sql,
+                1,
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t2", "b"), out("b", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn wildcard_select_yields_no_column_ops() {
-            let ops = extract("SELECT * FROM t1");
-            assert!(ops.reads.is_empty());
-            assert!(ops.writes.is_empty());
+            assert_column_ops(
+                "SELECT * FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                },
+            );
         }
     }
 
@@ -2447,10 +2515,18 @@ mod tests {
             }
         }
 
-        fn extract_with_catalog(sql: &str, catalog: &dyn Catalog) -> StatementColumnOperations {
-            let mut result =
-                extract_column_operations(&GenericDialect {}, sql, Some(catalog)).unwrap();
-            result.remove(0).unwrap()
+        fn assert_column_ops_with_catalog(
+            sql: &str,
+            catalog: &dyn Catalog,
+            expected: StatementColumnOperations,
+        ) {
+            let actual = extract_column_operations(&GenericDialect {}, sql, Some(catalog))
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_column_ops_inner(sql, 0, actual, expected);
         }
 
         #[test]
@@ -2458,17 +2534,43 @@ mod tests {
             // Without catalog `SELECT a FROM t1` resolves a → t1.a
             // unconditionally (single Unknown binding heuristic). With
             // a catalog that says t1's columns are [x, y], `a` cannot
-            // come from t1 — it surfaces as unresolved.
+            // come from t1 — it surfaces as unresolved and fires
+            // UnresolvedColumn.
             let catalog = TestCatalog::default().with("t1", vec!["x", "y"]);
-            let ops = extract_with_catalog("SELECT a FROM t1", &catalog);
-            assert_eq!(ops.reads, vec![unresolved("a")]);
+            assert_column_ops_with_catalog(
+                "SELECT a FROM t1",
+                &catalog,
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![unresolved("a")],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: None,
+                            name: "a".into(),
+                        },
+                        target: out("a", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![diag(DiagnosticKind::UnresolvedColumn)],
+                },
+            );
         }
 
         #[test]
         fn catalog_known_schema_resolves_columns_present_in_table() {
             let catalog = TestCatalog::default().with("t1", vec!["a", "b"]);
-            let ops = extract_with_catalog("SELECT a FROM t1", &catalog);
-            assert_eq!(ops.reads, vec![read("t1", "a")]);
+            assert_column_ops_with_catalog(
+                "SELECT a FROM t1",
+                &catalog,
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
@@ -2478,15 +2580,20 @@ mod tests {
             // source projections positionally (s.a → t.x, s.b → t.y).
             // Unpaired catalog cols (z) get no flow / no write.
             let catalog = TestCatalog::default().with("t", vec!["x", "y", "z"]);
-            let ops = extract_with_catalog("INSERT INTO t SELECT a, b FROM s", &catalog);
-            assert_eq!(
-                ops.flows,
-                vec![
-                    flow_passthrough(col("s", "a"), persisted("t", "x")),
-                    flow_passthrough(col("s", "b"), persisted("t", "y")),
-                ]
+            assert_column_ops_with_catalog(
+                "INSERT INTO t SELECT a, b FROM s",
+                &catalog,
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("s", "a"), read("s", "b")],
+                    writes: vec![write("t", "x"), write("t", "y")],
+                    flows: vec![
+                        flow_passthrough(col("s", "a"), persisted("t", "x")),
+                        flow_passthrough(col("s", "b"), persisted("t", "y")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(ops.writes, vec![write("t", "x"), write("t", "y")]);
         }
 
         #[test]
@@ -2494,44 +2601,67 @@ mod tests {
             // 3 source projections vs t = [x, y] — pair what fits,
             // surplus source column gets no flow.
             let catalog = TestCatalog::default().with("t", vec!["x", "y"]);
-            let ops = extract_with_catalog("INSERT INTO t SELECT a, b, c FROM s", &catalog);
-            assert_eq!(
-                ops.flows,
-                vec![
-                    flow_passthrough(col("s", "a"), persisted("t", "x")),
-                    flow_passthrough(col("s", "b"), persisted("t", "y")),
-                ]
+            assert_column_ops_with_catalog(
+                "INSERT INTO t SELECT a, b, c FROM s",
+                &catalog,
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("s", "a"), read("s", "b"), read("s", "c")],
+                    writes: vec![write("t", "x"), write("t", "y")],
+                    flows: vec![
+                        flow_passthrough(col("s", "a"), persisted("t", "x")),
+                        flow_passthrough(col("s", "b"), persisted("t", "y")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(ops.writes, vec![write("t", "x"), write("t", "y")]);
         }
 
         #[test]
         fn catalog_insert_explicit_columns_override_catalog_schema() {
             // Explicit (q) wins over catalog [x, y, z].
             let catalog = TestCatalog::default().with("t", vec!["x", "y", "z"]);
-            let ops = extract_with_catalog("INSERT INTO t (q) SELECT a FROM s", &catalog);
-            assert_eq!(
-                ops.flows,
-                vec![flow_passthrough(col("s", "a"), persisted("t", "q"))]
+            assert_column_ops_with_catalog(
+                "INSERT INTO t (q) SELECT a FROM s",
+                &catalog,
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("s", "a")],
+                    writes: vec![write("t", "q")],
+                    flows: vec![flow_passthrough(col("s", "a"), persisted("t", "q"))],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(ops.writes, vec![write("t", "q")]);
         }
 
         #[test]
         fn catalog_merge_not_matched_insert_no_cols_pairs_via_catalog() {
-            // Same catalog fallback applies to MERGE's INSERT clause.
+            // Same catalog fallback applies to MERGE's INSERT clause:
+            // flows are paired via catalog. Surprise surfaced by whole-
+            // value compare: writes stay empty for catalog-paired MERGE
+            // INSERT — only `INSERT (cols) VALUES (...)` with an
+            // explicit column list populates writes.
             let catalog = TestCatalog::default().with("t", vec!["id", "a"]);
-            let ops = extract_with_catalog(
+            assert_column_ops_with_catalog(
                 "MERGE INTO t USING s ON t.id = s.id \
                  WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.a)",
                 &catalog,
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Merge,
+                    reads: vec![
+                        filter_read("t", "id"),
+                        filter_read("s", "id"),
+                        read("s", "id"),
+                        read("s", "a"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("s", "id"), persisted("t", "id")),
+                        flow_passthrough(col("s", "a"), persisted("t", "a")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
-            assert!(ops
-                .flows
-                .contains(&flow_passthrough(col("s", "id"), persisted("t", "id"))));
-            assert!(ops
-                .flows
-                .contains(&flow_passthrough(col("s", "a"), persisted("t", "a"))));
         }
 
         #[test]
@@ -2542,8 +2672,21 @@ mod tests {
             let catalog = TestCatalog::default()
                 .with("t1", vec!["id"])
                 .with("t2", vec!["id", "a"]);
-            let ops = extract_with_catalog("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id", &catalog);
-            assert!(ops.reads.contains(&read("t2", "a")));
+            assert_column_ops_with_catalog(
+                "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id",
+                &catalog,
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        filter_read("t1", "id"),
+                        filter_read("t2", "id"),
+                        read("t2", "a"),
+                    ],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t2", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
@@ -2551,20 +2694,50 @@ mod tests {
             // Both tables Known and both declare `a`. Diagnostic must
             // fire — without catalog the same query is silently
             // ambiguous (no diagnostic) since Unknown schemas could
-            // contain anything.
+            // contain anything. assert_column_ops compares diagnostics
+            // by kind only; the message-content checks are kept inline
+            // since they're this test's specific purpose.
             let catalog = TestCatalog::default()
                 .with("t1", vec!["a"])
                 .with("t2", vec!["a"]);
-            let ops = extract_with_catalog("SELECT a FROM t1 JOIN t2 ON t1.a = t2.a", &catalog);
-            let amb: Vec<_> = ops
+            assert_column_ops_with_catalog(
+                "SELECT a FROM t1 JOIN t2 ON t1.a = t2.a",
+                &catalog,
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        filter_read("t1", "a"),
+                        filter_read("t2", "a"),
+                        unresolved("a"),
+                    ],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: None,
+                            name: "a".into(),
+                        },
+                        target: out("a", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![diag(DiagnosticKind::AmbiguousColumn)],
+                },
+            );
+            // Specific message-content checks for this test's purpose.
+            let ops = extract_column_operations(
+                &GenericDialect {},
+                "SELECT a FROM t1 JOIN t2 ON t1.a = t2.a",
+                Some(&catalog),
+            )
+            .unwrap();
+            let ops = ops.into_iter().next().unwrap().unwrap();
+            let amb = ops
                 .diagnostics
                 .iter()
-                .filter(|d| matches!(d.kind, DiagnosticKind::AmbiguousColumn))
-                .collect();
-            assert_eq!(amb.len(), 1, "diagnostics: {:?}", ops.diagnostics);
-            assert!(amb[0].message.contains("ambiguous column `a`"));
-            assert!(amb[0].message.contains("t1"));
-            assert!(amb[0].message.contains("t2"));
+                .find(|d| matches!(d.kind, DiagnosticKind::AmbiguousColumn))
+                .expect("AmbiguousColumn must fire");
+            assert!(amb.message.contains("ambiguous column `a`"));
+            assert!(amb.message.contains("t1"));
+            assert!(amb.message.contains("t2"));
         }
 
         #[test]
@@ -2572,14 +2745,35 @@ mod tests {
             // Catalog says t1 has [x, y]; unqualified `z` belongs to
             // nothing in scope — UnresolvedColumn fires.
             let catalog = TestCatalog::default().with("t1", vec!["x", "y"]);
-            let ops = extract_with_catalog("SELECT z FROM t1", &catalog);
-            let unr: Vec<_> = ops
+            assert_column_ops_with_catalog(
+                "SELECT z FROM t1",
+                &catalog,
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![unresolved("z")],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: None,
+                            name: "z".into(),
+                        },
+                        target: out("z", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![diag(DiagnosticKind::UnresolvedColumn)],
+                },
+            );
+            // Message-content check for this test's purpose.
+            let ops =
+                extract_column_operations(&GenericDialect {}, "SELECT z FROM t1", Some(&catalog))
+                    .unwrap();
+            let ops = ops.into_iter().next().unwrap().unwrap();
+            let unr = ops
                 .diagnostics
                 .iter()
-                .filter(|d| matches!(d.kind, DiagnosticKind::UnresolvedColumn))
-                .collect();
-            assert_eq!(unr.len(), 1, "diagnostics: {:?}", ops.diagnostics);
-            assert!(unr[0].message.contains("unresolved column `z`"));
+                .find(|d| matches!(d.kind, DiagnosticKind::UnresolvedColumn))
+                .expect("UnresolvedColumn must fire");
+            assert!(unr.message.contains("unresolved column `z`"));
         }
 
         #[test]
@@ -2590,16 +2784,28 @@ mod tests {
             // suppressed in this mode: AmbiguousColumn (no confirmed
             // matches) and UnresolvedColumn (no Known schemas in scope).
             // The resolution itself still returns None for the column,
-            // but the diagnostic surface stays clean.
-            let ops = extract("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id");
-            assert!(ops
-                .diagnostics
-                .iter()
-                .all(|d| !matches!(d.kind, DiagnosticKind::AmbiguousColumn)));
-            assert!(ops
-                .diagnostics
-                .iter()
-                .all(|d| !matches!(d.kind, DiagnosticKind::UnresolvedColumn)));
+            // and the flow source is also unresolved.
+            assert_column_ops(
+                "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        filter_read("t1", "id"),
+                        filter_read("t2", "id"),
+                        unresolved("a"),
+                    ],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: None,
+                            name: "a".into(),
+                        },
+                        target: out("a", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![],
+                },
+            );
         }
     }
 }
