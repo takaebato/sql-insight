@@ -759,7 +759,7 @@ mod tests {
         assert_eq!(extract(sql).writes, expected, "SQL: {sql}");
     }
 
-    mod reads_qualified {
+    mod reads {
         use super::*;
 
         #[test]
@@ -811,10 +811,6 @@ mod tests {
             let ops = extract("SELECT t1.a FROM t1 WHERE t1.b > 0");
             assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "b")]);
         }
-    }
-
-    mod reads_unqualified {
-        use super::*;
 
         #[test]
         fn unqualified_single_table_resolves_to_that_table() {
@@ -928,7 +924,7 @@ mod tests {
         }
     }
 
-    mod writes_insert {
+    mod writes {
         use super::*;
 
         #[test]
@@ -951,10 +947,6 @@ mod tests {
             assert!(ops.writes.is_empty());
             assert_eq!(ops.reads, vec![read("t2", "b")]);
         }
-    }
-
-    mod writes_update {
-        use super::*;
 
         #[test]
         fn update_set_targets_become_writes_on_update_table() {
@@ -983,7 +975,7 @@ mod tests {
         }
     }
 
-    mod delete_ddl {
+    mod delete {
         use super::*;
 
         #[test]
@@ -1078,10 +1070,6 @@ mod tests {
             // Outer `a` projection still Projection.
             assert!(ops.reads.contains(&read("t", "a")));
         }
-    }
-
-    mod read_kinds_conditional {
-        use super::*;
 
         #[test]
         fn case_when_condition_in_projection_gets_conditional_modifier() {
@@ -1410,10 +1398,6 @@ mod tests {
                 vec![flow_passthrough(col("t2", "b"), persisted("t1", "a"))],
             );
         }
-    }
-
-    mod flow_aggregation {
-        use super::*;
 
         #[test]
         fn aggregate_call_in_projection_emits_aggregation_flow() {
