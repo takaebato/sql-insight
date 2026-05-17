@@ -1,4 +1,4 @@
-use super::{FlowEdge, FlowTargetSpec, RelationResolver, TableRole};
+use super::{FlowTargetSpec, RelationResolver, TableRole};
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
@@ -233,24 +233,15 @@ impl<'a> RelationResolver<'a> {
             // sources surface as multiple projection groups, so each
             // branch pairs against the same target columns naturally.
             let resolved = self.resolve_query(source)?;
-            for group in &resolved.projections {
-                for (position, item) in group.items.iter().enumerate() {
-                    let Some(target_col) = insert.columns.get(position) else {
-                        continue;
-                    };
-                    let target = FlowTargetSpec::Persisted {
+            self.emit_per_projection(&resolved.projections, |position, _item| {
+                insert
+                    .columns
+                    .get(position)
+                    .map(|col| FlowTargetSpec::Persisted {
                         table: target_table.clone(),
-                        column: target_col.clone(),
-                    };
-                    for source in &item.source_refs {
-                        self.push_flow_edge(FlowEdge {
-                            source: source.clone(),
-                            target: target.clone(),
-                            kind: item.kind,
-                        });
-                    }
-                }
-            }
+                        column: col.clone(),
+                    })
+            });
         }
         for assignment in &insert.assignments {
             self.visit_expr(&assignment.value)?;
@@ -271,28 +262,16 @@ impl<'a> RelationResolver<'a> {
         explicit_columns: &[sqlparser::ast::Ident],
         resolved: &super::ResolvedQuery,
     ) {
-        for group in &resolved.projections {
-            for (position, item) in group.items.iter().enumerate() {
-                let target_col = explicit_columns
-                    .get(position)
-                    .cloned()
-                    .or_else(|| item.name.clone());
-                let Some(target_col) = target_col else {
-                    continue;
-                };
-                let target_spec = FlowTargetSpec::Persisted {
+        self.emit_per_projection(&resolved.projections, |position, item| {
+            explicit_columns
+                .get(position)
+                .cloned()
+                .or_else(|| item.name.clone())
+                .map(|column| FlowTargetSpec::Persisted {
                     table: target.clone(),
-                    column: target_col,
-                };
-                for source in &item.source_refs {
-                    self.push_flow_edge(FlowEdge {
-                        source: source.clone(),
-                        target: target_spec.clone(),
-                        kind: item.kind,
-                    });
-                }
-            }
-        }
+                    column,
+                })
+        });
     }
 
     fn visit_update(&mut self, update: &Update) -> Result<(), Error> {
@@ -309,13 +288,27 @@ impl<'a> RelationResolver<'a> {
                 self.visit_table_with_joins(table, TableRole::Read)?;
             }
         }
-        let target_table = match &update.table.relation {
-            sqlparser::ast::TableFactor::Table { .. } => {
-                TableReference::try_from(&update.table.relation).ok()
-            }
-            _ => None,
-        };
-        for assignment in &update.assignments {
+        let target_table = try_target_table_from_factor(&update.table.relation);
+        self.emit_assignment_flows(&update.assignments, target_table.as_ref())?;
+        if let Some(selection) = &update.selection {
+            self.with_filter_clause(|r| r.visit_expr(selection))?;
+        }
+        Ok(())
+    }
+
+    /// Walk each SET-style assignment's RHS expression and emit
+    /// Persisted flow edges from any newly recorded source refs into
+    /// the assignment's target column. Shared by `visit_update` and
+    /// MERGE's `WHEN MATCHED UPDATE` branch — both have identical
+    /// per-assignment semantics. Target column qualifier resolution:
+    /// qualified target (`t.col`) wins; bare target falls back to
+    /// `default_table` (UPDATE head / MERGE INTO target).
+    fn emit_assignment_flows(
+        &mut self,
+        assignments: &[sqlparser::ast::Assignment],
+        default_table: Option<&TableReference>,
+    ) -> Result<(), Error> {
+        for assignment in assignments {
             let target_parts = assignment_target_parts(&assignment.target);
             let kind = super::query::expr_kind(&assignment.value);
             let refs_before = self.column_refs_len();
@@ -323,8 +316,7 @@ impl<'a> RelationResolver<'a> {
             let Some(target_parts) = target_parts else {
                 continue;
             };
-            let Some(target_table_ref) =
-                assignment_target_table(&target_parts, target_table.as_ref())
+            let Some(target_table_ref) = assignment_target_table(&target_parts, default_table)
             else {
                 continue;
             };
@@ -332,18 +324,7 @@ impl<'a> RelationResolver<'a> {
                 table: target_table_ref,
                 column: target_parts.last().cloned().unwrap(),
             };
-            let new_count = self.column_refs_len() - refs_before;
-            for offset in 0..new_count {
-                let source = self.column_refs_slice(refs_before)[offset].clone();
-                self.push_flow_edge(FlowEdge {
-                    source,
-                    target: target.clone(),
-                    kind,
-                });
-            }
-        }
-        if let Some(selection) = &update.selection {
-            self.with_filter_clause(|r| r.visit_expr(selection))?;
+            self.push_edges_from_refs_since(refs_before, target, kind);
         }
         Ok(())
     }
@@ -389,12 +370,7 @@ impl<'a> RelationResolver<'a> {
         self.visit_table_factor(&merge.table, TableRole::Write)?;
         self.visit_table_factor(&merge.source, TableRole::Read)?;
         self.with_filter_clause(|r| r.visit_expr(&merge.on))?;
-        let target_table = match &merge.table {
-            sqlparser::ast::TableFactor::Table { .. } => {
-                TableReference::try_from(&merge.table).ok()
-            }
-            _ => None,
-        };
+        let target_table = try_target_table_from_factor(&merge.table);
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
                 self.with_filter_clause(|r| r.visit_expr(predicate))?;
@@ -416,7 +392,7 @@ impl<'a> RelationResolver<'a> {
                     // needs catalog knowledge of the target schema.
                 }
                 MergeAction::Update(update_expr) => {
-                    self.emit_merge_update_flows(&update_expr.assignments, target_table.as_ref())?;
+                    self.emit_assignment_flows(&update_expr.assignments, target_table.as_ref())?;
                 }
                 MergeAction::Delete { .. } => {
                     // DELETE has no column-level value flow.
@@ -453,52 +429,7 @@ impl<'a> RelationResolver<'a> {
                     table: target_table.clone(),
                     column: col_ident.clone(),
                 };
-                let new_count = self.column_refs_len() - refs_before;
-                for offset in 0..new_count {
-                    let source = self.column_refs_slice(refs_before)[offset].clone();
-                    self.push_flow_edge(FlowEdge {
-                        source,
-                        target: target.clone(),
-                        kind,
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Emit per-assignment Persisted flow edges for MERGE's
-    /// `WHEN MATCHED THEN UPDATE SET col = expr`. Mirrors the
-    /// per-assignment logic in `visit_update`.
-    fn emit_merge_update_flows(
-        &mut self,
-        assignments: &[sqlparser::ast::Assignment],
-        target_table: Option<&TableReference>,
-    ) -> Result<(), Error> {
-        for assignment in assignments {
-            let target_parts = assignment_target_parts(&assignment.target);
-            let kind = super::query::expr_kind(&assignment.value);
-            let refs_before = self.column_refs_len();
-            self.visit_expr(&assignment.value)?;
-            let Some(target_parts) = target_parts else {
-                continue;
-            };
-            let Some(target_table_ref) = assignment_target_table(&target_parts, target_table)
-            else {
-                continue;
-            };
-            let target = FlowTargetSpec::Persisted {
-                table: target_table_ref,
-                column: target_parts.last().cloned().unwrap(),
-            };
-            let new_count = self.column_refs_len() - refs_before;
-            for offset in 0..new_count {
-                let source = self.column_refs_slice(refs_before)[offset].clone();
-                self.push_flow_edge(FlowEdge {
-                    source,
-                    target: target.clone(),
-                    kind,
-                });
+                self.push_edges_from_refs_since(refs_before, target, kind);
             }
         }
         Ok(())
@@ -509,6 +440,18 @@ fn from_table_items(from: &FromTable) -> &[TableWithJoins] {
     match from {
         FromTable::WithFromKeyword(items) | FromTable::WithoutKeyword(items) => items,
     }
+}
+
+/// Best-effort extraction of a write-target `TableReference` from a
+/// `TableFactor`. Only the plain `TableFactor::Table` variant has a
+/// resolvable identity; derived / pivot / table-function targets are
+/// not valid SQL write targets and return `None`, leaving the caller's
+/// assignment / pairing logic to fall back to qualifier-only target
+/// derivation.
+fn try_target_table_from_factor(factor: &sqlparser::ast::TableFactor) -> Option<TableReference> {
+    matches!(factor, sqlparser::ast::TableFactor::Table { .. })
+        .then(|| TableReference::try_from(factor).ok())
+        .flatten()
 }
 
 fn assignment_target_parts(

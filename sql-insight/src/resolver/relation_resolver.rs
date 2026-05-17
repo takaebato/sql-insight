@@ -466,6 +466,66 @@ fn synthetic_table_ref(name: &Ident) -> TableReference {
     }
 }
 
+/// Apply a column alias rename list (from `WITH cte(a, b) AS ...` or
+/// `(SELECT ...) d(a, b)`) to a body's `output_schema`. The alias at
+/// position N overrides the body's inferred column at position N; body
+/// columns past the alias list keep their inferred names. An empty
+/// rename list returns `schema` unchanged; an `Unknown` body schema is
+/// promoted to `Known` containing exactly the declared rename columns
+/// (the only columns we can name with certainty after a rename clause).
+pub(super) fn rename_relation_schema(
+    schema: RelationSchema,
+    renames: &[sqlparser::ast::TableAliasColumnDef],
+) -> RelationSchema {
+    if renames.is_empty() {
+        return schema;
+    }
+    match schema {
+        RelationSchema::Unknown => RelationSchema::Known(
+            renames
+                .iter()
+                .map(|r| Column {
+                    name: r.name.clone(),
+                })
+                .collect(),
+        ),
+        RelationSchema::Known(mut cols) => {
+            for (position, rename) in renames.iter().enumerate() {
+                if let Some(col) = cols.get_mut(position) {
+                    col.name = rename.name.clone();
+                } else {
+                    cols.push(Column {
+                        name: rename.name.clone(),
+                    });
+                }
+            }
+            RelationSchema::Known(cols)
+        }
+    }
+}
+
+/// Apply the same rename to the projection items' inferred names so
+/// flow composition's name-match lookup finds the renamed columns.
+/// Position N in the rename list overrides position N's item name;
+/// positions beyond the list keep their body-inferred names. Each
+/// `ProjectionGroup` (set-op branch) is renamed independently.
+pub(super) fn rename_projection_groups(
+    mut groups: Vec<ProjectionGroup>,
+    renames: &[sqlparser::ast::TableAliasColumnDef],
+) -> Vec<ProjectionGroup> {
+    if renames.is_empty() {
+        return groups;
+    }
+    for group in &mut groups {
+        for (position, item) in group.items.iter_mut().enumerate() {
+            if let Some(rename) = renames.get(position) {
+                item.name = Some(rename.name.clone());
+            }
+        }
+    }
+    groups
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct RelationScope {
@@ -702,6 +762,29 @@ impl<'a> RelationResolver<'a> {
         self.flow_edges.push(edge);
     }
 
+    /// Emit one `FlowEdge` per `RawColumnRef` recorded into
+    /// `column_refs` since position `since`, all pointing to the same
+    /// `target` with the given `kind`. The typical caller snapshots
+    /// `column_refs_len()` before walking an expression, walks it,
+    /// then calls this with the snapshot to fan the new refs out as
+    /// edges. Used by UPDATE / MERGE assignment loops and MERGE
+    /// INSERT-VALUES emission.
+    pub(super) fn push_edges_from_refs_since(
+        &mut self,
+        since: usize,
+        target: FlowTargetSpec,
+        kind: ColumnFlowKind,
+    ) {
+        for offset in 0..(self.column_refs_len() - since) {
+            let source = self.column_refs_slice(since)[offset].clone();
+            self.push_flow_edge(FlowEdge {
+                source,
+                target: target.clone(),
+                kind,
+            });
+        }
+    }
+
     /// Push a fully-built `ProjectionGroup` into the active query's
     /// projection buffer. Called by `visit_select` once per SELECT body.
     pub(super) fn push_projection_group(&mut self, group: ProjectionGroup) {
@@ -716,16 +799,24 @@ impl<'a> RelationResolver<'a> {
         self.current_projections.extend(groups);
     }
 
-    /// Emit `QueryOutput` flow edges for every projection item in
-    /// `resolved`. The default disposition for queries whose output is
-    /// not bound to a persisted target (top-level SELECT, scalar
-    /// subqueries, derived tables, CTE bodies, predicate subqueries).
-    pub(super) fn emit_query_output_edges(&mut self, resolved: &ResolvedQuery) {
-        for group in &resolved.projections {
+    /// For each `(group, position, item)` in `projections`, ask
+    /// `target_for(position, item)` to produce a `FlowTargetSpec`;
+    /// when it returns `Some(target)`, fan out one `FlowEdge` per
+    /// `item.source_refs` to that target, carrying the item's
+    /// `ColumnFlowKind`. The closure shape lets the same loop drive
+    /// `QueryOutput` emission, INSERT positional pairing, and CTAS /
+    /// view's explicit-or-inferred column pairing.
+    pub(super) fn emit_per_projection<F>(
+        &mut self,
+        projections: &[ProjectionGroup],
+        mut target_for: F,
+    ) where
+        F: FnMut(usize, &ProjectionItem) -> Option<FlowTargetSpec>,
+    {
+        for group in projections {
             for (position, item) in group.items.iter().enumerate() {
-                let target = FlowTargetSpec::QueryOutput {
-                    name: item.name.clone(),
-                    position,
+                let Some(target) = target_for(position, item) else {
+                    continue;
                 };
                 for source in &item.source_refs {
                     self.push_flow_edge(FlowEdge {
@@ -736,6 +827,19 @@ impl<'a> RelationResolver<'a> {
                 }
             }
         }
+    }
+
+    /// Emit `QueryOutput` flow edges for every projection item in
+    /// `resolved`. The default disposition for queries whose output is
+    /// not bound to a persisted target (top-level SELECT, scalar
+    /// subqueries, derived tables, CTE bodies, predicate subqueries).
+    pub(super) fn emit_query_output_edges(&mut self, resolved: &ResolvedQuery) {
+        self.emit_per_projection(&resolved.projections, |position, item| {
+            Some(FlowTargetSpec::QueryOutput {
+                name: item.name.clone(),
+                position,
+            })
+        });
     }
 
     /// Convenience wrapper: resolve `query` and emit `QueryOutput` edges
@@ -986,68 +1090,6 @@ impl<'a> RelationResolver<'a> {
             }) => body_projections.clone(),
             _ => Vec::new(),
         }
-    }
-
-    /// Apply a column alias rename list (from `WITH cte(a, b) AS ...`
-    /// or `(SELECT ...) d(a, b)`) to a body's `output_schema`. The
-    /// alias at position N overrides the body's inferred column at
-    /// position N; body columns past the alias list keep their
-    /// inferred names. An empty rename list returns `schema`
-    /// unchanged; an `Unknown` body schema is promoted to `Known`
-    /// containing exactly the declared rename columns (the only
-    /// columns we can name with certainty after a rename clause).
-    pub(super) fn rename_relation_schema(
-        schema: RelationSchema,
-        renames: &[sqlparser::ast::TableAliasColumnDef],
-    ) -> RelationSchema {
-        if renames.is_empty() {
-            return schema;
-        }
-        match schema {
-            RelationSchema::Unknown => RelationSchema::Known(
-                renames
-                    .iter()
-                    .map(|r| Column {
-                        name: r.name.clone(),
-                    })
-                    .collect(),
-            ),
-            RelationSchema::Known(mut cols) => {
-                for (position, rename) in renames.iter().enumerate() {
-                    if let Some(col) = cols.get_mut(position) {
-                        col.name = rename.name.clone();
-                    } else {
-                        cols.push(Column {
-                            name: rename.name.clone(),
-                        });
-                    }
-                }
-                RelationSchema::Known(cols)
-            }
-        }
-    }
-
-    /// Apply the same rename to the projection items' inferred names
-    /// so flow composition's name-match lookup finds the renamed
-    /// columns. Position N in the rename list overrides position N's
-    /// item name; positions beyond the list keep their body-inferred
-    /// names. Each `ProjectionGroup` (set-op branch) is renamed
-    /// independently.
-    pub(super) fn rename_projection_groups(
-        mut groups: Vec<ProjectionGroup>,
-        renames: &[sqlparser::ast::TableAliasColumnDef],
-    ) -> Vec<ProjectionGroup> {
-        if renames.is_empty() {
-            return groups;
-        }
-        for group in &mut groups {
-            for (position, item) in group.items.iter_mut().enumerate() {
-                if let Some(rename) = renames.get(position) {
-                    item.name = Some(rename.name.clone());
-                }
-            }
-        }
-        groups
     }
 
     fn bind_cte(

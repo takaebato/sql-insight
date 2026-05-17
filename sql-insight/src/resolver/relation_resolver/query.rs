@@ -46,9 +46,9 @@ impl<'a> RelationResolver<'a> {
                     let resolved = self.resolve_query(&cte.query)?;
                     let renames = &cte.alias.columns;
                     let renamed_schema =
-                        RelationResolver::rename_relation_schema(resolved.output_schema, renames);
+                        super::rename_relation_schema(resolved.output_schema, renames);
                     let renamed_projections =
-                        RelationResolver::rename_projection_groups(resolved.projections, renames);
+                        super::rename_projection_groups(resolved.projections, renames);
                     self.bind_cte(cte.alias.name.clone(), renamed_schema, renamed_projections);
                 }
             }
@@ -137,14 +137,7 @@ impl<'a> RelationResolver<'a> {
         }
         let mut projection_items = Vec::with_capacity(select.projection.len());
         for item in &select.projection {
-            let refs_before = self.column_refs_len();
-            self.visit_select_item(item)?;
-            let source_refs = self.column_refs_slice(refs_before).to_vec();
-            projection_items.push(ProjectionItem {
-                name: projection_item_output_name(item),
-                source_refs,
-                kind: projection_item_kind(item),
-            });
+            projection_items.push(self.build_projection_item(item)?);
         }
         self.push_projection_group(ProjectionGroup {
             items: projection_items,
@@ -202,6 +195,20 @@ impl<'a> RelationResolver<'a> {
             }
         }
         Ok(projection_schema(&select.projection))
+    }
+
+    /// Walk a single projection item's expression and snapshot the
+    /// refs it records, packaging name / source_refs / kind into a
+    /// `ProjectionItem`.
+    fn build_projection_item(&mut self, item: &SelectItem) -> Result<ProjectionItem, Error> {
+        let refs_before = self.column_refs_len();
+        self.visit_select_item(item)?;
+        let source_refs = self.column_refs_slice(refs_before).to_vec();
+        Ok(ProjectionItem {
+            name: projection_item_output_name(item),
+            source_refs,
+            kind: projection_item_kind(item),
+        })
     }
 
     pub(super) fn visit_select_item(&mut self, item: &SelectItem) -> Result<(), Error> {

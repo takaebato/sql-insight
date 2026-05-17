@@ -119,9 +119,9 @@ impl<'a> RelationResolver<'a> {
                 if let Some(alias) = alias {
                     let renames = &alias.columns;
                     let renamed_schema =
-                        RelationResolver::rename_relation_schema(resolved.output_schema, renames);
+                        super::rename_relation_schema(resolved.output_schema, renames);
                     let renamed_projections =
-                        RelationResolver::rename_projection_groups(resolved.projections, renames);
+                        super::rename_projection_groups(resolved.projections, renames);
                     self.bind_derived_table(
                         alias.name.clone(),
                         renamed_schema,
