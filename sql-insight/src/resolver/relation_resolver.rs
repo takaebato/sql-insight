@@ -667,6 +667,12 @@ pub(crate) struct RelationResolver<'a> {
     /// Reset to `Projection` on `resolve_query` entry so subqueries
     /// don't inherit the enclosing clause's kind for their own bodies.
     current_read_kind: ReadKind,
+    /// Modifier flag layered on top of `current_read_kind`: when true,
+    /// recorded refs also carry `ReadKind::Conditional` to mark them
+    /// as appearing in a CASE-WHEN condition position. Toggled by
+    /// [`with_case_condition`] around the condition walk inside
+    /// `Expr::Case` handling.
+    in_case_condition: bool,
 }
 
 impl<'a> RelationResolver<'a> {
@@ -680,6 +686,7 @@ impl<'a> RelationResolver<'a> {
             current_projections: Vec::new(),
             current_scope_kind: ScopeKind::Body,
             current_read_kind: ReadKind::Projection,
+            in_case_condition: false,
         }
     }
 
@@ -752,12 +759,16 @@ impl<'a> RelationResolver<'a> {
     pub(super) fn record_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.scopes.current_scope_id();
         let (resolved, synthetic) = self.resolve_ref_at_walk(&parts, scope_id);
+        let mut kinds = vec![self.current_read_kind];
+        if self.in_case_condition {
+            kinds.push(ReadKind::Conditional);
+        }
         self.column_refs.push(RawColumnRef {
             parts,
             scope_id,
             resolved,
             synthetic,
-            kinds: vec![self.current_read_kind],
+            kinds,
         });
     }
 
@@ -870,6 +881,18 @@ impl<'a> RelationResolver<'a> {
         self.current_read_kind = kind;
         let r = f(self);
         self.current_read_kind = prev;
+        r
+    }
+
+    /// Temporarily mark recorded refs as appearing in a CASE-WHEN
+    /// condition position. Stacks additively on top of the current
+    /// `current_read_kind` — a column in a SELECT projection's CASE
+    /// condition ends up with `kinds = [Projection, Conditional]`.
+    pub(crate) fn with_case_condition<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.in_case_condition;
+        self.in_case_condition = true;
+        let r = f(self);
+        self.in_case_condition = prev;
         r
     }
 

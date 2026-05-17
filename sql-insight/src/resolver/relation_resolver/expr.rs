@@ -153,11 +153,19 @@ impl<'a> RelationResolver<'a> {
                 else_result,
                 ..
             } => {
+                // `CASE x WHEN ...`: the operand acts as a
+                // conditional input (compared against each WHEN
+                // pattern), parallel to the condition exprs in the
+                // searched form.
                 if let Some(expr) = operand {
-                    self.visit_expr(expr)?;
+                    self.with_case_condition(|r| r.visit_expr(expr))?;
                 }
                 for condition in conditions {
-                    self.visit_expr(&condition.condition)?;
+                    // `WHEN <cond>` part — Conditional modifier on
+                    // top of the surrounding clause kind.
+                    self.with_case_condition(|r| r.visit_expr(&condition.condition))?;
+                    // `THEN <result>` part is a value expression —
+                    // keep the surrounding kind unchanged.
                     self.visit_expr(&condition.result)?;
                 }
                 if let Some(expr) = else_result {

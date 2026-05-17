@@ -21,7 +21,9 @@
 //!   `kinds: Vec<ReadKind>` recording the syntactic clause(s) the
 //!   reference appeared in (`Projection` for SELECT list / UPDATE SET
 //!   RHS / etc., `Filter` for WHERE / HAVING / JOIN ON / MERGE ON /
-//!   CONNECT BY / pipe `|> WHERE`). Typically `len == 1`; multi-role
+//!   CONNECT BY / pipe `|> WHERE`, `GroupBy` / `Sort` / `Window`,
+//!   plus a `Conditional` modifier layered on the surrounding clause
+//!   for CASE-WHEN condition refs). Typically `len == 1`; multi-role
 //!   refs (USING / NATURAL JOIN merged columns) are future work.
 //! - `writes`: INSERT explicit column lists scoped to the INSERT
 //!   target, and UPDATE SET targets scoped to the UPDATE table.
@@ -44,8 +46,8 @@
 //!   dialects), or `Computed` (anything else). Composition is
 //!   `Aggregation`-dominant: any aggregation step in a CTE / derived
 //!   chain makes the resulting flow `Aggregation`. MERGE clauses,
-//!   CTAS / CREATE VIEW, column-list-less INSERT SELECT, and
-//!   `Conditional` (CASE WHEN condition) classification are deferred.
+//!   CTAS / CREATE VIEW, and column-list-less INSERT SELECT are
+//!   deferred.
 //!
 //! **Strictness scales with the catalog.** Without a catalog, Table
 //! bindings have `Unknown` schemas and unqualified refs to a
@@ -148,6 +150,12 @@ pub enum ReadKind {
     /// `SUM(x) OVER (...)`) stay `Projection` since they're
     /// value-producing.
     Window,
+    /// Ref appeared as a CASE-WHEN condition expression (`CASE WHEN
+    /// <cond> THEN ...`). Layered on top of the surrounding clause
+    /// kind — a column in `SELECT CASE WHEN a > 0 THEN b END FROM t`
+    /// gets `kinds = [Projection, Conditional]` for `a`. Result and
+    /// ELSE expressions stay at the surrounding kind.
+    Conditional,
 }
 
 /// A column that the statement writes to — an INSERT target column,
@@ -506,6 +514,16 @@ mod tests {
         }
     }
 
+    fn read_with_kinds(table_name: &str, col: &str, kinds: Vec<ReadKind>) -> ColumnRead {
+        ColumnRead {
+            column: ColumnReference {
+                table: Some(table(table_name)),
+                name: col.into(),
+            },
+            kinds,
+        }
+    }
+
     fn write(table_name: &str, col: &str) -> ColumnWrite {
         ColumnWrite {
             column: ColumnReference {
@@ -833,6 +851,61 @@ mod tests {
         assert!(ops.reads.contains(&read("s", "z")));
         // Outer `a` projection still Projection.
         assert!(ops.reads.contains(&read("t", "a")));
+    }
+
+    // ───────── Conditional ReadKind (Phase 5.6e) ─────────
+
+    #[test]
+    fn case_when_condition_in_projection_gets_conditional_modifier() {
+        // `a` is the WHEN condition → [Projection, Conditional];
+        // `b` is the THEN result → [Projection];
+        // `c` is the ELSE result → [Projection].
+        let ops = extract("SELECT CASE WHEN a > 0 THEN b ELSE c END FROM t1");
+        assert_eq!(
+            ops.reads,
+            vec![
+                read_with_kinds("t1", "a", vec![ReadKind::Projection, ReadKind::Conditional]),
+                read("t1", "b"),
+                read("t1", "c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn case_when_condition_in_where_layers_with_filter() {
+        // `x` is in WHERE's CASE WHEN condition → [Filter, Conditional];
+        // `y` is the THEN result (inside WHERE) → [Filter];
+        // `z` is the ELSE result (inside WHERE) → [Filter];
+        // `b` is the outer projection → [Projection].
+        let ops = extract("SELECT b FROM t WHERE CASE WHEN x > 0 THEN y ELSE z END = 1");
+        assert!(ops.reads.iter().any(|r| r.column.name.value == "x"
+            && r.kinds == vec![ReadKind::Filter, ReadKind::Conditional]));
+        assert!(ops
+            .reads
+            .iter()
+            .any(|r| r.column.name.value == "y" && r.kinds == vec![ReadKind::Filter]));
+        assert!(ops
+            .reads
+            .iter()
+            .any(|r| r.column.name.value == "b" && r.kinds == vec![ReadKind::Projection]));
+    }
+
+    #[test]
+    fn simple_case_operand_gets_conditional_modifier() {
+        // `CASE x WHEN 1 THEN a WHEN 2 THEN b END` — `x` is the
+        // operand (compared against each WHEN pattern), classified
+        // Conditional. `a` / `b` are results, plain Projection.
+        let ops = extract("SELECT CASE x WHEN 1 THEN a WHEN 2 THEN b END FROM t1");
+        assert!(ops.reads.iter().any(|r| r.column.name.value == "x"
+            && r.kinds == vec![ReadKind::Projection, ReadKind::Conditional]));
+        assert!(ops
+            .reads
+            .iter()
+            .any(|r| r.column.name.value == "a" && r.kinds == vec![ReadKind::Projection]));
+        assert!(ops
+            .reads
+            .iter()
+            .any(|r| r.column.name.value == "b" && r.kinds == vec![ReadKind::Projection]));
     }
 
     #[test]
