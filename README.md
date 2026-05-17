@@ -184,6 +184,25 @@ and
 [Behavior notes](https://docs.rs/sql-insight/latest/sql_insight/#behavior-notes)
 sections of the crate docs for the full set.
 
+## Examples
+
+Runnable examples under
+[`sql-insight/examples/`](sql-insight/examples):
+
+- [`table_operations.rs`](sql-insight/examples/table_operations.rs) —
+  table-level `reads` / `writes` / `flows` across a multi-statement
+  batch, with `StatementKind`-based dispatch.
+- [`column_operations.rs`](sql-insight/examples/column_operations.rs) —
+  per-column reads with clause-role tagging, and flows classified by
+  `ColumnFlowKind` (Passthrough / Aggregation / Computed) into
+  `Persisted` vs `QueryOutput` targets.
+- [`with_catalog.rs`](sql-insight/examples/with_catalog.rs) — supplying
+  a `Catalog` enables INSERT positional column pairing and surfaces
+  `AmbiguousColumn` / `UnresolvedColumn` diagnostics that stay silent
+  without one.
+
+Run with `cargo run --example <name> -p sql-insight`.
+
 ## Supported SQL Dialects
 
 `sql-insight` supports a comprehensive range of SQL dialects through [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs). For details on supported dialects, please refer to the [sqlparser-rs documentation](https://docs.rs/sqlparser/latest/sqlparser/dialect/index.html#structs).
