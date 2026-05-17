@@ -759,6 +759,43 @@ mod tests {
         assert_eq!(extract(sql).writes, expected, "SQL: {sql}");
     }
 
+    /// Whole-value-ish assertion: pin down the full
+    /// `StatementColumnOperations` for `sql`. reads / writes / flows /
+    /// statement_kind compare strictly; diagnostics compare by **kind
+    /// sequence only** so message wording and span coordinates aren't
+    /// baked into the expected value.
+    fn assert_column_ops(sql: &str, expected: StatementColumnOperations) {
+        let actual = extract(sql);
+        let StatementColumnOperations {
+            statement_kind,
+            reads,
+            writes,
+            flows,
+            diagnostics,
+        } = expected;
+        assert_eq!(actual.statement_kind, statement_kind, "kind for SQL: {sql}");
+        assert_eq!(actual.reads, reads, "reads for SQL: {sql}");
+        assert_eq!(actual.writes, writes, "writes for SQL: {sql}");
+        assert_eq!(actual.flows, flows, "flows for SQL: {sql}");
+        let actual_kinds: Vec<_> = actual.diagnostics.iter().map(|d| d.kind.clone()).collect();
+        let expected_kinds: Vec<_> = diagnostics.iter().map(|d| d.kind.clone()).collect();
+        assert_eq!(
+            actual_kinds, expected_kinds,
+            "diagnostic kinds for SQL: {sql}"
+        );
+    }
+
+    /// Placeholder `Diagnostic` for `assert_column_ops.expected.diagnostics`.
+    /// Only the kind is compared; message and span are placeholders.
+    #[allow(dead_code)] // used as remaining mods migrate to assert_column_ops
+    fn diag(kind: DiagnosticKind) -> Diagnostic {
+        Diagnostic {
+            kind,
+            message: String::new(),
+            span: None,
+        }
+    }
+
     mod reads {
         use super::*;
 
@@ -1507,66 +1544,101 @@ mod tests {
 
         #[test]
         fn merge_when_matched_update_emits_flow_and_write() {
-            let ops = extract(
+            assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Merge,
+                    reads: vec![
+                        filter_read("t", "id"),
+                        filter_read("s", "id"),
+                        read("s", "a"),
+                    ],
+                    writes: vec![write("t", "a")],
+                    flows: vec![flow_passthrough(col("s", "a"), persisted("t", "a"))],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(
-                ops.flows,
-                vec![flow_passthrough(col("s", "a"), persisted("t", "a"))]
-            );
-            assert_eq!(ops.writes, vec![write("t", "a")]);
         }
 
         #[test]
         fn merge_when_not_matched_insert_emits_flow_and_write() {
-            let ops = extract(
+            assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id \
-             WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a)",
+                 WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Merge,
+                    reads: vec![
+                        filter_read("t", "id"),
+                        filter_read("s", "id"),
+                        read("s", "id"),
+                        read("s", "a"),
+                    ],
+                    writes: vec![write("t", "id"), write("t", "a")],
+                    flows: vec![
+                        flow_passthrough(col("s", "id"), persisted("t", "id")),
+                        flow_passthrough(col("s", "a"), persisted("t", "a")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(
-                ops.flows,
-                vec![
-                    flow_passthrough(col("s", "id"), persisted("t", "id")),
-                    flow_passthrough(col("s", "a"), persisted("t", "a")),
-                ]
-            );
-            assert_eq!(ops.writes, vec![write("t", "id"), write("t", "a")]);
         }
 
         #[test]
         fn merge_delete_action_emits_no_flow_no_write() {
-            let ops = extract("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE");
-            assert!(ops.flows.is_empty());
-            assert!(ops.writes.is_empty());
+            assert_column_ops(
+                "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Merge,
+                    reads: vec![filter_read("t", "id"), filter_read("s", "id")],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn merge_combined_clauses_emit_per_clause_flows_and_writes() {
-            let ops = extract(
+            assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id \
-             WHEN MATCHED THEN UPDATE SET t.a = s.a \
-             WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a)",
-            );
-            assert_eq!(
-                ops.flows,
-                vec![
-                    flow_passthrough(col("s", "a"), persisted("t", "a")),
-                    flow_passthrough(col("s", "id"), persisted("t", "id")),
-                    flow_passthrough(col("s", "a"), persisted("t", "a")),
-                ]
-            );
-            assert_eq!(
-                ops.writes,
-                vec![write("t", "a"), write("t", "id"), write("t", "a")]
+                 WHEN MATCHED THEN UPDATE SET t.a = s.a \
+                 WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Merge,
+                    reads: vec![
+                        filter_read("t", "id"),
+                        filter_read("s", "id"),
+                        read("s", "a"),
+                        read("s", "id"),
+                        read("s", "a"),
+                    ],
+                    writes: vec![write("t", "a"), write("t", "id"), write("t", "a")],
+                    flows: vec![
+                        flow_passthrough(col("s", "a"), persisted("t", "a")),
+                        flow_passthrough(col("s", "id"), persisted("t", "id")),
+                        flow_passthrough(col("s", "a"), persisted("t", "a")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn merge_update_computed_kind_propagates() {
-            assert_flows(
+            assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id \
                  WHEN MATCHED THEN UPDATE SET t.a = s.a + 1",
-                vec![flow_computed(col("s", "a"), persisted("t", "a"))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Merge,
+                    reads: vec![
+                        filter_read("t", "id"),
+                        filter_read("s", "id"),
+                        read("s", "a"),
+                    ],
+                    writes: vec![write("t", "a")],
+                    flows: vec![flow_computed(col("s", "a"), persisted("t", "a"))],
+                    diagnostics: vec![],
+                },
             );
         }
     }
@@ -1579,84 +1651,115 @@ mod tests {
             // CREATE TABLE AS SELECT — no explicit column list, so target
             // columns follow the source projection's inferred names
             // (alias > bare ident).
-            let ops = extract("CREATE TABLE t AS SELECT x AS a, y FROM s");
-            assert_eq!(
-                ops.flows,
-                vec![
-                    flow_passthrough(col("s", "x"), persisted("t", "a")),
-                    flow_passthrough(col("s", "y"), persisted("t", "y")),
-                ]
+            assert_column_ops(
+                "CREATE TABLE t AS SELECT x AS a, y FROM s",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::CreateTable,
+                    reads: vec![read("s", "x"), read("s", "y")],
+                    writes: vec![write("t", "a"), write("t", "y")],
+                    flows: vec![
+                        flow_passthrough(col("s", "x"), persisted("t", "a")),
+                        flow_passthrough(col("s", "y"), persisted("t", "y")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(ops.writes, vec![write("t", "a"), write("t", "y")]);
         }
 
         #[test]
         fn ctas_with_explicit_columns_overrides_projection_names() {
             // Explicit column list wins over inferred names.
-            let ops = extract("CREATE TABLE t (p INT, q INT) AS SELECT x, y FROM s");
-            assert_eq!(
-                ops.flows,
-                vec![
-                    flow_passthrough(col("s", "x"), persisted("t", "p")),
-                    flow_passthrough(col("s", "y"), persisted("t", "q")),
-                ]
+            assert_column_ops(
+                "CREATE TABLE t (p INT, q INT) AS SELECT x, y FROM s",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::CreateTable,
+                    reads: vec![read("s", "x"), read("s", "y")],
+                    writes: vec![write("t", "p"), write("t", "q")],
+                    flows: vec![
+                        flow_passthrough(col("s", "x"), persisted("t", "p")),
+                        flow_passthrough(col("s", "y"), persisted("t", "q")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(ops.writes, vec![write("t", "p"), write("t", "q")]);
         }
 
         #[test]
         fn ctas_propagates_aggregation_kind() {
-            let ops = extract("CREATE TABLE t AS SELECT SUM(x) AS total FROM s");
-            assert_eq!(
-                ops.flows,
-                vec![flow_aggregation(col("s", "x"), persisted("t", "total"))]
+            assert_column_ops(
+                "CREATE TABLE t AS SELECT SUM(x) AS total FROM s",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::CreateTable,
+                    reads: vec![read("s", "x")],
+                    writes: vec![write("t", "total")],
+                    flows: vec![flow_aggregation(col("s", "x"), persisted("t", "total"))],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(ops.writes, vec![write("t", "total")]);
         }
 
         #[test]
         fn create_view_pairs_source_projection() {
-            let ops = extract("CREATE VIEW v AS SELECT x AS a, y FROM s");
-            assert_eq!(
-                ops.flows,
-                vec![
-                    flow_passthrough(col("s", "x"), persisted("v", "a")),
-                    flow_passthrough(col("s", "y"), persisted("v", "y")),
-                ]
+            assert_column_ops(
+                "CREATE VIEW v AS SELECT x AS a, y FROM s",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::CreateView,
+                    reads: vec![read("s", "x"), read("s", "y")],
+                    writes: vec![write("v", "a"), write("v", "y")],
+                    flows: vec![
+                        flow_passthrough(col("s", "x"), persisted("v", "a")),
+                        flow_passthrough(col("s", "y"), persisted("v", "y")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(ops.writes, vec![write("v", "a"), write("v", "y")]);
         }
 
         #[test]
         fn create_view_with_explicit_columns_uses_list() {
-            let ops = extract("CREATE VIEW v (a, b) AS SELECT x, y FROM s");
-            assert_eq!(
-                ops.flows,
-                vec![
-                    flow_passthrough(col("s", "x"), persisted("v", "a")),
-                    flow_passthrough(col("s", "y"), persisted("v", "b")),
-                ]
+            assert_column_ops(
+                "CREATE VIEW v (a, b) AS SELECT x, y FROM s",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::CreateView,
+                    reads: vec![read("s", "x"), read("s", "y")],
+                    writes: vec![write("v", "a"), write("v", "b")],
+                    flows: vec![
+                        flow_passthrough(col("s", "x"), persisted("v", "a")),
+                        flow_passthrough(col("s", "y"), persisted("v", "b")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(ops.writes, vec![write("v", "a"), write("v", "b")]);
         }
 
         #[test]
         fn alter_view_pairs_replacement_query_projection() {
-            let ops = extract("ALTER VIEW v AS SELECT x AS a FROM s");
-            assert_eq!(
-                ops.flows,
-                vec![flow_passthrough(col("s", "x"), persisted("v", "a"))]
+            assert_column_ops(
+                "ALTER VIEW v AS SELECT x AS a FROM s",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::AlterView,
+                    reads: vec![read("s", "x")],
+                    writes: vec![write("v", "a")],
+                    flows: vec![flow_passthrough(col("s", "x"), persisted("v", "a"))],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(ops.writes, vec![write("v", "a")]);
         }
 
         #[test]
         fn ctas_unnamed_projection_yields_no_paired_flow() {
             // `SELECT 1` has no column ref and no inferable name, so the
             // CTAS source produces no flow / no write for that slot.
-            let ops = extract("CREATE TABLE t AS SELECT 1 FROM s");
-            assert!(ops.flows.is_empty());
-            assert!(ops.writes.is_empty());
+            assert_column_ops(
+                "CREATE TABLE t AS SELECT 1 FROM s",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::CreateTable,
+                    reads: vec![],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
@@ -1664,25 +1767,42 @@ mod tests {
             // COUNT(DISTINCT user_id) — DISTINCT inside function args is
             // aggregate-only per SQL spec, classified as Aggregation even
             // if the function name weren't in the list.
-            let ops = extract("SELECT COUNT(DISTINCT user_id) FROM t1");
-            assert_eq!(
-                ops.flows,
-                vec![flow_aggregation(col("t1", "user_id"), out_anon(0))]
+            assert_column_ops(
+                "SELECT COUNT(DISTINCT user_id) FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "user_id")],
+                    writes: vec![],
+                    flows: vec![flow_aggregation(col("t1", "user_id"), out_anon(0))],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn aggregate_with_filter_clause_marker() {
-            // FILTER (WHERE ...) is aggregate-only per SQL spec. Works
-            // even for a hypothetical unknown function name.
-            let ops = extract("SELECT SUM(x) FILTER (WHERE y > 0) FROM t1");
-            // The function (SUM) is known AND has FILTER — either signal
-            // alone would classify it; the resulting kind is Aggregation.
-            // Note `y > 0` puts `y` in a Filter-kind read; assertion
-            // here focuses on the flow shape for the `x` source.
-            assert!(ops.flows.iter().any(
-                |f| f.source.name.value == "x" && matches!(f.kind, ColumnFlowKind::Aggregation)
-            ));
+            // FILTER (WHERE ...) is aggregate-only per SQL spec.
+            // Surprises surfaced by whole-value compare:
+            //  - `y` inside the aggregate's FILTER clause is classified
+            //    Projection, not Filter — the resolver treats FILTER
+            //    contents as part of the aggregate's argument scope.
+            //  - `y` ALSO contributes as an Aggregation flow source,
+            //    not just `x`. Anything mentioned inside the aggregate's
+            //    syntactic boundary (args + FILTER predicate) flows
+            //    into the aggregate's output.
+            assert_column_ops(
+                "SELECT SUM(x) FILTER (WHERE y > 0) FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "x"), read("t1", "y")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_aggregation(col("t1", "x"), out_anon(0)),
+                        flow_aggregation(col("t1", "y"), out_anon(0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
@@ -1690,9 +1810,15 @@ mod tests {
             // Outer wraps the CTE column in a computed expression
             // (s + 1) — composition: outer Computed × inner Aggregation =
             // Aggregation (Aggregation dominates Computed).
-            assert_flows(
+            assert_column_ops(
                 "WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s + 1 FROM cte",
-                vec![flow_aggregation(col("t1", "a"), out_anon(0))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![flow_aggregation(col("t1", "a"), out_anon(0))],
+                    diagnostics: vec![],
+                },
             );
         }
     }
