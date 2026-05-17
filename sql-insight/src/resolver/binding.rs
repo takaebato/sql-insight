@@ -93,9 +93,10 @@ pub(crate) enum Binding {
         schema: RelationSchema,
         /// The CTE body's projection groups, captured so that flow
         /// composition can substitute references to `cte.col` with the
-        /// body's source refs (transitive lineage). Empty for recursive
-        /// CTEs where the body is walked under a pre-bound stub and
-        /// fixpoint-aware projection capture is deferred.
+        /// body's source refs (transitive source → target flow).
+        /// Empty for recursive CTEs where the body is walked under a
+        /// pre-bound stub and fixpoint-aware projection capture is
+        /// deferred.
         body_projections: Vec<ProjectionGroup>,
     },
     DerivedTable {
@@ -474,7 +475,7 @@ impl<'a> Resolver<'a> {
         self.record_diagnostic(Diagnostic {
             kind: DiagnosticKind::WildcardSuppressed,
             message: format!(
-                "{}{} left unexpanded — lineage will be incomplete for this projection",
+                "{}{} left unexpanded — column flows will be incomplete for this projection",
                 description,
                 span_suffix(span),
             ),

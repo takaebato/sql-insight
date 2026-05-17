@@ -117,8 +117,8 @@ by hand.
   merge, EXCLUDE / REPLACE / RENAME clauses, CTE column rename,
   multi-segment qualifiers) is too high for a SQL-text-only library
   to handle correctly. Wildcards contribute nothing to `reads` /
-  `flows`; consumers needing per-column lineage either supply
-  resolved query plans or do their own expansion.
+  `flows`; consumers needing per-column source → target flows either
+  supply resolved query plans or do their own expansion.
 - Aggregate function classification combines spec-guaranteed
   structural markers (`FILTER (WHERE …)`, `WITHIN GROUP (…)`,
   `DISTINCT` in args — all aggregate-only per SQL standard) with a

@@ -25,8 +25,8 @@ pub enum DiagnosticKind {
     /// statement.
     UnsupportedStatement,
     /// `SELECT *` / `t.*` left unexpanded — the resolver does not perform
-    /// wildcard expansion (see crate docs), so lineage is incomplete for
-    /// projections that include a wildcard.
+    /// wildcard expansion (see crate docs), so column flows are incomplete
+    /// for projections that include a wildcard.
     WildcardSuppressed,
     /// Unqualified column reference matched multiple in-scope bindings
     /// whose schemas definitively contain the name. The reference is
