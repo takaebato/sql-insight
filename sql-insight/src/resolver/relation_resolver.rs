@@ -1092,6 +1092,26 @@ impl<'a> RelationResolver<'a> {
         }
     }
 
+    /// Resolve the effective target column list for INSERT-style
+    /// positional pairing: explicit list wins when non-empty,
+    /// otherwise the catalog-provided schema if known. Returns an
+    /// empty `Vec` when neither path yields names — the caller then
+    /// emits no Persisted edges (matches the no-catalog
+    /// column-list-less INSERT behavior).
+    pub(super) fn effective_target_columns(
+        &self,
+        explicit: &[Ident],
+        target: &TableReference,
+    ) -> Vec<Ident> {
+        if !explicit.is_empty() {
+            return explicit.to_vec();
+        }
+        match self.lookup_table_schema(target) {
+            RelationSchema::Known(cols) => cols.into_iter().map(|c| c.name).collect(),
+            RelationSchema::Unknown => Vec::new(),
+        }
+    }
+
     /// Look up an in-scope CTE's body projections, for re-binding under
     /// an alias (`FROM cte AS c`). Returns an empty `Vec` when the
     /// reference is multi-segment, not bound, or not a Cte binding —

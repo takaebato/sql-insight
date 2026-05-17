@@ -227,6 +227,11 @@ impl<'a> RelationResolver<'a> {
         let target_table = table.clone();
         self.bind_base_table(table, alias, TableRole::Write);
         if let Some(source) = &insert.source {
+            // Explicit column list wins; otherwise fall back to the
+            // catalog-provided schema (when present) for positional
+            // pairing. Without either, no flow edges are emitted —
+            // we have no target column names to pair against.
+            let effective_columns = self.effective_target_columns(&insert.columns, &target_table);
             // Raw resolve_query (not the QueryOutput-emitting wrapper):
             // INSERT pairs each projection item positionally with its
             // target column instead, emitting Persisted edges. UNION
@@ -234,8 +239,7 @@ impl<'a> RelationResolver<'a> {
             // branch pairs against the same target columns naturally.
             let resolved = self.resolve_query(source)?;
             self.emit_per_projection(&resolved.projections, |position, _item| {
-                insert
-                    .columns
+                effective_columns
                     .get(position)
                     .map(|col| FlowTargetSpec::Persisted {
                         table: target_table.clone(),
@@ -413,16 +417,27 @@ impl<'a> RelationResolver<'a> {
         columns: &[sqlparser::ast::ObjectName],
         target_table: Option<&TableReference>,
     ) -> Result<(), Error> {
+        // Resolve effective target column idents up-front: when the
+        // INSERT clause has an explicit list, take each ObjectName's
+        // last segment; otherwise fall back to the catalog-provided
+        // schema (returns empty without catalog, matching the
+        // no-pairing behavior).
+        let explicit_idents: Vec<sqlparser::ast::Ident> = columns
+            .iter()
+            .filter_map(|c| c.0.last().and_then(|p| p.as_ident().cloned()))
+            .collect();
+        let effective_idents = match target_table {
+            Some(target) => self.effective_target_columns(&explicit_idents, target),
+            None => explicit_idents,
+        };
         for row in &values.rows {
             for (position, value_expr) in row.iter().enumerate() {
                 let kind = super::query::expr_kind(value_expr);
                 let refs_before = self.column_refs_len();
                 self.visit_expr(value_expr)?;
-                let (Some(target_table), Some(col_obj)) = (target_table, columns.get(position))
+                let (Some(target_table), Some(col_ident)) =
+                    (target_table, effective_idents.get(position))
                 else {
-                    continue;
-                };
-                let Some(col_ident) = col_obj.0.last().and_then(|p| p.as_ident()) else {
                     continue;
                 };
                 let target = FlowTargetSpec::Persisted {

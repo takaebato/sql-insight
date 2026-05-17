@@ -25,18 +25,22 @@
 //!   plus a `Conditional` modifier layered on the surrounding clause
 //!   for CASE-WHEN condition refs). Typically `len == 1`; multi-role
 //!   refs (USING / NATURAL JOIN merged columns) are future work.
-//! - `writes`: INSERT explicit column lists scoped to the INSERT
-//!   target, UPDATE SET targets scoped to the UPDATE table,
+//! - `writes`: INSERT target columns (explicit list when given;
+//!   when omitted and the catalog provides the target's schema,
+//!   the columns the resolver paired with source projections via
+//!   the catalog), UPDATE SET targets scoped to the UPDATE table,
 //!   CTAS / CREATE VIEW / ALTER VIEW target columns (explicit
 //!   column list when provided, else the names the resolver derived
 //!   from the source projection), and MERGE WHEN-clause writes
-//!   (UPDATE SET targets and INSERT column lists). Column-list-less
-//!   INSERT SELECT remains deferred.
+//!   (UPDATE SET targets and INSERT column lists, with the same
+//!   catalog fallback for column-list-less INSERT).
 //! - `flows`: per-projection-item edges for SELECT (target =
 //!   `QueryOutput { name, position }`), positionally paired
-//!   `source-column → target-column` edges for INSERT with explicit
-//!   column list (one ProjectionGroup per UNION branch, each paired
-//!   against the same target columns), and per-assignment edges for
+//!   `source-column → target-column` edges for INSERT (explicit
+//!   column list, or — when the catalog provides the target's
+//!   schema — the catalog columns; one ProjectionGroup per UNION
+//!   branch, each paired against the same target columns), and
+//!   per-assignment edges for
 //!   UPDATE SET. Sources that reference CTEs or derived tables are
 //!   composed end-to-end — references substitute through the
 //!   intermediate's body projections recursively, so a SELECT through
@@ -401,8 +405,8 @@ fn collect_writes(
     let mut writes = Vec::new();
     match statement {
         Statement::Insert(insert) => {
+            let target = TableReference::try_from(insert)?;
             if !insert.columns.is_empty() {
-                let target = TableReference::try_from(insert)?;
                 for col in &insert.columns {
                     writes.push(ColumnWrite {
                         column: ColumnReference {
@@ -411,6 +415,12 @@ fn collect_writes(
                         },
                     });
                 }
+            } else {
+                // INSERT without an explicit column list — when the
+                // catalog provided the target schema, the resolver
+                // emitted Persisted flows to each paired column. Read
+                // those off to surface the implicit writes.
+                writes.extend(persisted_target_writes(&target, resolution));
             }
         }
         Statement::Update(update) => {
@@ -488,9 +498,9 @@ fn collect_writes(
 }
 
 /// Writes for a CREATE-as-style target: when an explicit column list
-/// is given, use it verbatim; otherwise scan the resolution's
-/// `Persisted` flow edges to this table and collect the unique
-/// columns the resolver paired with source projections.
+/// is given, use it verbatim; otherwise delegate to
+/// [`persisted_target_writes`] to recover the columns from the
+/// resolver's flow edges.
 fn created_writes(
     target: &TableReference,
     explicit: &[Ident],
@@ -507,6 +517,18 @@ fn created_writes(
             })
             .collect();
     }
+    persisted_target_writes(target, resolution)
+}
+
+/// Scan the resolution's `Persisted` flow edges for any pointing at
+/// `target`, returning a deduped `ColumnWrite` per unique column
+/// name. Used by both CREATE-as-style writes derivation and INSERT
+/// without an explicit column list (where the catalog-provided
+/// schema let the resolver pair source projections positionally).
+fn persisted_target_writes(
+    target: &TableReference,
+    resolution: &RelationResolution,
+) -> Vec<ColumnWrite> {
     let mut seen: Vec<Ident> = Vec::new();
     for edge in &resolution.flow_edges {
         if let FlowTargetSpec::Persisted { table, column } = &edge.target {
@@ -1782,6 +1804,69 @@ mod tests {
             let catalog = TestCatalog::default().with("t1", vec!["a", "b"]);
             let ops = extract_with_catalog("SELECT a FROM t1", &catalog);
             assert_eq!(ops.reads, vec![read("t1", "a")]);
+        }
+
+        #[test]
+        fn catalog_insert_without_explicit_columns_pairs_via_catalog_schema() {
+            // INSERT INTO t SELECT a, b FROM s — no explicit column
+            // list. With t = [x, y, z] in catalog, the resolver pairs
+            // source projections positionally (s.a → t.x, s.b → t.y).
+            // Unpaired catalog cols (z) get no flow / no write.
+            let catalog = TestCatalog::default().with("t", vec!["x", "y", "z"]);
+            let ops = extract_with_catalog("INSERT INTO t SELECT a, b FROM s", &catalog);
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("s", "a"), persisted("t", "x")),
+                    flow_passthrough(col("s", "b"), persisted("t", "y")),
+                ]
+            );
+            assert_eq!(ops.writes, vec![write("t", "x"), write("t", "y")]);
+        }
+
+        #[test]
+        fn catalog_insert_without_explicit_columns_source_longer_than_target() {
+            // 3 source projections vs t = [x, y] — pair what fits,
+            // surplus source column gets no flow.
+            let catalog = TestCatalog::default().with("t", vec!["x", "y"]);
+            let ops = extract_with_catalog("INSERT INTO t SELECT a, b, c FROM s", &catalog);
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("s", "a"), persisted("t", "x")),
+                    flow_passthrough(col("s", "b"), persisted("t", "y")),
+                ]
+            );
+            assert_eq!(ops.writes, vec![write("t", "x"), write("t", "y")]);
+        }
+
+        #[test]
+        fn catalog_insert_explicit_columns_override_catalog_schema() {
+            // Explicit (q) wins over catalog [x, y, z].
+            let catalog = TestCatalog::default().with("t", vec!["x", "y", "z"]);
+            let ops = extract_with_catalog("INSERT INTO t (q) SELECT a FROM s", &catalog);
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("s", "a"), persisted("t", "q"))]
+            );
+            assert_eq!(ops.writes, vec![write("t", "q")]);
+        }
+
+        #[test]
+        fn catalog_merge_not_matched_insert_no_cols_pairs_via_catalog() {
+            // Same catalog fallback applies to MERGE's INSERT clause.
+            let catalog = TestCatalog::default().with("t", vec!["id", "a"]);
+            let ops = extract_with_catalog(
+                "MERGE INTO t USING s ON t.id = s.id \
+                 WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.a)",
+                &catalog,
+            );
+            assert!(ops
+                .flows
+                .contains(&flow_passthrough(col("s", "id"), persisted("t", "id"))));
+            assert!(ops
+                .flows
+                .contains(&flow_passthrough(col("s", "a"), persisted("t", "a"))));
         }
 
         #[test]
