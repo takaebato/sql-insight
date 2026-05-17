@@ -8,7 +8,7 @@ use indexmap::IndexMap;
 use crate::catalog::{Catalog, ColumnSchema};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::error::Error;
-use crate::extractor::column_operation_extractor::ReadKind;
+use crate::extractor::column_operation_extractor::{ColumnFlowKind, ReadKind};
 use crate::relation::TableReference;
 use sqlparser::ast::{Ident, ObjectName, Statement};
 
@@ -78,8 +78,9 @@ pub(crate) struct RelationResolution {
 
 /// A pre-resolution column flow record. `source` still needs scope-chain
 /// resolution (for unqualified parts); `target` is fully spec'd by the
-/// resolver; `bare` distinguishes a passthrough source (bare
-/// `Identifier` / `CompoundIdentifier`) from a computed expression.
+/// resolver; `kind` is the public `ColumnFlowKind` to surface (composed
+/// further by `composed_flow_edges` when the source goes through a
+/// synthetic intermediate).
 ///
 /// Created by callers from [`ProjectionGroup`]s (for SELECT-style flows
 /// — INSERT pairs with target columns, top-level / nested SELECTs emit
@@ -89,7 +90,7 @@ pub(crate) struct RelationResolution {
 pub(crate) struct FlowEdge {
     pub(crate) source: RawColumnRef,
     pub(crate) target: FlowTargetSpec,
-    pub(crate) bare: bool,
+    pub(crate) kind: ColumnFlowKind,
 }
 
 /// One SELECT's projection captured during the walk — one
@@ -112,7 +113,11 @@ pub(crate) struct ProjectionGroup {
 pub(crate) struct ProjectionItem {
     pub(crate) name: Option<Ident>,
     pub(crate) source_refs: Vec<RawColumnRef>,
-    pub(crate) bare: bool,
+    /// Classification of how the projection's expression turns its
+    /// `source_refs` into the output value (Passthrough / Aggregation /
+    /// Computed). Composed with the outer flow's kind when this item
+    /// participates in a CTE / derived table substitution.
+    pub(crate) kind: ColumnFlowKind,
 }
 
 /// Target spec for a [`FlowEdge`]. `QueryOutput` is for transient
@@ -292,19 +297,20 @@ impl RelationResolution {
     /// substituted by walking that body's matching `ProjectionItem`
     /// and emitting one edge per inner source ref — recursively, until
     /// the chain bottoms out at a real table or an unresolvable ref.
-    /// Each substitution AND's the outer edge's `bare` flag with the
-    /// body item's, so passthrough through computed becomes computed.
-    /// Bounded by [`MAX_COMPOSITION_DEPTH`] as a cycle guard.
+    /// The outer edge's `kind` is combined with each body item's kind
+    /// via [`compose_flow_kinds`] (Aggregation dominates; Passthrough
+    /// is preserved only when both sides are Passthrough). Bounded by
+    /// [`MAX_COMPOSITION_DEPTH`] as a cycle guard.
     pub(crate) fn composed_flow_edges(&self) -> Vec<FlowEdge> {
         self.flow_edges
             .iter()
             .flat_map(|edge| {
-                self.substitute_source(&edge.source, edge.bare, 0)
+                self.substitute_source(&edge.source, edge.kind, 0)
                     .into_iter()
-                    .map(|(source, bare)| FlowEdge {
+                    .map(|(source, kind)| FlowEdge {
                         source,
                         target: edge.target.clone(),
-                        bare,
+                        kind,
                     })
             })
             .collect()
@@ -313,11 +319,11 @@ impl RelationResolution {
     fn substitute_source(
         &self,
         raw: &RawColumnRef,
-        outer_bare: bool,
+        outer_kind: ColumnFlowKind,
         depth: usize,
-    ) -> Vec<(RawColumnRef, bool)> {
+    ) -> Vec<(RawColumnRef, ColumnFlowKind)> {
         if depth >= MAX_COMPOSITION_DEPTH {
-            return vec![(raw.clone(), outer_bare)];
+            return vec![(raw.clone(), outer_kind)];
         }
         let body_projections = match self.synthetic_owning_binding(raw) {
             Some(RelationBinding::Cte {
@@ -326,13 +332,13 @@ impl RelationResolution {
             Some(RelationBinding::DerivedTable {
                 body_projections, ..
             }) => body_projections,
-            _ => return vec![(raw.clone(), outer_bare)],
+            _ => return vec![(raw.clone(), outer_kind)],
         };
         if body_projections.is_empty() {
-            return vec![(raw.clone(), outer_bare)];
+            return vec![(raw.clone(), outer_kind)];
         }
         let Some(col_name) = raw.parts.last() else {
-            return vec![(raw.clone(), outer_bare)];
+            return vec![(raw.clone(), outer_kind)];
         };
         let key = RelationKey::from_ident(col_name);
         let mut result = Vec::new();
@@ -345,14 +351,14 @@ impl RelationResolution {
                 if !matches {
                     continue;
                 }
-                let new_bare = outer_bare && item.bare;
+                let composed = compose_flow_kinds(outer_kind, item.kind);
                 for source in &item.source_refs {
-                    result.extend(self.substitute_source(source, new_bare, depth + 1));
+                    result.extend(self.substitute_source(source, composed, depth + 1));
                 }
             }
         }
         if result.is_empty() {
-            vec![(raw.clone(), outer_bare)]
+            vec![(raw.clone(), outer_kind)]
         } else {
             result
         }
@@ -363,6 +369,20 @@ impl RelationResolution {
 /// cycles (recursive CTEs are pre-bound with empty body_projections, so
 /// the typical case stops there; this is a defence for unexpected loops).
 const MAX_COMPOSITION_DEPTH: usize = 64;
+
+/// Combine two flow kinds along a substitution edge: `Aggregation`
+/// dominates (any aggregation step makes the whole chain Aggregation);
+/// otherwise `Passthrough` survives only when both sides agree; any
+/// other mix collapses to `Computed`.
+fn compose_flow_kinds(outer: ColumnFlowKind, inner: ColumnFlowKind) -> ColumnFlowKind {
+    if outer == ColumnFlowKind::Aggregation || inner == ColumnFlowKind::Aggregation {
+        ColumnFlowKind::Aggregation
+    } else if outer == ColumnFlowKind::Passthrough && inner == ColumnFlowKind::Passthrough {
+        ColumnFlowKind::Passthrough
+    } else {
+        ColumnFlowKind::Computed
+    }
+}
 
 fn is_synthetic_binding(binding: &RelationBinding) -> bool {
     matches!(
@@ -704,7 +724,7 @@ impl<'a> RelationResolver<'a> {
                     self.push_flow_edge(FlowEdge {
                         source: source.clone(),
                         target: target.clone(),
-                        bare: item.bare,
+                        kind: item.kind,
                     });
                 }
             }

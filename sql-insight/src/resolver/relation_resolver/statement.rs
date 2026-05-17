@@ -235,7 +235,7 @@ impl<'a> RelationResolver<'a> {
                         self.push_flow_edge(FlowEdge {
                             source: source.clone(),
                             target: target.clone(),
-                            bare: item.bare,
+                            kind: item.kind,
                         });
                     }
                 }
@@ -269,7 +269,7 @@ impl<'a> RelationResolver<'a> {
         };
         for assignment in &update.assignments {
             let target_parts = assignment_target_parts(&assignment.target);
-            let bare = super::query::expr_is_bare(&assignment.value);
+            let kind = super::query::expr_kind(&assignment.value);
             let refs_before = self.column_refs_len();
             self.visit_expr(&assignment.value)?;
             let Some(target_parts) = target_parts else {
@@ -290,7 +290,7 @@ impl<'a> RelationResolver<'a> {
                 self.push_flow_edge(FlowEdge {
                     source,
                     target: target.clone(),
-                    bare,
+                    kind,
                 });
             }
         }

@@ -36,12 +36,16 @@
 //!   composed end-to-end — references substitute through the
 //!   intermediate's body projections recursively, so a SELECT through
 //!   a chain of CTEs surfaces flows whose sources are the underlying
-//!   base tables. Each edge is tagged `Passthrough` (bare ref) or
-//!   `Computed` (any expression / a composition step that crosses a
-//!   computed body item). MERGE clauses, CTAS / CREATE VIEW,
-//!   column-list-less INSERT SELECT, and predicate-side influence
-//!   (Filter / Join / GroupBy / Sort / Window / Conditional) are
-//!   deferred.
+//!   base tables. Each edge is tagged with a `ColumnFlowKind`:
+//!   `Passthrough` (bare ref), `Aggregation` (top-level aggregate
+//!   function call — detected via SQL-spec structural markers like
+//!   `FILTER (WHERE ...)` / `WITHIN GROUP (...)` / `DISTINCT` in
+//!   args, plus a name list of common aggregates across major
+//!   dialects), or `Computed` (anything else). Composition is
+//!   `Aggregation`-dominant: any aggregation step in a CTE / derived
+//!   chain makes the resulting flow `Aggregation`. MERGE clauses,
+//!   CTAS / CREATE VIEW, column-list-less INSERT SELECT, and
+//!   `Conditional` (CASE WHEN condition) classification are deferred.
 //!
 //! **Strictness scales with the catalog.** Without a catalog, Table
 //! bindings have `Unknown` schemas and unqualified refs to a
@@ -196,20 +200,24 @@ pub enum ColumnTarget {
 
 /// How a source column contributes to its target.
 ///
-/// MVP carries two variants:
 /// - `Passthrough` — the source value is forwarded unchanged
 ///   (`SELECT a FROM t1`, `INSERT INTO t1 (a) SELECT b FROM t2`).
-/// - `Computed` — the source feeds an expression that produces the
-///   target (`SELECT a + b FROM t1`, both `a` and `b` are `Computed`).
+/// - `Aggregation` — the projection's top-level expression is an
+///   aggregate function call (`SUM(a)`, `COUNT(b)`, etc.), and the
+///   source feeds it. Composition propagates: if any step along the
+///   flow chain is an aggregation, the resulting flow is
+///   `Aggregation`.
+/// - `Computed` — the source feeds any other non-aggregate
+///   expression (`SELECT a + b FROM t1`, both `a` and `b` are
+///   `Computed`).
 ///
-/// More variants (`Aggregation`, plus predicate-influence kinds like
-/// `Filter` / `Join` / `GroupBy` / `Sort` / `Window` / `Conditional`)
-/// will be added incrementally as later phases tighten the
-/// classification.
+/// Future variants (`Conditional`, etc.) may further split
+/// `Computed` as later phases tighten the classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ColumnFlowKind {
     Passthrough,
+    Aggregation,
     Computed,
 }
 
@@ -290,15 +298,10 @@ fn extract_flows(resolution: &RelationResolution) -> Vec<ColumnFlow> {
                     })
                 }
             };
-            let kind = if edge.bare {
-                ColumnFlowKind::Passthrough
-            } else {
-                ColumnFlowKind::Computed
-            };
             Some(ColumnFlow {
                 source,
                 target,
-                kind,
+                kind: edge.kind,
             })
         })
         .collect()
@@ -944,6 +947,14 @@ mod tests {
         }
     }
 
+    fn flow_aggregation(source: ColumnReference, target: ColumnTarget) -> ColumnFlow {
+        ColumnFlow {
+            source,
+            target,
+            kind: ColumnFlowKind::Aggregation,
+        }
+    }
+
     fn flow_computed(source: ColumnReference, target: ColumnTarget) -> ColumnFlow {
         ColumnFlow {
             source,
@@ -1109,6 +1120,95 @@ mod tests {
     fn wildcard_select_emits_no_flow() {
         let ops = extract("SELECT * FROM t1");
         assert!(ops.flows.is_empty());
+    }
+
+    // ───────── ColumnFlowKind::Aggregation (Phase 5.6d) ─────────
+
+    #[test]
+    fn aggregate_call_in_projection_emits_aggregation_flow() {
+        let ops = extract("SELECT SUM(a) FROM t1");
+        assert_eq!(
+            ops.flows,
+            vec![flow_aggregation(col("t1", "a"), out_anon(0))]
+        );
+    }
+
+    #[test]
+    fn aggregate_with_alias_carries_aliased_name() {
+        let ops = extract("SELECT COUNT(b) AS n FROM t1");
+        assert_eq!(
+            ops.flows,
+            vec![flow_aggregation(col("t1", "b"), out("n", 0))]
+        );
+    }
+
+    #[test]
+    fn aggregate_wrapped_in_expression_falls_back_to_computed() {
+        // `SUM(a) + 1` has BinaryOp at the top level, so the
+        // projection's kind is Computed — only a bare aggregate call
+        // qualifies as Aggregation.
+        let ops = extract("SELECT SUM(a) + 1 FROM t1");
+        assert_eq!(ops.flows, vec![flow_computed(col("t1", "a"), out_anon(0))]);
+    }
+
+    #[test]
+    fn aggregate_in_insert_select_propagates_aggregation() {
+        let ops = extract("INSERT INTO t2 (n) SELECT COUNT(a) FROM t1");
+        assert_eq!(
+            ops.flows,
+            vec![flow_aggregation(col("t1", "a"), persisted("t2", "n"))]
+        );
+    }
+
+    #[test]
+    fn cte_aggregate_composes_to_outer_as_aggregation() {
+        // CTE body's `s` is Aggregation (SUM(a)); outer's bare `s`
+        // would be Passthrough, but composition (Aggregation
+        // dominates) collapses the chain to Aggregation.
+        let ops = extract("WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s FROM cte");
+        assert_eq!(
+            ops.flows,
+            vec![flow_aggregation(col("t1", "a"), out("s", 0))]
+        );
+    }
+
+    #[test]
+    fn aggregate_with_distinct_args_marker() {
+        // COUNT(DISTINCT user_id) — DISTINCT inside function args is
+        // aggregate-only per SQL spec, classified as Aggregation even
+        // if the function name weren't in the list.
+        let ops = extract("SELECT COUNT(DISTINCT user_id) FROM t1");
+        assert_eq!(
+            ops.flows,
+            vec![flow_aggregation(col("t1", "user_id"), out_anon(0))]
+        );
+    }
+
+    #[test]
+    fn aggregate_with_filter_clause_marker() {
+        // FILTER (WHERE ...) is aggregate-only per SQL spec. Works
+        // even for a hypothetical unknown function name.
+        let ops = extract("SELECT SUM(x) FILTER (WHERE y > 0) FROM t1");
+        // The function (SUM) is known AND has FILTER — either signal
+        // alone would classify it; the resulting kind is Aggregation.
+        // Note `y > 0` puts `y` in a Filter-kind read; assertion
+        // here focuses on the flow shape for the `x` source.
+        assert!(ops
+            .flows
+            .iter()
+            .any(|f| f.source.name.value == "x" && matches!(f.kind, ColumnFlowKind::Aggregation)));
+    }
+
+    #[test]
+    fn cte_aggregate_then_outer_compute_still_aggregation() {
+        // Outer wraps the CTE column in a computed expression
+        // (s + 1) — composition: outer Computed × inner Aggregation =
+        // Aggregation (Aggregation dominates Computed).
+        let ops = extract("WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s + 1 FROM cte");
+        assert_eq!(
+            ops.flows,
+            vec![flow_aggregation(col("t1", "a"), out_anon(0))]
+        );
     }
 
     // ───────── transitive composition through CTE / derived ─────────
