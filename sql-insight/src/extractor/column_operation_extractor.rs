@@ -802,9 +802,18 @@ mod tests {
 
         #[test]
         fn qualified_select_collects_qualified_reads() {
-            assert_reads(
+            assert_column_ops(
                 "SELECT t1.a, t1.b FROM t1",
-                vec![read("t1", "a"), read("t1", "b")],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t1", "b"), out("b", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -813,68 +822,127 @@ mod tests {
             // Resolver walks FROM (including JOIN ON) before the projection,
             // so the predicate columns appear ahead of the projected ones —
             // and are tagged Filter while projection refs are Projection.
-            assert_reads(
+            assert_column_ops(
                 "SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id",
-                vec![
-                    filter_read("t1", "id"),
-                    filter_read("t2", "id"),
-                    read("t1", "a"),
-                    read("t2", "b"),
-                ],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        filter_read("t1", "id"),
+                        filter_read("t2", "id"),
+                        read("t1", "a"),
+                        read("t2", "b"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t2", "b"), out("b", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn schema_qualified_ref_resolves_to_schema_dot_table() {
-            let ops = extract("SELECT s1.t1.a FROM s1.t1");
             let table_ref = TableReference {
                 catalog: None,
                 schema: Some("s1".into()),
                 name: "t1".into(),
             };
-            assert_eq!(
-                ops.reads,
-                vec![ColumnRead {
-                    column: ColumnReference {
-                        table: Some(table_ref),
-                        name: "a".into(),
-                    },
-                    kinds: vec![ReadKind::Projection],
-                }]
+            assert_column_ops(
+                "SELECT s1.t1.a FROM s1.t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![ColumnRead {
+                        column: ColumnReference {
+                            table: Some(table_ref.clone()),
+                            name: "a".into(),
+                        },
+                        kinds: vec![ReadKind::Projection],
+                    }],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(
+                        ColumnReference {
+                            table: Some(table_ref),
+                            name: "a".into(),
+                        },
+                        out("a", 0),
+                    )],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn where_predicate_qualified_ref_is_a_read() {
-            let ops = extract("SELECT t1.a FROM t1 WHERE t1.b > 0");
-            assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "b")]);
+            assert_column_ops(
+                "SELECT t1.a FROM t1 WHERE t1.b > 0",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), filter_read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn unqualified_single_table_resolves_to_that_table() {
-            let ops = extract("SELECT a, b FROM t1");
-            assert_eq!(ops.reads, vec![read("t1", "a"), read("t1", "b")]);
+            assert_column_ops(
+                "SELECT a, b FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t1", "b"), out("b", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn unqualified_in_where_resolves_to_single_table() {
-            let ops = extract("SELECT a FROM t1 WHERE b > 0");
-            assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "b")]);
+            assert_column_ops(
+                "SELECT a FROM t1 WHERE b > 0",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), filter_read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn unqualified_with_multiple_tables_stays_unresolved() {
             // Two `Unknown`-schema tables — without a catalog the resolver
             // cannot tell which `a` belongs to, so the ref surfaces with
-            // `table: None`.
-            let ops = extract("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id");
-            assert_eq!(
-                ops.reads,
-                vec![
-                    filter_read("t1", "id"),
-                    filter_read("t2", "id"),
-                    unresolved("a"),
-                ]
+            // `table: None`. The flow source also stays unresolved.
+            assert_column_ops(
+                "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        filter_read("t1", "id"),
+                        filter_read("t2", "id"),
+                        unresolved("a"),
+                    ],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: None,
+                            name: "a".into(),
+                        },
+                        target: out("a", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -882,8 +950,16 @@ mod tests {
         fn unqualified_uses_alias_binding_but_returns_real_table() {
             // Alias is just a binding key; the resolver returns the
             // alias-free TableReference of the binding's underlying table.
-            let ops = extract("SELECT a FROM t1 AS u");
-            assert_eq!(ops.reads, vec![read("t1", "a")]);
+            assert_column_ops(
+                "SELECT a FROM t1 AS u",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
@@ -892,31 +968,27 @@ mod tests {
             // intermediate, not real storage), so it's dropped from reads.
             // Reads surface only references with real Table owners or
             // unresolved column names. `unknown_col` doesn't match the
-            // cte's schema, so it surfaces unresolved (table: None).
-            let ops = extract("WITH cte AS (SELECT id FROM t1) SELECT id, unknown_col FROM cte");
-            // CTE body's own `id` (from t1) is a real read.
-            assert!(
-                ops.reads.contains(&read("t1", "id")),
-                "expected t1.id in {:?}",
-                ops.reads
-            );
-            // Outer `id` resolves to cte → dropped.
-            assert!(
-                !ops.reads.iter().any(|r| r
-                    .column
-                    .table
-                    .as_ref()
-                    .is_some_and(|t| t.name.value == "cte")),
-                "cte.id should not surface in {:?}",
-                ops.reads
-            );
-            // Unresolved name still surfaces with table: None.
-            assert!(
-                ops.reads
-                    .iter()
-                    .any(|r| r.column.name.value == "unknown_col" && r.column.table.is_none()),
-                "expected unresolved unknown_col in {:?}",
-                ops.reads
+            // cte's Known schema [id], so it surfaces unresolved
+            // (table: None) AND fires an UnresolvedColumn diagnostic.
+            assert_column_ops(
+                "WITH cte AS (SELECT id FROM t1) SELECT id, unknown_col FROM cte",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "id"), unresolved("unknown_col")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "id"), out("id", 0)),
+                        ColumnFlow {
+                            source: ColumnReference {
+                                table: None,
+                                name: "unknown_col".into(),
+                            },
+                            target: out("unknown_col", 1),
+                            kind: ColumnFlowKind::Passthrough,
+                        },
+                    ],
+                    diagnostics: vec![diag(DiagnosticKind::UnresolvedColumn)],
+                },
             );
         }
 
@@ -924,8 +996,16 @@ mod tests {
         fn derived_table_ref_does_not_surface_in_reads() {
             // Outer `id` resolves to derived alias `d` — synthetic, dropped.
             // Only the inner SELECT's t1.id is a real read.
-            let ops = extract("SELECT id FROM (SELECT id FROM t1) AS d");
-            assert_eq!(ops.reads, vec![read("t1", "id")]);
+            assert_column_ops(
+                "SELECT id FROM (SELECT id FROM t1) AS d",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "id")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
@@ -933,32 +1013,48 @@ mod tests {
             // Inner subquery has its own t2 in scope; the unqualified `y`
             // inside the IN-subquery resolves to t2 even though t1 is
             // also in the outer scope. Standard SQL inner-shadows-outer.
-            // `y` is in the inner WHERE so its kind is Filter.
-            let ops = extract("SELECT * FROM t1 WHERE id IN (SELECT id FROM t2 WHERE y > 0)");
-            assert!(ops.reads.contains(&filter_read("t2", "y")));
+            // `y` is in the inner WHERE so its kind is Filter. The inner
+            // subquery's projection `id` also produces a flow into a
+            // QueryOutput slot of the inner SELECT — that flow surfaces
+            // even though the outer wraps it.
+            assert_column_ops(
+                "SELECT * FROM t1 WHERE id IN (SELECT id FROM t2 WHERE y > 0)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        filter_read("t1", "id"),
+                        read("t2", "id"),
+                        filter_read("t2", "y"),
+                    ],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t2", "id"), out("id", 0))],
+                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                },
+            );
         }
 
         #[test]
         fn unqualified_correlated_walks_to_outer_when_inner_has_no_candidate() {
             // Inner CTE has Known schema [zz]; `outer_col` doesn't fit it,
             // so resolution walks to the outer scope and picks the t1
-            // (Unknown) binding.
-            let ops = extract(
+            // (Unknown) binding. The innermost SELECT's projection `zz`
+            // also produces a flow that surfaces.
+            assert_column_ops(
                 "SELECT * FROM t1 WHERE id IN (\
                 WITH inner_cte AS (SELECT zz FROM t1) \
                 SELECT zz FROM inner_cte WHERE outer_col > 0)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        filter_read("t1", "id"),
+                        read("t1", "zz"),
+                        filter_read("t1", "outer_col"),
+                    ],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "zz"), out("zz", 0))],
+                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                },
             );
-            // The point: `outer_col` walks past the CTE binding (Known
-            // schema doesn't list it) and lands on the outer t1 (Unknown).
-            // Note that t1 appears twice in the chain (outer and inside
-            // the CTE body) — they're separate scopes; the inner
-            // inner_cte scope's t1 isn't the same scope as the outer.
-            // For this test we just check that `outer_col` resolves
-            // somewhere reasonable rather than the exact target.
-            assert!(ops
-                .reads
-                .iter()
-                .any(|r| r.column.name.value == "outer_col" && r.column.table.is_some()));
         }
     }
 
@@ -967,48 +1063,94 @@ mod tests {
 
         #[test]
         fn insert_with_explicit_columns_writes_those_columns_on_target() {
-            let ops = extract("INSERT INTO t1 (a, b) VALUES (1, 2)");
-            assert_eq!(ops.writes, vec![write("t1", "a"), write("t1", "b")]);
-            assert!(ops.reads.is_empty());
+            assert_column_ops(
+                "INSERT INTO t1 (a, b) VALUES (1, 2)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![],
+                    writes: vec![write("t1", "a"), write("t1", "b")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn insert_select_records_target_writes_and_qualified_source_reads() {
-            let ops = extract("INSERT INTO t1 (a) SELECT t2.b FROM t2");
-            assert_eq!(ops.writes, vec![write("t1", "a")]);
-            assert_eq!(ops.reads, vec![read("t2", "b")]);
+            assert_column_ops(
+                "INSERT INTO t1 (a) SELECT t2.b FROM t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t2", "b")],
+                    writes: vec![write("t1", "a")],
+                    flows: vec![flow_passthrough(col("t2", "b"), persisted("t1", "a"))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn insert_without_explicit_columns_yields_no_writes() {
-            let ops = extract("INSERT INTO t1 SELECT t2.b FROM t2");
-            assert!(ops.writes.is_empty());
-            assert_eq!(ops.reads, vec![read("t2", "b")]);
+            // Without an explicit column list AND without a catalog, the
+            // resolver can't pair source projections to target columns;
+            // writes / flows stay empty.
+            assert_column_ops(
+                "INSERT INTO t1 SELECT t2.b FROM t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn update_set_targets_become_writes_on_update_table() {
-            assert_writes("UPDATE t1 SET a = 1", vec![write("t1", "a")]);
+            assert_column_ops(
+                "UPDATE t1 SET a = 1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Update,
+                    reads: vec![],
+                    writes: vec![write("t1", "a")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn update_set_qualified_target_keeps_qualifier() {
-            assert_writes("UPDATE t1 SET t1.a = 1", vec![write("t1", "a")]);
+            assert_column_ops(
+                "UPDATE t1 SET t1.a = 1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Update,
+                    reads: vec![],
+                    writes: vec![write("t1", "a")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn update_set_rhs_qualified_ref_is_a_read() {
             // SET RHS is value-producing (Projection-like); WHERE refs are
             // Filter-tagged.
-            let ops = extract("UPDATE t1 SET a = t2.b FROM t2 WHERE t1.id = t2.id");
-            assert_eq!(ops.writes, vec![write("t1", "a")]);
-            assert_eq!(
-                ops.reads,
-                vec![
-                    read("t2", "b"),
-                    filter_read("t1", "id"),
-                    filter_read("t2", "id"),
-                ]
+            assert_column_ops(
+                "UPDATE t1 SET a = t2.b FROM t2 WHERE t1.id = t2.id",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Update,
+                    reads: vec![
+                        read("t2", "b"),
+                        filter_read("t1", "id"),
+                        filter_read("t2", "id"),
+                    ],
+                    writes: vec![write("t1", "a")],
+                    flows: vec![flow_passthrough(col("t2", "b"), persisted("t1", "a"))],
+                    diagnostics: vec![],
+                },
             );
         }
     }
@@ -1039,81 +1181,135 @@ mod tests {
             // The two textual `a` references each get their own ColumnRead
             // entry — one Projection, one Filter — preserving syntactic role
             // per textual occurrence.
-            let ops = extract("SELECT a FROM t1 WHERE a > 0");
-            assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "a"),]);
+            assert_column_ops(
+                "SELECT a FROM t1 WHERE a > 0",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), filter_read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn subquery_where_ref_carries_filter_kind_not_outer_projection() {
             // The IN-subquery's WHERE walker resets current_read_kind to
             // Filter inside the subquery; the outer Projection default
-            // doesn't leak in.
-            let ops = extract("SELECT a FROM t WHERE id IN (SELECT id FROM s WHERE flag = 1)");
-            // s.flag is in the inner subquery's WHERE → Filter.
-            assert!(
-                ops.reads.contains(&filter_read("s", "flag")),
-                "expected s.flag Filter in {:?}",
-                ops.reads
-            );
-            // Outer WHERE's LHS id → Filter, on t.
-            assert!(
-                ops.reads.contains(&filter_read("t", "id")),
-                "expected t.id Filter in {:?}",
-                ops.reads
-            );
-            // Inner subquery's projection id → Projection (the subquery's
-            // syntactic projection, even though it's an IN's RHS).
-            assert!(
-                ops.reads.contains(&read("s", "id")),
-                "expected s.id Projection in {:?}",
-                ops.reads
-            );
-            // Outer projection.
-            assert!(
-                ops.reads.contains(&read("t", "a")),
-                "expected t.a Projection in {:?}",
-                ops.reads
+            // doesn't leak in. Inner subquery's flow is emitted first
+            // (during inner SELECT walk), then the outer projection's.
+            assert_column_ops(
+                "SELECT a FROM t WHERE id IN (SELECT id FROM s WHERE flag = 1)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t", "a"),
+                        filter_read("t", "id"),
+                        read("s", "id"),
+                        filter_read("s", "flag"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("s", "id"), out("id", 0)),
+                        flow_passthrough(col("t", "a"), out("a", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn group_by_ref_carries_group_by_kind() {
-            let ops = extract("SELECT a, COUNT(*) FROM t1 GROUP BY a");
-            assert_eq!(ops.reads, vec![read("t1", "a"), group_by_read("t1", "a"),]);
+            assert_column_ops(
+                "SELECT a, COUNT(*) FROM t1 GROUP BY a",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), group_by_read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn order_by_ref_carries_sort_kind() {
-            let ops = extract("SELECT a FROM t1 ORDER BY b");
-            assert_eq!(ops.reads, vec![read("t1", "a"), sort_read("t1", "b"),]);
+            assert_column_ops(
+                "SELECT a FROM t1 ORDER BY b",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), sort_read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn group_by_with_having_separates_kinds() {
-            // GROUP BY a → GroupBy; HAVING COUNT(*) > 1 has no column ref;
-            // HAVING SUM(b) > 0 → b is Filter.
-            let ops = extract("SELECT a FROM t1 GROUP BY a HAVING SUM(b) > 0");
-            assert!(ops.reads.contains(&read("t1", "a"))); // projection
-            assert!(ops.reads.contains(&group_by_read("t1", "a"))); // GROUP BY
-            assert!(ops.reads.contains(&filter_read("t1", "b"))); // HAVING
+            // GROUP BY a → GroupBy; HAVING SUM(b) > 0 → b is Filter.
+            // Walk order: projection → HAVING → GROUP BY (the visitor
+            // hits HAVING before GROUP BY), so the read order reflects
+            // that, not the textual SQL order.
+            assert_column_ops(
+                "SELECT a FROM t1 GROUP BY a HAVING SUM(b) > 0",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "a"),
+                        filter_read("t1", "b"),
+                        group_by_read("t1", "a"),
+                    ],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn group_by_rollup_modifier_carries_group_by_kind() {
-            let ops = extract("SELECT a, b FROM t1 GROUP BY ROLLUP(a, b)");
-            assert!(ops.reads.contains(&group_by_read("t1", "a")));
-            assert!(ops.reads.contains(&group_by_read("t1", "b")));
+            assert_column_ops(
+                "SELECT a, b FROM t1 GROUP BY ROLLUP(a, b)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "a"),
+                        read("t1", "b"),
+                        group_by_read("t1", "a"),
+                        group_by_read("t1", "b"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t1", "b"), out("b", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn subquery_in_group_by_keeps_inner_projection_kind() {
             // GROUP BY (SELECT max(z) FROM s) — the inner subquery's `z` is
             // its own Projection, not the outer GroupBy. resolve_query
-            // resets current_read_kind on entry.
-            let ops = extract("SELECT a FROM t GROUP BY (SELECT z FROM s)");
-            assert!(ops.reads.contains(&read("s", "z")));
-            // Outer `a` projection still Projection.
-            assert!(ops.reads.contains(&read("t", "a")));
+            // resets current_read_kind on entry. Inner flow emitted
+            // first, then outer projection's.
+            assert_column_ops(
+                "SELECT a FROM t GROUP BY (SELECT z FROM s)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t", "a"), read("s", "z")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("s", "z"), out("z", 0)),
+                        flow_passthrough(col("t", "a"), out("a", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
@@ -1121,14 +1317,23 @@ mod tests {
             // `a` is the WHEN condition → [Projection, Conditional];
             // `b` is the THEN result → [Projection];
             // `c` is the ELSE result → [Projection].
-            let ops = extract("SELECT CASE WHEN a > 0 THEN b ELSE c END FROM t1");
-            assert_eq!(
-                ops.reads,
-                vec![
-                    read_with_kinds("t1", "a", vec![ReadKind::Projection, ReadKind::Conditional]),
-                    read("t1", "b"),
-                    read("t1", "c"),
-                ]
+            assert_column_ops(
+                "SELECT CASE WHEN a > 0 THEN b ELSE c END FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read_with_kinds("t1", "a", vec![ReadKind::Projection, ReadKind::Conditional]),
+                        read("t1", "b"),
+                        read("t1", "c"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_computed(col("t1", "a"), out_anon(0)),
+                        flow_computed(col("t1", "b"), out_anon(0)),
+                        flow_computed(col("t1", "c"), out_anon(0)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1138,17 +1343,21 @@ mod tests {
             // `y` is the THEN result (inside WHERE) → [Filter];
             // `z` is the ELSE result (inside WHERE) → [Filter];
             // `b` is the outer projection → [Projection].
-            let ops = extract("SELECT b FROM t WHERE CASE WHEN x > 0 THEN y ELSE z END = 1");
-            assert!(ops.reads.iter().any(|r| r.column.name.value == "x"
-                && r.kinds == vec![ReadKind::Filter, ReadKind::Conditional]));
-            assert!(ops
-                .reads
-                .iter()
-                .any(|r| r.column.name.value == "y" && r.kinds == vec![ReadKind::Filter]));
-            assert!(ops
-                .reads
-                .iter()
-                .any(|r| r.column.name.value == "b" && r.kinds == vec![ReadKind::Projection]));
+            assert_column_ops(
+                "SELECT b FROM t WHERE CASE WHEN x > 0 THEN y ELSE z END = 1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t", "b"),
+                        read_with_kinds("t", "x", vec![ReadKind::Filter, ReadKind::Conditional]),
+                        filter_read("t", "y"),
+                        filter_read("t", "z"),
+                    ],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t", "b"), out("b", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
@@ -1158,23 +1367,25 @@ mod tests {
             // the subquery's own projection (or its own WHERE etc.) and
             // should NOT inherit `Conditional` from the outer CASE — the
             // modifier resets at the subquery boundary.
-            let ops =
-                extract("SELECT CASE WHEN (SELECT x FROM s WHERE y > 0) IS NULL THEN 1 END FROM t");
-            // s.x is the subquery's projection → plain Projection.
-            assert!(
-                ops.reads
-                    .iter()
-                    .any(|r| r.column.name.value == "x" && r.kinds == vec![ReadKind::Projection]),
-                "s.x should be Projection only, got {:?}",
-                ops.reads
-            );
-            // s.y is the subquery's WHERE → Filter only, no Conditional.
-            assert!(
-                ops.reads
-                    .iter()
-                    .any(|r| r.column.name.value == "y" && r.kinds == vec![ReadKind::Filter]),
-                "s.y should be Filter only, got {:?}",
-                ops.reads
+            //
+            // Flow shape (surfaced by whole-value):
+            //   1. inner subquery's projection: s.x → out("x", 0) Passthrough
+            //   2-3. outer CASE composes the scalar subquery's projection
+            //        AND its WHERE refs as Computed flows into the
+            //        outer anonymous output. Both s.x and s.y appear.
+            assert_column_ops(
+                "SELECT CASE WHEN (SELECT x FROM s WHERE y > 0) IS NULL THEN 1 END FROM t",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("s", "x"), filter_read("s", "y")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("s", "x"), out("x", 0)),
+                        flow_computed(col("s", "x"), out_anon(0)),
+                        flow_computed(col("s", "y"), out_anon(0)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1183,57 +1394,117 @@ mod tests {
             // `CASE x WHEN 1 THEN a WHEN 2 THEN b END` — `x` is the
             // operand (compared against each WHEN pattern), classified
             // Conditional. `a` / `b` are results, plain Projection.
-            let ops = extract("SELECT CASE x WHEN 1 THEN a WHEN 2 THEN b END FROM t1");
-            assert!(ops.reads.iter().any(|r| r.column.name.value == "x"
-                && r.kinds == vec![ReadKind::Projection, ReadKind::Conditional]));
-            assert!(ops
-                .reads
-                .iter()
-                .any(|r| r.column.name.value == "a" && r.kinds == vec![ReadKind::Projection]));
-            assert!(ops
-                .reads
-                .iter()
-                .any(|r| r.column.name.value == "b" && r.kinds == vec![ReadKind::Projection]));
+            assert_column_ops(
+                "SELECT CASE x WHEN 1 THEN a WHEN 2 THEN b END FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read_with_kinds("t1", "x", vec![ReadKind::Projection, ReadKind::Conditional]),
+                        read("t1", "a"),
+                        read("t1", "b"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_computed(col("t1", "x"), out_anon(0)),
+                        flow_computed(col("t1", "a"), out_anon(0)),
+                        flow_computed(col("t1", "b"), out_anon(0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn window_partition_by_carries_window_kind() {
-            // OVER (PARTITION BY p) — p is Window; the aggregate arg `x`
-            // stays Projection (value flow into the output column).
-            let ops = extract("SELECT SUM(x) OVER (PARTITION BY p) FROM t1");
-            assert!(ops.reads.contains(&read("t1", "x")));
-            assert!(ops.reads.contains(&window_read("t1", "p")));
+            // OVER (PARTITION BY p) — p's read kind is Window; the
+            // aggregate arg `x` stays Projection on the read. But on
+            // the flow side, BOTH x AND p contribute as Aggregation
+            // sources (the whole SUM(...) OVER (...) expression
+            // classifies as an aggregate-shaped flow producer).
+            assert_column_ops(
+                "SELECT SUM(x) OVER (PARTITION BY p) FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "x"), window_read("t1", "p")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_aggregation(col("t1", "x"), out_anon(0)),
+                        flow_aggregation(col("t1", "p"), out_anon(0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn window_order_by_carries_window_kind() {
-            let ops = extract("SELECT SUM(x) OVER (ORDER BY o) FROM t1");
-            assert!(ops.reads.contains(&read("t1", "x")));
-            assert!(ops.reads.contains(&window_read("t1", "o")));
+            assert_column_ops(
+                "SELECT SUM(x) OVER (ORDER BY o) FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "x"), window_read("t1", "o")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_aggregation(col("t1", "x"), out_anon(0)),
+                        flow_aggregation(col("t1", "o"), out_anon(0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn window_partition_and_order_both_classified() {
-            let ops = extract("SELECT SUM(x) OVER (PARTITION BY p ORDER BY o) FROM t1");
-            assert!(ops.reads.contains(&read("t1", "x")));
-            assert!(ops.reads.contains(&window_read("t1", "p")));
-            assert!(ops.reads.contains(&window_read("t1", "o")));
+            assert_column_ops(
+                "SELECT SUM(x) OVER (PARTITION BY p ORDER BY o) FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "x"),
+                        window_read("t1", "p"),
+                        window_read("t1", "o"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_aggregation(col("t1", "x"), out_anon(0)),
+                        flow_aggregation(col("t1", "p"), out_anon(0)),
+                        flow_aggregation(col("t1", "o"), out_anon(0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn merge_on_clause_carries_filter_kind() {
-            let ops = extract(
+            assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Merge,
+                    reads: vec![
+                        filter_read("t", "id"),
+                        filter_read("s", "id"),
+                        read("s", "a"),
+                    ],
+                    writes: vec![write("t", "a")],
+                    flows: vec![flow_passthrough(col("s", "a"), persisted("t", "a"))],
+                    diagnostics: vec![],
+                },
             );
-            assert!(ops.reads.contains(&filter_read("t", "id")));
-            assert!(ops.reads.contains(&filter_read("s", "id")));
         }
 
         #[test]
         fn create_table_definitions_are_not_writes() {
-            let ops = extract("CREATE TABLE t1 (a INT, b INT)");
-            assert!(ops.reads.is_empty());
-            assert!(ops.writes.is_empty());
+            assert_column_ops(
+                "CREATE TABLE t1 (a INT, b INT)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::CreateTable,
+                    reads: vec![],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
     }
 
