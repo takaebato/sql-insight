@@ -117,10 +117,15 @@ impl<'a> RelationResolver<'a> {
                 // through the derived alias.
                 let resolved = self.resolve_query(subquery)?;
                 if let Some(alias) = alias {
+                    let renames = &alias.columns;
+                    let renamed_schema =
+                        RelationResolver::rename_relation_schema(resolved.output_schema, renames);
+                    let renamed_projections =
+                        RelationResolver::rename_projection_groups(resolved.projections, renames);
                     self.bind_derived_table(
                         alias.name.clone(),
-                        resolved.output_schema,
-                        resolved.projections,
+                        renamed_schema,
+                        renamed_projections,
                     );
                 }
                 if let Some(sample) = sample {

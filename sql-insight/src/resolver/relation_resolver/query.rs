@@ -44,11 +44,12 @@ impl<'a> RelationResolver<'a> {
                     // own — references through the CTE compose end to
                     // end at flow-emission time.
                     let resolved = self.resolve_query(&cte.query)?;
-                    self.bind_cte(
-                        cte.alias.name.clone(),
-                        resolved.output_schema,
-                        resolved.projections,
-                    );
+                    let renames = &cte.alias.columns;
+                    let renamed_schema =
+                        RelationResolver::rename_relation_schema(resolved.output_schema, renames);
+                    let renamed_projections =
+                        RelationResolver::rename_projection_groups(resolved.projections, renames);
+                    self.bind_cte(cte.alias.name.clone(), renamed_schema, renamed_projections);
                 }
             }
         }

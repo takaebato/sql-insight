@@ -1350,6 +1350,64 @@ mod tests {
         );
     }
 
+    // ───────── CTE / derived column rename (Phase 5.10) ─────────
+
+    #[test]
+    fn cte_column_rename_composes_through_renamed_name() {
+        // Outer `a` refers to cte's renamed column at position 0,
+        // which body-positionally is `x` from t. Composition follows
+        // the renamed name back to the body item, then to t.x.
+        let ops = extract("WITH cte (a) AS (SELECT x FROM t) SELECT a FROM cte");
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("t", "x"), out("a", 0))]
+        );
+        // Reads surface only the real-table ref (CTE binding is
+        // synthetic, dropped).
+        assert_eq!(ops.reads, vec![read("t", "x")]);
+    }
+
+    #[test]
+    fn cte_column_rename_partial_keeps_remaining_body_names() {
+        // Rename `(p)` covers position 0 only. Position 1's body name
+        // `y` survives; outer can reference `p` or `y`.
+        let ops = extract("WITH cte (p) AS (SELECT x, y FROM t) SELECT p, y FROM cte");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_passthrough(col("t", "x"), out("p", 0)),
+                flow_passthrough(col("t", "y"), out("y", 1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_table_column_rename_composes() {
+        // `(SELECT x FROM t) AS d(a)` — outer `a` resolves via d's
+        // renamed column at position 0 → body item x → t.x.
+        let ops = extract("SELECT a FROM (SELECT x FROM t) d(a)");
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("t", "x"), out("a", 0))]
+        );
+        assert_eq!(ops.reads, vec![read("t", "x")]);
+    }
+
+    #[test]
+    fn cte_column_rename_into_insert() {
+        // `INSERT INTO t2 (col) WITH cte(a) AS (SELECT x FROM t1)
+        //  SELECT a FROM cte` composes through both the CTE rename
+        //  and the INSERT pairing: t1.x → t2.col.
+        let ops = extract(
+            "INSERT INTO t2 (col) WITH cte (a) AS (SELECT x FROM t1) \
+             SELECT a FROM cte",
+        );
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("t1", "x"), persisted("t2", "col"))]
+        );
+    }
+
     // ───────── MERGE column-level (Phase 5.7) ─────────
 
     #[test]
