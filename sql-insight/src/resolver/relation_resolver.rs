@@ -154,7 +154,7 @@ pub(crate) struct RawColumnRef {
     /// `None`.
     pub(crate) synthetic: bool,
     /// SQL-clause role(s) this reference plays — captured from the
-    /// resolver's `pending_read_kind` at record time. Typically a
+    /// resolver's `current_read_kind` at record time. Typically a
     /// single element; future multi-role cases (USING expansion etc.)
     /// may extend.
     pub(crate) kinds: Vec<ReadKind>,
@@ -633,18 +633,20 @@ pub(crate) struct RelationResolver<'a> {
     /// walk and packs the collected groups into the returned
     /// `ResolvedQuery`, so each query gets exactly its own projections.
     current_projections: Vec<ProjectionGroup>,
-    /// Kind stamped on the next pushed scope. Defaults to `Body`; clause
-    /// walkers (WHERE, HAVING, JOIN ON, …) flip it to `Predicate` via
-    /// [`with_scope_kind`] for the duration of their child walk so that
-    /// subqueries nested inside those clauses inherit the right kind.
-    pending_scope_kind: ScopeKind,
-    /// Kind stamped on `column_refs` recorded during the next walk.
-    /// Defaults to `Projection`; filter-clause walkers
+    /// Scope kind in effect for the current walking context — stamped
+    /// onto every scope pushed while this is set. Defaults to `Body`;
+    /// clause walkers (WHERE, HAVING, JOIN ON, …) flip it to
+    /// `Predicate` via [`with_scope_kind`] for the duration of their
+    /// child walk so subqueries nested in those clauses inherit it.
+    current_scope_kind: ScopeKind,
+    /// Read kind in effect for the current walking context — stamped
+    /// onto every column ref recorded while this is set. Defaults to
+    /// `Projection`; filter-clause walkers
     /// (WHERE/HAVING/QUALIFY/JOIN ON/etc.) flip it via
     /// [`with_filter_clause`] for the duration of the clause walk.
     /// Reset to `Projection` on `resolve_query` entry so subqueries
     /// don't inherit the enclosing clause's kind for their own bodies.
-    pending_read_kind: ReadKind,
+    current_read_kind: ReadKind,
 }
 
 impl<'a> RelationResolver<'a> {
@@ -656,8 +658,8 @@ impl<'a> RelationResolver<'a> {
             column_refs: Vec::new(),
             flow_edges: Vec::new(),
             current_projections: Vec::new(),
-            pending_scope_kind: ScopeKind::Body,
-            pending_read_kind: ReadKind::Projection,
+            current_scope_kind: ScopeKind::Body,
+            current_read_kind: ReadKind::Projection,
         }
     }
 
@@ -735,7 +737,7 @@ impl<'a> RelationResolver<'a> {
             scope_id,
             resolved,
             synthetic,
-            kinds: vec![self.pending_read_kind],
+            kinds: vec![self.current_read_kind],
         });
     }
 
@@ -814,7 +816,7 @@ impl<'a> RelationResolver<'a> {
     /// in each branch resolve only against its own FROMs — matching
     /// SQL's per-SELECT name resolution.
     pub(crate) fn with_branch_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.scopes.push_query_scope(self.pending_scope_kind);
+        self.scopes.push_query_scope(self.current_scope_kind);
         let r = f(self);
         self.scopes.pop_scope();
         r
@@ -829,9 +831,10 @@ impl<'a> RelationResolver<'a> {
         kind: ScopeKind,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let prev = std::mem::replace(&mut self.pending_scope_kind, kind);
+        let prev = self.current_scope_kind;
+        self.current_scope_kind = kind;
         let r = f(self);
-        self.pending_scope_kind = prev;
+        self.current_scope_kind = prev;
         r
     }
 
@@ -843,15 +846,16 @@ impl<'a> RelationResolver<'a> {
         kind: ReadKind,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let prev = std::mem::replace(&mut self.pending_read_kind, kind);
+        let prev = self.current_read_kind;
+        self.current_read_kind = kind;
         let r = f(self);
-        self.pending_read_kind = prev;
+        self.current_read_kind = prev;
         r
     }
 
     /// Convenience for walking a filter-position clause: stamps both
-    /// `pending_read_kind = Filter` (so column refs land with the
-    /// `Filter` kind) AND `pending_scope_kind = Predicate` (so any
+    /// `current_read_kind = Filter` (so column refs land with the
+    /// `Filter` kind) AND `current_scope_kind = Predicate` (so any
     /// subquery pushed inside is classified as a predicate scope and
     /// thus excluded from table-flow). Used for WHERE, HAVING,
     /// QUALIFY, JOIN ON, AsOf match, MERGE ON, CONNECT BY, pipe

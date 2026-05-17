@@ -479,7 +479,6 @@ mod tests {
         }
     }
 
-
     // ───────── reads: qualified ─────────
 
     #[test]
@@ -719,7 +718,7 @@ mod tests {
 
     #[test]
     fn subquery_where_ref_carries_filter_kind_not_outer_projection() {
-        // The IN-subquery's WHERE walker resets pending_read_kind to
+        // The IN-subquery's WHERE walker resets current_read_kind to
         // Filter inside the subquery; the outer Projection default
         // doesn't leak in.
         let ops = extract("SELECT a FROM t WHERE id IN (SELECT id FROM s WHERE flag = 1)");
