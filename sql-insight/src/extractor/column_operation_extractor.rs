@@ -26,11 +26,12 @@
 //!   for CASE-WHEN condition refs). Typically `len == 1`; multi-role
 //!   refs (USING / NATURAL JOIN merged columns) are future work.
 //! - `writes`: INSERT explicit column lists scoped to the INSERT
-//!   target, UPDATE SET targets scoped to the UPDATE table, and
+//!   target, UPDATE SET targets scoped to the UPDATE table,
 //!   CTAS / CREATE VIEW / ALTER VIEW target columns (explicit
 //!   column list when provided, else the names the resolver derived
-//!   from the source projection). MERGE WHEN-clause writes and
-//!   column-list-less INSERT SELECT remain deferred.
+//!   from the source projection), and MERGE WHEN-clause writes
+//!   (UPDATE SET targets and INSERT column lists). Column-list-less
+//!   INSERT SELECT remains deferred.
 //! - `flows`: per-projection-item edges for SELECT (target =
 //!   `QueryOutput { name, position }`), positionally paired
 //!   `source-column → target-column` edges for INSERT with explicit
@@ -48,9 +49,12 @@
 //!   dialects), or `Computed` (anything else). Composition is
 //!   `Aggregation`-dominant: any aggregation step in a CTE / derived
 //!   chain makes the resulting flow `Aggregation`. CTAS / CREATE
-//!   VIEW / ALTER VIEW also emit Persisted flows from source
-//!   projections to the created relation's columns. MERGE clauses
-//!   and column-list-less INSERT SELECT are deferred.
+//!   VIEW / ALTER VIEW emit Persisted flows from source projections
+//!   to the created relation's columns. MERGE emits per-clause
+//!   Persisted flows for WHEN MATCHED UPDATE (per assignment) and
+//!   WHEN NOT MATCHED INSERT VALUES (positional pair with the INSERT
+//!   column list); DELETE actions emit nothing. Column-list-less
+//!   INSERT SELECT is deferred.
 //!
 //! **Strictness scales with the catalog.** Without a catalog, Table
 //! bindings have `Unknown` schemas and unqualified refs to a
@@ -441,6 +445,42 @@ fn collect_writes(
         Statement::AlterView { name, columns, .. } => {
             let target = TableReference::try_from(name)?;
             writes.extend(created_writes(&target, columns, resolution));
+        }
+        Statement::Merge(merge) => {
+            use sqlparser::ast::MergeAction;
+            let target = match &merge.table {
+                TableFactor::Table { .. } => TableReference::try_from(&merge.table).ok(),
+                _ => None,
+            };
+            for clause in &merge.clauses {
+                match &clause.action {
+                    MergeAction::Insert(insert_expr) => {
+                        let Some(target) = &target else { continue };
+                        for col_obj in &insert_expr.columns {
+                            let Some(ident) = col_obj.0.last().and_then(|p| p.as_ident()) else {
+                                continue;
+                            };
+                            writes.push(ColumnWrite {
+                                column: ColumnReference {
+                                    table: Some(target.clone()),
+                                    name: ident.clone(),
+                                },
+                            });
+                        }
+                    }
+                    MergeAction::Update(update_expr) => {
+                        for assignment in &update_expr.assignments {
+                            if let Some(column) = column_ref_from_assignment_target(
+                                &assignment.target,
+                                target.as_ref(),
+                            ) {
+                                writes.push(ColumnWrite { column });
+                            }
+                        }
+                    }
+                    MergeAction::Delete { .. } => {}
+                }
+            }
         }
         _ => {}
     }
@@ -1307,6 +1347,75 @@ mod tests {
         assert_eq!(
             ops.flows,
             vec![flow_aggregation(col("t1", "a"), out("s", 0))]
+        );
+    }
+
+    // ───────── MERGE column-level (Phase 5.7) ─────────
+
+    #[test]
+    fn merge_when_matched_update_emits_flow_and_write() {
+        let ops =
+            extract("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a");
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("s", "a"), persisted("t", "a"))]
+        );
+        assert_eq!(ops.writes, vec![write("t", "a")]);
+    }
+
+    #[test]
+    fn merge_when_not_matched_insert_emits_flow_and_write() {
+        let ops = extract(
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a)",
+        );
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_passthrough(col("s", "id"), persisted("t", "id")),
+                flow_passthrough(col("s", "a"), persisted("t", "a")),
+            ]
+        );
+        assert_eq!(ops.writes, vec![write("t", "id"), write("t", "a")]);
+    }
+
+    #[test]
+    fn merge_delete_action_emits_no_flow_no_write() {
+        let ops = extract("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE");
+        assert!(ops.flows.is_empty());
+        assert!(ops.writes.is_empty());
+    }
+
+    #[test]
+    fn merge_combined_clauses_emit_per_clause_flows_and_writes() {
+        let ops = extract(
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.a = s.a \
+             WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a)",
+        );
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_passthrough(col("s", "a"), persisted("t", "a")),
+                flow_passthrough(col("s", "id"), persisted("t", "id")),
+                flow_passthrough(col("s", "a"), persisted("t", "a")),
+            ]
+        );
+        assert_eq!(
+            ops.writes,
+            vec![write("t", "a"), write("t", "id"), write("t", "a")]
+        );
+    }
+
+    #[test]
+    fn merge_update_computed_kind_propagates() {
+        let ops = extract(
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.a = s.a + 1",
+        );
+        assert_eq!(
+            ops.flows,
+            vec![flow_computed(col("s", "a"), persisted("t", "a"))]
         );
     }
 

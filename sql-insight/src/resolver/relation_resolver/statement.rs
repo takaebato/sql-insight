@@ -385,12 +385,120 @@ impl<'a> RelationResolver<'a> {
     }
 
     fn visit_merge(&mut self, merge: &Merge) -> Result<(), Error> {
+        use sqlparser::ast::{MergeAction, MergeInsertKind};
         self.visit_table_factor(&merge.table, TableRole::Write)?;
         self.visit_table_factor(&merge.source, TableRole::Read)?;
         self.with_filter_clause(|r| r.visit_expr(&merge.on))?;
+        let target_table = match &merge.table {
+            sqlparser::ast::TableFactor::Table { .. } => {
+                TableReference::try_from(&merge.table).ok()
+            }
+            _ => None,
+        };
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
                 self.with_filter_clause(|r| r.visit_expr(predicate))?;
+            }
+            match &clause.action {
+                MergeAction::Insert(insert_expr) => {
+                    if let Some(pred) = &insert_expr.insert_predicate {
+                        self.with_filter_clause(|r| r.visit_expr(pred))?;
+                    }
+                    if let MergeInsertKind::Values(values) = &insert_expr.kind {
+                        self.emit_merge_insert_flows(
+                            values,
+                            &insert_expr.columns,
+                            target_table.as_ref(),
+                        )?;
+                    }
+                    // MergeInsertKind::Row (BigQuery `INSERT ROW`) — the
+                    // source row is inserted as-is; per-column pairing
+                    // needs catalog knowledge of the target schema.
+                }
+                MergeAction::Update(update_expr) => {
+                    self.emit_merge_update_flows(&update_expr.assignments, target_table.as_ref())?;
+                }
+                MergeAction::Delete { .. } => {
+                    // DELETE has no column-level value flow.
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit per-position Persisted flow edges for MERGE's
+    /// `WHEN NOT MATCHED THEN INSERT (cols) VALUES (...)`. Each value
+    /// expression's source refs pair with the column at the same
+    /// position in `columns`. Walks values with default `Projection`
+    /// kind for read classification.
+    fn emit_merge_insert_flows(
+        &mut self,
+        values: &sqlparser::ast::Values,
+        columns: &[sqlparser::ast::ObjectName],
+        target_table: Option<&TableReference>,
+    ) -> Result<(), Error> {
+        for row in &values.rows {
+            for (position, value_expr) in row.iter().enumerate() {
+                let kind = super::query::expr_kind(value_expr);
+                let refs_before = self.column_refs_len();
+                self.visit_expr(value_expr)?;
+                let (Some(target_table), Some(col_obj)) = (target_table, columns.get(position))
+                else {
+                    continue;
+                };
+                let Some(col_ident) = col_obj.0.last().and_then(|p| p.as_ident()) else {
+                    continue;
+                };
+                let target = FlowTargetSpec::Persisted {
+                    table: target_table.clone(),
+                    column: col_ident.clone(),
+                };
+                let new_count = self.column_refs_len() - refs_before;
+                for offset in 0..new_count {
+                    let source = self.column_refs_slice(refs_before)[offset].clone();
+                    self.push_flow_edge(FlowEdge {
+                        source,
+                        target: target.clone(),
+                        kind,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit per-assignment Persisted flow edges for MERGE's
+    /// `WHEN MATCHED THEN UPDATE SET col = expr`. Mirrors the
+    /// per-assignment logic in `visit_update`.
+    fn emit_merge_update_flows(
+        &mut self,
+        assignments: &[sqlparser::ast::Assignment],
+        target_table: Option<&TableReference>,
+    ) -> Result<(), Error> {
+        for assignment in assignments {
+            let target_parts = assignment_target_parts(&assignment.target);
+            let kind = super::query::expr_kind(&assignment.value);
+            let refs_before = self.column_refs_len();
+            self.visit_expr(&assignment.value)?;
+            let Some(target_parts) = target_parts else {
+                continue;
+            };
+            let Some(target_table_ref) = assignment_target_table(&target_parts, target_table)
+            else {
+                continue;
+            };
+            let target = FlowTargetSpec::Persisted {
+                table: target_table_ref,
+                column: target_parts.last().cloned().unwrap(),
+            };
+            let new_count = self.column_refs_len() - refs_before;
+            for offset in 0..new_count {
+                let source = self.column_refs_slice(refs_before)[offset].clone();
+                self.push_flow_edge(FlowEdge {
+                    source,
+                    target: target.clone(),
+                    kind,
+                });
             }
         }
         Ok(())
