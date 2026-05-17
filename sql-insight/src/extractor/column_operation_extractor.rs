@@ -1122,6 +1122,26 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_in_projection_reports_diagnostic() {
+        let ops = extract("SELECT * FROM t1");
+        let kinds: Vec<&DiagnosticKind> = ops.diagnostics.iter().map(|d| &d.kind).collect();
+        assert_eq!(kinds, vec![&DiagnosticKind::WildcardSuppressed]);
+        // Span info ("at L1:C8") makes it into the message.
+        assert!(
+            ops.diagnostics[0].message.contains("at L1:C8"),
+            "expected span suffix in message, got: {}",
+            ops.diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn qualified_wildcard_in_projection_reports_diagnostic() {
+        let ops = extract("SELECT t1.* FROM t1");
+        let kinds: Vec<&DiagnosticKind> = ops.diagnostics.iter().map(|d| &d.kind).collect();
+        assert_eq!(kinds, vec![&DiagnosticKind::WildcardSuppressed]);
+    }
+
+    #[test]
     fn multiple_statements_produce_multiple_results() {
         let result = extract_column_operations(
             &GenericDialect {},
@@ -1884,6 +1904,62 @@ mod tests {
                 .with("t2", vec!["id", "a"]);
             let ops = extract_with_catalog("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id", &catalog);
             assert!(ops.reads.contains(&read("t2", "a")));
+        }
+
+        #[test]
+        fn catalog_confirmed_ambiguity_reports_diagnostic() {
+            // Both tables Known and both declare `a`. Diagnostic must
+            // fire — without catalog the same query is silently
+            // ambiguous (no diagnostic) since Unknown schemas could
+            // contain anything.
+            let catalog = TestCatalog::default()
+                .with("t1", vec!["a"])
+                .with("t2", vec!["a"]);
+            let ops = extract_with_catalog("SELECT a FROM t1 JOIN t2 ON t1.a = t2.a", &catalog);
+            let amb: Vec<_> = ops
+                .diagnostics
+                .iter()
+                .filter(|d| matches!(d.kind, DiagnosticKind::AmbiguousColumn))
+                .collect();
+            assert_eq!(amb.len(), 1, "diagnostics: {:?}", ops.diagnostics);
+            assert!(amb[0].message.contains("ambiguous column `a`"));
+            assert!(amb[0].message.contains("t1"));
+            assert!(amb[0].message.contains("t2"));
+        }
+
+        #[test]
+        fn catalog_unresolved_unqualified_reports_diagnostic() {
+            // Catalog says t1 has [x, y]; unqualified `z` belongs to
+            // nothing in scope — UnresolvedColumn fires.
+            let catalog = TestCatalog::default().with("t1", vec!["x", "y"]);
+            let ops = extract_with_catalog("SELECT z FROM t1", &catalog);
+            let unr: Vec<_> = ops
+                .diagnostics
+                .iter()
+                .filter(|d| matches!(d.kind, DiagnosticKind::UnresolvedColumn))
+                .collect();
+            assert_eq!(unr.len(), 1, "diagnostics: {:?}", ops.diagnostics);
+            assert!(unr[0].message.contains("unresolved column `z`"));
+        }
+
+        #[test]
+        fn no_catalog_unqualified_is_silent_even_when_ambiguous_shape() {
+            // No catalog → all schemas are Unknown → resolver can't
+            // tell whether `a` is genuinely in both t1 and t2, only one,
+            // or neither. Two diagnostic kinds are intentionally
+            // suppressed in this mode: AmbiguousColumn (no confirmed
+            // matches) and UnresolvedColumn (no Known schemas in scope).
+            // The resolution itself still returns None for the column,
+            // but the diagnostic surface stays clean.
+            let ops = extract("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id");
+            assert!(ops
+                .diagnostics
+                .iter()
+                .all(|d| !matches!(d.kind, DiagnosticKind::AmbiguousColumn)));
+            assert!(ops
+                .diagnostics
+                .iter()
+                .all(|d| !matches!(d.kind, DiagnosticKind::UnresolvedColumn)));
         }
     }
 }

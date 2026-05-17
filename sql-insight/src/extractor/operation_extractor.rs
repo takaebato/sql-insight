@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn select_emits_reads_only() {
-        let ops = extract("SELECT * FROM users");
+        let ops = extract("SELECT id FROM users");
         assert_eq!(ops.statement_kind, StatementKind::Select);
         assert_eq!(ops.reads, vec![read("users")]);
         assert!(ops.writes.is_empty());

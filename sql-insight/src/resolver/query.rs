@@ -223,14 +223,27 @@ impl<'a> Resolver<'a> {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                 self.visit_expr(expr)
             }
-            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::Expr(expr), _) => {
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::Expr(expr), options) => {
+                self.record_wildcard_suppressed(
+                    "qualified wildcard `(expr).*`",
+                    options.wildcard_token.0.span,
+                );
                 self.visit_expr(expr)
             }
             SelectItem::QualifiedWildcard(
-                SelectItemQualifiedWildcardKind::ObjectName(_),
+                SelectItemQualifiedWildcardKind::ObjectName(name),
                 options,
-            )
-            | SelectItem::Wildcard(options) => self.visit_wildcard_options(options),
+            ) => {
+                self.record_wildcard_suppressed(
+                    &format!("qualified wildcard `{}.*`", name),
+                    options.wildcard_token.0.span,
+                );
+                self.visit_wildcard_options(options)
+            }
+            SelectItem::Wildcard(options) => {
+                self.record_wildcard_suppressed("wildcard `*`", options.wildcard_token.0.span);
+                self.visit_wildcard_options(options)
+            }
         }
     }
 

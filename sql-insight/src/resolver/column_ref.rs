@@ -4,13 +4,15 @@
 
 use sqlparser::ast::Ident;
 
+use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::extractor::column_operation_extractor::ReadKind;
 use crate::relation::TableReference;
 
 use super::binding::{
-    binding_alias_key, binding_could_contain_column, is_synthetic_binding, BindingKey,
+    binding_alias_key, binding_confirms_column, binding_could_contain_column,
+    binding_has_known_schema, is_synthetic_binding, span_suffix, BindingKey,
 };
-use super::{Binding, Resolver, ScopeId};
+use super::{Resolver, ScopeId};
 
 /// A column reference captured by the resolver during the AST walk.
 ///
@@ -99,7 +101,7 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_ref_at_walk(
-        &self,
+        &mut self,
         parts: &[Ident],
         scope_id: ScopeId,
     ) -> (Option<TableReference>, bool) {
@@ -110,27 +112,83 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Walk the scope chain for an unqualified column reference. Emits
+    /// `AmbiguousColumn` when two or more bindings with `Known` schemas
+    /// confirm the column, and `UnresolvedColumn` when no in-scope
+    /// binding contains it but at least one scope had a `Known` schema
+    /// (catalog-aware mode). Both diagnostics are suppressed when every
+    /// candidate / scope is `Unknown`, since `Unknown` schemas could
+    /// hold anything and silence is the safer default without catalog
+    /// enrichment.
     fn resolve_unqualified_at_walk(
-        &self,
+        &mut self,
         name: &Ident,
         scope_id: ScopeId,
     ) -> (Option<TableReference>, bool) {
         let mut current = Some(scope_id);
+        let mut had_known_schemas_anywhere = false;
+        let mut resolved: Option<(TableReference, bool)> = None;
+        // (candidate tables, confirmed-by-Known count)
+        let mut ambiguity: Option<(Vec<TableReference>, usize)> = None;
+
         while let Some(id) = current {
             let scope = self.scopes().scope(id);
-            let candidates: Vec<&Binding> = scope
+            if scope.iter_bindings().any(binding_has_known_schema) {
+                had_known_schemas_anywhere = true;
+            }
+            let matches: Vec<(TableReference, bool, bool)> = scope
                 .iter_bindings()
-                .filter(|b| binding_could_contain_column(b, name).is_some())
+                .filter_map(|b| {
+                    let tbl = binding_could_contain_column(b, name)?;
+                    Some((
+                        tbl,
+                        binding_confirms_column(b, name),
+                        is_synthetic_binding(b),
+                    ))
+                })
                 .collect();
-            if !candidates.is_empty() {
-                if candidates.len() != 1 {
-                    return (None, false);
+            if !matches.is_empty() {
+                if matches.len() == 1 {
+                    let (tbl, _, syn) = matches.into_iter().next().unwrap();
+                    resolved = Some((tbl, syn));
+                } else {
+                    let confirmed = matches.iter().filter(|(_, c, _)| *c).count();
+                    let candidates: Vec<TableReference> =
+                        matches.into_iter().map(|(t, _, _)| t).collect();
+                    ambiguity = Some((candidates, confirmed));
                 }
-                let binding = candidates[0];
-                let table = binding_could_contain_column(binding, name);
-                return (table, is_synthetic_binding(binding));
+                break;
             }
             current = scope.parent;
+        }
+
+        if let Some((tbl, syn)) = resolved {
+            return (Some(tbl), syn);
+        }
+        if let Some((candidates, confirmed_count)) = ambiguity {
+            if confirmed_count >= 2 {
+                let names: Vec<String> = candidates.iter().map(|t| t.name.value.clone()).collect();
+                self.record_diagnostic(Diagnostic {
+                    kind: DiagnosticKind::AmbiguousColumn,
+                    message: format!(
+                        "ambiguous column `{}`{} — matches in: [{}]",
+                        name.value,
+                        span_suffix(name.span),
+                        names.join(", ")
+                    ),
+                });
+            }
+            return (None, false);
+        }
+        if had_known_schemas_anywhere {
+            self.record_diagnostic(Diagnostic {
+                kind: DiagnosticKind::UnresolvedColumn,
+                message: format!(
+                    "unresolved column `{}`{} — no in-scope relation with a known schema contains it",
+                    name.value,
+                    span_suffix(name.span),
+                ),
+            });
         }
         (None, false)
     }

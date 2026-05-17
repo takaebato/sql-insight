@@ -3,6 +3,7 @@
 
 use indexmap::IndexMap;
 use sqlparser::ast::{Ident, ObjectName, Statement};
+use sqlparser::tokenizer::Span;
 
 use crate::catalog::ColumnSchema;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
@@ -261,6 +262,35 @@ pub(super) fn binding_could_contain_column(
     }
 }
 
+/// Schema-confirmed membership: `true` iff the binding has a `Known`
+/// schema that declares the column. Distinguished from
+/// `binding_could_contain_column`, which also returns `Some` for
+/// `Unknown` schemas. Used by diagnostic emit to separate "definitely
+/// ambiguous" from "uncertain over Unknown schemas".
+pub(super) fn binding_confirms_column(binding: &Binding, name: &Ident) -> bool {
+    matches!(
+        binding_schema(binding),
+        RelationSchema::Known(cols)
+            if cols.iter().any(|c| BindingKey::from_ident(&c.name) == BindingKey::from_ident(name))
+    )
+}
+
+/// `true` iff the binding's schema is `Known` (not `Unknown`). Used to
+/// gate `UnresolvedColumn` diagnostics — without at least one Known
+/// schema in scope, the resolver can't claim a column is missing.
+pub(super) fn binding_has_known_schema(binding: &Binding) -> bool {
+    matches!(binding_schema(binding), RelationSchema::Known(_))
+}
+
+fn binding_schema(binding: &Binding) -> &RelationSchema {
+    match binding {
+        Binding::Table { schema, .. }
+        | Binding::Cte { schema, .. }
+        | Binding::DerivedTable { schema, .. }
+        | Binding::TableFunction { schema, .. } => schema,
+    }
+}
+
 fn schema_could_contain(schema: &RelationSchema, name: &Ident) -> bool {
     match schema {
         RelationSchema::Unknown => true,
@@ -275,6 +305,17 @@ pub(super) fn synthetic_table_ref(name: &Ident) -> TableReference {
         catalog: None,
         schema: None,
         name: name.clone(),
+    }
+}
+
+/// Format a span as ` at L<line>:C<col>` for inclusion in diagnostic
+/// messages. Returns an empty string when the span carries no source
+/// location (sqlparser convention: `line == 0` means "unknown").
+pub(super) fn span_suffix(span: Span) -> String {
+    if span.start.line == 0 {
+        String::new()
+    } else {
+        format!(" at L{}:C{}", span.start.line, span.start.column)
     }
 }
 
@@ -418,6 +459,17 @@ impl<'a> Resolver<'a> {
         self.record_diagnostic(Diagnostic {
             kind: DiagnosticKind::UnsupportedStatement,
             message: format!("Unsupported statement while inspecting SQL: {}", statement),
+        });
+    }
+
+    pub(super) fn record_wildcard_suppressed(&mut self, description: &str, span: Span) {
+        self.record_diagnostic(Diagnostic {
+            kind: DiagnosticKind::WildcardSuppressed,
+            message: format!(
+                "{}{} left unexpanded — lineage will be incomplete for this projection",
+                description,
+                span_suffix(span),
+            ),
         });
     }
 
