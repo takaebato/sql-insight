@@ -71,7 +71,7 @@
 use crate::catalog::Catalog;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::error::Error;
-use crate::extractor::operation_extractor::StatementKind;
+use crate::extractor::table_operation_extractor::StatementKind;
 use crate::relation::TableReference;
 use crate::resolver::{FlowTargetSpec, RawColumnRef, Resolution, Resolver};
 use sqlparser::ast::{AssignmentTarget, Ident, Statement, TableFactor};
@@ -279,7 +279,7 @@ impl ColumnOperationExtractor {
         statement: &Statement,
         catalog: Option<&dyn Catalog>,
     ) -> Result<StatementColumnOperations, Error> {
-        let kind = super::operation_extractor::classify_statement(statement);
+        let kind = super::table_operation_extractor::classify_statement(statement);
         let resolution = Resolver::resolve_statement(catalog, statement)?;
 
         // Start from resolver-level diagnostics; extractor adds its own

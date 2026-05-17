@@ -41,7 +41,7 @@ by hand.
 - Extractors consume the resolver's output:
   - `table_extractor` — flat list of `TableReference`s (legacy API).
   - `crud_table_extractor` — CRUD-bucketed tables (legacy API).
-  - `operation_extractor` — `extract_table_operations` returns
+  - `table_operation_extractor` — `extract_table_operations` returns
     `StatementTableOperations { statement_kind, reads, writes,
     flows, diagnostics }` per parsed statement.
   - `column_operation_extractor` — `extract_column_operations`
