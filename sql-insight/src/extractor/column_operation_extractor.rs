@@ -695,500 +695,6 @@ mod tests {
         }
     }
 
-    // ───────── reads: qualified ─────────
-
-    #[test]
-    fn qualified_select_collects_qualified_reads() {
-        let ops = extract("SELECT t1.a, t1.b FROM t1");
-        assert_eq!(ops.reads, vec![read("t1", "a"), read("t1", "b")]);
-    }
-
-    #[test]
-    fn qualified_join_collects_reads_from_both_sides() {
-        // Resolver walks FROM (including JOIN ON) before the projection,
-        // so the predicate columns appear ahead of the projected ones —
-        // and are tagged Filter while projection refs are Projection.
-        let ops = extract("SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id");
-        assert_eq!(
-            ops.reads,
-            vec![
-                filter_read("t1", "id"),
-                filter_read("t2", "id"),
-                read("t1", "a"),
-                read("t2", "b"),
-            ]
-        );
-    }
-
-    #[test]
-    fn schema_qualified_ref_resolves_to_schema_dot_table() {
-        let ops = extract("SELECT s1.t1.a FROM s1.t1");
-        let table_ref = TableReference {
-            catalog: None,
-            schema: Some("s1".into()),
-            name: "t1".into(),
-        };
-        assert_eq!(
-            ops.reads,
-            vec![ColumnRead {
-                column: ColumnReference {
-                    table: Some(table_ref),
-                    name: "a".into(),
-                },
-                kinds: vec![ReadKind::Projection],
-            }]
-        );
-    }
-
-    #[test]
-    fn where_predicate_qualified_ref_is_a_read() {
-        let ops = extract("SELECT t1.a FROM t1 WHERE t1.b > 0");
-        assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "b")]);
-    }
-
-    // ───────── reads: unqualified resolution ─────────
-
-    #[test]
-    fn unqualified_single_table_resolves_to_that_table() {
-        let ops = extract("SELECT a, b FROM t1");
-        assert_eq!(ops.reads, vec![read("t1", "a"), read("t1", "b")]);
-    }
-
-    #[test]
-    fn unqualified_in_where_resolves_to_single_table() {
-        let ops = extract("SELECT a FROM t1 WHERE b > 0");
-        assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "b")]);
-    }
-
-    #[test]
-    fn unqualified_with_multiple_tables_stays_unresolved() {
-        // Two `Unknown`-schema tables — without a catalog the resolver
-        // cannot tell which `a` belongs to, so the ref surfaces with
-        // `table: None`.
-        let ops = extract("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id");
-        assert_eq!(
-            ops.reads,
-            vec![
-                filter_read("t1", "id"),
-                filter_read("t2", "id"),
-                unresolved("a"),
-            ]
-        );
-    }
-
-    #[test]
-    fn unqualified_uses_alias_binding_but_returns_real_table() {
-        // Alias is just a binding key; the resolver returns the
-        // alias-free TableReference of the binding's underlying table.
-        let ops = extract("SELECT a FROM t1 AS u");
-        assert_eq!(ops.reads, vec![read("t1", "a")]);
-    }
-
-    #[test]
-    fn cte_ref_does_not_surface_in_reads() {
-        // The outer `id` resolves to the cte binding (a synthetic
-        // intermediate, not real storage), so it's dropped from reads.
-        // Reads surface only references with real Table owners or
-        // unresolved column names. `unknown_col` doesn't match the
-        // cte's schema, so it surfaces unresolved (table: None).
-        let ops = extract("WITH cte AS (SELECT id FROM t1) SELECT id, unknown_col FROM cte");
-        // CTE body's own `id` (from t1) is a real read.
-        assert!(
-            ops.reads.contains(&read("t1", "id")),
-            "expected t1.id in {:?}",
-            ops.reads
-        );
-        // Outer `id` resolves to cte → dropped.
-        assert!(
-            !ops.reads.iter().any(|r| r
-                .column
-                .table
-                .as_ref()
-                .is_some_and(|t| t.name.value == "cte")),
-            "cte.id should not surface in {:?}",
-            ops.reads
-        );
-        // Unresolved name still surfaces with table: None.
-        assert!(
-            ops.reads
-                .iter()
-                .any(|r| r.column.name.value == "unknown_col" && r.column.table.is_none()),
-            "expected unresolved unknown_col in {:?}",
-            ops.reads
-        );
-    }
-
-    #[test]
-    fn derived_table_ref_does_not_surface_in_reads() {
-        // Outer `id` resolves to derived alias `d` — synthetic, dropped.
-        // Only the inner SELECT's t1.id is a real read.
-        let ops = extract("SELECT id FROM (SELECT id FROM t1) AS d");
-        assert_eq!(ops.reads, vec![read("t1", "id")]);
-    }
-
-    #[test]
-    fn unqualified_inner_scope_shadows_outer() {
-        // Inner subquery has its own t2 in scope; the unqualified `y`
-        // inside the IN-subquery resolves to t2 even though t1 is
-        // also in the outer scope. Standard SQL inner-shadows-outer.
-        // `y` is in the inner WHERE so its kind is Filter.
-        let ops = extract("SELECT * FROM t1 WHERE id IN (SELECT id FROM t2 WHERE y > 0)");
-        assert!(ops.reads.contains(&filter_read("t2", "y")));
-    }
-
-    #[test]
-    fn unqualified_correlated_walks_to_outer_when_inner_has_no_candidate() {
-        // Inner CTE has Known schema [zz]; `outer_col` doesn't fit it,
-        // so resolution walks to the outer scope and picks the t1
-        // (Unknown) binding.
-        let ops = extract(
-            "SELECT * FROM t1 WHERE id IN (\
-                WITH inner_cte AS (SELECT zz FROM t1) \
-                SELECT zz FROM inner_cte WHERE outer_col > 0)",
-        );
-        // The point: `outer_col` walks past the CTE binding (Known
-        // schema doesn't list it) and lands on the outer t1 (Unknown).
-        // Note that t1 appears twice in the chain (outer and inside
-        // the CTE body) — they're separate scopes; the inner
-        // inner_cte scope's t1 isn't the same scope as the outer.
-        // For this test we just check that `outer_col` resolves
-        // somewhere reasonable rather than the exact target.
-        assert!(ops
-            .reads
-            .iter()
-            .any(|r| r.column.name.value == "outer_col" && r.column.table.is_some()));
-    }
-
-    // ───────── writes: INSERT explicit column list ─────────
-
-    #[test]
-    fn insert_with_explicit_columns_writes_those_columns_on_target() {
-        let ops = extract("INSERT INTO t1 (a, b) VALUES (1, 2)");
-        assert_eq!(ops.writes, vec![write("t1", "a"), write("t1", "b")]);
-        assert!(ops.reads.is_empty());
-    }
-
-    #[test]
-    fn insert_select_records_target_writes_and_qualified_source_reads() {
-        let ops = extract("INSERT INTO t1 (a) SELECT t2.b FROM t2");
-        assert_eq!(ops.writes, vec![write("t1", "a")]);
-        assert_eq!(ops.reads, vec![read("t2", "b")]);
-    }
-
-    #[test]
-    fn insert_without_explicit_columns_yields_no_writes() {
-        let ops = extract("INSERT INTO t1 SELECT t2.b FROM t2");
-        assert!(ops.writes.is_empty());
-        assert_eq!(ops.reads, vec![read("t2", "b")]);
-    }
-
-    // ───────── writes: UPDATE SET targets ─────────
-
-    #[test]
-    fn update_set_targets_become_writes_on_update_table() {
-        let ops = extract("UPDATE t1 SET a = 1");
-        assert_eq!(ops.writes, vec![write("t1", "a")]);
-    }
-
-    #[test]
-    fn update_set_qualified_target_keeps_qualifier() {
-        let ops = extract("UPDATE t1 SET t1.a = 1");
-        assert_eq!(ops.writes, vec![write("t1", "a")]);
-    }
-
-    #[test]
-    fn update_set_rhs_qualified_ref_is_a_read() {
-        // SET RHS is value-producing (Projection-like); WHERE refs are
-        // Filter-tagged.
-        let ops = extract("UPDATE t1 SET a = t2.b FROM t2 WHERE t1.id = t2.id");
-        assert_eq!(ops.writes, vec![write("t1", "a")]);
-        assert_eq!(
-            ops.reads,
-            vec![
-                read("t2", "b"),
-                filter_read("t1", "id"),
-                filter_read("t2", "id"),
-            ]
-        );
-    }
-
-    // ───────── delete / DDL ─────────
-
-    #[test]
-    fn delete_qualified_predicate_is_a_read() {
-        let ops = extract("DELETE FROM t1 WHERE t1.id = 5");
-        assert_eq!(ops.reads, vec![filter_read("t1", "id")]);
-        assert!(ops.writes.is_empty());
-    }
-
-    // ───────── read kinds (Phase 5.6a) ─────────
-
-    #[test]
-    fn same_column_in_projection_and_where_is_two_reads_with_different_kinds() {
-        // The two textual `a` references each get their own ColumnRead
-        // entry — one Projection, one Filter — preserving syntactic role
-        // per textual occurrence.
-        let ops = extract("SELECT a FROM t1 WHERE a > 0");
-        assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "a"),]);
-    }
-
-    #[test]
-    fn subquery_where_ref_carries_filter_kind_not_outer_projection() {
-        // The IN-subquery's WHERE walker resets current_read_kind to
-        // Filter inside the subquery; the outer Projection default
-        // doesn't leak in.
-        let ops = extract("SELECT a FROM t WHERE id IN (SELECT id FROM s WHERE flag = 1)");
-        // s.flag is in the inner subquery's WHERE → Filter.
-        assert!(
-            ops.reads.contains(&filter_read("s", "flag")),
-            "expected s.flag Filter in {:?}",
-            ops.reads
-        );
-        // Outer WHERE's LHS id → Filter, on t.
-        assert!(
-            ops.reads.contains(&filter_read("t", "id")),
-            "expected t.id Filter in {:?}",
-            ops.reads
-        );
-        // Inner subquery's projection id → Projection (the subquery's
-        // syntactic projection, even though it's an IN's RHS).
-        assert!(
-            ops.reads.contains(&read("s", "id")),
-            "expected s.id Projection in {:?}",
-            ops.reads
-        );
-        // Outer projection.
-        assert!(
-            ops.reads.contains(&read("t", "a")),
-            "expected t.a Projection in {:?}",
-            ops.reads
-        );
-    }
-
-    #[test]
-    fn group_by_ref_carries_group_by_kind() {
-        let ops = extract("SELECT a, COUNT(*) FROM t1 GROUP BY a");
-        assert_eq!(ops.reads, vec![read("t1", "a"), group_by_read("t1", "a"),]);
-    }
-
-    #[test]
-    fn order_by_ref_carries_sort_kind() {
-        let ops = extract("SELECT a FROM t1 ORDER BY b");
-        assert_eq!(ops.reads, vec![read("t1", "a"), sort_read("t1", "b"),]);
-    }
-
-    #[test]
-    fn group_by_with_having_separates_kinds() {
-        // GROUP BY a → GroupBy; HAVING COUNT(*) > 1 has no column ref;
-        // HAVING SUM(b) > 0 → b is Filter.
-        let ops = extract("SELECT a FROM t1 GROUP BY a HAVING SUM(b) > 0");
-        assert!(ops.reads.contains(&read("t1", "a"))); // projection
-        assert!(ops.reads.contains(&group_by_read("t1", "a"))); // GROUP BY
-        assert!(ops.reads.contains(&filter_read("t1", "b"))); // HAVING
-    }
-
-    #[test]
-    fn group_by_rollup_modifier_carries_group_by_kind() {
-        let ops = extract("SELECT a, b FROM t1 GROUP BY ROLLUP(a, b)");
-        assert!(ops.reads.contains(&group_by_read("t1", "a")));
-        assert!(ops.reads.contains(&group_by_read("t1", "b")));
-    }
-
-    #[test]
-    fn subquery_in_group_by_keeps_inner_projection_kind() {
-        // GROUP BY (SELECT max(z) FROM s) — the inner subquery's `z` is
-        // its own Projection, not the outer GroupBy. resolve_query
-        // resets current_read_kind on entry.
-        let ops = extract("SELECT a FROM t GROUP BY (SELECT z FROM s)");
-        assert!(ops.reads.contains(&read("s", "z")));
-        // Outer `a` projection still Projection.
-        assert!(ops.reads.contains(&read("t", "a")));
-    }
-
-    // ───────── Conditional ReadKind (Phase 5.6e) ─────────
-
-    #[test]
-    fn case_when_condition_in_projection_gets_conditional_modifier() {
-        // `a` is the WHEN condition → [Projection, Conditional];
-        // `b` is the THEN result → [Projection];
-        // `c` is the ELSE result → [Projection].
-        let ops = extract("SELECT CASE WHEN a > 0 THEN b ELSE c END FROM t1");
-        assert_eq!(
-            ops.reads,
-            vec![
-                read_with_kinds("t1", "a", vec![ReadKind::Projection, ReadKind::Conditional]),
-                read("t1", "b"),
-                read("t1", "c"),
-            ]
-        );
-    }
-
-    #[test]
-    fn case_when_condition_in_where_layers_with_filter() {
-        // `x` is in WHERE's CASE WHEN condition → [Filter, Conditional];
-        // `y` is the THEN result (inside WHERE) → [Filter];
-        // `z` is the ELSE result (inside WHERE) → [Filter];
-        // `b` is the outer projection → [Projection].
-        let ops = extract("SELECT b FROM t WHERE CASE WHEN x > 0 THEN y ELSE z END = 1");
-        assert!(ops.reads.iter().any(|r| r.column.name.value == "x"
-            && r.kinds == vec![ReadKind::Filter, ReadKind::Conditional]));
-        assert!(ops
-            .reads
-            .iter()
-            .any(|r| r.column.name.value == "y" && r.kinds == vec![ReadKind::Filter]));
-        assert!(ops
-            .reads
-            .iter()
-            .any(|r| r.column.name.value == "b" && r.kinds == vec![ReadKind::Projection]));
-    }
-
-    #[test]
-    fn subquery_in_case_condition_does_not_leak_conditional_to_inner_refs() {
-        // A scalar subquery in a CASE condition position is itself
-        // the "conditional" expression. Refs INSIDE the subquery are
-        // the subquery's own projection (or its own WHERE etc.) and
-        // should NOT inherit `Conditional` from the outer CASE — the
-        // modifier resets at the subquery boundary.
-        let ops =
-            extract("SELECT CASE WHEN (SELECT x FROM s WHERE y > 0) IS NULL THEN 1 END FROM t");
-        // s.x is the subquery's projection → plain Projection.
-        assert!(
-            ops.reads
-                .iter()
-                .any(|r| r.column.name.value == "x" && r.kinds == vec![ReadKind::Projection]),
-            "s.x should be Projection only, got {:?}",
-            ops.reads
-        );
-        // s.y is the subquery's WHERE → Filter only, no Conditional.
-        assert!(
-            ops.reads
-                .iter()
-                .any(|r| r.column.name.value == "y" && r.kinds == vec![ReadKind::Filter]),
-            "s.y should be Filter only, got {:?}",
-            ops.reads
-        );
-    }
-
-    #[test]
-    fn simple_case_operand_gets_conditional_modifier() {
-        // `CASE x WHEN 1 THEN a WHEN 2 THEN b END` — `x` is the
-        // operand (compared against each WHEN pattern), classified
-        // Conditional. `a` / `b` are results, plain Projection.
-        let ops = extract("SELECT CASE x WHEN 1 THEN a WHEN 2 THEN b END FROM t1");
-        assert!(ops.reads.iter().any(|r| r.column.name.value == "x"
-            && r.kinds == vec![ReadKind::Projection, ReadKind::Conditional]));
-        assert!(ops
-            .reads
-            .iter()
-            .any(|r| r.column.name.value == "a" && r.kinds == vec![ReadKind::Projection]));
-        assert!(ops
-            .reads
-            .iter()
-            .any(|r| r.column.name.value == "b" && r.kinds == vec![ReadKind::Projection]));
-    }
-
-    #[test]
-    fn window_partition_by_carries_window_kind() {
-        // OVER (PARTITION BY p) — p is Window; the aggregate arg `x`
-        // stays Projection (value flow into the output column).
-        let ops = extract("SELECT SUM(x) OVER (PARTITION BY p) FROM t1");
-        assert!(ops.reads.contains(&read("t1", "x")));
-        assert!(ops.reads.contains(&window_read("t1", "p")));
-    }
-
-    #[test]
-    fn window_order_by_carries_window_kind() {
-        let ops = extract("SELECT SUM(x) OVER (ORDER BY o) FROM t1");
-        assert!(ops.reads.contains(&read("t1", "x")));
-        assert!(ops.reads.contains(&window_read("t1", "o")));
-    }
-
-    #[test]
-    fn window_partition_and_order_both_classified() {
-        let ops = extract("SELECT SUM(x) OVER (PARTITION BY p ORDER BY o) FROM t1");
-        assert!(ops.reads.contains(&read("t1", "x")));
-        assert!(ops.reads.contains(&window_read("t1", "p")));
-        assert!(ops.reads.contains(&window_read("t1", "o")));
-    }
-
-    #[test]
-    fn merge_on_clause_carries_filter_kind() {
-        let ops =
-            extract("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a");
-        assert!(ops.reads.contains(&filter_read("t", "id")));
-        assert!(ops.reads.contains(&filter_read("s", "id")));
-    }
-
-    #[test]
-    fn create_table_definitions_are_not_writes() {
-        let ops = extract("CREATE TABLE t1 (a INT, b INT)");
-        assert!(ops.reads.is_empty());
-        assert!(ops.writes.is_empty());
-    }
-
-    // ───────── diagnostics / structure ─────────
-
-    #[test]
-    fn unsupported_statement_reports_diagnostic() {
-        let ops = extract("CREATE INDEX idx ON t1 (a)");
-        assert_eq!(ops.statement_kind, StatementKind::Unsupported);
-        assert!(ops.reads.is_empty());
-        assert!(ops.writes.is_empty());
-        assert_eq!(ops.diagnostics.len(), 1);
-        assert_eq!(
-            ops.diagnostics[0].kind,
-            DiagnosticKind::UnsupportedStatement
-        );
-    }
-
-    #[test]
-    fn wildcard_in_projection_reports_diagnostic() {
-        let ops = extract("SELECT * FROM t1");
-        let kinds: Vec<&DiagnosticKind> = ops.diagnostics.iter().map(|d| &d.kind).collect();
-        assert_eq!(kinds, vec![&DiagnosticKind::WildcardSuppressed]);
-        // Span info ("at L1:C8") is duplicated in message and surfaced
-        // as structured data for programmatic consumers.
-        assert!(
-            ops.diagnostics[0].message.contains("at L1:C8"),
-            "expected span suffix in message, got: {}",
-            ops.diagnostics[0].message
-        );
-        let span = ops.diagnostics[0]
-            .span
-            .expect("wildcard token carries a span");
-        assert_eq!(span.start.line, 1);
-        assert_eq!(span.start.column, 8);
-    }
-
-    #[test]
-    fn qualified_wildcard_in_projection_reports_diagnostic() {
-        let ops = extract("SELECT t1.* FROM t1");
-        let kinds: Vec<&DiagnosticKind> = ops.diagnostics.iter().map(|d| &d.kind).collect();
-        assert_eq!(kinds, vec![&DiagnosticKind::WildcardSuppressed]);
-    }
-
-    #[test]
-    fn multiple_statements_produce_multiple_results() {
-        let result = extract_column_operations(
-            &GenericDialect {},
-            "SELECT t1.a FROM t1; SELECT t2.b FROM t2",
-            None,
-        )
-        .unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].as_ref().unwrap().reads, vec![read("t1", "a")]);
-        assert_eq!(result[1].as_ref().unwrap().reads, vec![read("t2", "b")]);
-    }
-
-    #[test]
-    fn wildcard_select_yields_no_column_ops() {
-        let ops = extract("SELECT * FROM t1");
-        assert!(ops.reads.is_empty());
-        assert!(ops.writes.is_empty());
-    }
-
-    // ───────── flows ─────────
-
     fn out(name: &str, position: usize) -> ColumnTarget {
         ColumnTarget::QueryOutput {
             name: Some(name.into()),
@@ -1241,567 +747,1110 @@ mod tests {
         }
     }
 
-    #[test]
-    fn select_bare_column_emits_passthrough_flow_to_query_output() {
-        let ops = extract("SELECT a FROM t1");
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("t1", "a"), out("a", 0))]
+    /// Run a list of `(input, expected)` cases against a runner closure,
+    /// collecting all mismatches and reporting them together. Better
+    /// than per-case `assert_eq!` when the cases share the same shape
+    /// — a single failing run shows every divergence so you don't have
+    /// to whack-a-mole.
+    fn run_cases<I, E, F>(cases: &[(I, E)], runner: F)
+    where
+        I: AsRef<str>,
+        E: std::fmt::Debug + PartialEq,
+        F: Fn(&str) -> E,
+    {
+        let failures: Vec<String> = cases
+            .iter()
+            .filter_map(|(input, expected)| {
+                let actual = runner(input.as_ref());
+                (actual != *expected).then(|| {
+                    format!(
+                        "\n  SQL: {}\n    expected: {expected:?}\n    actual:   {actual:?}",
+                        input.as_ref()
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} case(s) failed:{}",
+            failures.len(),
+            failures.join("")
         );
     }
 
-    #[test]
-    fn select_aliased_column_uses_alias_as_output_name() {
-        let ops = extract("SELECT a AS x FROM t1");
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("t1", "a"), out("x", 0))]
-        );
+    mod reads_qualified {
+        use super::*;
+
+        #[test]
+        fn qualified_select_collects_qualified_reads() {
+            let ops = extract("SELECT t1.a, t1.b FROM t1");
+            assert_eq!(ops.reads, vec![read("t1", "a"), read("t1", "b")]);
+        }
+
+        #[test]
+        fn qualified_join_collects_reads_from_both_sides() {
+            // Resolver walks FROM (including JOIN ON) before the projection,
+            // so the predicate columns appear ahead of the projected ones —
+            // and are tagged Filter while projection refs are Projection.
+            let ops = extract("SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id");
+            assert_eq!(
+                ops.reads,
+                vec![
+                    filter_read("t1", "id"),
+                    filter_read("t2", "id"),
+                    read("t1", "a"),
+                    read("t2", "b"),
+                ]
+            );
+        }
+
+        #[test]
+        fn schema_qualified_ref_resolves_to_schema_dot_table() {
+            let ops = extract("SELECT s1.t1.a FROM s1.t1");
+            let table_ref = TableReference {
+                catalog: None,
+                schema: Some("s1".into()),
+                name: "t1".into(),
+            };
+            assert_eq!(
+                ops.reads,
+                vec![ColumnRead {
+                    column: ColumnReference {
+                        table: Some(table_ref),
+                        name: "a".into(),
+                    },
+                    kinds: vec![ReadKind::Projection],
+                }]
+            );
+        }
+
+        #[test]
+        fn where_predicate_qualified_ref_is_a_read() {
+            let ops = extract("SELECT t1.a FROM t1 WHERE t1.b > 0");
+            assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "b")]);
+        }
     }
 
-    #[test]
-    fn select_computed_emits_one_flow_per_source_with_computed_kind() {
-        let ops = extract("SELECT a + b FROM t1");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_computed(col("t1", "a"), out_anon(0)),
-                flow_computed(col("t1", "b"), out_anon(0)),
-            ]
-        );
+    mod reads_unqualified {
+        use super::*;
+
+        #[test]
+        fn unqualified_single_table_resolves_to_that_table() {
+            let ops = extract("SELECT a, b FROM t1");
+            assert_eq!(ops.reads, vec![read("t1", "a"), read("t1", "b")]);
+        }
+
+        #[test]
+        fn unqualified_in_where_resolves_to_single_table() {
+            let ops = extract("SELECT a FROM t1 WHERE b > 0");
+            assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "b")]);
+        }
+
+        #[test]
+        fn unqualified_with_multiple_tables_stays_unresolved() {
+            // Two `Unknown`-schema tables — without a catalog the resolver
+            // cannot tell which `a` belongs to, so the ref surfaces with
+            // `table: None`.
+            let ops = extract("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id");
+            assert_eq!(
+                ops.reads,
+                vec![
+                    filter_read("t1", "id"),
+                    filter_read("t2", "id"),
+                    unresolved("a"),
+                ]
+            );
+        }
+
+        #[test]
+        fn unqualified_uses_alias_binding_but_returns_real_table() {
+            // Alias is just a binding key; the resolver returns the
+            // alias-free TableReference of the binding's underlying table.
+            let ops = extract("SELECT a FROM t1 AS u");
+            assert_eq!(ops.reads, vec![read("t1", "a")]);
+        }
+
+        #[test]
+        fn cte_ref_does_not_surface_in_reads() {
+            // The outer `id` resolves to the cte binding (a synthetic
+            // intermediate, not real storage), so it's dropped from reads.
+            // Reads surface only references with real Table owners or
+            // unresolved column names. `unknown_col` doesn't match the
+            // cte's schema, so it surfaces unresolved (table: None).
+            let ops = extract("WITH cte AS (SELECT id FROM t1) SELECT id, unknown_col FROM cte");
+            // CTE body's own `id` (from t1) is a real read.
+            assert!(
+                ops.reads.contains(&read("t1", "id")),
+                "expected t1.id in {:?}",
+                ops.reads
+            );
+            // Outer `id` resolves to cte → dropped.
+            assert!(
+                !ops.reads.iter().any(|r| r
+                    .column
+                    .table
+                    .as_ref()
+                    .is_some_and(|t| t.name.value == "cte")),
+                "cte.id should not surface in {:?}",
+                ops.reads
+            );
+            // Unresolved name still surfaces with table: None.
+            assert!(
+                ops.reads
+                    .iter()
+                    .any(|r| r.column.name.value == "unknown_col" && r.column.table.is_none()),
+                "expected unresolved unknown_col in {:?}",
+                ops.reads
+            );
+        }
+
+        #[test]
+        fn derived_table_ref_does_not_surface_in_reads() {
+            // Outer `id` resolves to derived alias `d` — synthetic, dropped.
+            // Only the inner SELECT's t1.id is a real read.
+            let ops = extract("SELECT id FROM (SELECT id FROM t1) AS d");
+            assert_eq!(ops.reads, vec![read("t1", "id")]);
+        }
+
+        #[test]
+        fn unqualified_inner_scope_shadows_outer() {
+            // Inner subquery has its own t2 in scope; the unqualified `y`
+            // inside the IN-subquery resolves to t2 even though t1 is
+            // also in the outer scope. Standard SQL inner-shadows-outer.
+            // `y` is in the inner WHERE so its kind is Filter.
+            let ops = extract("SELECT * FROM t1 WHERE id IN (SELECT id FROM t2 WHERE y > 0)");
+            assert!(ops.reads.contains(&filter_read("t2", "y")));
+        }
+
+        #[test]
+        fn unqualified_correlated_walks_to_outer_when_inner_has_no_candidate() {
+            // Inner CTE has Known schema [zz]; `outer_col` doesn't fit it,
+            // so resolution walks to the outer scope and picks the t1
+            // (Unknown) binding.
+            let ops = extract(
+                "SELECT * FROM t1 WHERE id IN (\
+                WITH inner_cte AS (SELECT zz FROM t1) \
+                SELECT zz FROM inner_cte WHERE outer_col > 0)",
+            );
+            // The point: `outer_col` walks past the CTE binding (Known
+            // schema doesn't list it) and lands on the outer t1 (Unknown).
+            // Note that t1 appears twice in the chain (outer and inside
+            // the CTE body) — they're separate scopes; the inner
+            // inner_cte scope's t1 isn't the same scope as the outer.
+            // For this test we just check that `outer_col` resolves
+            // somewhere reasonable rather than the exact target.
+            assert!(ops
+                .reads
+                .iter()
+                .any(|r| r.column.name.value == "outer_col" && r.column.table.is_some()));
+        }
     }
 
-    #[test]
-    fn select_mixed_projection_separates_targets_by_position() {
-        let ops = extract("SELECT a, a + b FROM t1");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_passthrough(col("t1", "a"), out("a", 0)),
-                flow_computed(col("t1", "a"), out_anon(1)),
-                flow_computed(col("t1", "b"), out_anon(1)),
-            ]
-        );
+    mod writes_insert {
+        use super::*;
+
+        #[test]
+        fn insert_with_explicit_columns_writes_those_columns_on_target() {
+            let ops = extract("INSERT INTO t1 (a, b) VALUES (1, 2)");
+            assert_eq!(ops.writes, vec![write("t1", "a"), write("t1", "b")]);
+            assert!(ops.reads.is_empty());
+        }
+
+        #[test]
+        fn insert_select_records_target_writes_and_qualified_source_reads() {
+            let ops = extract("INSERT INTO t1 (a) SELECT t2.b FROM t2");
+            assert_eq!(ops.writes, vec![write("t1", "a")]);
+            assert_eq!(ops.reads, vec![read("t2", "b")]);
+        }
+
+        #[test]
+        fn insert_without_explicit_columns_yields_no_writes() {
+            let ops = extract("INSERT INTO t1 SELECT t2.b FROM t2");
+            assert!(ops.writes.is_empty());
+            assert_eq!(ops.reads, vec![read("t2", "b")]);
+        }
     }
 
-    #[test]
-    fn select_qualified_ref_in_computed_resolves_directly() {
-        let ops = extract("SELECT t1.a + t1.b AS sum FROM t1");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_computed(col("t1", "a"), out("sum", 0)),
-                flow_computed(col("t1", "b"), out("sum", 0)),
-            ]
-        );
+    mod writes_update {
+        use super::*;
+
+        #[test]
+        fn update_set_targets_become_writes_on_update_table() {
+            let ops = extract("UPDATE t1 SET a = 1");
+            assert_eq!(ops.writes, vec![write("t1", "a")]);
+        }
+
+        #[test]
+        fn update_set_qualified_target_keeps_qualifier() {
+            let ops = extract("UPDATE t1 SET t1.a = 1");
+            assert_eq!(ops.writes, vec![write("t1", "a")]);
+        }
+
+        #[test]
+        fn update_set_rhs_qualified_ref_is_a_read() {
+            // SET RHS is value-producing (Projection-like); WHERE refs are
+            // Filter-tagged.
+            let ops = extract("UPDATE t1 SET a = t2.b FROM t2 WHERE t1.id = t2.id");
+            assert_eq!(ops.writes, vec![write("t1", "a")]);
+            assert_eq!(
+                ops.reads,
+                vec![
+                    read("t2", "b"),
+                    filter_read("t1", "id"),
+                    filter_read("t2", "id"),
+                ]
+            );
+        }
     }
 
-    #[test]
-    fn insert_select_pairs_target_cols_positionally() {
-        let ops = extract("INSERT INTO t1 (a, b) SELECT x, y FROM t2");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_passthrough(col("t2", "x"), persisted("t1", "a")),
-                flow_passthrough(col("t2", "y"), persisted("t1", "b")),
-            ]
-        );
+    mod delete_ddl {
+        use super::*;
+
+        #[test]
+        fn delete_qualified_predicate_is_a_read() {
+            let ops = extract("DELETE FROM t1 WHERE t1.id = 5");
+            assert_eq!(ops.reads, vec![filter_read("t1", "id")]);
+            assert!(ops.writes.is_empty());
+        }
     }
 
-    #[test]
-    fn insert_select_computed_marks_kind_per_source() {
-        let ops = extract("INSERT INTO t1 (a) SELECT x + y FROM t2");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_computed(col("t2", "x"), persisted("t1", "a")),
-                flow_computed(col("t2", "y"), persisted("t1", "a")),
-            ]
-        );
+    mod read_kinds {
+        use super::*;
+
+        #[test]
+        fn same_column_in_projection_and_where_is_two_reads_with_different_kinds() {
+            // The two textual `a` references each get their own ColumnRead
+            // entry — one Projection, one Filter — preserving syntactic role
+            // per textual occurrence.
+            let ops = extract("SELECT a FROM t1 WHERE a > 0");
+            assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "a"),]);
+        }
+
+        #[test]
+        fn subquery_where_ref_carries_filter_kind_not_outer_projection() {
+            // The IN-subquery's WHERE walker resets current_read_kind to
+            // Filter inside the subquery; the outer Projection default
+            // doesn't leak in.
+            let ops = extract("SELECT a FROM t WHERE id IN (SELECT id FROM s WHERE flag = 1)");
+            // s.flag is in the inner subquery's WHERE → Filter.
+            assert!(
+                ops.reads.contains(&filter_read("s", "flag")),
+                "expected s.flag Filter in {:?}",
+                ops.reads
+            );
+            // Outer WHERE's LHS id → Filter, on t.
+            assert!(
+                ops.reads.contains(&filter_read("t", "id")),
+                "expected t.id Filter in {:?}",
+                ops.reads
+            );
+            // Inner subquery's projection id → Projection (the subquery's
+            // syntactic projection, even though it's an IN's RHS).
+            assert!(
+                ops.reads.contains(&read("s", "id")),
+                "expected s.id Projection in {:?}",
+                ops.reads
+            );
+            // Outer projection.
+            assert!(
+                ops.reads.contains(&read("t", "a")),
+                "expected t.a Projection in {:?}",
+                ops.reads
+            );
+        }
+
+        #[test]
+        fn group_by_ref_carries_group_by_kind() {
+            let ops = extract("SELECT a, COUNT(*) FROM t1 GROUP BY a");
+            assert_eq!(ops.reads, vec![read("t1", "a"), group_by_read("t1", "a"),]);
+        }
+
+        #[test]
+        fn order_by_ref_carries_sort_kind() {
+            let ops = extract("SELECT a FROM t1 ORDER BY b");
+            assert_eq!(ops.reads, vec![read("t1", "a"), sort_read("t1", "b"),]);
+        }
+
+        #[test]
+        fn group_by_with_having_separates_kinds() {
+            // GROUP BY a → GroupBy; HAVING COUNT(*) > 1 has no column ref;
+            // HAVING SUM(b) > 0 → b is Filter.
+            let ops = extract("SELECT a FROM t1 GROUP BY a HAVING SUM(b) > 0");
+            assert!(ops.reads.contains(&read("t1", "a"))); // projection
+            assert!(ops.reads.contains(&group_by_read("t1", "a"))); // GROUP BY
+            assert!(ops.reads.contains(&filter_read("t1", "b"))); // HAVING
+        }
+
+        #[test]
+        fn group_by_rollup_modifier_carries_group_by_kind() {
+            let ops = extract("SELECT a, b FROM t1 GROUP BY ROLLUP(a, b)");
+            assert!(ops.reads.contains(&group_by_read("t1", "a")));
+            assert!(ops.reads.contains(&group_by_read("t1", "b")));
+        }
+
+        #[test]
+        fn subquery_in_group_by_keeps_inner_projection_kind() {
+            // GROUP BY (SELECT max(z) FROM s) — the inner subquery's `z` is
+            // its own Projection, not the outer GroupBy. resolve_query
+            // resets current_read_kind on entry.
+            let ops = extract("SELECT a FROM t GROUP BY (SELECT z FROM s)");
+            assert!(ops.reads.contains(&read("s", "z")));
+            // Outer `a` projection still Projection.
+            assert!(ops.reads.contains(&read("t", "a")));
+        }
     }
 
-    #[test]
-    fn insert_select_union_pairs_both_branches_with_target_cols() {
-        // Both UNION branches feed the same INSERT target positions,
-        // so each branch's projection should pair `position N → t.col_N`.
-        let ops = extract(
-            "INSERT INTO t1 (a, b) \
+    mod read_kinds_conditional {
+        use super::*;
+
+        #[test]
+        fn case_when_condition_in_projection_gets_conditional_modifier() {
+            // `a` is the WHEN condition → [Projection, Conditional];
+            // `b` is the THEN result → [Projection];
+            // `c` is the ELSE result → [Projection].
+            let ops = extract("SELECT CASE WHEN a > 0 THEN b ELSE c END FROM t1");
+            assert_eq!(
+                ops.reads,
+                vec![
+                    read_with_kinds("t1", "a", vec![ReadKind::Projection, ReadKind::Conditional]),
+                    read("t1", "b"),
+                    read("t1", "c"),
+                ]
+            );
+        }
+
+        #[test]
+        fn case_when_condition_in_where_layers_with_filter() {
+            // `x` is in WHERE's CASE WHEN condition → [Filter, Conditional];
+            // `y` is the THEN result (inside WHERE) → [Filter];
+            // `z` is the ELSE result (inside WHERE) → [Filter];
+            // `b` is the outer projection → [Projection].
+            let ops = extract("SELECT b FROM t WHERE CASE WHEN x > 0 THEN y ELSE z END = 1");
+            assert!(ops.reads.iter().any(|r| r.column.name.value == "x"
+                && r.kinds == vec![ReadKind::Filter, ReadKind::Conditional]));
+            assert!(ops
+                .reads
+                .iter()
+                .any(|r| r.column.name.value == "y" && r.kinds == vec![ReadKind::Filter]));
+            assert!(ops
+                .reads
+                .iter()
+                .any(|r| r.column.name.value == "b" && r.kinds == vec![ReadKind::Projection]));
+        }
+
+        #[test]
+        fn subquery_in_case_condition_does_not_leak_conditional_to_inner_refs() {
+            // A scalar subquery in a CASE condition position is itself
+            // the "conditional" expression. Refs INSIDE the subquery are
+            // the subquery's own projection (or its own WHERE etc.) and
+            // should NOT inherit `Conditional` from the outer CASE — the
+            // modifier resets at the subquery boundary.
+            let ops =
+                extract("SELECT CASE WHEN (SELECT x FROM s WHERE y > 0) IS NULL THEN 1 END FROM t");
+            // s.x is the subquery's projection → plain Projection.
+            assert!(
+                ops.reads
+                    .iter()
+                    .any(|r| r.column.name.value == "x" && r.kinds == vec![ReadKind::Projection]),
+                "s.x should be Projection only, got {:?}",
+                ops.reads
+            );
+            // s.y is the subquery's WHERE → Filter only, no Conditional.
+            assert!(
+                ops.reads
+                    .iter()
+                    .any(|r| r.column.name.value == "y" && r.kinds == vec![ReadKind::Filter]),
+                "s.y should be Filter only, got {:?}",
+                ops.reads
+            );
+        }
+
+        #[test]
+        fn simple_case_operand_gets_conditional_modifier() {
+            // `CASE x WHEN 1 THEN a WHEN 2 THEN b END` — `x` is the
+            // operand (compared against each WHEN pattern), classified
+            // Conditional. `a` / `b` are results, plain Projection.
+            let ops = extract("SELECT CASE x WHEN 1 THEN a WHEN 2 THEN b END FROM t1");
+            assert!(ops.reads.iter().any(|r| r.column.name.value == "x"
+                && r.kinds == vec![ReadKind::Projection, ReadKind::Conditional]));
+            assert!(ops
+                .reads
+                .iter()
+                .any(|r| r.column.name.value == "a" && r.kinds == vec![ReadKind::Projection]));
+            assert!(ops
+                .reads
+                .iter()
+                .any(|r| r.column.name.value == "b" && r.kinds == vec![ReadKind::Projection]));
+        }
+
+        #[test]
+        fn window_partition_by_carries_window_kind() {
+            // OVER (PARTITION BY p) — p is Window; the aggregate arg `x`
+            // stays Projection (value flow into the output column).
+            let ops = extract("SELECT SUM(x) OVER (PARTITION BY p) FROM t1");
+            assert!(ops.reads.contains(&read("t1", "x")));
+            assert!(ops.reads.contains(&window_read("t1", "p")));
+        }
+
+        #[test]
+        fn window_order_by_carries_window_kind() {
+            let ops = extract("SELECT SUM(x) OVER (ORDER BY o) FROM t1");
+            assert!(ops.reads.contains(&read("t1", "x")));
+            assert!(ops.reads.contains(&window_read("t1", "o")));
+        }
+
+        #[test]
+        fn window_partition_and_order_both_classified() {
+            let ops = extract("SELECT SUM(x) OVER (PARTITION BY p ORDER BY o) FROM t1");
+            assert!(ops.reads.contains(&read("t1", "x")));
+            assert!(ops.reads.contains(&window_read("t1", "p")));
+            assert!(ops.reads.contains(&window_read("t1", "o")));
+        }
+
+        #[test]
+        fn merge_on_clause_carries_filter_kind() {
+            let ops = extract(
+                "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a",
+            );
+            assert!(ops.reads.contains(&filter_read("t", "id")));
+            assert!(ops.reads.contains(&filter_read("s", "id")));
+        }
+
+        #[test]
+        fn create_table_definitions_are_not_writes() {
+            let ops = extract("CREATE TABLE t1 (a INT, b INT)");
+            assert!(ops.reads.is_empty());
+            assert!(ops.writes.is_empty());
+        }
+    }
+
+    mod diagnostics {
+        use super::*;
+
+        #[test]
+        fn unsupported_statement_reports_diagnostic() {
+            let ops = extract("CREATE INDEX idx ON t1 (a)");
+            assert_eq!(ops.statement_kind, StatementKind::Unsupported);
+            assert!(ops.reads.is_empty());
+            assert!(ops.writes.is_empty());
+            assert_eq!(ops.diagnostics.len(), 1);
+            assert_eq!(
+                ops.diagnostics[0].kind,
+                DiagnosticKind::UnsupportedStatement
+            );
+        }
+
+        #[test]
+        fn wildcard_in_projection_reports_diagnostic() {
+            let ops = extract("SELECT * FROM t1");
+            let kinds: Vec<&DiagnosticKind> = ops.diagnostics.iter().map(|d| &d.kind).collect();
+            assert_eq!(kinds, vec![&DiagnosticKind::WildcardSuppressed]);
+            // Span info ("at L1:C8") is duplicated in message and surfaced
+            // as structured data for programmatic consumers.
+            assert!(
+                ops.diagnostics[0].message.contains("at L1:C8"),
+                "expected span suffix in message, got: {}",
+                ops.diagnostics[0].message
+            );
+            let span = ops.diagnostics[0]
+                .span
+                .expect("wildcard token carries a span");
+            assert_eq!(span.start.line, 1);
+            assert_eq!(span.start.column, 8);
+        }
+
+        #[test]
+        fn qualified_wildcard_in_projection_reports_diagnostic() {
+            let ops = extract("SELECT t1.* FROM t1");
+            let kinds: Vec<&DiagnosticKind> = ops.diagnostics.iter().map(|d| &d.kind).collect();
+            assert_eq!(kinds, vec![&DiagnosticKind::WildcardSuppressed]);
+        }
+
+        #[test]
+        fn multiple_statements_produce_multiple_results() {
+            let result = extract_column_operations(
+                &GenericDialect {},
+                "SELECT t1.a FROM t1; SELECT t2.b FROM t2",
+                None,
+            )
+            .unwrap();
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0].as_ref().unwrap().reads, vec![read("t1", "a")]);
+            assert_eq!(result[1].as_ref().unwrap().reads, vec![read("t2", "b")]);
+        }
+
+        #[test]
+        fn wildcard_select_yields_no_column_ops() {
+            let ops = extract("SELECT * FROM t1");
+            assert!(ops.reads.is_empty());
+            assert!(ops.writes.is_empty());
+        }
+    }
+
+    mod flows {
+        use super::*;
+
+        #[test]
+        fn select_bare_column_emits_passthrough_flow_to_query_output() {
+            let ops = extract("SELECT a FROM t1");
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("t1", "a"), out("a", 0))]
+            );
+        }
+
+        #[test]
+        fn select_aliased_column_uses_alias_as_output_name() {
+            let ops = extract("SELECT a AS x FROM t1");
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("t1", "a"), out("x", 0))]
+            );
+        }
+
+        #[test]
+        fn select_computed_emits_one_flow_per_source_with_computed_kind() {
+            let ops = extract("SELECT a + b FROM t1");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_computed(col("t1", "a"), out_anon(0)),
+                    flow_computed(col("t1", "b"), out_anon(0)),
+                ]
+            );
+        }
+
+        #[test]
+        fn select_mixed_projection_separates_targets_by_position() {
+            let ops = extract("SELECT a, a + b FROM t1");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("t1", "a"), out("a", 0)),
+                    flow_computed(col("t1", "a"), out_anon(1)),
+                    flow_computed(col("t1", "b"), out_anon(1)),
+                ]
+            );
+        }
+
+        #[test]
+        fn select_qualified_ref_in_computed_resolves_directly() {
+            let ops = extract("SELECT t1.a + t1.b AS sum FROM t1");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_computed(col("t1", "a"), out("sum", 0)),
+                    flow_computed(col("t1", "b"), out("sum", 0)),
+                ]
+            );
+        }
+
+        #[test]
+        fn insert_select_pairs_target_cols_positionally() {
+            let ops = extract("INSERT INTO t1 (a, b) SELECT x, y FROM t2");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("t2", "x"), persisted("t1", "a")),
+                    flow_passthrough(col("t2", "y"), persisted("t1", "b")),
+                ]
+            );
+        }
+
+        #[test]
+        fn insert_select_computed_marks_kind_per_source() {
+            let ops = extract("INSERT INTO t1 (a) SELECT x + y FROM t2");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_computed(col("t2", "x"), persisted("t1", "a")),
+                    flow_computed(col("t2", "y"), persisted("t1", "a")),
+                ]
+            );
+        }
+
+        #[test]
+        fn insert_select_union_pairs_both_branches_with_target_cols() {
+            // Both UNION branches feed the same INSERT target positions,
+            // so each branch's projection should pair `position N → t.col_N`.
+            let ops = extract(
+                "INSERT INTO t1 (a, b) \
              SELECT x, y FROM t2 \
              UNION ALL \
              SELECT p, q FROM t3",
-        );
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_passthrough(col("t2", "x"), persisted("t1", "a")),
-                flow_passthrough(col("t2", "y"), persisted("t1", "b")),
-                flow_passthrough(col("t3", "p"), persisted("t1", "a")),
-                flow_passthrough(col("t3", "q"), persisted("t1", "b")),
-            ]
-        );
+            );
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("t2", "x"), persisted("t1", "a")),
+                    flow_passthrough(col("t2", "y"), persisted("t1", "b")),
+                    flow_passthrough(col("t3", "p"), persisted("t1", "a")),
+                    flow_passthrough(col("t3", "q"), persisted("t1", "b")),
+                ]
+            );
+        }
+
+        #[test]
+        fn statements_that_emit_no_flows() {
+            // Statements that don't physically move column data — either
+            // by design (DELETE), by lack of catalog context (INSERT
+            // without explicit columns), by literal-only sources, or
+            // because wildcards aren't expanded.
+            run_cases::<&str, Vec<ColumnFlow>, _>(
+                &[
+                    // INSERT without explicit column list: target column names
+                    // would need catalog-driven positional mapping; defaults
+                    // to no flow without catalog.
+                    ("INSERT INTO t1 SELECT x FROM t2", vec![]),
+                    ("INSERT INTO t1 (a, b) VALUES (1, 2)", vec![]),
+                    ("UPDATE t1 SET a = 1", vec![]),
+                    ("DELETE FROM t1 WHERE id = 5", vec![]),
+                    ("SELECT * FROM t1", vec![]),
+                ],
+                |sql| extract(sql).flows,
+            );
+        }
+
+        #[test]
+        fn update_set_passthrough_flow() {
+            let ops = extract("UPDATE t1 SET a = b");
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("t1", "b"), persisted("t1", "a"))]
+            );
+        }
+
+        #[test]
+        fn update_set_computed_flow() {
+            let ops = extract("UPDATE t1 SET a = b + 1");
+            assert_eq!(
+                ops.flows,
+                vec![flow_computed(col("t1", "b"), persisted("t1", "a"))]
+            );
+        }
+
+        #[test]
+        fn update_set_with_qualified_rhs_resolves_to_other_table() {
+            let ops = extract("UPDATE t1 SET a = t2.b FROM t2 WHERE t1.id = t2.id");
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("t2", "b"), persisted("t1", "a"))]
+            );
+        }
     }
 
-    #[test]
-    fn insert_without_explicit_cols_emits_no_flows() {
-        // Target column names would need positional mapping against
-        // the table schema (catalog). Deferred.
-        let ops = extract("INSERT INTO t1 SELECT x FROM t2");
-        assert!(ops.flows.is_empty());
+    mod flow_aggregation {
+        use super::*;
+
+        #[test]
+        fn aggregate_call_in_projection_emits_aggregation_flow() {
+            let ops = extract("SELECT SUM(a) FROM t1");
+            assert_eq!(
+                ops.flows,
+                vec![flow_aggregation(col("t1", "a"), out_anon(0))]
+            );
+        }
+
+        #[test]
+        fn aggregate_with_alias_carries_aliased_name() {
+            let ops = extract("SELECT COUNT(b) AS n FROM t1");
+            assert_eq!(
+                ops.flows,
+                vec![flow_aggregation(col("t1", "b"), out("n", 0))]
+            );
+        }
+
+        #[test]
+        fn aggregate_wrapped_in_expression_falls_back_to_computed() {
+            // `SUM(a) + 1` has BinaryOp at the top level, so the
+            // projection's kind is Computed — only a bare aggregate call
+            // qualifies as Aggregation.
+            let ops = extract("SELECT SUM(a) + 1 FROM t1");
+            assert_eq!(ops.flows, vec![flow_computed(col("t1", "a"), out_anon(0))]);
+        }
+
+        #[test]
+        fn aggregate_in_insert_select_propagates_aggregation() {
+            let ops = extract("INSERT INTO t2 (n) SELECT COUNT(a) FROM t1");
+            assert_eq!(
+                ops.flows,
+                vec![flow_aggregation(col("t1", "a"), persisted("t2", "n"))]
+            );
+        }
+
+        #[test]
+        fn cte_aggregate_composes_to_outer_as_aggregation() {
+            // CTE body's `s` is Aggregation (SUM(a)); outer's bare `s`
+            // would be Passthrough, but composition (Aggregation
+            // dominates) collapses the chain to Aggregation.
+            let ops = extract("WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s FROM cte");
+            assert_eq!(
+                ops.flows,
+                vec![flow_aggregation(col("t1", "a"), out("s", 0))]
+            );
+        }
     }
 
-    #[test]
-    fn insert_values_with_literals_emits_no_flows() {
-        let ops = extract("INSERT INTO t1 (a, b) VALUES (1, 2)");
-        assert!(ops.flows.is_empty());
-    }
+    mod cte_derived_rename {
+        use super::*;
 
-    #[test]
-    fn update_set_passthrough_flow() {
-        let ops = extract("UPDATE t1 SET a = b");
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("t1", "b"), persisted("t1", "a"))]
-        );
-    }
+        #[test]
+        fn cte_column_rename_composes_through_renamed_name() {
+            // Outer `a` refers to cte's renamed column at position 0,
+            // which body-positionally is `x` from t. Composition follows
+            // the renamed name back to the body item, then to t.x.
+            let ops = extract("WITH cte (a) AS (SELECT x FROM t) SELECT a FROM cte");
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("t", "x"), out("a", 0))]
+            );
+            // Reads surface only the real-table ref (CTE binding is
+            // synthetic, dropped).
+            assert_eq!(ops.reads, vec![read("t", "x")]);
+        }
 
-    #[test]
-    fn update_set_computed_flow() {
-        let ops = extract("UPDATE t1 SET a = b + 1");
-        assert_eq!(
-            ops.flows,
-            vec![flow_computed(col("t1", "b"), persisted("t1", "a"))]
-        );
-    }
+        #[test]
+        fn cte_column_rename_partial_keeps_remaining_body_names() {
+            // Rename `(p)` covers position 0 only. Position 1's body name
+            // `y` survives; outer can reference `p` or `y`.
+            let ops = extract("WITH cte (p) AS (SELECT x, y FROM t) SELECT p, y FROM cte");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("t", "x"), out("p", 0)),
+                    flow_passthrough(col("t", "y"), out("y", 1)),
+                ]
+            );
+        }
 
-    #[test]
-    fn update_set_with_qualified_rhs_resolves_to_other_table() {
-        let ops = extract("UPDATE t1 SET a = t2.b FROM t2 WHERE t1.id = t2.id");
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("t2", "b"), persisted("t1", "a"))]
-        );
-    }
+        #[test]
+        fn derived_table_column_rename_composes() {
+            // `(SELECT x FROM t) AS d(a)` — outer `a` resolves via d's
+            // renamed column at position 0 → body item x → t.x.
+            let ops = extract("SELECT a FROM (SELECT x FROM t) d(a)");
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("t", "x"), out("a", 0))]
+            );
+            assert_eq!(ops.reads, vec![read("t", "x")]);
+        }
 
-    #[test]
-    fn update_set_literal_emits_no_flow() {
-        let ops = extract("UPDATE t1 SET a = 1");
-        assert!(ops.flows.is_empty());
-    }
-
-    #[test]
-    fn delete_emits_no_flow() {
-        let ops = extract("DELETE FROM t1 WHERE id = 5");
-        assert!(ops.flows.is_empty());
-    }
-
-    #[test]
-    fn wildcard_select_emits_no_flow() {
-        let ops = extract("SELECT * FROM t1");
-        assert!(ops.flows.is_empty());
-    }
-
-    // ───────── ColumnFlowKind::Aggregation (Phase 5.6d) ─────────
-
-    #[test]
-    fn aggregate_call_in_projection_emits_aggregation_flow() {
-        let ops = extract("SELECT SUM(a) FROM t1");
-        assert_eq!(
-            ops.flows,
-            vec![flow_aggregation(col("t1", "a"), out_anon(0))]
-        );
-    }
-
-    #[test]
-    fn aggregate_with_alias_carries_aliased_name() {
-        let ops = extract("SELECT COUNT(b) AS n FROM t1");
-        assert_eq!(
-            ops.flows,
-            vec![flow_aggregation(col("t1", "b"), out("n", 0))]
-        );
-    }
-
-    #[test]
-    fn aggregate_wrapped_in_expression_falls_back_to_computed() {
-        // `SUM(a) + 1` has BinaryOp at the top level, so the
-        // projection's kind is Computed — only a bare aggregate call
-        // qualifies as Aggregation.
-        let ops = extract("SELECT SUM(a) + 1 FROM t1");
-        assert_eq!(ops.flows, vec![flow_computed(col("t1", "a"), out_anon(0))]);
-    }
-
-    #[test]
-    fn aggregate_in_insert_select_propagates_aggregation() {
-        let ops = extract("INSERT INTO t2 (n) SELECT COUNT(a) FROM t1");
-        assert_eq!(
-            ops.flows,
-            vec![flow_aggregation(col("t1", "a"), persisted("t2", "n"))]
-        );
-    }
-
-    #[test]
-    fn cte_aggregate_composes_to_outer_as_aggregation() {
-        // CTE body's `s` is Aggregation (SUM(a)); outer's bare `s`
-        // would be Passthrough, but composition (Aggregation
-        // dominates) collapses the chain to Aggregation.
-        let ops = extract("WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s FROM cte");
-        assert_eq!(
-            ops.flows,
-            vec![flow_aggregation(col("t1", "a"), out("s", 0))]
-        );
-    }
-
-    // ───────── CTE / derived column rename (Phase 5.10) ─────────
-
-    #[test]
-    fn cte_column_rename_composes_through_renamed_name() {
-        // Outer `a` refers to cte's renamed column at position 0,
-        // which body-positionally is `x` from t. Composition follows
-        // the renamed name back to the body item, then to t.x.
-        let ops = extract("WITH cte (a) AS (SELECT x FROM t) SELECT a FROM cte");
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("t", "x"), out("a", 0))]
-        );
-        // Reads surface only the real-table ref (CTE binding is
-        // synthetic, dropped).
-        assert_eq!(ops.reads, vec![read("t", "x")]);
-    }
-
-    #[test]
-    fn cte_column_rename_partial_keeps_remaining_body_names() {
-        // Rename `(p)` covers position 0 only. Position 1's body name
-        // `y` survives; outer can reference `p` or `y`.
-        let ops = extract("WITH cte (p) AS (SELECT x, y FROM t) SELECT p, y FROM cte");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_passthrough(col("t", "x"), out("p", 0)),
-                flow_passthrough(col("t", "y"), out("y", 1)),
-            ]
-        );
-    }
-
-    #[test]
-    fn derived_table_column_rename_composes() {
-        // `(SELECT x FROM t) AS d(a)` — outer `a` resolves via d's
-        // renamed column at position 0 → body item x → t.x.
-        let ops = extract("SELECT a FROM (SELECT x FROM t) d(a)");
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("t", "x"), out("a", 0))]
-        );
-        assert_eq!(ops.reads, vec![read("t", "x")]);
-    }
-
-    #[test]
-    fn cte_column_rename_into_insert() {
-        // `INSERT INTO t2 (col) WITH cte(a) AS (SELECT x FROM t1)
-        //  SELECT a FROM cte` composes through both the CTE rename
-        //  and the INSERT pairing: t1.x → t2.col.
-        let ops = extract(
-            "INSERT INTO t2 (col) WITH cte (a) AS (SELECT x FROM t1) \
+        #[test]
+        fn cte_column_rename_into_insert() {
+            // `INSERT INTO t2 (col) WITH cte(a) AS (SELECT x FROM t1)
+            //  SELECT a FROM cte` composes through both the CTE rename
+            //  and the INSERT pairing: t1.x → t2.col.
+            let ops = extract(
+                "INSERT INTO t2 (col) WITH cte (a) AS (SELECT x FROM t1) \
              SELECT a FROM cte",
-        );
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("t1", "x"), persisted("t2", "col"))]
-        );
+            );
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("t1", "x"), persisted("t2", "col"))]
+            );
+        }
     }
 
-    // ───────── MERGE column-level (Phase 5.7) ─────────
+    mod merge {
+        use super::*;
 
-    #[test]
-    fn merge_when_matched_update_emits_flow_and_write() {
-        let ops =
-            extract("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a");
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("s", "a"), persisted("t", "a"))]
-        );
-        assert_eq!(ops.writes, vec![write("t", "a")]);
-    }
+        #[test]
+        fn merge_when_matched_update_emits_flow_and_write() {
+            let ops = extract(
+                "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a",
+            );
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("s", "a"), persisted("t", "a"))]
+            );
+            assert_eq!(ops.writes, vec![write("t", "a")]);
+        }
 
-    #[test]
-    fn merge_when_not_matched_insert_emits_flow_and_write() {
-        let ops = extract(
-            "MERGE INTO t USING s ON t.id = s.id \
+        #[test]
+        fn merge_when_not_matched_insert_emits_flow_and_write() {
+            let ops = extract(
+                "MERGE INTO t USING s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a)",
-        );
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_passthrough(col("s", "id"), persisted("t", "id")),
-                flow_passthrough(col("s", "a"), persisted("t", "a")),
-            ]
-        );
-        assert_eq!(ops.writes, vec![write("t", "id"), write("t", "a")]);
-    }
+            );
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("s", "id"), persisted("t", "id")),
+                    flow_passthrough(col("s", "a"), persisted("t", "a")),
+                ]
+            );
+            assert_eq!(ops.writes, vec![write("t", "id"), write("t", "a")]);
+        }
 
-    #[test]
-    fn merge_delete_action_emits_no_flow_no_write() {
-        let ops = extract("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE");
-        assert!(ops.flows.is_empty());
-        assert!(ops.writes.is_empty());
-    }
+        #[test]
+        fn merge_delete_action_emits_no_flow_no_write() {
+            let ops = extract("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE");
+            assert!(ops.flows.is_empty());
+            assert!(ops.writes.is_empty());
+        }
 
-    #[test]
-    fn merge_combined_clauses_emit_per_clause_flows_and_writes() {
-        let ops = extract(
-            "MERGE INTO t USING s ON t.id = s.id \
+        #[test]
+        fn merge_combined_clauses_emit_per_clause_flows_and_writes() {
+            let ops = extract(
+                "MERGE INTO t USING s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET t.a = s.a \
              WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a)",
-        );
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_passthrough(col("s", "a"), persisted("t", "a")),
-                flow_passthrough(col("s", "id"), persisted("t", "id")),
-                flow_passthrough(col("s", "a"), persisted("t", "a")),
-            ]
-        );
-        assert_eq!(
-            ops.writes,
-            vec![write("t", "a"), write("t", "id"), write("t", "a")]
-        );
-    }
+            );
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("s", "a"), persisted("t", "a")),
+                    flow_passthrough(col("s", "id"), persisted("t", "id")),
+                    flow_passthrough(col("s", "a"), persisted("t", "a")),
+                ]
+            );
+            assert_eq!(
+                ops.writes,
+                vec![write("t", "a"), write("t", "id"), write("t", "a")]
+            );
+        }
 
-    #[test]
-    fn merge_update_computed_kind_propagates() {
-        let ops = extract(
-            "MERGE INTO t USING s ON t.id = s.id \
+        #[test]
+        fn merge_update_computed_kind_propagates() {
+            let ops = extract(
+                "MERGE INTO t USING s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET t.a = s.a + 1",
-        );
-        assert_eq!(
-            ops.flows,
-            vec![flow_computed(col("s", "a"), persisted("t", "a"))]
-        );
+            );
+            assert_eq!(
+                ops.flows,
+                vec![flow_computed(col("s", "a"), persisted("t", "a"))]
+            );
+        }
     }
 
-    // ───────── CTAS / CREATE VIEW / ALTER VIEW (Phase 5.8) ─────────
+    mod ctas_view {
+        use super::*;
 
-    #[test]
-    fn ctas_pairs_source_projection_with_inferred_column_names() {
-        // CREATE TABLE AS SELECT — no explicit column list, so target
-        // columns follow the source projection's inferred names
-        // (alias > bare ident).
-        let ops = extract("CREATE TABLE t AS SELECT x AS a, y FROM s");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_passthrough(col("s", "x"), persisted("t", "a")),
-                flow_passthrough(col("s", "y"), persisted("t", "y")),
-            ]
-        );
-        assert_eq!(ops.writes, vec![write("t", "a"), write("t", "y")]);
+        #[test]
+        fn ctas_pairs_source_projection_with_inferred_column_names() {
+            // CREATE TABLE AS SELECT — no explicit column list, so target
+            // columns follow the source projection's inferred names
+            // (alias > bare ident).
+            let ops = extract("CREATE TABLE t AS SELECT x AS a, y FROM s");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("s", "x"), persisted("t", "a")),
+                    flow_passthrough(col("s", "y"), persisted("t", "y")),
+                ]
+            );
+            assert_eq!(ops.writes, vec![write("t", "a"), write("t", "y")]);
+        }
+
+        #[test]
+        fn ctas_with_explicit_columns_overrides_projection_names() {
+            // Explicit column list wins over inferred names.
+            let ops = extract("CREATE TABLE t (p INT, q INT) AS SELECT x, y FROM s");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("s", "x"), persisted("t", "p")),
+                    flow_passthrough(col("s", "y"), persisted("t", "q")),
+                ]
+            );
+            assert_eq!(ops.writes, vec![write("t", "p"), write("t", "q")]);
+        }
+
+        #[test]
+        fn ctas_propagates_aggregation_kind() {
+            let ops = extract("CREATE TABLE t AS SELECT SUM(x) AS total FROM s");
+            assert_eq!(
+                ops.flows,
+                vec![flow_aggregation(col("s", "x"), persisted("t", "total"))]
+            );
+            assert_eq!(ops.writes, vec![write("t", "total")]);
+        }
+
+        #[test]
+        fn create_view_pairs_source_projection() {
+            let ops = extract("CREATE VIEW v AS SELECT x AS a, y FROM s");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("s", "x"), persisted("v", "a")),
+                    flow_passthrough(col("s", "y"), persisted("v", "y")),
+                ]
+            );
+            assert_eq!(ops.writes, vec![write("v", "a"), write("v", "y")]);
+        }
+
+        #[test]
+        fn create_view_with_explicit_columns_uses_list() {
+            let ops = extract("CREATE VIEW v (a, b) AS SELECT x, y FROM s");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("s", "x"), persisted("v", "a")),
+                    flow_passthrough(col("s", "y"), persisted("v", "b")),
+                ]
+            );
+            assert_eq!(ops.writes, vec![write("v", "a"), write("v", "b")]);
+        }
+
+        #[test]
+        fn alter_view_pairs_replacement_query_projection() {
+            let ops = extract("ALTER VIEW v AS SELECT x AS a FROM s");
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("s", "x"), persisted("v", "a"))]
+            );
+            assert_eq!(ops.writes, vec![write("v", "a")]);
+        }
+
+        #[test]
+        fn ctas_unnamed_projection_yields_no_paired_flow() {
+            // `SELECT 1` has no column ref and no inferable name, so the
+            // CTAS source produces no flow / no write for that slot.
+            let ops = extract("CREATE TABLE t AS SELECT 1 FROM s");
+            assert!(ops.flows.is_empty());
+            assert!(ops.writes.is_empty());
+        }
+
+        #[test]
+        fn aggregate_with_distinct_args_marker() {
+            // COUNT(DISTINCT user_id) — DISTINCT inside function args is
+            // aggregate-only per SQL spec, classified as Aggregation even
+            // if the function name weren't in the list.
+            let ops = extract("SELECT COUNT(DISTINCT user_id) FROM t1");
+            assert_eq!(
+                ops.flows,
+                vec![flow_aggregation(col("t1", "user_id"), out_anon(0))]
+            );
+        }
+
+        #[test]
+        fn aggregate_with_filter_clause_marker() {
+            // FILTER (WHERE ...) is aggregate-only per SQL spec. Works
+            // even for a hypothetical unknown function name.
+            let ops = extract("SELECT SUM(x) FILTER (WHERE y > 0) FROM t1");
+            // The function (SUM) is known AND has FILTER — either signal
+            // alone would classify it; the resulting kind is Aggregation.
+            // Note `y > 0` puts `y` in a Filter-kind read; assertion
+            // here focuses on the flow shape for the `x` source.
+            assert!(ops.flows.iter().any(
+                |f| f.source.name.value == "x" && matches!(f.kind, ColumnFlowKind::Aggregation)
+            ));
+        }
+
+        #[test]
+        fn cte_aggregate_then_outer_compute_still_aggregation() {
+            // Outer wraps the CTE column in a computed expression
+            // (s + 1) — composition: outer Computed × inner Aggregation =
+            // Aggregation (Aggregation dominates Computed).
+            let ops = extract("WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s + 1 FROM cte");
+            assert_eq!(
+                ops.flows,
+                vec![flow_aggregation(col("t1", "a"), out_anon(0))]
+            );
+        }
     }
 
-    #[test]
-    fn ctas_with_explicit_columns_overrides_projection_names() {
-        // Explicit column list wins over inferred names.
-        let ops = extract("CREATE TABLE t (p INT, q INT) AS SELECT x, y FROM s");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_passthrough(col("s", "x"), persisted("t", "p")),
-                flow_passthrough(col("s", "y"), persisted("t", "q")),
-            ]
-        );
-        assert_eq!(ops.writes, vec![write("t", "p"), write("t", "q")]);
+    mod composition {
+        use super::*;
+
+        #[test]
+        fn cte_passthrough_composes_to_base_table() {
+            // The outer flow's source `id` resolves to cte, then composes
+            // through the CTE body's projection back to t1.id. No
+            // intermediate cte.id → out edge survives.
+            let ops = extract("WITH cte AS (SELECT id FROM t1) SELECT id FROM cte");
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("t1", "id"), out("id", 0))]
+            );
+        }
+
+        #[test]
+        fn cte_computed_propagates_computed_kind_after_composition() {
+            // CTE body's `sum` is computed from a, b. Outer's bare `sum`
+            // composes back into two flows, each marked Computed because
+            // the body item is Computed (outer.bare && item.bare = false).
+            let ops = extract("WITH cte AS (SELECT a + b AS sum FROM t1) SELECT sum FROM cte");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_computed(col("t1", "a"), out("sum", 0)),
+                    flow_computed(col("t1", "b"), out("sum", 0)),
+                ]
+            );
+        }
+
+        #[test]
+        fn cte_to_insert_composes_end_to_end() {
+            // Composition flows past the CTE boundary into the INSERT
+            // target — t1.id → t2.x directly, no cte.id step.
+            let ops =
+                extract("INSERT INTO t2 (x) WITH cte AS (SELECT id FROM t1) SELECT id FROM cte");
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("t1", "id"), persisted("t2", "x"))]
+            );
+        }
+
+        #[test]
+        fn cte_chain_composes_through_all_levels() {
+            // a → b → outer: outer's `b.id` composes via b's body back to
+            // a, then via a's body back to t1. Outer is qualified because
+            // having both `a` and `b` in scope with the same column name
+            // makes the unqualified form ambiguous under our scope model
+            // (outer SELECT sees both CTE bindings, not just b).
+            let ops = extract(
+                "WITH a AS (SELECT id FROM t1), b AS (SELECT id FROM a) SELECT b.id FROM b",
+            );
+            assert_eq!(
+                ops.flows,
+                vec![flow_passthrough(col("t1", "id"), out("id", 0))]
+            );
+        }
+
+        #[test]
+        fn derived_table_composes_to_base_table() {
+            // The outer projection's `col` composes through derived `d`'s
+            // body (a + b AS col) into two Computed flows on t1.
+            let ops = extract("SELECT col FROM (SELECT a + b AS col FROM t1) d");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_computed(col("t1", "a"), out("col", 0)),
+                    flow_computed(col("t1", "b"), out("col", 0)),
+                ]
+            );
+        }
+
+        #[test]
+        fn cte_referenced_twice_composes_each_use() {
+            // Each cte reference in the projection composes independently
+            // back to t1.id.
+            let ops =
+                extract("WITH cte AS (SELECT id FROM t1) SELECT cte.id AS a, cte.id AS b FROM cte");
+            assert_eq!(
+                ops.flows,
+                vec![
+                    flow_passthrough(col("t1", "id"), out("a", 0)),
+                    flow_passthrough(col("t1", "id"), out("b", 1)),
+                ]
+            );
+        }
+
+        #[test]
+        fn recursive_cte_does_not_panic_and_skips_composition() {
+            // Recursive CTEs don't carry body_projections (fixpoint is
+            // deferred), so composition falls back to leaving the ref
+            // pointing at the CTE binding — which is then dropped from
+            // reads as synthetic. No infinite recursion either.
+            let ops = extract(
+                "WITH RECURSIVE r AS (SELECT id FROM t1 UNION SELECT id FROM r) SELECT id FROM r",
+            );
+            // Reads at least include t1.id from the recursive CTE's
+            // first branch.
+            assert!(ops.reads.contains(&read("t1", "id")));
+        }
     }
-
-    #[test]
-    fn ctas_propagates_aggregation_kind() {
-        let ops = extract("CREATE TABLE t AS SELECT SUM(x) AS total FROM s");
-        assert_eq!(
-            ops.flows,
-            vec![flow_aggregation(col("s", "x"), persisted("t", "total"))]
-        );
-        assert_eq!(ops.writes, vec![write("t", "total")]);
-    }
-
-    #[test]
-    fn create_view_pairs_source_projection() {
-        let ops = extract("CREATE VIEW v AS SELECT x AS a, y FROM s");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_passthrough(col("s", "x"), persisted("v", "a")),
-                flow_passthrough(col("s", "y"), persisted("v", "y")),
-            ]
-        );
-        assert_eq!(ops.writes, vec![write("v", "a"), write("v", "y")]);
-    }
-
-    #[test]
-    fn create_view_with_explicit_columns_uses_list() {
-        let ops = extract("CREATE VIEW v (a, b) AS SELECT x, y FROM s");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_passthrough(col("s", "x"), persisted("v", "a")),
-                flow_passthrough(col("s", "y"), persisted("v", "b")),
-            ]
-        );
-        assert_eq!(ops.writes, vec![write("v", "a"), write("v", "b")]);
-    }
-
-    #[test]
-    fn alter_view_pairs_replacement_query_projection() {
-        let ops = extract("ALTER VIEW v AS SELECT x AS a FROM s");
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("s", "x"), persisted("v", "a"))]
-        );
-        assert_eq!(ops.writes, vec![write("v", "a")]);
-    }
-
-    #[test]
-    fn ctas_unnamed_projection_yields_no_paired_flow() {
-        // `SELECT 1` has no column ref and no inferable name, so the
-        // CTAS source produces no flow / no write for that slot.
-        let ops = extract("CREATE TABLE t AS SELECT 1 FROM s");
-        assert!(ops.flows.is_empty());
-        assert!(ops.writes.is_empty());
-    }
-
-    #[test]
-    fn aggregate_with_distinct_args_marker() {
-        // COUNT(DISTINCT user_id) — DISTINCT inside function args is
-        // aggregate-only per SQL spec, classified as Aggregation even
-        // if the function name weren't in the list.
-        let ops = extract("SELECT COUNT(DISTINCT user_id) FROM t1");
-        assert_eq!(
-            ops.flows,
-            vec![flow_aggregation(col("t1", "user_id"), out_anon(0))]
-        );
-    }
-
-    #[test]
-    fn aggregate_with_filter_clause_marker() {
-        // FILTER (WHERE ...) is aggregate-only per SQL spec. Works
-        // even for a hypothetical unknown function name.
-        let ops = extract("SELECT SUM(x) FILTER (WHERE y > 0) FROM t1");
-        // The function (SUM) is known AND has FILTER — either signal
-        // alone would classify it; the resulting kind is Aggregation.
-        // Note `y > 0` puts `y` in a Filter-kind read; assertion
-        // here focuses on the flow shape for the `x` source.
-        assert!(ops
-            .flows
-            .iter()
-            .any(|f| f.source.name.value == "x" && matches!(f.kind, ColumnFlowKind::Aggregation)));
-    }
-
-    #[test]
-    fn cte_aggregate_then_outer_compute_still_aggregation() {
-        // Outer wraps the CTE column in a computed expression
-        // (s + 1) — composition: outer Computed × inner Aggregation =
-        // Aggregation (Aggregation dominates Computed).
-        let ops = extract("WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s + 1 FROM cte");
-        assert_eq!(
-            ops.flows,
-            vec![flow_aggregation(col("t1", "a"), out_anon(0))]
-        );
-    }
-
-    // ───────── transitive composition through CTE / derived ─────────
-
-    #[test]
-    fn cte_passthrough_composes_to_base_table() {
-        // The outer flow's source `id` resolves to cte, then composes
-        // through the CTE body's projection back to t1.id. No
-        // intermediate cte.id → out edge survives.
-        let ops = extract("WITH cte AS (SELECT id FROM t1) SELECT id FROM cte");
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("t1", "id"), out("id", 0))]
-        );
-    }
-
-    #[test]
-    fn cte_computed_propagates_computed_kind_after_composition() {
-        // CTE body's `sum` is computed from a, b. Outer's bare `sum`
-        // composes back into two flows, each marked Computed because
-        // the body item is Computed (outer.bare && item.bare = false).
-        let ops = extract("WITH cte AS (SELECT a + b AS sum FROM t1) SELECT sum FROM cte");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_computed(col("t1", "a"), out("sum", 0)),
-                flow_computed(col("t1", "b"), out("sum", 0)),
-            ]
-        );
-    }
-
-    #[test]
-    fn cte_to_insert_composes_end_to_end() {
-        // Composition flows past the CTE boundary into the INSERT
-        // target — t1.id → t2.x directly, no cte.id step.
-        let ops = extract("INSERT INTO t2 (x) WITH cte AS (SELECT id FROM t1) SELECT id FROM cte");
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("t1", "id"), persisted("t2", "x"))]
-        );
-    }
-
-    #[test]
-    fn cte_chain_composes_through_all_levels() {
-        // a → b → outer: outer's `b.id` composes via b's body back to
-        // a, then via a's body back to t1. Outer is qualified because
-        // having both `a` and `b` in scope with the same column name
-        // makes the unqualified form ambiguous under our scope model
-        // (outer SELECT sees both CTE bindings, not just b).
-        let ops =
-            extract("WITH a AS (SELECT id FROM t1), b AS (SELECT id FROM a) SELECT b.id FROM b");
-        assert_eq!(
-            ops.flows,
-            vec![flow_passthrough(col("t1", "id"), out("id", 0))]
-        );
-    }
-
-    #[test]
-    fn derived_table_composes_to_base_table() {
-        // The outer projection's `col` composes through derived `d`'s
-        // body (a + b AS col) into two Computed flows on t1.
-        let ops = extract("SELECT col FROM (SELECT a + b AS col FROM t1) d");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_computed(col("t1", "a"), out("col", 0)),
-                flow_computed(col("t1", "b"), out("col", 0)),
-            ]
-        );
-    }
-
-    #[test]
-    fn cte_referenced_twice_composes_each_use() {
-        // Each cte reference in the projection composes independently
-        // back to t1.id.
-        let ops =
-            extract("WITH cte AS (SELECT id FROM t1) SELECT cte.id AS a, cte.id AS b FROM cte");
-        assert_eq!(
-            ops.flows,
-            vec![
-                flow_passthrough(col("t1", "id"), out("a", 0)),
-                flow_passthrough(col("t1", "id"), out("b", 1)),
-            ]
-        );
-    }
-
-    #[test]
-    fn recursive_cte_does_not_panic_and_skips_composition() {
-        // Recursive CTEs don't carry body_projections (fixpoint is
-        // deferred), so composition falls back to leaving the ref
-        // pointing at the CTE binding — which is then dropped from
-        // reads as synthetic. No infinite recursion either.
-        let ops = extract(
-            "WITH RECURSIVE r AS (SELECT id FROM t1 UNION SELECT id FROM r) SELECT id FROM r",
-        );
-        // Reads at least include t1.id from the recursive CTE's
-        // first branch.
-        assert!(ops.reads.contains(&read("t1", "id")));
-    }
-
-    // ───────── reads: catalog-strict resolution ─────────
 
     mod catalog_strict {
         use super::*;
