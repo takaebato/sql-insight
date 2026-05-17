@@ -19,17 +19,30 @@ impl<'a> RelationResolver<'a> {
         if let Some(with) = &query.with {
             if with.recursive {
                 for cte in &with.cte_tables {
-                    self.bind_cte(cte.alias.name.clone(), RelationSchema::Unknown);
+                    // Recursive CTEs pre-bind with empty body_projections;
+                    // fixpoint-aware projection capture is deferred.
+                    self.bind_cte(cte.alias.name.clone(), RelationSchema::Unknown, Vec::new());
                 }
                 for cte in &with.cte_tables {
-                    // Body's output_schema is discarded for recursive CTEs;
-                    // proper handling needs a fixpoint and is deferred.
-                    self.resolve_query_emitting_query_output(&cte.query)?;
+                    // Body output is discarded for recursive CTEs (no
+                    // composition either). Raw resolve_query so the
+                    // intermediate QueryOutput edges aren't emitted.
+                    self.resolve_query(&cte.query)?;
                 }
             } else {
                 for cte in &with.cte_tables {
-                    let resolved = self.resolve_query_emitting_query_output(&cte.query)?;
-                    self.bind_cte(cte.alias.name.clone(), resolved.output_schema);
+                    // Raw resolve_query: the body's projections are
+                    // stored in the binding for flow composition, and
+                    // no intermediate QueryOutput edges are emitted
+                    // since the CTE output isn't a query result on its
+                    // own — references through the CTE compose end to
+                    // end at flow-emission time.
+                    let resolved = self.resolve_query(&cte.query)?;
+                    self.bind_cte(
+                        cte.alias.name.clone(),
+                        resolved.output_schema,
+                        resolved.projections,
+                    );
                 }
             }
         }

@@ -12,8 +12,12 @@
 //! **Current coverage** (column tracking is rolling in incrementally):
 //! - `reads`: qualified column references decompose directly to
 //!   `TableReference + name`; unqualified ones are resolved against
-//!   the scope chain. A unique candidate binding wins; 0 or 2+
-//!   candidates leave `table: None` (the column name still surfaces).
+//!   the scope chain at walk time. A unique candidate binding wins;
+//!   0 or 2+ candidates leave `table: None` (the column name still
+//!   surfaces). References whose walk-time owning binding was a CTE,
+//!   derived table, or table function (synthetic intermediates, not
+//!   real storage) are dropped from reads — only references to real
+//!   tables or unresolved names surface.
 //! - `writes`: INSERT explicit column lists scoped to the INSERT
 //!   target, and UPDATE SET targets scoped to the UPDATE table.
 //!   Projection-derived writes (CTAS / CREATE VIEW / MERGE actions)
@@ -21,12 +25,18 @@
 //! - `flows`: per-projection-item edges for SELECT (target =
 //!   `QueryOutput { name, position }`), positionally paired
 //!   `source-column → target-column` edges for INSERT with explicit
-//!   column list, and per-assignment edges for UPDATE SET. Each edge
-//!   is tagged `Passthrough` (bare ref) or `Computed` (expression
-//!   evaluation). MERGE clauses, CTAS / CREATE VIEW, INSERT without
-//!   explicit columns, UNION-position fan-out, and predicate-side
-//!   influence (Filter / Join / GroupBy / Sort / Window / Conditional)
-//!   are deferred.
+//!   column list (one ProjectionGroup per UNION branch, each paired
+//!   against the same target columns), and per-assignment edges for
+//!   UPDATE SET. Sources that reference CTEs or derived tables are
+//!   composed end-to-end — references substitute through the
+//!   intermediate's body projections recursively, so a SELECT through
+//!   a chain of CTEs surfaces flows whose sources are the underlying
+//!   base tables. Each edge is tagged `Passthrough` (bare ref) or
+//!   `Computed` (any expression / a composition step that crosses a
+//!   computed body item). MERGE clauses, CTAS / CREATE VIEW,
+//!   column-list-less INSERT SELECT, and predicate-side influence
+//!   (Filter / Join / GroupBy / Sort / Window / Conditional) are
+//!   deferred.
 //!
 //! **Strictness scales with the catalog.** Without a catalog, Table
 //! bindings have `Unknown` schemas and unqualified refs to a
@@ -228,7 +238,7 @@ fn extract_flows(resolution: &RelationResolution) -> Vec<ColumnFlow> {
         .flow_edges
         .iter()
         .filter_map(|edge| {
-            let source = resolve_raw_ref(&edge.source, resolution)?;
+            let source = resolve_raw_ref(&edge.source)?;
             let target = match &edge.target {
                 FlowTargetSpec::QueryOutput { name, position } => ColumnTarget::QueryOutput {
                     name: name.clone(),
@@ -255,54 +265,33 @@ fn extract_flows(resolution: &RelationResolution) -> Vec<ColumnFlow> {
         .collect()
 }
 
-fn resolve_raw_ref(raw: &RawColumnRef, resolution: &RelationResolution) -> Option<ColumnReference> {
-    match raw.parts.len() {
-        0 => None,
-        1 => {
-            let name = raw.parts[0].clone();
-            let table = resolution.resolve_unqualified_column(&name, raw.scope_id);
-            Some(ColumnReference { table, name })
-        }
-        _ => column_ref_from_parts(&raw.parts),
-    }
+/// Build a `ColumnReference` from a resolver-captured raw ref. The
+/// resolver records owning-table resolution at walk time, so this is
+/// a 1:1 read of `(resolved, parts.last())`. Refs whose owning
+/// binding was synthetic at walk time are dropped upstream by the
+/// resolver itself before they reach the extractor — see
+/// `RelationResolution::real_column_refs`.
+fn resolve_raw_ref(raw: &RawColumnRef) -> Option<ColumnReference> {
+    let name = raw.parts.last()?.clone();
+    Some(ColumnReference {
+        table: raw.resolved.clone(),
+        name,
+    })
 }
 
-/// Turn the resolver's raw column refs into [`ColumnRead`]. Qualified
-/// refs decompose by part length; unqualified refs hit the scope-chain
-/// resolver, which returns the owning table when a single binding in
-/// the chain could carry the column (`None` for 0 or 2+ candidates —
-/// the result still surfaces the column with `table: None`).
 fn collect_reads(resolution: &RelationResolution) -> Vec<ColumnRead> {
     resolution
         .column_refs
         .iter()
-        .filter_map(|raw| build_read_column_ref(raw, resolution))
+        .filter_map(resolve_raw_ref)
         .map(|column| ColumnRead { column })
         .collect()
 }
 
-fn build_read_column_ref(
-    raw: &RawColumnRef,
-    resolution: &RelationResolution,
-) -> Option<ColumnReference> {
-    match raw.parts.len() {
-        0 => None,
-        1 => {
-            let name = raw.parts[0].clone();
-            let table = resolution.resolve_unqualified_column(&name, raw.scope_id);
-            Some(ColumnReference { table, name })
-        }
-        _ => column_ref_from_parts(&raw.parts),
-    }
-}
-
-/// Build a `ColumnReference` from a CompoundIdentifier's parts.
-///
-/// The last part is always the column name; the preceding parts form
-/// the table identifier (`t1`, `schema.t1`, `catalog.schema.t1`).
-/// Returns `None` for unqualified inputs (1 part — handled elsewhere
-/// via scope-chain resolution) and 5+ part inputs (likely struct field
-/// access on a qualified column, out of MVP scope).
+/// Build a `ColumnReference` from a `CompoundIdentifier`'s parts —
+/// used by UPDATE SET target parsing where the target's qualifier
+/// hasn't been resolver-walked. The last part is the column name;
+/// preceding parts decode into `TableReference` by length (1 / 2 / 3).
 fn column_ref_from_parts(parts: &[Ident]) -> Option<ColumnReference> {
     let (col, table_parts) = match parts.split_last() {
         Some((col, rest)) if !rest.is_empty() => (col.clone(), rest),
@@ -531,21 +520,30 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_resolves_to_cte_when_cte_schema_contains_it() {
-        // CTE schema is inferred from its body's projection
-        // (Known([id])), so `id` resolves to `cte` while `unknown_col`
-        // doesn't.
+    fn cte_ref_does_not_surface_in_reads() {
+        // The outer `id` resolves to the cte binding (a synthetic
+        // intermediate, not real storage), so it's dropped from reads.
+        // Reads surface only references with real Table owners or
+        // unresolved column names. `unknown_col` doesn't match the
+        // cte's schema, so it surfaces unresolved (table: None).
         let ops = extract("WITH cte AS (SELECT id FROM t1) SELECT id, unknown_col FROM cte");
-        // The outer scope has only the `cte` binding visible.
-        let cte_id = ColumnReference {
-            table: Some(table("cte")),
-            name: "id".into(),
-        };
+        // CTE body's own `id` (from t1) is a real read.
         assert!(
-            ops.reads.contains(&ColumnRead { column: cte_id }),
-            "expected cte.id in {:?}",
+            ops.reads.contains(&read("t1", "id")),
+            "expected t1.id in {:?}",
             ops.reads
         );
+        // Outer `id` resolves to cte → dropped.
+        assert!(
+            !ops.reads.iter().any(|r| r
+                .column
+                .table
+                .as_ref()
+                .is_some_and(|t| t.name.value == "cte")),
+            "cte.id should not surface in {:?}",
+            ops.reads
+        );
+        // Unresolved name still surfaces with table: None.
         assert!(
             ops.reads
                 .iter()
@@ -556,17 +554,11 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_resolves_to_derived_table_alias() {
+    fn derived_table_ref_does_not_surface_in_reads() {
+        // Outer `id` resolves to derived alias `d` — synthetic, dropped.
+        // Only the inner SELECT's t1.id is a real read.
         let ops = extract("SELECT id FROM (SELECT id FROM t1) AS d");
-        // `id` in outer SELECT should resolve to d (the derived
-        // table). Inner SELECT also reads id (from t1).
-        assert!(ops.reads.contains(&ColumnRead {
-            column: ColumnReference {
-                table: Some(table("d")),
-                name: "id".into(),
-            },
-        }));
-        assert!(ops.reads.contains(&read("t1", "id")));
+        assert_eq!(ops.reads, vec![read("t1", "id")]);
     }
 
     #[test]
@@ -902,6 +894,104 @@ mod tests {
     fn wildcard_select_emits_no_flow() {
         let ops = extract("SELECT * FROM t1");
         assert!(ops.flows.is_empty());
+    }
+
+    // ───────── transitive composition through CTE / derived ─────────
+
+    #[test]
+    fn cte_passthrough_composes_to_base_table() {
+        // The outer flow's source `id` resolves to cte, then composes
+        // through the CTE body's projection back to t1.id. No
+        // intermediate cte.id → out edge survives.
+        let ops = extract("WITH cte AS (SELECT id FROM t1) SELECT id FROM cte");
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("t1", "id"), out("id", 0))]
+        );
+    }
+
+    #[test]
+    fn cte_computed_propagates_computed_kind_after_composition() {
+        // CTE body's `sum` is computed from a, b. Outer's bare `sum`
+        // composes back into two flows, each marked Computed because
+        // the body item is Computed (outer.bare && item.bare = false).
+        let ops = extract("WITH cte AS (SELECT a + b AS sum FROM t1) SELECT sum FROM cte");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_computed(col("t1", "a"), out("sum", 0)),
+                flow_computed(col("t1", "b"), out("sum", 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn cte_to_insert_composes_end_to_end() {
+        // Composition flows past the CTE boundary into the INSERT
+        // target — t1.id → t2.x directly, no cte.id step.
+        let ops = extract("INSERT INTO t2 (x) WITH cte AS (SELECT id FROM t1) SELECT id FROM cte");
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("t1", "id"), persisted("t2", "x"))]
+        );
+    }
+
+    #[test]
+    fn cte_chain_composes_through_all_levels() {
+        // a → b → outer: outer's `b.id` composes via b's body back to
+        // a, then via a's body back to t1. Outer is qualified because
+        // having both `a` and `b` in scope with the same column name
+        // makes the unqualified form ambiguous under our scope model
+        // (outer SELECT sees both CTE bindings, not just b).
+        let ops =
+            extract("WITH a AS (SELECT id FROM t1), b AS (SELECT id FROM a) SELECT b.id FROM b");
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("t1", "id"), out("id", 0))]
+        );
+    }
+
+    #[test]
+    fn derived_table_composes_to_base_table() {
+        // The outer projection's `col` composes through derived `d`'s
+        // body (a + b AS col) into two Computed flows on t1.
+        let ops = extract("SELECT col FROM (SELECT a + b AS col FROM t1) d");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_computed(col("t1", "a"), out("col", 0)),
+                flow_computed(col("t1", "b"), out("col", 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn cte_referenced_twice_composes_each_use() {
+        // Each cte reference in the projection composes independently
+        // back to t1.id.
+        let ops =
+            extract("WITH cte AS (SELECT id FROM t1) SELECT cte.id AS a, cte.id AS b FROM cte");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_passthrough(col("t1", "id"), out("a", 0)),
+                flow_passthrough(col("t1", "id"), out("b", 1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn recursive_cte_does_not_panic_and_skips_composition() {
+        // Recursive CTEs don't carry body_projections (fixpoint is
+        // deferred), so composition falls back to leaving the ref
+        // pointing at the CTE binding — which is then dropped from
+        // reads as synthetic. No infinite recursion either.
+        let ops = extract(
+            "WITH RECURSIVE r AS (SELECT id FROM t1 UNION SELECT id FROM r) SELECT id FROM r",
+        );
+        // Reads at least include t1.id from the recursive CTE's
+        // first branch.
+        assert!(ops.reads.contains(&read("t1", "id")));
     }
 
     // ───────── reads: catalog-strict resolution ─────────

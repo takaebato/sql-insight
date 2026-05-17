@@ -95,7 +95,7 @@ pub(crate) struct FlowEdge {
 /// `ProjectionItem` per output column, in projection order. Set
 /// operations contribute one group per branch (so UNION INSERT pairs
 /// each branch's items with the same target columns).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectionGroup {
     pub(crate) items: Vec<ProjectionItem>,
 }
@@ -107,7 +107,7 @@ pub(crate) struct ProjectionGroup {
 /// (explicit alias > bare ident name > `None`). `bare` is true iff the
 /// projection item is a bare `Identifier` / `CompoundIdentifier`, used
 /// to pick `Passthrough` vs `Computed` at the edge-emitter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectionItem {
     pub(crate) name: Option<Ident>,
     pub(crate) source_refs: Vec<RawColumnRef>,
@@ -129,15 +129,29 @@ pub(crate) enum FlowTargetSpec {
     },
 }
 
-/// An unresolved column reference captured by the resolver during the
-/// AST walk. `parts` mirrors `sqlparser`'s split — 1 part for bare
-/// `a`, 2 for `t1.a`, 3 for `schema.t1.a`, 4 for `catalog.schema.t1.a`.
-/// `scope_id` is the scope in which the reference appeared and is the
-/// entry point for scope-chain resolution of unqualified names.
+/// A column reference captured by the resolver during the AST walk.
+///
+/// `parts` mirrors `sqlparser`'s split — 1 part for bare `a`, 2 for
+/// `t1.a`, 3 for `schema.t1.a`, 4 for `catalog.schema.t1.a`. `scope_id`
+/// is the scope in which the reference appeared (kept for diagnostics
+/// and for `find_qualified_owning` lookups at composition time).
+///
+/// `resolved` and `synthetic` are computed at record time, when scope
+/// state still reflects what was visible to the SQL author at that
+/// point in the walk — necessary for multi-CTE chains where later CTE
+/// bindings would otherwise ambify earlier resolutions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RawColumnRef {
     pub(crate) parts: Vec<Ident>,
     pub(crate) scope_id: ScopeId,
+    /// Owning table captured at walk time. `None` for ambiguous /
+    /// no-candidate / unrecognized-qualifier-shape cases.
+    pub(crate) resolved: Option<TableReference>,
+    /// True iff the walk-time owning binding was synthetic
+    /// (`Cte` / `DerivedTable` / `TableFunction`). Drives reads
+    /// filtering and flow composition. `false` when `resolved` is
+    /// `None`.
+    pub(crate) synthetic: bool,
 }
 
 impl RelationResolution {
@@ -228,26 +242,165 @@ impl RelationResolution {
     /// back `Known(cols)`; columns absent from the table are rejected
     /// as candidates, eliminating false positives like a `count` typo
     /// (meant `count(*)`) resolving to `t1.count`.
-    pub(crate) fn resolve_unqualified_column(
-        &self,
-        name: &Ident,
-        scope_id: ScopeId,
-    ) -> Option<TableReference> {
-        let mut current = Some(scope_id);
+    /// Look up the binding a synthetic-owning raw ref points at, by
+    /// matching the walk-time-captured table name against scope
+    /// bindings. Name match is unique within IndexMap, so this avoids
+    /// the column-membership ambiguity that scope-chain resolution can
+    /// hit when CTEs accumulate. Returns `None` for non-synthetic refs.
+    fn synthetic_owning_binding(&self, raw: &RawColumnRef) -> Option<&RelationBinding> {
+        if !raw.synthetic {
+            return None;
+        }
+        let table = raw.resolved.as_ref()?;
+        let key = RelationKey::from_ident(&table.name);
+        let mut current = Some(raw.scope_id);
         while let Some(id) = current {
             let scope = &self.scopes[id.0];
-            let candidates: Vec<TableReference> = scope
-                .iter_bindings()
-                .filter_map(|b| binding_could_contain_column(b, name))
-                .collect();
-            if !candidates.is_empty() {
-                // Inner scope shadows outer: as soon as a scope has any
-                // candidate, stop walking. Standard SQL name resolution.
-                return (candidates.len() == 1).then(|| candidates.into_iter().next().unwrap());
+            for binding in scope.iter_bindings() {
+                if binding_alias_key(binding) == key {
+                    return Some(binding);
+                }
             }
             current = scope.parent;
         }
         None
+    }
+
+    /// Filter [`column_refs`] down to "real reads": references whose
+    /// walk-time owning binding was a `Table` (or unresolved). Refs
+    /// that pointed at a synthetic intermediate (`Cte` /
+    /// `DerivedTable` / `TableFunction`) are dropped — those
+    /// intermediates aren't storage, so they don't belong in the
+    /// public reads surface.
+    pub(crate) fn real_column_refs(&self) -> Vec<RawColumnRef> {
+        self.column_refs
+            .iter()
+            .filter(|raw| !raw.synthetic)
+            .cloned()
+            .collect()
+    }
+
+    /// Compose every flow edge so its source resolves to a real
+    /// (non-synthetic) reference. References whose walk-time owner is
+    /// a Cte / DerivedTable with non-empty `body_projections` get
+    /// substituted by walking that body's matching `ProjectionItem`
+    /// and emitting one edge per inner source ref — recursively, until
+    /// the chain bottoms out at a real table or an unresolvable ref.
+    /// Each substitution AND's the outer edge's `bare` flag with the
+    /// body item's, so passthrough through computed becomes computed.
+    /// Bounded by [`MAX_COMPOSITION_DEPTH`] as a cycle guard.
+    pub(crate) fn composed_flow_edges(&self) -> Vec<FlowEdge> {
+        self.flow_edges
+            .iter()
+            .flat_map(|edge| {
+                self.substitute_source(&edge.source, edge.bare, 0)
+                    .into_iter()
+                    .map(|(source, bare)| FlowEdge {
+                        source,
+                        target: edge.target.clone(),
+                        bare,
+                    })
+            })
+            .collect()
+    }
+
+    fn substitute_source(
+        &self,
+        raw: &RawColumnRef,
+        outer_bare: bool,
+        depth: usize,
+    ) -> Vec<(RawColumnRef, bool)> {
+        if depth >= MAX_COMPOSITION_DEPTH {
+            return vec![(raw.clone(), outer_bare)];
+        }
+        let body_projections = match self.synthetic_owning_binding(raw) {
+            Some(RelationBinding::Cte {
+                body_projections, ..
+            }) => body_projections,
+            Some(RelationBinding::DerivedTable {
+                body_projections, ..
+            }) => body_projections,
+            _ => return vec![(raw.clone(), outer_bare)],
+        };
+        if body_projections.is_empty() {
+            return vec![(raw.clone(), outer_bare)];
+        }
+        let Some(col_name) = raw.parts.last() else {
+            return vec![(raw.clone(), outer_bare)];
+        };
+        let key = RelationKey::from_ident(col_name);
+        let mut result = Vec::new();
+        for group in body_projections {
+            for item in &group.items {
+                let matches = item
+                    .name
+                    .as_ref()
+                    .is_some_and(|n| RelationKey::from_ident(n) == key);
+                if !matches {
+                    continue;
+                }
+                let new_bare = outer_bare && item.bare;
+                for source in &item.source_refs {
+                    result.extend(self.substitute_source(source, new_bare, depth + 1));
+                }
+            }
+        }
+        if result.is_empty() {
+            vec![(raw.clone(), outer_bare)]
+        } else {
+            result
+        }
+    }
+}
+
+/// Recursion ceiling for `substitute_source` — guards against accidental
+/// cycles (recursive CTEs are pre-bound with empty body_projections, so
+/// the typical case stops there; this is a defence for unexpected loops).
+const MAX_COMPOSITION_DEPTH: usize = 64;
+
+fn is_synthetic_binding(binding: &RelationBinding) -> bool {
+    matches!(
+        binding,
+        RelationBinding::Cte { .. }
+            | RelationBinding::DerivedTable { .. }
+            | RelationBinding::TableFunction { .. }
+    )
+}
+
+/// Decode a qualified ref's leading parts (everything before the
+/// column name) into a `TableReference`. 1 part = bare name, 2 =
+/// schema.name, 3 = catalog.schema.name. Other lengths (0 / 4+) return
+/// `None` — they're either accidentally invalid or struct-field
+/// accesses on a fully qualified column, which we don't model yet.
+fn table_from_qualifier_parts(parts: &[Ident]) -> Option<TableReference> {
+    match parts.len() {
+        1 => Some(TableReference {
+            catalog: None,
+            schema: None,
+            name: parts[0].clone(),
+        }),
+        2 => Some(TableReference {
+            catalog: None,
+            schema: Some(parts[0].clone()),
+            name: parts[1].clone(),
+        }),
+        3 => Some(TableReference {
+            catalog: Some(parts[0].clone()),
+            schema: Some(parts[1].clone()),
+            name: parts[2].clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn binding_alias_key(binding: &RelationBinding) -> RelationKey {
+    match binding {
+        RelationBinding::Table { table, alias, .. } => {
+            RelationKey::from_ident(alias.as_ref().unwrap_or(&table.name))
+        }
+        RelationBinding::Cte { name, .. } => RelationKey::from_ident(name),
+        RelationBinding::DerivedTable { alias, .. }
+        | RelationBinding::TableFunction { alias, .. } => RelationKey::from_ident(alias),
     }
 }
 
@@ -259,8 +412,9 @@ fn binding_could_contain_column(binding: &RelationBinding, name: &Ident) -> Opti
         RelationBinding::Cte {
             name: cte_name,
             schema,
+            ..
         } => schema_could_contain(schema, name).then(|| synthetic_table_ref(cte_name)),
-        RelationBinding::DerivedTable { alias, schema } => {
+        RelationBinding::DerivedTable { alias, schema, .. } => {
             schema_could_contain(schema, name).then(|| synthetic_table_ref(alias))
         }
         // TableFunction schemas are always Unknown for now, so any
@@ -343,6 +497,10 @@ struct ScopeStack {
 }
 
 impl ScopeStack {
+    fn scope(&self, id: ScopeId) -> &RelationScope {
+        &self.scopes[id.0]
+    }
+
     fn into_scopes(self) -> Vec<RelationScope> {
         self.scopes
     }
@@ -422,10 +580,19 @@ pub(crate) enum RelationBinding {
     Cte {
         name: Ident,
         schema: RelationSchema,
+        /// The CTE body's projection groups, captured so that flow
+        /// composition can substitute references to `cte.col` with the
+        /// body's source refs (transitive lineage). Empty for recursive
+        /// CTEs where the body is walked under a pre-bound stub and
+        /// fixpoint-aware projection capture is deferred.
+        body_projections: Vec<ProjectionGroup>,
     },
     DerivedTable {
         alias: Ident,
         schema: RelationSchema,
+        /// Same role as `Cte::body_projections` — captured at the
+        /// derived subquery walk and consumed by flow composition.
+        body_projections: Vec<ProjectionGroup>,
     },
     TableFunction {
         alias: Ident,
@@ -542,13 +709,88 @@ impl<'a> RelationResolver<'a> {
         Ok(resolved)
     }
 
-    /// Record a raw column reference observed in the current scope.
-    /// Called from `visit_expr` for every `Expr::Identifier` and
-    /// `Expr::CompoundIdentifier` — resolution and classification are
-    /// the consumer's concern.
+    /// Record a column reference observed in the current scope.
+    /// Resolution (owning table) and synthetic-vs-real classification
+    /// are computed right now, while scope state is authoritative —
+    /// later CTE bindings won't ambify what this reference saw.
     pub(super) fn record_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.scopes.current_scope_id();
-        self.column_refs.push(RawColumnRef { parts, scope_id });
+        let (resolved, synthetic) = self.resolve_ref_at_walk(&parts, scope_id);
+        self.column_refs.push(RawColumnRef {
+            parts,
+            scope_id,
+            resolved,
+            synthetic,
+        });
+    }
+
+    fn resolve_ref_at_walk(
+        &self,
+        parts: &[Ident],
+        scope_id: ScopeId,
+    ) -> (Option<TableReference>, bool) {
+        match parts.len() {
+            0 => (None, false),
+            1 => self.resolve_unqualified_at_walk(&parts[0], scope_id),
+            n => self.resolve_qualified_at_walk(&parts[..n - 1], scope_id),
+        }
+    }
+
+    fn resolve_unqualified_at_walk(
+        &self,
+        name: &Ident,
+        scope_id: ScopeId,
+    ) -> (Option<TableReference>, bool) {
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let scope = self.scopes.scope(id);
+            let candidates: Vec<&RelationBinding> = scope
+                .iter_bindings()
+                .filter(|b| binding_could_contain_column(b, name).is_some())
+                .collect();
+            if !candidates.is_empty() {
+                if candidates.len() != 1 {
+                    return (None, false);
+                }
+                let binding = candidates[0];
+                let table = binding_could_contain_column(binding, name);
+                return (table, is_synthetic_binding(binding));
+            }
+            current = scope.parent;
+        }
+        (None, false)
+    }
+
+    fn resolve_qualified_at_walk(
+        &self,
+        qualifier_parts: &[Ident],
+        scope_id: ScopeId,
+    ) -> (Option<TableReference>, bool) {
+        let table = table_from_qualifier_parts(qualifier_parts);
+        // Determine synthetic-ness by looking up the qualifier head in
+        // the scope chain. Multi-segment qualifiers (s.t.col) match
+        // only on the head — schema/catalog-qualified bound names are
+        // rare and we don't currently bind their full path anyway.
+        let synthetic = qualifier_parts
+            .first()
+            .map(|head| self.qualifier_is_synthetic_at_walk(head, scope_id))
+            .unwrap_or(false);
+        (table, synthetic)
+    }
+
+    fn qualifier_is_synthetic_at_walk(&self, qualifier: &Ident, scope_id: ScopeId) -> bool {
+        let key = RelationKey::from_ident(qualifier);
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let scope = self.scopes.scope(id);
+            for binding in scope.iter_bindings() {
+                if binding_alias_key(binding) == key {
+                    return is_synthetic_binding(binding);
+                }
+            }
+            current = scope.parent;
+        }
+        false
     }
 
     /// Push a fresh scope, run `f`, then pop it. Use around each
@@ -588,12 +830,20 @@ impl<'a> RelationResolver<'a> {
     }
 
     fn into_relation_resolution(self) -> RelationResolution {
-        RelationResolution {
+        let mut resolution = RelationResolution {
             diagnostics: self.diagnostics,
             scopes: self.scopes.into_scopes(),
             column_refs: self.column_refs,
             flow_edges: self.flow_edges,
-        }
+        };
+        // Two post-passes, both rely on the scope arena being final:
+        // - compose flow edges so synthetic-binding (Cte/Derived)
+        //   sources are substituted with their body's source refs;
+        // - filter column refs so synthetic-owned ones don't surface
+        //   in the public reads list.
+        resolution.flow_edges = resolution.composed_flow_edges();
+        resolution.column_refs = resolution.real_column_refs();
+        resolution
     }
 
     fn is_cte_reference(&self, relation: &ObjectName) -> bool {
@@ -634,14 +884,50 @@ impl<'a> RelationResolver<'a> {
         }
     }
 
-    fn bind_cte(&mut self, name: Ident, schema: RelationSchema) {
-        self.bind_relation(name.clone(), RelationBinding::Cte { name, schema });
+    /// Look up an in-scope CTE's body projections, for re-binding under
+    /// an alias (`FROM cte AS c`). Returns an empty `Vec` when the
+    /// reference is multi-segment, not bound, or not a Cte binding —
+    /// the caller (alias-bound Cte construction) treats that as "no
+    /// composition through this alias", matching recursive-CTE
+    /// behavior.
+    pub(super) fn cte_body_projections(&self, cte_name: &ObjectName) -> Vec<ProjectionGroup> {
+        match self.scopes.resolve_unqualified_relation(cte_name) {
+            Some(RelationBinding::Cte {
+                body_projections, ..
+            }) => body_projections.clone(),
+            _ => Vec::new(),
+        }
     }
 
-    fn bind_derived_table(&mut self, alias: Ident, schema: RelationSchema) {
+    fn bind_cte(
+        &mut self,
+        name: Ident,
+        schema: RelationSchema,
+        body_projections: Vec<ProjectionGroup>,
+    ) {
+        self.bind_relation(
+            name.clone(),
+            RelationBinding::Cte {
+                name,
+                schema,
+                body_projections,
+            },
+        );
+    }
+
+    fn bind_derived_table(
+        &mut self,
+        alias: Ident,
+        schema: RelationSchema,
+        body_projections: Vec<ProjectionGroup>,
+    ) {
         self.bind_relation(
             alias.clone(),
-            RelationBinding::DerivedTable { alias, schema },
+            RelationBinding::DerivedTable {
+                alias,
+                schema,
+                body_projections,
+            },
         );
     }
 

@@ -81,7 +81,12 @@ impl<'a> RelationResolver<'a> {
             } => {
                 if self.is_cte_reference(name) {
                     if let Some(alias) = alias {
-                        self.bind_cte(alias.name.clone(), RelationSchema::Unknown);
+                        // Carry the original CTE's body_projections to
+                        // the alias-bound Cte so flow composition works
+                        // through the alias too (`FROM cte AS c` →
+                        // `c.col` still composes to the body's source).
+                        let body = self.cte_body_projections(name);
+                        self.bind_cte(alias.name.clone(), RelationSchema::Unknown, body);
                     }
                     return Ok(());
                 }
@@ -107,9 +112,18 @@ impl<'a> RelationResolver<'a> {
                 sample,
                 ..
             } => {
-                let resolved = self.resolve_query_emitting_query_output(subquery)?;
+                // Raw resolve_query — same rationale as CTE bodies:
+                // the derived subquery's projection isn't a query
+                // result on its own, and storing its projections on
+                // the binding lets flow composition substitute
+                // through the derived alias.
+                let resolved = self.resolve_query(subquery)?;
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone(), resolved.output_schema);
+                    self.bind_derived_table(
+                        alias.name.clone(),
+                        resolved.output_schema,
+                        resolved.projections,
+                    );
                 }
                 if let Some(sample) = sample {
                     self.visit_table_sample_kind(sample)?;
@@ -121,7 +135,11 @@ impl<'a> RelationResolver<'a> {
             } => {
                 self.visit_table_with_joins(table_with_joins, TableRole::Read)?;
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone(), RelationSchema::Unknown);
+                    self.bind_derived_table(
+                        alias.name.clone(),
+                        RelationSchema::Unknown,
+                        Vec::new(),
+                    );
                 }
             }
             TableFactor::Pivot {
@@ -143,7 +161,11 @@ impl<'a> RelationResolver<'a> {
                     self.visit_expr(expr)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone(), RelationSchema::Unknown);
+                    self.bind_derived_table(
+                        alias.name.clone(),
+                        RelationSchema::Unknown,
+                        Vec::new(),
+                    );
                 }
             }
             TableFactor::Unpivot {
@@ -159,7 +181,11 @@ impl<'a> RelationResolver<'a> {
                     self.visit_expr(&expr.expr)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone(), RelationSchema::Unknown);
+                    self.bind_derived_table(
+                        alias.name.clone(),
+                        RelationSchema::Unknown,
+                        Vec::new(),
+                    );
                 }
             }
             TableFactor::MatchRecognize {
@@ -183,7 +209,11 @@ impl<'a> RelationResolver<'a> {
                     self.visit_expr(&symbol.definition)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(alias.name.clone(), RelationSchema::Unknown);
+                    self.bind_derived_table(
+                        alias.name.clone(),
+                        RelationSchema::Unknown,
+                        Vec::new(),
+                    );
                 }
             }
             TableFactor::TableFunction { expr, alias } => {
