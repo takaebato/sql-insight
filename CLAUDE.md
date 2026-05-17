@@ -14,16 +14,21 @@ by hand.
 
 ## Architecture
 
-- `resolver/relation_resolver.rs` walks a `Statement` once and produces
-  a `RelationResolution`:
-  - a scope arena of `RelationBinding`s (`Table` / `Cte` /
-    `DerivedTable` / `TableFunction`),
+- The `resolver` module walks a `Statement` once and produces a
+  `Resolution`:
+  - a scope arena of `Binding`s (`Table` / `Cte` / `DerivedTable` /
+    `TableFunction`),
   - a buffer of `RawColumnRef`s captured at walk time with
     resolved-table + synthetic-vs-real + clause-kind metadata,
   - a buffer of `FlowEdge`s emitted directly during the walk.
-  Two post-passes on `into_relation_resolution` compose the flow
-  graph end-to-end through CTE / derived intermediates and filter
-  reads down to references whose walk-time owner was a real `Table`.
+  Two post-passes on `into_resolution` compose the flow graph
+  end-to-end through CTE / derived intermediates and filter reads
+  down to references whose walk-time owner was a real `Table`.
+  Sub-modules are split by responsibility: `binding` (scope arena),
+  `context` (`VisitContext`), `column_ref`, `projection`, `flow`,
+  `composition`, `rename`; walker files (`expr` / `query` /
+  `statement` / `table`) live as siblings and add `visit_*` methods
+  via `impl Resolver` blocks.
 - Pull-style design: `resolve_query` returns a `ResolvedQuery`
   carrying the body's `projections: Vec<ProjectionGroup>`. Callers
   (visit_insert / CTAS / scalar subqueries / etc.) decide what to do
@@ -96,10 +101,17 @@ by hand.
   resolver via flag bags — instead expose helpers like
   `with_filter_clause` / `with_branch_scope` for scoped, lexical
   context.
-- Walking-context state is "in effect for the current visit", not
-  "queued" — fields are named `current_*_kind`. Save / restore is
-  done via `with_*` helpers; `mem::replace` is reserved for owning
-  types (`Vec<…>`), Copy types use plain assignment.
+- Walking-context state lives in `VisitContext` (`scope_kind` /
+  `read_kind` / `in_case_condition`) — "in effect for the current
+  visit", not "queued". Save / restore goes through `with_context`
+  (and the focused `with_read_kind` / `with_branch_scope` /
+  `with_filter_clause` / `with_case_condition` helpers) so the prior
+  context is restored on scope exit. `resolve_query` resets the
+  fields that don't propagate through a subquery boundary
+  (`read_kind`, `in_case_condition`) but preserves `scope_kind` so
+  predicate-ness flows transitively. For owning per-query buffers
+  like `current_projections: Vec<…>`, `mem::replace` is used
+  instead.
 - Wildcards (`SELECT *`, `t.*`) are not expanded at the parser
   level — even with a catalog. The rigor cost (USING / NATURAL JOIN
   merge, EXCLUDE / REPLACE / RENAME clauses, CTE column rename,
