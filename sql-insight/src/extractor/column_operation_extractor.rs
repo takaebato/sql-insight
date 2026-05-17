@@ -69,10 +69,9 @@
 //! typos that would otherwise silently resolve become unresolved.
 
 use crate::catalog::Catalog;
+use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::error::Error;
-use crate::extractor::operation_extractor::{
-    OperationDiagnostic, OperationDiagnosticCode, StatementKind,
-};
+use crate::extractor::operation_extractor::StatementKind;
 use crate::relation::TableReference;
 use crate::resolver::{FlowTargetSpec, RawColumnRef, Resolution, Resolver};
 use sqlparser::ast::{AssignmentTarget, Ident, Statement, TableFactor};
@@ -105,7 +104,7 @@ pub struct StatementColumnOperations {
     pub reads: Vec<ColumnRead>,
     pub writes: Vec<ColumnWrite>,
     pub flows: Vec<ColumnFlow>,
-    pub diagnostics: Vec<OperationDiagnostic>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// A column-level identity reference: an optional owning table plus the
@@ -262,16 +261,26 @@ impl ColumnOperationExtractor {
         catalog: Option<&dyn Catalog>,
     ) -> Result<StatementColumnOperations, Error> {
         let kind = super::operation_extractor::classify_statement(statement);
-        let mut diagnostics = Vec::new();
+        let resolution = Resolver::resolve_statement(catalog, statement)?;
+
+        // Start from resolver-level diagnostics; extractor adds its own
+        // only when classify_statement detects an unsupported case the
+        // resolver did not already report.
+        let mut diagnostics = resolution.diagnostics.clone();
 
         if matches!(kind, StatementKind::Unsupported) {
-            diagnostics.push(OperationDiagnostic {
-                code: OperationDiagnosticCode::UnsupportedStatement,
-                message: format!(
-                    "Unsupported statement for column operation extraction: {}",
-                    statement
-                ),
-            });
+            if !diagnostics
+                .iter()
+                .any(|d| matches!(d.kind, DiagnosticKind::UnsupportedStatement))
+            {
+                diagnostics.push(Diagnostic {
+                    kind: DiagnosticKind::UnsupportedStatement,
+                    message: format!(
+                        "Unsupported statement for column operation extraction: {}",
+                        statement
+                    ),
+                });
+            }
             return Ok(StatementColumnOperations {
                 statement_kind: kind,
                 reads: Vec::new(),
@@ -281,7 +290,6 @@ impl ColumnOperationExtractor {
             });
         }
 
-        let resolution = Resolver::resolve_statement(catalog, statement)?;
         let reads = collect_reads(&resolution);
         let writes = collect_writes(statement, &resolution)?;
         let flows = extract_flows(&resolution);
@@ -1108,8 +1116,8 @@ mod tests {
         assert!(ops.writes.is_empty());
         assert_eq!(ops.diagnostics.len(), 1);
         assert_eq!(
-            ops.diagnostics[0].code,
-            OperationDiagnosticCode::UnsupportedStatement
+            ops.diagnostics[0].kind,
+            DiagnosticKind::UnsupportedStatement
         );
     }
 

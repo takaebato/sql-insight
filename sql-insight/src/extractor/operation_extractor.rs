@@ -20,6 +20,7 @@
 //! a row source).
 
 use crate::catalog::Catalog;
+use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::error::Error;
 use crate::relation::TableReference;
 use crate::resolver::Resolver;
@@ -63,7 +64,7 @@ pub struct StatementTableOperations {
     pub reads: Vec<TableRead>,
     pub writes: Vec<TableWrite>,
     pub flows: Vec<TableFlow>,
-    pub diagnostics: Vec<OperationDiagnostic>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// What a statement does, at a coarse level. The *verb* of the statement
@@ -137,21 +138,6 @@ pub struct TableFlow {
     pub target: TableReference,
 }
 
-/// A non-fatal diagnostic specific to operation extraction. Distinct from
-/// the resolver-level [`Diagnostic`](crate::Diagnostic) because the codes
-/// here speak the operations vocabulary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OperationDiagnostic {
-    pub code: OperationDiagnosticCode,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum OperationDiagnosticCode {
-    UnsupportedStatement,
-}
-
 /// Extracts operations from SQL.
 #[derive(Default, Debug)]
 pub struct TableOperationExtractor;
@@ -178,16 +164,26 @@ impl TableOperationExtractor {
 
         let mut reads = Vec::new();
         let mut writes = Vec::new();
-        let mut diagnostics = Vec::new();
+        // Start from resolver-level diagnostics (e.g. statements the
+        // resolver explicitly flagged unsupported). Extractor adds its
+        // own only when classify_statement detects an unsupported case
+        // the resolver did not already report — avoids duplicating the
+        // common case where both layers agree.
+        let mut diagnostics = resolution.diagnostics.clone();
 
         if matches!(kind, StatementKind::Unsupported) {
-            diagnostics.push(OperationDiagnostic {
-                code: OperationDiagnosticCode::UnsupportedStatement,
-                message: format!(
-                    "Unsupported statement for operation extraction: {}",
-                    statement
-                ),
-            });
+            if !diagnostics
+                .iter()
+                .any(|d| matches!(d.kind, DiagnosticKind::UnsupportedStatement))
+            {
+                diagnostics.push(Diagnostic {
+                    kind: DiagnosticKind::UnsupportedStatement,
+                    message: format!(
+                        "Unsupported statement for operation extraction: {}",
+                        statement
+                    ),
+                });
+            }
         } else {
             // A multi-role table (e.g. `DELETE t1 FROM t1` — t1 is both
             // deletion target and row source) appears in both lists.
@@ -364,8 +360,8 @@ mod tests {
         assert!(ops.writes.is_empty());
         assert_eq!(ops.diagnostics.len(), 1);
         assert_eq!(
-            ops.diagnostics[0].code,
-            OperationDiagnosticCode::UnsupportedStatement
+            ops.diagnostics[0].kind,
+            DiagnosticKind::UnsupportedStatement
         );
     }
 
