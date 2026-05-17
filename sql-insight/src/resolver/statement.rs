@@ -314,7 +314,7 @@ impl<'a> RelationResolver<'a> {
     ) -> Result<(), Error> {
         for assignment in assignments {
             let target_parts = assignment_target_parts(&assignment.target);
-            let kind = super::query::expr_kind(&assignment.value);
+            let kind = super::projection::expr_kind(&assignment.value);
             let refs_before = self.column_refs_len();
             self.visit_expr(&assignment.value)?;
             let Some(target_parts) = target_parts else {
@@ -432,7 +432,7 @@ impl<'a> RelationResolver<'a> {
         };
         for row in &values.rows {
             for (position, value_expr) in row.iter().enumerate() {
-                let kind = super::query::expr_kind(value_expr);
+                let kind = super::projection::expr_kind(value_expr);
                 let refs_before = self.column_refs_len();
                 self.visit_expr(value_expr)?;
                 let (Some(target_table), Some(col_ident)) =
