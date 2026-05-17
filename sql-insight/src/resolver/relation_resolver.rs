@@ -69,6 +69,64 @@ pub(crate) struct RelationResolution {
     /// Semantic interpretation (alias resolution, scope-chain lookup,
     /// `Passthrough` vs `Computed` classification) belongs to consumers.
     pub(crate) column_refs: Vec<RawColumnRef>,
+    /// Flow edges emitted directly by the resolver — one entry per
+    /// (source column ref, target) pair. The column extractor maps
+    /// these 1:1 to `ColumnFlow` without re-walking the AST.
+    pub(crate) flow_edges: Vec<FlowEdge>,
+}
+
+/// A pre-resolution column flow record. `source` still needs scope-chain
+/// resolution (for unqualified parts); `target` is fully spec'd by the
+/// resolver; `bare` distinguishes a passthrough source (bare
+/// `Identifier` / `CompoundIdentifier`) from a computed expression.
+///
+/// Created by callers from [`ProjectionGroup`]s (for SELECT-style flows
+/// — INSERT pairs with target columns, top-level / nested SELECTs emit
+/// `QueryOutput`) or directly by UPDATE / similar walkers that already
+/// know their write target.
+#[derive(Debug, Clone)]
+pub(crate) struct FlowEdge {
+    pub(crate) source: RawColumnRef,
+    pub(crate) target: FlowTargetSpec,
+    pub(crate) bare: bool,
+}
+
+/// One SELECT's projection captured during the walk — one
+/// `ProjectionItem` per output column, in projection order. Set
+/// operations contribute one group per branch (so UNION INSERT pairs
+/// each branch's items with the same target columns).
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectionGroup {
+    pub(crate) items: Vec<ProjectionItem>,
+}
+
+/// A single projection slot's resolver-collected facts.
+///
+/// `source_refs` are the raw column refs the projection item's
+/// expression read, in walk order. `name` is the inferable output name
+/// (explicit alias > bare ident name > `None`). `bare` is true iff the
+/// projection item is a bare `Identifier` / `CompoundIdentifier`, used
+/// to pick `Passthrough` vs `Computed` at the edge-emitter.
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectionItem {
+    pub(crate) name: Option<Ident>,
+    pub(crate) source_refs: Vec<RawColumnRef>,
+    pub(crate) bare: bool,
+}
+
+/// Target spec for a [`FlowEdge`]. `QueryOutput` is for transient
+/// SELECT output columns; `Persisted` is for INSERT / UPDATE / etc.
+/// target columns that live in a real relation.
+#[derive(Debug, Clone)]
+pub(crate) enum FlowTargetSpec {
+    QueryOutput {
+        name: Option<Ident>,
+        position: usize,
+    },
+    Persisted {
+        table: TableReference,
+        column: Ident,
+    },
 }
 
 /// An unresolved column reference captured by the resolver during the
@@ -375,11 +433,17 @@ pub(crate) enum RelationBinding {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct ResolvedQuery {
     pub(crate) scope_id: ScopeId,
     pub(crate) output_schema: RelationSchema,
+    /// One entry per top-level SELECT producing output rows for this
+    /// query. A bare `SELECT ...` query yields exactly one group; a
+    /// `SELECT ... UNION SELECT ...` yields one per branch. Callers
+    /// decide what to do with them — emit `QueryOutput` edges (default)
+    /// or pair with target columns (INSERT).
+    pub(crate) projections: Vec<ProjectionGroup>,
 }
 
 #[derive(Debug)]
@@ -390,6 +454,12 @@ pub(crate) struct RelationResolver<'a> {
     diagnostics: Vec<Diagnostic>,
     scopes: ScopeStack,
     column_refs: Vec<RawColumnRef>,
+    flow_edges: Vec<FlowEdge>,
+    /// Per-query buffer of projection groups collected by `visit_select`.
+    /// `resolve_query` swaps a fresh buffer in for the duration of its
+    /// walk and packs the collected groups into the returned
+    /// `ResolvedQuery`, so each query gets exactly its own projections.
+    current_projections: Vec<ProjectionGroup>,
     /// Kind stamped on the next pushed scope. Defaults to `Body`; clause
     /// walkers (WHERE, HAVING, JOIN ON, …) flip it to `Predicate` via
     /// [`with_scope_kind`] for the duration of their child walk so that
@@ -404,8 +474,72 @@ impl<'a> RelationResolver<'a> {
             diagnostics: Vec::new(),
             scopes: ScopeStack::default(),
             column_refs: Vec::new(),
+            flow_edges: Vec::new(),
+            current_projections: Vec::new(),
             pending_scope_kind: ScopeKind::Body,
         }
+    }
+
+    pub(super) fn column_refs_len(&self) -> usize {
+        self.column_refs.len()
+    }
+
+    pub(super) fn column_refs_slice(&self, since: usize) -> &[RawColumnRef] {
+        &self.column_refs[since..]
+    }
+
+    pub(super) fn push_flow_edge(&mut self, edge: FlowEdge) {
+        self.flow_edges.push(edge);
+    }
+
+    /// Push a fully-built `ProjectionGroup` into the active query's
+    /// projection buffer. Called by `visit_select` once per SELECT body.
+    pub(super) fn push_projection_group(&mut self, group: ProjectionGroup) {
+        self.current_projections.push(group);
+    }
+
+    /// Extend the active query's projection buffer with externally
+    /// produced groups — used by `SetExpr::Query` to bubble the inner
+    /// query's projections up into the enclosing query (so INSERT
+    /// pairing reaches through a parenthesized source).
+    pub(super) fn extend_projections(&mut self, groups: Vec<ProjectionGroup>) {
+        self.current_projections.extend(groups);
+    }
+
+    /// Emit `QueryOutput` flow edges for every projection item in
+    /// `resolved`. The default disposition for queries whose output is
+    /// not bound to a persisted target (top-level SELECT, scalar
+    /// subqueries, derived tables, CTE bodies, predicate subqueries).
+    pub(super) fn emit_query_output_edges(&mut self, resolved: &ResolvedQuery) {
+        for group in &resolved.projections {
+            for (position, item) in group.items.iter().enumerate() {
+                let target = FlowTargetSpec::QueryOutput {
+                    name: item.name.clone(),
+                    position,
+                };
+                for source in &item.source_refs {
+                    self.push_flow_edge(FlowEdge {
+                        source: source.clone(),
+                        target: target.clone(),
+                        bare: item.bare,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Convenience wrapper: resolve `query` and emit `QueryOutput` edges
+    /// for its projections in one shot. Use this from any caller that
+    /// doesn't have a special target — INSERT calls the raw
+    /// [`resolve_query`] instead so it can pair projections with its
+    /// target columns.
+    pub(super) fn resolve_query_emitting_query_output(
+        &mut self,
+        query: &sqlparser::ast::Query,
+    ) -> Result<ResolvedQuery, Error> {
+        let resolved = self.resolve_query(query)?;
+        self.emit_query_output_edges(&resolved);
+        Ok(resolved)
     }
 
     /// Record a raw column reference observed in the current scope.
@@ -415,6 +549,18 @@ impl<'a> RelationResolver<'a> {
     pub(super) fn record_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.scopes.current_scope_id();
         self.column_refs.push(RawColumnRef { parts, scope_id });
+    }
+
+    /// Push a fresh scope, run `f`, then pop it. Use around each
+    /// branch of a `SetExpr::SetOperation` so the branches' FROM
+    /// bindings don't shadow each other and unqualified column refs
+    /// in each branch resolve only against its own FROMs — matching
+    /// SQL's per-SELECT name resolution.
+    pub(crate) fn with_branch_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.scopes.push_query_scope(self.pending_scope_kind);
+        let r = f(self);
+        self.scopes.pop_scope();
+        r
     }
 
     /// Temporarily set the kind to stamp on subquery scopes pushed inside
@@ -446,6 +592,7 @@ impl<'a> RelationResolver<'a> {
             diagnostics: self.diagnostics,
             scopes: self.scopes.into_scopes(),
             column_refs: self.column_refs,
+            flow_edges: self.flow_edges,
         }
     }
 

@@ -1,3 +1,5 @@
 mod relation_resolver;
 
-pub(crate) use relation_resolver::{RawColumnRef, RelationResolution, RelationResolver};
+pub(crate) use relation_resolver::{
+    FlowTargetSpec, RawColumnRef, RelationResolution, RelationResolver,
+};

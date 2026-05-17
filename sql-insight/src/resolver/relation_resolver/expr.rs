@@ -11,11 +11,14 @@ impl<'a> RelationResolver<'a> {
     pub(super) fn visit_expr(&mut self, expr: &Expr) -> Result<(), Error> {
         // Keep this match exhaustive so sqlparser Expr additions are reviewed here.
         match expr {
-            Expr::Subquery(query) => self.resolve_query(query).map(|_| ()),
-            Expr::Exists { subquery, .. } => self.resolve_query(subquery).map(|_| ()),
+            Expr::Subquery(query) => self.resolve_query_emitting_query_output(query).map(|_| ()),
+            Expr::Exists { subquery, .. } => self
+                .resolve_query_emitting_query_output(subquery)
+                .map(|_| ()),
             Expr::InSubquery { expr, subquery, .. } => {
                 self.visit_expr(expr)?;
-                self.resolve_query(subquery).map(|_| ())
+                self.resolve_query_emitting_query_output(subquery)
+                    .map(|_| ())
             }
             Expr::BinaryOp { left, right, .. }
             | Expr::IsDistinctFrom(left, right)
@@ -334,7 +337,7 @@ impl<'a> RelationResolver<'a> {
             | PipeOperator::Intersect { queries, .. }
             | PipeOperator::Except { queries, .. } => {
                 for query in queries {
-                    self.resolve_query(query)?;
+                    self.resolve_query_emitting_query_output(query)?;
                 }
                 Ok(())
             }
@@ -393,7 +396,9 @@ impl<'a> RelationResolver<'a> {
     fn visit_function_arguments(&mut self, arguments: &FunctionArguments) -> Result<(), Error> {
         match arguments {
             FunctionArguments::None => Ok(()),
-            FunctionArguments::Subquery(query) => self.resolve_query(query).map(|_| ()),
+            FunctionArguments::Subquery(query) => {
+                self.resolve_query_emitting_query_output(query).map(|_| ())
+            }
             FunctionArguments::List(args) => self.visit_function_argument_list(args),
         }
     }

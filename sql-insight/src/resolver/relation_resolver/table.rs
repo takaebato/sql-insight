@@ -107,7 +107,7 @@ impl<'a> RelationResolver<'a> {
                 sample,
                 ..
             } => {
-                let resolved = self.resolve_query(subquery)?;
+                let resolved = self.resolve_query_emitting_query_output(subquery)?;
                 if let Some(alias) = alias {
                     self.bind_derived_table(alias.name.clone(), resolved.output_schema);
                 }
@@ -294,7 +294,9 @@ impl<'a> RelationResolver<'a> {
                 }
                 Ok(())
             }
-            PivotValueSource::Subquery(query) => self.resolve_query(query).map(|_| ()),
+            PivotValueSource::Subquery(query) => {
+                self.resolve_query_emitting_query_output(query).map(|_| ())
+            }
         }
     }
 }

@@ -18,8 +18,15 @@
 //!   target, and UPDATE SET targets scoped to the UPDATE table.
 //!   Projection-derived writes (CTAS / CREATE VIEW / MERGE actions)
 //!   and column-list-less INSERT SELECT are deferred.
-//! - `flows`: always empty in this slice; column flow construction
-//!   needs `reads` / `writes` completeness first.
+//! - `flows`: per-projection-item edges for SELECT (target =
+//!   `QueryOutput { name, position }`), positionally paired
+//!   `source-column → target-column` edges for INSERT with explicit
+//!   column list, and per-assignment edges for UPDATE SET. Each edge
+//!   is tagged `Passthrough` (bare ref) or `Computed` (expression
+//!   evaluation). MERGE clauses, CTAS / CREATE VIEW, INSERT without
+//!   explicit columns, UNION-position fan-out, and predicate-side
+//!   influence (Filter / Join / GroupBy / Sort / Window / Conditional)
+//!   are deferred.
 //!
 //! **Strictness scales with the catalog.** Without a catalog, Table
 //! bindings have `Unknown` schemas and unqualified refs to a
@@ -35,7 +42,7 @@ use crate::extractor::operation_extractor::{
     OperationDiagnostic, OperationDiagnosticCode, StatementKind,
 };
 use crate::relation::TableReference;
-use crate::resolver::{RawColumnRef, RelationResolution, RelationResolver};
+use crate::resolver::{FlowTargetSpec, RawColumnRef, RelationResolution, RelationResolver};
 use sqlparser::ast::{AssignmentTarget, Ident, Statement, TableFactor};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -201,14 +208,62 @@ impl ColumnOperationExtractor {
         let resolution = RelationResolver::resolve_statement(catalog, statement)?;
         let reads = collect_reads(&resolution);
         let writes = collect_writes(statement)?;
+        let flows = extract_flows(&resolution);
 
         Ok(StatementColumnOperations {
             statement_kind: kind,
             reads,
             writes,
-            flows: Vec::new(),
+            flows,
             diagnostics,
         })
+    }
+}
+
+/// Map the resolver's pre-built `flow_edges` 1:1 to public
+/// `ColumnFlow`. Sources go through scope-chain resolution; targets
+/// are already fully spec'd by the resolver.
+fn extract_flows(resolution: &RelationResolution) -> Vec<ColumnFlow> {
+    resolution
+        .flow_edges
+        .iter()
+        .filter_map(|edge| {
+            let source = resolve_raw_ref(&edge.source, resolution)?;
+            let target = match &edge.target {
+                FlowTargetSpec::QueryOutput { name, position } => ColumnTarget::QueryOutput {
+                    name: name.clone(),
+                    position: *position,
+                },
+                FlowTargetSpec::Persisted { table, column } => {
+                    ColumnTarget::Persisted(ColumnReference {
+                        table: Some(table.clone()),
+                        name: column.clone(),
+                    })
+                }
+            };
+            let kind = if edge.bare {
+                ColumnFlowKind::Passthrough
+            } else {
+                ColumnFlowKind::Computed
+            };
+            Some(ColumnFlow {
+                source,
+                target,
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn resolve_raw_ref(raw: &RawColumnRef, resolution: &RelationResolution) -> Option<ColumnReference> {
+    match raw.parts.len() {
+        0 => None,
+        1 => {
+            let name = raw.parts[0].clone();
+            let table = resolution.resolve_unqualified_column(&name, raw.scope_id);
+            Some(ColumnReference { table, name })
+        }
+        _ => column_ref_from_parts(&raw.parts),
     }
 }
 
@@ -642,6 +697,211 @@ mod tests {
         let ops = extract("SELECT * FROM t1");
         assert!(ops.reads.is_empty());
         assert!(ops.writes.is_empty());
+    }
+
+    // ───────── flows ─────────
+
+    fn out(name: &str, position: usize) -> ColumnTarget {
+        ColumnTarget::QueryOutput {
+            name: Some(name.into()),
+            position,
+        }
+    }
+
+    fn out_anon(position: usize) -> ColumnTarget {
+        ColumnTarget::QueryOutput {
+            name: None,
+            position,
+        }
+    }
+
+    fn persisted(table_name: &str, col: &str) -> ColumnTarget {
+        ColumnTarget::Persisted(ColumnReference {
+            table: Some(table(table_name)),
+            name: col.into(),
+        })
+    }
+
+    fn col(table_name: &str, name: &str) -> ColumnReference {
+        ColumnReference {
+            table: Some(table(table_name)),
+            name: name.into(),
+        }
+    }
+
+    fn flow_passthrough(source: ColumnReference, target: ColumnTarget) -> ColumnFlow {
+        ColumnFlow {
+            source,
+            target,
+            kind: ColumnFlowKind::Passthrough,
+        }
+    }
+
+    fn flow_computed(source: ColumnReference, target: ColumnTarget) -> ColumnFlow {
+        ColumnFlow {
+            source,
+            target,
+            kind: ColumnFlowKind::Computed,
+        }
+    }
+
+    #[test]
+    fn select_bare_column_emits_passthrough_flow_to_query_output() {
+        let ops = extract("SELECT a FROM t1");
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("t1", "a"), out("a", 0))]
+        );
+    }
+
+    #[test]
+    fn select_aliased_column_uses_alias_as_output_name() {
+        let ops = extract("SELECT a AS x FROM t1");
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("t1", "a"), out("x", 0))]
+        );
+    }
+
+    #[test]
+    fn select_computed_emits_one_flow_per_source_with_computed_kind() {
+        let ops = extract("SELECT a + b FROM t1");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_computed(col("t1", "a"), out_anon(0)),
+                flow_computed(col("t1", "b"), out_anon(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_mixed_projection_separates_targets_by_position() {
+        let ops = extract("SELECT a, a + b FROM t1");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_passthrough(col("t1", "a"), out("a", 0)),
+                flow_computed(col("t1", "a"), out_anon(1)),
+                flow_computed(col("t1", "b"), out_anon(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_qualified_ref_in_computed_resolves_directly() {
+        let ops = extract("SELECT t1.a + t1.b AS sum FROM t1");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_computed(col("t1", "a"), out("sum", 0)),
+                flow_computed(col("t1", "b"), out("sum", 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_select_pairs_target_cols_positionally() {
+        let ops = extract("INSERT INTO t1 (a, b) SELECT x, y FROM t2");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_passthrough(col("t2", "x"), persisted("t1", "a")),
+                flow_passthrough(col("t2", "y"), persisted("t1", "b")),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_select_computed_marks_kind_per_source() {
+        let ops = extract("INSERT INTO t1 (a) SELECT x + y FROM t2");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_computed(col("t2", "x"), persisted("t1", "a")),
+                flow_computed(col("t2", "y"), persisted("t1", "a")),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_select_union_pairs_both_branches_with_target_cols() {
+        // Both UNION branches feed the same INSERT target positions,
+        // so each branch's projection should pair `position N → t.col_N`.
+        let ops = extract(
+            "INSERT INTO t1 (a, b) \
+             SELECT x, y FROM t2 \
+             UNION ALL \
+             SELECT p, q FROM t3",
+        );
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_passthrough(col("t2", "x"), persisted("t1", "a")),
+                flow_passthrough(col("t2", "y"), persisted("t1", "b")),
+                flow_passthrough(col("t3", "p"), persisted("t1", "a")),
+                flow_passthrough(col("t3", "q"), persisted("t1", "b")),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_without_explicit_cols_emits_no_flows() {
+        // Target column names would need positional mapping against
+        // the table schema (catalog). Deferred.
+        let ops = extract("INSERT INTO t1 SELECT x FROM t2");
+        assert!(ops.flows.is_empty());
+    }
+
+    #[test]
+    fn insert_values_with_literals_emits_no_flows() {
+        let ops = extract("INSERT INTO t1 (a, b) VALUES (1, 2)");
+        assert!(ops.flows.is_empty());
+    }
+
+    #[test]
+    fn update_set_passthrough_flow() {
+        let ops = extract("UPDATE t1 SET a = b");
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("t1", "b"), persisted("t1", "a"))]
+        );
+    }
+
+    #[test]
+    fn update_set_computed_flow() {
+        let ops = extract("UPDATE t1 SET a = b + 1");
+        assert_eq!(
+            ops.flows,
+            vec![flow_computed(col("t1", "b"), persisted("t1", "a"))]
+        );
+    }
+
+    #[test]
+    fn update_set_with_qualified_rhs_resolves_to_other_table() {
+        let ops = extract("UPDATE t1 SET a = t2.b FROM t2 WHERE t1.id = t2.id");
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("t2", "b"), persisted("t1", "a"))]
+        );
+    }
+
+    #[test]
+    fn update_set_literal_emits_no_flow() {
+        let ops = extract("UPDATE t1 SET a = 1");
+        assert!(ops.flows.is_empty());
+    }
+
+    #[test]
+    fn delete_emits_no_flow() {
+        let ops = extract("DELETE FROM t1 WHERE id = 5");
+        assert!(ops.flows.is_empty());
+    }
+
+    #[test]
+    fn wildcard_select_emits_no_flow() {
+        let ops = extract("SELECT * FROM t1");
+        assert!(ops.flows.is_empty());
     }
 
     // ───────── reads: catalog-strict resolution ─────────

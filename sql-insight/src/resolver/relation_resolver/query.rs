@@ -1,4 +1,7 @@
-use super::{Column, RelationResolver, RelationSchema, ResolvedQuery, ScopeKind, TableRole};
+use super::{
+    Column, ProjectionGroup, ProjectionItem, RelationResolver, RelationSchema, ResolvedQuery,
+    ScopeKind, TableRole,
+};
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
@@ -9,6 +12,10 @@ use sqlparser::ast::{
 impl<'a> RelationResolver<'a> {
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
         let scope_id = self.scopes.push_query_scope(self.pending_scope_kind);
+        // Swap in a fresh projection buffer for this query — restored on
+        // return — so each ResolvedQuery owns exactly its own groups
+        // without leaking into siblings or ancestors.
+        let prev_projections = std::mem::take(&mut self.current_projections);
         if let Some(with) = &query.with {
             if with.recursive {
                 for cte in &with.cte_tables {
@@ -17,11 +24,11 @@ impl<'a> RelationResolver<'a> {
                 for cte in &with.cte_tables {
                     // Body's output_schema is discarded for recursive CTEs;
                     // proper handling needs a fixpoint and is deferred.
-                    self.resolve_query(&cte.query)?;
+                    self.resolve_query_emitting_query_output(&cte.query)?;
                 }
             } else {
                 for cte in &with.cte_tables {
-                    let resolved = self.resolve_query(&cte.query)?;
+                    let resolved = self.resolve_query_emitting_query_output(&cte.query)?;
                     self.bind_cte(cte.alias.name.clone(), resolved.output_schema);
                 }
             }
@@ -45,21 +52,36 @@ impl<'a> RelationResolver<'a> {
             self.visit_pipe_operator(pipe_operator)?;
         }
         self.scopes.pop_scope();
+        let projections = std::mem::replace(&mut self.current_projections, prev_projections);
         Ok(ResolvedQuery {
             scope_id,
             output_schema: body_schema,
+            projections,
         })
     }
 
     fn visit_set_expr(&mut self, set_expr: &SetExpr) -> Result<RelationSchema, Error> {
         match set_expr {
             SetExpr::Select(select) => self.visit_select(select),
-            SetExpr::Query(query) => self.resolve_query(query).map(|r| r.output_schema),
+            SetExpr::Query(query) => {
+                // Parenthesized continuation of the enclosing query —
+                // bubble the inner projections up so an outer INSERT (or
+                // any other caller) sees them as if they were inline.
+                let resolved = self.resolve_query(query)?;
+                let output_schema = resolved.output_schema.clone();
+                self.extend_projections(resolved.projections);
+                Ok(output_schema)
+            }
             SetExpr::SetOperation { left, right, .. } => {
-                // Set ops require column-compatible operands; the result schema
-                // conventionally follows the left side's column names.
-                let left_schema = self.visit_set_expr(left)?;
-                self.visit_set_expr(right)?;
+                // Each branch lives in its own scope so name resolution
+                // doesn't see sibling branches' FROM bindings — matching
+                // SQL's per-SELECT name resolution. The branches' own
+                // visit_select calls each contribute a ProjectionGroup,
+                // so UNION INSERT naturally pairs every branch with the
+                // same target columns. Result schema conventionally
+                // follows the left side's column names.
+                let left_schema = self.with_branch_scope(|r| r.visit_set_expr(left))?;
+                self.with_branch_scope(|r| r.visit_set_expr(right))?;
                 Ok(left_schema)
             }
             SetExpr::Insert(statement)
@@ -92,9 +114,20 @@ impl<'a> RelationResolver<'a> {
         for table in &select.from {
             self.visit_table_with_joins(table, TableRole::Read)?;
         }
+        let mut projection_items = Vec::with_capacity(select.projection.len());
         for item in &select.projection {
+            let refs_before = self.column_refs_len();
             self.visit_select_item(item)?;
+            let source_refs = self.column_refs_slice(refs_before).to_vec();
+            projection_items.push(ProjectionItem {
+                name: projection_item_output_name(item),
+                source_refs,
+                bare: projection_item_is_bare(item),
+            });
         }
+        self.push_projection_group(ProjectionGroup {
+            items: projection_items,
+        });
         if let Some(into) = &select.into {
             // SELECT ... INTO new_table acts like CTAS — INTO is the write target.
             self.bind_base_table(
@@ -235,4 +268,33 @@ fn column_from_expr(expr: &Expr) -> Option<Column> {
         Expr::CompoundIdentifier(parts) => parts.last().cloned().map(|name| Column { name }),
         _ => None,
     }
+}
+
+fn projection_item_output_name(item: &SelectItem) -> Option<sqlparser::ast::Ident> {
+    match item {
+        SelectItem::ExprWithAlias { alias, .. } => Some(alias.clone()),
+        SelectItem::UnnamedExpr(expr) => expr_inferred_name(expr),
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
+    }
+}
+
+fn projection_item_is_bare(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => {
+            expr_is_bare(expr)
+        }
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => false,
+    }
+}
+
+fn expr_inferred_name(expr: &Expr) -> Option<sqlparser::ast::Ident> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().cloned(),
+        _ => None,
+    }
+}
+
+pub(super) fn expr_is_bare(expr: &Expr) -> bool {
+    matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
 }
