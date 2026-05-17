@@ -253,7 +253,7 @@ fn is_data_moving(kind: &StatementKind) -> bool {
     )
 }
 
-fn classify_statement(statement: &Statement) -> StatementKind {
+pub(super) fn classify_statement(statement: &Statement) -> StatementKind {
     use sqlparser::ast::ObjectType;
     match statement {
         Statement::Query(_) => StatementKind::Select,
