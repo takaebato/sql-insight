@@ -10,16 +10,24 @@
 //! expressions.
 //!
 //! **Current coverage** (column tracking is rolling in incrementally):
-//! - `reads`: qualified column references (`t1.a`, `schema.t1.a`,
-//!   `catalog.schema.t1.a`) collected from anywhere in the statement.
-//!   Unqualified references (`a`) are dropped here; their scope-chain
-//!   resolution lands in a later phase.
+//! - `reads`: qualified column references decompose directly to
+//!   `TableReference + name`; unqualified ones are resolved against
+//!   the scope chain. A unique candidate binding wins; 0 or 2+
+//!   candidates leave `table: None` (the column name still surfaces).
 //! - `writes`: INSERT explicit column lists scoped to the INSERT
 //!   target, and UPDATE SET targets scoped to the UPDATE table.
 //!   Projection-derived writes (CTAS / CREATE VIEW / MERGE actions)
 //!   and column-list-less INSERT SELECT are deferred.
 //! - `flows`: always empty in this slice; column flow construction
 //!   needs `reads` / `writes` completeness first.
+//!
+//! **Strictness scales with the catalog.** Without a catalog, Table
+//! bindings have `Unknown` schemas and unqualified refs to a
+//! single-table scope resolve unconditionally (best-effort, matches
+//! the implicit promise of `catalog: None`). With a catalog, Table
+//! schemas come back `Known(cols)` and unqualified refs only resolve
+//! when the candidate's schema actually lists the column — column
+//! typos that would otherwise silently resolve become unresolved.
 
 use crate::catalog::Catalog;
 use crate::error::Error;
@@ -27,7 +35,7 @@ use crate::extractor::operation_extractor::{
     OperationDiagnostic, OperationDiagnosticCode, StatementKind,
 };
 use crate::relation::TableReference;
-use crate::resolver::{RawColumnRef, RelationResolver};
+use crate::resolver::{RawColumnRef, RelationResolution, RelationResolver};
 use sqlparser::ast::{AssignmentTarget, Ident, Statement, TableFactor};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -191,7 +199,7 @@ impl ColumnOperationExtractor {
         }
 
         let resolution = RelationResolver::resolve_statement(catalog, statement)?;
-        let reads = collect_qualified_reads(&resolution.column_refs);
+        let reads = collect_reads(&resolution);
         let writes = collect_writes(statement)?;
 
         Ok(StatementColumnOperations {
@@ -204,15 +212,33 @@ impl ColumnOperationExtractor {
     }
 }
 
-/// Filter the resolver's raw column refs down to qualified ones and
-/// convert them into [`ColumnRead`]. Unqualified refs need scope-chain
-/// resolution and are dropped here.
-fn collect_qualified_reads(column_refs: &[RawColumnRef]) -> Vec<ColumnRead> {
-    column_refs
+/// Turn the resolver's raw column refs into [`ColumnRead`]. Qualified
+/// refs decompose by part length; unqualified refs hit the scope-chain
+/// resolver, which returns the owning table when a single binding in
+/// the chain could carry the column (`None` for 0 or 2+ candidates —
+/// the result still surfaces the column with `table: None`).
+fn collect_reads(resolution: &RelationResolution) -> Vec<ColumnRead> {
+    resolution
+        .column_refs
         .iter()
-        .filter_map(|raw| column_ref_from_parts(&raw.parts))
+        .filter_map(|raw| build_read_column_ref(raw, resolution))
         .map(|column| ColumnRead { column })
         .collect()
+}
+
+fn build_read_column_ref(
+    raw: &RawColumnRef,
+    resolution: &RelationResolution,
+) -> Option<ColumnReference> {
+    match raw.parts.len() {
+        0 => None,
+        1 => {
+            let name = raw.parts[0].clone();
+            let table = resolution.resolve_unqualified_column(&name, raw.scope_id);
+            Some(ColumnReference { table, name })
+        }
+        _ => column_ref_from_parts(&raw.parts),
+    }
 }
 
 /// Build a `ColumnReference` from a CompoundIdentifier's parts.
@@ -357,14 +383,16 @@ mod tests {
         }
     }
 
-    // ───────── reads: qualified-only ─────────
-
-    #[test]
-    fn unqualified_select_yields_no_reads() {
-        let ops = extract("SELECT a, b FROM t1");
-        assert_eq!(ops.statement_kind, StatementKind::Select);
-        assert!(ops.reads.is_empty());
+    fn unresolved(col: &str) -> ColumnRead {
+        ColumnRead {
+            column: ColumnReference {
+                table: None,
+                name: col.into(),
+            },
+        }
     }
+
+    // ───────── reads: qualified ─────────
 
     #[test]
     fn qualified_select_collects_qualified_reads() {
@@ -411,6 +439,111 @@ mod tests {
     fn where_predicate_qualified_ref_is_a_read() {
         let ops = extract("SELECT t1.a FROM t1 WHERE t1.b > 0");
         assert_eq!(ops.reads, vec![read("t1", "a"), read("t1", "b")]);
+    }
+
+    // ───────── reads: unqualified resolution ─────────
+
+    #[test]
+    fn unqualified_single_table_resolves_to_that_table() {
+        let ops = extract("SELECT a, b FROM t1");
+        assert_eq!(ops.reads, vec![read("t1", "a"), read("t1", "b")]);
+    }
+
+    #[test]
+    fn unqualified_in_where_resolves_to_single_table() {
+        let ops = extract("SELECT a FROM t1 WHERE b > 0");
+        assert_eq!(ops.reads, vec![read("t1", "a"), read("t1", "b")]);
+    }
+
+    #[test]
+    fn unqualified_with_multiple_tables_stays_unresolved() {
+        // Two `Unknown`-schema tables — without a catalog the resolver
+        // cannot tell which `a` belongs to, so the ref surfaces with
+        // `table: None`.
+        let ops = extract("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id");
+        assert_eq!(
+            ops.reads,
+            vec![read("t1", "id"), read("t2", "id"), unresolved("a"),]
+        );
+    }
+
+    #[test]
+    fn unqualified_uses_alias_binding_but_returns_real_table() {
+        // Alias is just a binding key; the resolver returns the
+        // alias-free TableReference of the binding's underlying table.
+        let ops = extract("SELECT a FROM t1 AS u");
+        assert_eq!(ops.reads, vec![read("t1", "a")]);
+    }
+
+    #[test]
+    fn unqualified_resolves_to_cte_when_cte_schema_contains_it() {
+        // CTE schema is inferred from its body's projection
+        // (Known([id])), so `id` resolves to `cte` while `unknown_col`
+        // doesn't.
+        let ops = extract("WITH cte AS (SELECT id FROM t1) SELECT id, unknown_col FROM cte");
+        // The outer scope has only the `cte` binding visible.
+        let cte_id = ColumnReference {
+            table: Some(table("cte")),
+            name: "id".into(),
+        };
+        assert!(
+            ops.reads.contains(&ColumnRead { column: cte_id }),
+            "expected cte.id in {:?}",
+            ops.reads
+        );
+        assert!(
+            ops.reads
+                .iter()
+                .any(|r| r.column.name.value == "unknown_col" && r.column.table.is_none()),
+            "expected unresolved unknown_col in {:?}",
+            ops.reads
+        );
+    }
+
+    #[test]
+    fn unqualified_resolves_to_derived_table_alias() {
+        let ops = extract("SELECT id FROM (SELECT id FROM t1) AS d");
+        // `id` in outer SELECT should resolve to d (the derived
+        // table). Inner SELECT also reads id (from t1).
+        assert!(ops.reads.contains(&ColumnRead {
+            column: ColumnReference {
+                table: Some(table("d")),
+                name: "id".into(),
+            },
+        }));
+        assert!(ops.reads.contains(&read("t1", "id")));
+    }
+
+    #[test]
+    fn unqualified_inner_scope_shadows_outer() {
+        // Inner subquery has its own t2 in scope; the unqualified `y`
+        // inside the IN-subquery resolves to t2 even though t1 is
+        // also in the outer scope. Standard SQL inner-shadows-outer.
+        let ops = extract("SELECT * FROM t1 WHERE id IN (SELECT id FROM t2 WHERE y > 0)");
+        assert!(ops.reads.contains(&read("t2", "y")));
+    }
+
+    #[test]
+    fn unqualified_correlated_walks_to_outer_when_inner_has_no_candidate() {
+        // Inner CTE has Known schema [zz]; `outer_col` doesn't fit it,
+        // so resolution walks to the outer scope and picks the t1
+        // (Unknown) binding.
+        let ops = extract(
+            "SELECT * FROM t1 WHERE id IN (\
+                WITH inner_cte AS (SELECT zz FROM t1) \
+                SELECT zz FROM inner_cte WHERE outer_col > 0)",
+        );
+        // The point: `outer_col` walks past the CTE binding (Known
+        // schema doesn't list it) and lands on the outer t1 (Unknown).
+        // Note that t1 appears twice in the chain (outer and inside
+        // the CTE body) — they're separate scopes; the inner
+        // inner_cte scope's t1 isn't the same scope as the outer.
+        // For this test we just check that `outer_col` resolves
+        // somewhere reasonable rather than the exact target.
+        assert!(ops
+            .reads
+            .iter()
+            .any(|r| r.column.name.value == "outer_col" && r.column.table.is_some()));
     }
 
     // ───────── writes: INSERT explicit column list ─────────
@@ -509,5 +642,74 @@ mod tests {
         let ops = extract("SELECT * FROM t1");
         assert!(ops.reads.is_empty());
         assert!(ops.writes.is_empty());
+    }
+
+    // ───────── reads: catalog-strict resolution ─────────
+
+    mod catalog_strict {
+        use super::*;
+        use crate::catalog::{Catalog, ColumnSchema};
+        use sqlparser::ast::Ident;
+        use std::collections::HashMap;
+
+        #[derive(Debug, Default)]
+        struct TestCatalog {
+            tables: HashMap<String, Vec<&'static str>>,
+        }
+
+        impl TestCatalog {
+            fn with(mut self, name: &str, cols: Vec<&'static str>) -> Self {
+                self.tables.insert(name.to_string(), cols);
+                self
+            }
+        }
+
+        impl Catalog for TestCatalog {
+            fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
+                self.tables.get(table.name.value.as_str()).map(|cols| {
+                    cols.iter()
+                        .map(|c| ColumnSchema {
+                            name: Ident::new(*c),
+                        })
+                        .collect()
+                })
+            }
+        }
+
+        fn extract_with_catalog(sql: &str, catalog: &dyn Catalog) -> StatementColumnOperations {
+            let mut result =
+                extract_column_operations(&GenericDialect {}, sql, Some(catalog)).unwrap();
+            result.remove(0).unwrap()
+        }
+
+        #[test]
+        fn catalog_known_schema_rejects_columns_not_in_table() {
+            // Without catalog `SELECT a FROM t1` resolves a → t1.a
+            // unconditionally (single Unknown binding heuristic). With
+            // a catalog that says t1's columns are [x, y], `a` cannot
+            // come from t1 — it surfaces as unresolved.
+            let catalog = TestCatalog::default().with("t1", vec!["x", "y"]);
+            let ops = extract_with_catalog("SELECT a FROM t1", &catalog);
+            assert_eq!(ops.reads, vec![unresolved("a")]);
+        }
+
+        #[test]
+        fn catalog_known_schema_resolves_columns_present_in_table() {
+            let catalog = TestCatalog::default().with("t1", vec!["a", "b"]);
+            let ops = extract_with_catalog("SELECT a FROM t1", &catalog);
+            assert_eq!(ops.reads, vec![read("t1", "a")]);
+        }
+
+        #[test]
+        fn catalog_disambiguates_join_unqualified_ref() {
+            // Both tables are Known via catalog; only t2 has `a`, so
+            // unqualified `a` in `t1 JOIN t2` resolves to t2 (no
+            // catalog: same SQL would be ambiguous).
+            let catalog = TestCatalog::default()
+                .with("t1", vec!["id"])
+                .with("t2", vec!["id", "a"]);
+            let ops = extract_with_catalog("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id", &catalog);
+            assert!(ops.reads.contains(&read("t2", "a")));
+        }
     }
 }

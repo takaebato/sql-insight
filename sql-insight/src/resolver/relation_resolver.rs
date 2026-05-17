@@ -151,6 +151,81 @@ impl RelationResolution {
         }
         false
     }
+
+    /// Resolve an unqualified column name against the scope chain
+    /// rooted at `scope_id`. Walks innermost-first; the first scope
+    /// with any candidate wins (standard SQL inner-shadows-outer).
+    /// Returns the owning table when exactly one binding in that
+    /// scope could carry the column — a real `Table`, or a
+    /// synthesized reference for `Cte` / `DerivedTable` /
+    /// `TableFunction`. Returns `None` when 0 or 2+ bindings match.
+    ///
+    /// **Strictness scales with the catalog.** Without a catalog,
+    /// Table bindings have `Unknown` schemas and qualify
+    /// unconditionally: `SELECT a FROM t1` resolves `a` to t1 even
+    /// though column existence is not verified. This matches the SQL
+    /// spec's single-relation rule under the assumption that the SQL
+    /// is valid — and matches the implicit promise of `catalog: None`
+    /// (best-effort, not strict). With a catalog, Table bindings come
+    /// back `Known(cols)`; columns absent from the table are rejected
+    /// as candidates, eliminating false positives like a `count` typo
+    /// (meant `count(*)`) resolving to `t1.count`.
+    pub(crate) fn resolve_unqualified_column(
+        &self,
+        name: &Ident,
+        scope_id: ScopeId,
+    ) -> Option<TableReference> {
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let scope = &self.scopes[id.0];
+            let candidates: Vec<TableReference> = scope
+                .iter_bindings()
+                .filter_map(|b| binding_could_contain_column(b, name))
+                .collect();
+            if !candidates.is_empty() {
+                // Inner scope shadows outer: as soon as a scope has any
+                // candidate, stop walking. Standard SQL name resolution.
+                return (candidates.len() == 1).then(|| candidates.into_iter().next().unwrap());
+            }
+            current = scope.parent;
+        }
+        None
+    }
+}
+
+fn binding_could_contain_column(binding: &RelationBinding, name: &Ident) -> Option<TableReference> {
+    match binding {
+        RelationBinding::Table { table, schema, .. } => {
+            schema_could_contain(schema, name).then(|| (**table).clone())
+        }
+        RelationBinding::Cte {
+            name: cte_name,
+            schema,
+        } => schema_could_contain(schema, name).then(|| synthetic_table_ref(cte_name)),
+        RelationBinding::DerivedTable { alias, schema } => {
+            schema_could_contain(schema, name).then(|| synthetic_table_ref(alias))
+        }
+        // TableFunction schemas are always Unknown for now, so any
+        // unqualified column could plausibly come from one.
+        RelationBinding::TableFunction { alias, .. } => Some(synthetic_table_ref(alias)),
+    }
+}
+
+fn schema_could_contain(schema: &RelationSchema, name: &Ident) -> bool {
+    match schema {
+        RelationSchema::Unknown => true,
+        RelationSchema::Known(cols) => cols
+            .iter()
+            .any(|c| RelationKey::from_ident(&c.name) == RelationKey::from_ident(name)),
+    }
+}
+
+fn synthetic_table_ref(name: &Ident) -> TableReference {
+    TableReference {
+        catalog: None,
+        schema: None,
+        name: name.clone(),
+    }
 }
 
 #[derive(Debug)]
