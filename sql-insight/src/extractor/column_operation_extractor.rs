@@ -26,9 +26,11 @@
 //!   for CASE-WHEN condition refs). Typically `len == 1`; multi-role
 //!   refs (USING / NATURAL JOIN merged columns) are future work.
 //! - `writes`: INSERT explicit column lists scoped to the INSERT
-//!   target, and UPDATE SET targets scoped to the UPDATE table.
-//!   Projection-derived writes (CTAS / CREATE VIEW / MERGE actions)
-//!   and column-list-less INSERT SELECT are deferred.
+//!   target, UPDATE SET targets scoped to the UPDATE table, and
+//!   CTAS / CREATE VIEW / ALTER VIEW target columns (explicit
+//!   column list when provided, else the names the resolver derived
+//!   from the source projection). MERGE WHEN-clause writes and
+//!   column-list-less INSERT SELECT remain deferred.
 //! - `flows`: per-projection-item edges for SELECT (target =
 //!   `QueryOutput { name, position }`), positionally paired
 //!   `source-column → target-column` edges for INSERT with explicit
@@ -45,9 +47,10 @@
 //!   args, plus a name list of common aggregates across major
 //!   dialects), or `Computed` (anything else). Composition is
 //!   `Aggregation`-dominant: any aggregation step in a CTE / derived
-//!   chain makes the resulting flow `Aggregation`. MERGE clauses,
-//!   CTAS / CREATE VIEW, and column-list-less INSERT SELECT are
-//!   deferred.
+//!   chain makes the resulting flow `Aggregation`. CTAS / CREATE
+//!   VIEW / ALTER VIEW also emit Persisted flows from source
+//!   projections to the created relation's columns. MERGE clauses
+//!   and column-list-less INSERT SELECT are deferred.
 //!
 //! **Strictness scales with the catalog.** Without a catalog, Table
 //! bindings have `Unknown` schemas and unqualified refs to a
@@ -272,7 +275,7 @@ impl ColumnOperationExtractor {
 
         let resolution = RelationResolver::resolve_statement(catalog, statement)?;
         let reads = collect_reads(&resolution);
-        let writes = collect_writes(statement)?;
+        let writes = collect_writes(statement, &resolution)?;
         let flows = extract_flows(&resolution);
 
         Ok(StatementColumnOperations {
@@ -381,10 +384,16 @@ fn column_ref_from_parts(parts: &[Ident]) -> Option<ColumnReference> {
 /// - UPDATE SET targets → writes scoped to the UPDATE target table
 ///   (qualifier is honored when the SET target is qualified, otherwise
 ///   the UPDATE head provides the table).
+/// - CTAS / CREATE VIEW / ALTER VIEW → writes follow the created
+///   relation's columns (explicit list when given, otherwise the
+///   columns the resolver derived from the source projection — read
+///   off the resolution's `Persisted` flow edges to that target).
 ///
-/// MERGE, CTAS, CREATE VIEW writes need projection-derived column
-/// names and land in a later phase.
-fn collect_writes(statement: &Statement) -> Result<Vec<ColumnWrite>, Error> {
+/// MERGE WHEN clause writes are deferred.
+fn collect_writes(
+    statement: &Statement,
+    resolution: &RelationResolution,
+) -> Result<Vec<ColumnWrite>, Error> {
     let mut writes = Vec::new();
     match statement {
         Statement::Insert(insert) => {
@@ -415,9 +424,65 @@ fn collect_writes(statement: &Statement) -> Result<Vec<ColumnWrite>, Error> {
                 }
             }
         }
+        Statement::CreateTable(ct) => {
+            // Plain `CREATE TABLE t (a INT, ...)` (no AS) is pure DDL —
+            // no data write. Only CTAS (with a query) emits writes.
+            if ct.query.is_some() {
+                let target = TableReference::try_from(&ct.name)?;
+                let explicit: Vec<Ident> = ct.columns.iter().map(|c| c.name.clone()).collect();
+                writes.extend(created_writes(&target, &explicit, resolution));
+            }
+        }
+        Statement::CreateView(cv) => {
+            let target = TableReference::try_from(&cv.name)?;
+            let explicit: Vec<Ident> = cv.columns.iter().map(|c| c.name.clone()).collect();
+            writes.extend(created_writes(&target, &explicit, resolution));
+        }
+        Statement::AlterView { name, columns, .. } => {
+            let target = TableReference::try_from(name)?;
+            writes.extend(created_writes(&target, columns, resolution));
+        }
         _ => {}
     }
     Ok(writes)
+}
+
+/// Writes for a CREATE-as-style target: when an explicit column list
+/// is given, use it verbatim; otherwise scan the resolution's
+/// `Persisted` flow edges to this table and collect the unique
+/// columns the resolver paired with source projections.
+fn created_writes(
+    target: &TableReference,
+    explicit: &[Ident],
+    resolution: &RelationResolution,
+) -> Vec<ColumnWrite> {
+    if !explicit.is_empty() {
+        return explicit
+            .iter()
+            .map(|c| ColumnWrite {
+                column: ColumnReference {
+                    table: Some(target.clone()),
+                    name: c.clone(),
+                },
+            })
+            .collect();
+    }
+    let mut seen: Vec<Ident> = Vec::new();
+    for edge in &resolution.flow_edges {
+        if let FlowTargetSpec::Persisted { table, column } = &edge.target {
+            if table == target && !seen.iter().any(|n| n.value == column.value) {
+                seen.push(column.clone());
+            }
+        }
+    }
+    seen.into_iter()
+        .map(|name| ColumnWrite {
+            column: ColumnReference {
+                table: Some(target.clone()),
+                name,
+            },
+        })
+        .collect()
 }
 
 /// Resolve a SET assignment target to a `ColumnReference`. If the
@@ -1243,6 +1308,93 @@ mod tests {
             ops.flows,
             vec![flow_aggregation(col("t1", "a"), out("s", 0))]
         );
+    }
+
+    // ───────── CTAS / CREATE VIEW / ALTER VIEW (Phase 5.8) ─────────
+
+    #[test]
+    fn ctas_pairs_source_projection_with_inferred_column_names() {
+        // CREATE TABLE AS SELECT — no explicit column list, so target
+        // columns follow the source projection's inferred names
+        // (alias > bare ident).
+        let ops = extract("CREATE TABLE t AS SELECT x AS a, y FROM s");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_passthrough(col("s", "x"), persisted("t", "a")),
+                flow_passthrough(col("s", "y"), persisted("t", "y")),
+            ]
+        );
+        assert_eq!(ops.writes, vec![write("t", "a"), write("t", "y")]);
+    }
+
+    #[test]
+    fn ctas_with_explicit_columns_overrides_projection_names() {
+        // Explicit column list wins over inferred names.
+        let ops = extract("CREATE TABLE t (p INT, q INT) AS SELECT x, y FROM s");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_passthrough(col("s", "x"), persisted("t", "p")),
+                flow_passthrough(col("s", "y"), persisted("t", "q")),
+            ]
+        );
+        assert_eq!(ops.writes, vec![write("t", "p"), write("t", "q")]);
+    }
+
+    #[test]
+    fn ctas_propagates_aggregation_kind() {
+        let ops = extract("CREATE TABLE t AS SELECT SUM(x) AS total FROM s");
+        assert_eq!(
+            ops.flows,
+            vec![flow_aggregation(col("s", "x"), persisted("t", "total"))]
+        );
+        assert_eq!(ops.writes, vec![write("t", "total")]);
+    }
+
+    #[test]
+    fn create_view_pairs_source_projection() {
+        let ops = extract("CREATE VIEW v AS SELECT x AS a, y FROM s");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_passthrough(col("s", "x"), persisted("v", "a")),
+                flow_passthrough(col("s", "y"), persisted("v", "y")),
+            ]
+        );
+        assert_eq!(ops.writes, vec![write("v", "a"), write("v", "y")]);
+    }
+
+    #[test]
+    fn create_view_with_explicit_columns_uses_list() {
+        let ops = extract("CREATE VIEW v (a, b) AS SELECT x, y FROM s");
+        assert_eq!(
+            ops.flows,
+            vec![
+                flow_passthrough(col("s", "x"), persisted("v", "a")),
+                flow_passthrough(col("s", "y"), persisted("v", "b")),
+            ]
+        );
+        assert_eq!(ops.writes, vec![write("v", "a"), write("v", "b")]);
+    }
+
+    #[test]
+    fn alter_view_pairs_replacement_query_projection() {
+        let ops = extract("ALTER VIEW v AS SELECT x AS a FROM s");
+        assert_eq!(
+            ops.flows,
+            vec![flow_passthrough(col("s", "x"), persisted("v", "a"))]
+        );
+        assert_eq!(ops.writes, vec![write("v", "a")]);
+    }
+
+    #[test]
+    fn ctas_unnamed_projection_yields_no_paired_flow() {
+        // `SELECT 1` has no column ref and no inferable name, so the
+        // CTAS source produces no flow / no write for that slot.
+        let ops = extract("CREATE TABLE t AS SELECT 1 FROM s");
+        assert!(ops.flows.is_empty());
+        assert!(ops.writes.is_empty());
     }
 
     #[test]

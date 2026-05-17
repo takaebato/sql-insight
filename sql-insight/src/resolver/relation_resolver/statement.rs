@@ -16,34 +16,45 @@ impl<'a> RelationResolver<'a> {
             Statement::Delete(delete) => self.visit_delete(delete),
             Statement::Merge(merge) => self.visit_merge(merge),
             Statement::CreateTable(create_table) => {
-                self.bind_base_table(
-                    TableReference::try_from(&create_table.name)?,
-                    None,
-                    TableRole::Write,
-                );
+                let target = TableReference::try_from(&create_table.name)?;
+                self.bind_base_table(target.clone(), None, TableRole::Write);
                 if let Some(query) = &create_table.query {
-                    // CTAS: until column-level CREATE TABLE writes are wired,
-                    // the source query's projections surface as QueryOutput
-                    // edges (not yet paired with the new table's columns).
-                    self.resolve_query_emitting_query_output(query)?;
+                    // CTAS: source projections pair with the new
+                    // table's columns. Explicit column defs (if any)
+                    // win over inferred names from the source SELECT.
+                    let explicit: Vec<sqlparser::ast::Ident> = create_table
+                        .columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect();
+                    let resolved = self.resolve_query(query)?;
+                    self.emit_persisted_to_created(&target, &explicit, &resolved);
                 }
                 Ok(())
             }
             Statement::CreateView(create_view) => {
-                self.bind_base_table(
-                    TableReference::try_from(&create_view.name)?,
-                    None,
-                    TableRole::Write,
-                );
-                self.resolve_query_emitting_query_output(&create_view.query)?;
+                let target = TableReference::try_from(&create_view.name)?;
+                self.bind_base_table(target.clone(), None, TableRole::Write);
+                let explicit: Vec<sqlparser::ast::Ident> =
+                    create_view.columns.iter().map(|c| c.name.clone()).collect();
+                let resolved = self.resolve_query(&create_view.query)?;
+                self.emit_persisted_to_created(&target, &explicit, &resolved);
                 if let Some(to) = &create_view.to {
                     self.bind_base_table(TableReference::try_from(to)?, None, TableRole::Write);
                 }
                 Ok(())
             }
-            Statement::AlterView { name, query, .. } => {
-                self.bind_base_table(TableReference::try_from(name)?, None, TableRole::Write);
-                self.resolve_query_emitting_query_output(query).map(|_| ())
+            Statement::AlterView {
+                name,
+                query,
+                columns,
+                ..
+            } => {
+                let target = TableReference::try_from(name)?;
+                self.bind_base_table(target.clone(), None, TableRole::Write);
+                let resolved = self.resolve_query(query)?;
+                self.emit_persisted_to_created(&target, columns, &resolved);
+                Ok(())
             }
             Statement::CreateVirtualTable { name, .. } => {
                 self.bind_base_table(TableReference::try_from(name)?, None, TableRole::Write);
@@ -245,6 +256,43 @@ impl<'a> RelationResolver<'a> {
             self.visit_expr(&assignment.value)?;
         }
         Ok(())
+    }
+
+    /// Emit Persisted flow edges for a CREATE-AS source: each
+    /// projection item pairs with the created relation's column at
+    /// the same position. Target column name comes from the explicit
+    /// column list when present, otherwise from the projection's
+    /// inferred name (alias > bare ident name); items without an
+    /// inferable name and no explicit slot are silently skipped.
+    /// Used by CTAS, CREATE VIEW, and ALTER VIEW.
+    fn emit_persisted_to_created(
+        &mut self,
+        target: &TableReference,
+        explicit_columns: &[sqlparser::ast::Ident],
+        resolved: &super::ResolvedQuery,
+    ) {
+        for group in &resolved.projections {
+            for (position, item) in group.items.iter().enumerate() {
+                let target_col = explicit_columns
+                    .get(position)
+                    .cloned()
+                    .or_else(|| item.name.clone());
+                let Some(target_col) = target_col else {
+                    continue;
+                };
+                let target_spec = FlowTargetSpec::Persisted {
+                    table: target.clone(),
+                    column: target_col,
+                };
+                for source in &item.source_refs {
+                    self.push_flow_edge(FlowEdge {
+                        source: source.clone(),
+                        target: target_spec.clone(),
+                        kind: item.kind,
+                    });
+                }
+            }
+        }
     }
 
     fn visit_update(&mut self, update: &Update) -> Result<(), Error> {
