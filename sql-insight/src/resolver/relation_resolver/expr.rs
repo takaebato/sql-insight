@@ -197,9 +197,15 @@ impl<'a> RelationResolver<'a> {
                 self.visit_expr(&member_of.value)?;
                 self.visit_expr(&member_of.array)
             }
-            Expr::Identifier(_)
-            | Expr::CompoundIdentifier(_)
-            | Expr::Value(_)
+            Expr::Identifier(ident) => {
+                self.record_column_ref(vec![ident.clone()]);
+                Ok(())
+            }
+            Expr::CompoundIdentifier(parts) => {
+                self.record_column_ref(parts.clone());
+                Ok(())
+            }
+            Expr::Value(_)
             | Expr::TypedString(_)
             | Expr::MatchAgainst { .. }
             | Expr::Wildcard(_)

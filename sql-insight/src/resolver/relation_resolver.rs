@@ -63,6 +63,23 @@ impl RelationKey {
 pub(crate) struct RelationResolution {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) scopes: Vec<RelationScope>,
+    /// Raw column references collected during the AST walk. Each entry
+    /// records the identifier parts (`["t1", "a"]` for `t1.a`, `["a"]`
+    /// for the bare unqualified `a`) and the scope where it appeared.
+    /// Semantic interpretation (alias resolution, scope-chain lookup,
+    /// `Passthrough` vs `Computed` classification) belongs to consumers.
+    pub(crate) column_refs: Vec<RawColumnRef>,
+}
+
+/// An unresolved column reference captured by the resolver during the
+/// AST walk. `parts` mirrors `sqlparser`'s split — 1 part for bare
+/// `a`, 2 for `t1.a`, 3 for `schema.t1.a`, 4 for `catalog.schema.t1.a`.
+/// `scope_id` is the scope in which the reference appeared and is the
+/// entry point for scope-chain resolution of unqualified names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RawColumnRef {
+    pub(crate) parts: Vec<Ident>,
+    pub(crate) scope_id: ScopeId,
 }
 
 impl RelationResolution {
@@ -297,6 +314,7 @@ pub(crate) struct RelationResolver<'a> {
     catalog: Option<&'a dyn Catalog>,
     diagnostics: Vec<Diagnostic>,
     scopes: ScopeStack,
+    column_refs: Vec<RawColumnRef>,
     /// Kind stamped on the next pushed scope. Defaults to `Body`; clause
     /// walkers (WHERE, HAVING, JOIN ON, …) flip it to `Predicate` via
     /// [`with_scope_kind`] for the duration of their child walk so that
@@ -310,8 +328,18 @@ impl<'a> RelationResolver<'a> {
             catalog,
             diagnostics: Vec::new(),
             scopes: ScopeStack::default(),
+            column_refs: Vec::new(),
             pending_scope_kind: ScopeKind::Body,
         }
+    }
+
+    /// Record a raw column reference observed in the current scope.
+    /// Called from `visit_expr` for every `Expr::Identifier` and
+    /// `Expr::CompoundIdentifier` — resolution and classification are
+    /// the consumer's concern.
+    pub(super) fn record_column_ref(&mut self, parts: Vec<Ident>) {
+        let scope_id = self.scopes.current_scope_id();
+        self.column_refs.push(RawColumnRef { parts, scope_id });
     }
 
     /// Temporarily set the kind to stamp on subquery scopes pushed inside
@@ -342,6 +370,7 @@ impl<'a> RelationResolver<'a> {
         RelationResolution {
             diagnostics: self.diagnostics,
             scopes: self.scopes.into_scopes(),
+            column_refs: self.column_refs,
         }
     }
 
