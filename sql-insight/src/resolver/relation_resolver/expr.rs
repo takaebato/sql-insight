@@ -513,17 +513,21 @@ impl<'a> RelationResolver<'a> {
     }
 
     pub(super) fn visit_window_spec(&mut self, spec: &WindowSpec) -> Result<(), Error> {
-        self.visit_exprs(&spec.partition_by)?;
-        for expr in &spec.order_by {
-            self.visit_order_by_expr(expr)?;
-        }
-        if let Some(frame) = &spec.window_frame {
-            self.visit_window_frame_bound(&frame.start_bound)?;
-            if let Some(bound) = &frame.end_bound {
-                self.visit_window_frame_bound(bound)?;
+        // OVER (...) shapes the window — every ref inside (PARTITION
+        // BY, ORDER BY, frame bounds) is Window kind, not value flow.
+        self.with_read_kind(super::ReadKind::Window, |r| {
+            r.visit_exprs(&spec.partition_by)?;
+            for expr in &spec.order_by {
+                r.visit_order_by_expr(expr)?;
             }
-        }
-        Ok(())
+            if let Some(frame) = &spec.window_frame {
+                r.visit_window_frame_bound(&frame.start_bound)?;
+                if let Some(bound) = &frame.end_bound {
+                    r.visit_window_frame_bound(bound)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn visit_window_frame_bound(&mut self, bound: &WindowFrameBound) -> Result<(), Error> {

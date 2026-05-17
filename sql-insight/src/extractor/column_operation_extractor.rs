@@ -138,6 +138,12 @@ pub enum ReadKind {
     /// Ref appeared in a row-ordering clause — `ORDER BY` / `SORT BY`
     /// or pipe-operator `|> ORDER BY`.
     Sort,
+    /// Ref appeared inside an `OVER (...)` window spec — `PARTITION BY`,
+    /// the window's `ORDER BY`, or a window-frame bound expression.
+    /// Refs in the aggregate function's arguments (e.g., `x` in
+    /// `SUM(x) OVER (...)`) stay `Projection` since they're
+    /// value-producing.
+    Window,
 }
 
 /// A column that the statement writes to — an INSERT target column,
@@ -487,6 +493,16 @@ mod tests {
         }
     }
 
+    fn window_read(table_name: &str, col: &str) -> ColumnRead {
+        ColumnRead {
+            column: ColumnReference {
+                table: Some(table(table_name)),
+                name: col.into(),
+            },
+            kinds: vec![ReadKind::Window],
+        }
+    }
+
     fn write(table_name: &str, col: &str) -> ColumnWrite {
         ColumnWrite {
             column: ColumnReference {
@@ -814,6 +830,30 @@ mod tests {
         assert!(ops.reads.contains(&read("s", "z")));
         // Outer `a` projection still Projection.
         assert!(ops.reads.contains(&read("t", "a")));
+    }
+
+    #[test]
+    fn window_partition_by_carries_window_kind() {
+        // OVER (PARTITION BY p) — p is Window; the aggregate arg `x`
+        // stays Projection (value flow into the output column).
+        let ops = extract("SELECT SUM(x) OVER (PARTITION BY p) FROM t1");
+        assert!(ops.reads.contains(&read("t1", "x")));
+        assert!(ops.reads.contains(&window_read("t1", "p")));
+    }
+
+    #[test]
+    fn window_order_by_carries_window_kind() {
+        let ops = extract("SELECT SUM(x) OVER (ORDER BY o) FROM t1");
+        assert!(ops.reads.contains(&read("t1", "x")));
+        assert!(ops.reads.contains(&window_read("t1", "o")));
+    }
+
+    #[test]
+    fn window_partition_and_order_both_classified() {
+        let ops = extract("SELECT SUM(x) OVER (PARTITION BY p ORDER BY o) FROM t1");
+        assert!(ops.reads.contains(&read("t1", "x")));
+        assert!(ops.reads.contains(&window_read("t1", "p")));
+        assert!(ops.reads.contains(&window_read("t1", "o")));
     }
 
     #[test]
