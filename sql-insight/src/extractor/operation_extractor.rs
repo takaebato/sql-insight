@@ -22,7 +22,7 @@
 use crate::catalog::Catalog;
 use crate::error::Error;
 use crate::relation::TableReference;
-use crate::resolver::RelationResolver;
+use crate::resolver::Resolver;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -174,7 +174,7 @@ impl TableOperationExtractor {
         catalog: Option<&dyn Catalog>,
     ) -> Result<StatementTableOperations, Error> {
         let kind = classify_statement(statement);
-        let resolution = RelationResolver::resolve_statement(catalog, statement)?;
+        let resolution = Resolver::resolve_statement(catalog, statement)?;
 
         let mut reads = Vec::new();
         let mut writes = Vec::new();
@@ -219,7 +219,7 @@ impl TableOperationExtractor {
 /// for statements that physically move data. Statements without a write
 /// target or without any data-feeding source produce no flows.
 fn extract_table_flows(
-    resolution: &crate::resolver::RelationResolution,
+    resolution: &crate::resolver::Resolution,
     kind: &StatementKind,
 ) -> Vec<TableFlow> {
     if !is_data_moving(kind) {

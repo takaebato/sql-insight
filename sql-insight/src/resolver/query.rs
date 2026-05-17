@@ -1,7 +1,6 @@
 use super::projection::{projection_item_kind, projection_item_output_name};
 use super::{
-    Column, ProjectionGroup, ProjectionItem, RelationResolver, RelationSchema, ResolvedQuery,
-    TableRole,
+    Column, ProjectionGroup, ProjectionItem, RelationSchema, ResolvedQuery, Resolver, TableRole,
 };
 use crate::error::Error;
 use crate::relation::TableReference;
@@ -10,7 +9,7 @@ use sqlparser::ast::{
     Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Table, TopQuantity, Values,
 };
 
-impl<'a> RelationResolver<'a> {
+impl<'a> Resolver<'a> {
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
         let scope_id = self.scopes.push_query_scope(self.ctx.scope_kind);
         // Swap in a fresh projection buffer for this query — restored on
@@ -315,4 +314,3 @@ fn column_from_expr(expr: &Expr) -> Option<Column> {
         _ => None,
     }
 }
-

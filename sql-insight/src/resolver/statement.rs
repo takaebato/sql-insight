@@ -1,11 +1,11 @@
-use super::{FlowTargetSpec, RelationResolver, TableRole};
+use super::{FlowTargetSpec, Resolver, TableRole};
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
     Delete, FromTable, Merge, ObjectType, Statement, TableWithJoins, Update, UpdateTableFromKind,
 };
 
-impl<'a> RelationResolver<'a> {
+impl<'a> Resolver<'a> {
     pub(super) fn visit_statement(&mut self, statement: &Statement) -> Result<(), Error> {
         // Keep this match exhaustive. Unsupported variants are listed explicitly so sqlparser
         // Statement additions become compile errors instead of silent misses.

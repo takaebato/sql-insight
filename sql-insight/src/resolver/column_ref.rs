@@ -8,9 +8,9 @@ use crate::extractor::column_operation_extractor::ReadKind;
 use crate::relation::TableReference;
 
 use super::binding::{
-    binding_alias_key, binding_could_contain_column, is_synthetic_binding, RelationKey,
+    binding_alias_key, binding_could_contain_column, is_synthetic_binding, BindingKey,
 };
-use super::{Binding, RelationResolver, ScopeId};
+use super::{Binding, Resolver, ScopeId};
 
 /// A column reference captured by the resolver during the AST walk.
 ///
@@ -69,7 +69,7 @@ pub(super) fn table_from_qualifier_parts(parts: &[Ident]) -> Option<TableReferen
     }
 }
 
-impl<'a> RelationResolver<'a> {
+impl<'a> Resolver<'a> {
     pub(super) fn column_refs_len(&self) -> usize {
         self.column_refs.len()
     }
@@ -153,7 +153,7 @@ impl<'a> RelationResolver<'a> {
     }
 
     fn qualifier_is_synthetic_at_walk(&self, qualifier: &Ident, scope_id: ScopeId) -> bool {
-        let key = RelationKey::from_ident(qualifier);
+        let key = BindingKey::from_ident(qualifier);
         let mut current = Some(scope_id);
         while let Some(id) = current {
             let scope = self.scopes().scope(id);

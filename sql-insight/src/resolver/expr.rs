@@ -1,4 +1,4 @@
-use super::RelationResolver;
+use super::Resolver;
 use crate::error::Error;
 use sqlparser::ast::{
     AccessExpr, Array, DictionaryField, Expr, Fetch, Function, FunctionArg, FunctionArgExpr,
@@ -7,7 +7,7 @@ use sqlparser::ast::{
     WildcardAdditionalOptions, WindowFrameBound, WindowSpec, WindowType,
 };
 
-impl<'a> RelationResolver<'a> {
+impl<'a> Resolver<'a> {
     pub(super) fn visit_expr(&mut self, expr: &Expr) -> Result<(), Error> {
         // Keep this match exhaustive so sqlparser Expr additions are reviewed here.
         match expr {

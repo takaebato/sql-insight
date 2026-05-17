@@ -8,11 +8,11 @@ use crate::catalog::ColumnSchema;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::relation::TableReference;
 
-use super::{ProjectionGroup, RelationResolver, RelationResolution};
+use super::{ProjectionGroup, Resolution, Resolver};
 
 /// Internal role a table binding carries within a statement. Surfaced
-/// to the operation extractor via [`RelationResolution::read_tables`]
-/// and [`RelationResolution::write_tables`]; the public API exposes
+/// to the operation extractor via [`Resolution::read_tables`]
+/// and [`Resolution::write_tables`]; the public API exposes
 /// two separate lists instead of this enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum TableRole {
@@ -42,12 +42,12 @@ pub(crate) enum ScopeKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum RelationKey {
+pub(super) enum BindingKey {
     Unquoted(String),
     Quoted(String),
 }
 
-impl RelationKey {
+impl BindingKey {
     pub(super) fn from_ident(ident: &Ident) -> Self {
         if ident.quote_style.is_some() {
             Self::Quoted(ident.value.clone())
@@ -70,7 +70,7 @@ pub(crate) struct Column {
     pub(crate) name: Ident,
 }
 
-/// What's bound to a name in a [`RelationScope`] — a real Table or
+/// What's bound to a name in a [`Scope`] — a real Table or
 /// one of the synthetic intermediates (CTE / derived subquery / table
 /// function) that SQL exposes as a named row set.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,14 +112,14 @@ pub(crate) enum Binding {
 
 #[derive(Debug)]
 #[allow(dead_code)]
-pub(crate) struct RelationScope {
+pub(crate) struct Scope {
     pub(crate) id: ScopeId,
     pub(crate) parent: Option<ScopeId>,
     pub(crate) kind: ScopeKind,
-    pub(super) bindings: IndexMap<RelationKey, Binding>,
+    pub(super) bindings: IndexMap<BindingKey, Binding>,
 }
 
-impl RelationScope {
+impl Scope {
     fn new(id: ScopeId, parent: Option<ScopeId>, kind: ScopeKind) -> Self {
         Self {
             id,
@@ -130,7 +130,7 @@ impl RelationScope {
     }
 
     fn bind(&mut self, name: &Ident, binding: Binding) {
-        let key = RelationKey::from_ident(name);
+        let key = BindingKey::from_ident(name);
         // Re-binding the same name as a Table merges roles rather than
         // replacing — this captures the `DELETE t1 FROM t1` style case
         // where a single name plays multiple roles in one statement.
@@ -152,7 +152,7 @@ impl RelationScope {
     }
 
     fn resolve(&self, name: &Ident) -> Option<&Binding> {
-        self.bindings.get(&RelationKey::from_ident(name))
+        self.bindings.get(&BindingKey::from_ident(name))
     }
 
     pub(super) fn iter_bindings(&self) -> impl Iterator<Item = &Binding> {
@@ -162,16 +162,16 @@ impl RelationScope {
 
 #[derive(Default, Debug)]
 pub(super) struct ScopeStack {
-    pub(super) scopes: Vec<RelationScope>,
+    pub(super) scopes: Vec<Scope>,
     stack: Vec<ScopeId>,
 }
 
 impl ScopeStack {
-    pub(super) fn scope(&self, id: ScopeId) -> &RelationScope {
+    pub(super) fn scope(&self, id: ScopeId) -> &Scope {
         &self.scopes[id.0]
     }
 
-    pub(super) fn into_scopes(self) -> Vec<RelationScope> {
+    pub(super) fn into_scopes(self) -> Vec<Scope> {
         self.scopes
     }
 
@@ -188,10 +188,7 @@ impl ScopeStack {
         self.current_scope_mut().bind(&name, binding);
     }
 
-    pub(super) fn resolve_unqualified_relation(
-        &self,
-        relation: &ObjectName,
-    ) -> Option<&Binding> {
+    pub(super) fn resolve_unqualified_relation(&self, relation: &ObjectName) -> Option<&Binding> {
         if relation.0.len() != 1 {
             return None;
         }
@@ -204,7 +201,7 @@ impl ScopeStack {
 
     fn push_scope(&mut self, parent: Option<ScopeId>, kind: ScopeKind) -> ScopeId {
         let id = ScopeId(self.scopes.len());
-        self.scopes.push(RelationScope::new(id, parent, kind));
+        self.scopes.push(Scope::new(id, parent, kind));
         self.stack.push(id);
         id
     }
@@ -217,7 +214,7 @@ impl ScopeStack {
         }
     }
 
-    fn current_scope_mut(&mut self) -> &mut RelationScope {
+    fn current_scope_mut(&mut self) -> &mut Scope {
         let id = self.current_scope_id();
         &mut self.scopes[id.0]
     }
@@ -230,14 +227,14 @@ pub(super) fn is_synthetic_binding(binding: &Binding) -> bool {
     )
 }
 
-pub(super) fn binding_alias_key(binding: &Binding) -> RelationKey {
+pub(super) fn binding_alias_key(binding: &Binding) -> BindingKey {
     match binding {
         Binding::Table { table, alias, .. } => {
-            RelationKey::from_ident(alias.as_ref().unwrap_or(&table.name))
+            BindingKey::from_ident(alias.as_ref().unwrap_or(&table.name))
         }
-        Binding::Cte { name, .. } => RelationKey::from_ident(name),
+        Binding::Cte { name, .. } => BindingKey::from_ident(name),
         Binding::DerivedTable { alias, .. } | Binding::TableFunction { alias, .. } => {
-            RelationKey::from_ident(alias)
+            BindingKey::from_ident(alias)
         }
     }
 }
@@ -269,7 +266,7 @@ fn schema_could_contain(schema: &RelationSchema, name: &Ident) -> bool {
         RelationSchema::Unknown => true,
         RelationSchema::Known(cols) => cols
             .iter()
-            .any(|c| RelationKey::from_ident(&c.name) == RelationKey::from_ident(name)),
+            .any(|c| BindingKey::from_ident(&c.name) == BindingKey::from_ident(name)),
     }
 }
 
@@ -281,9 +278,9 @@ pub(super) fn synthetic_table_ref(name: &Ident) -> TableReference {
     }
 }
 
-// ───────── RelationResolver binding-related methods ─────────
+// ───────── Resolver binding-related methods ─────────
 
-impl<'a> RelationResolver<'a> {
+impl<'a> Resolver<'a> {
     pub(super) fn scopes(&self) -> &ScopeStack {
         &self.scopes
     }
@@ -429,9 +426,9 @@ impl<'a> RelationResolver<'a> {
     }
 }
 
-// ───────── RelationResolution binding-related queries ─────────
+// ───────── Resolution binding-related queries ─────────
 
-impl RelationResolution {
+impl Resolution {
     /// All tables touched by the statement, in scope-arena order. The
     /// union of [`Self::read_tables`] and [`Self::write_tables`] (with
     /// duplicates when a single table carries both roles).

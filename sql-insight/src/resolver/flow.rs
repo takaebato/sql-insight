@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::extractor::column_operation_extractor::ColumnFlowKind;
 use crate::relation::TableReference;
 
-use super::{ProjectionGroup, ProjectionItem, RawColumnRef, RelationResolver, ResolvedQuery};
+use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolver};
 
 /// A pre-resolution column flow record. `source` still needs
 /// scope-chain resolution (for unqualified parts); `target` is fully
@@ -43,7 +43,7 @@ pub(crate) enum FlowTargetSpec {
     },
 }
 
-impl<'a> RelationResolver<'a> {
+impl<'a> Resolver<'a> {
     pub(super) fn push_flow_edge(&mut self, edge: FlowEdge) {
         self.flow_edges.push(edge);
     }

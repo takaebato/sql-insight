@@ -5,15 +5,15 @@
 
 use crate::extractor::column_operation_extractor::ReadKind;
 
-use super::{RelationResolver, ScopeKind};
+use super::{Resolver, ScopeKind};
 
 /// Walking-context state that varies lexically as the resolver walks
 /// expressions and clauses. All fields are `Copy`, so the whole
 /// struct is saved / restored cheaply around closure-scoped helpers
-/// ([`RelationResolver::with_read_kind`],
-/// [`RelationResolver::with_filter_clause`],
-/// [`RelationResolver::with_case_condition`]) via
-/// [`RelationResolver::with_context`].
+/// ([`Resolver::with_read_kind`],
+/// [`Resolver::with_filter_clause`],
+/// [`Resolver::with_case_condition`]) via
+/// [`Resolver::with_context`].
 ///
 /// - `scope_kind` is stamped onto every scope pushed while this is in
 ///   effect. Default `Body`; flipped to `Predicate` by filter-clause
@@ -47,7 +47,7 @@ impl Default for VisitContext {
     }
 }
 
-impl<'a> RelationResolver<'a> {
+impl<'a> Resolver<'a> {
     /// Push a fresh scope, run `f`, then pop it. Use around each
     /// branch of a `SetExpr::SetOperation` so the branches' FROM
     /// bindings don't shadow each other and unqualified column refs

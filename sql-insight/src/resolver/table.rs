@@ -1,4 +1,4 @@
-use super::{RelationResolver, RelationSchema, TableRole};
+use super::{RelationSchema, Resolver, TableRole};
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
@@ -6,7 +6,7 @@ use sqlparser::ast::{
     TableSampleKind, TableWithJoins,
 };
 
-impl<'a> RelationResolver<'a> {
+impl<'a> Resolver<'a> {
     /// Visit a `TableWithJoins`. `role` applies only to the head relation;
     /// joined tables are always read-position (a write target makes no
     /// sense in a JOIN for any of our statement kinds).

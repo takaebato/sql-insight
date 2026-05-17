@@ -7,7 +7,7 @@ use core::fmt;
 use crate::diagnostic::Diagnostic;
 use crate::error::Error;
 pub use crate::relation::TableReference;
-use crate::resolver::RelationResolver;
+use crate::resolver::Resolver;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -98,7 +98,7 @@ impl TableExtractor {
     pub fn extract_from_statement(statement: &Statement) -> Result<TableExtraction, Error> {
         // The legacy table-extraction API does not surface columns, so a
         // catalog would not influence its output; pass `None`.
-        let resolution = RelationResolver::resolve_statement(None, statement)?;
+        let resolution = Resolver::resolve_statement(None, statement)?;
         Ok(TableExtraction {
             tables: resolution.tables(),
             diagnostics: resolution.diagnostics,

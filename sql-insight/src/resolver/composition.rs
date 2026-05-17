@@ -1,16 +1,16 @@
-//! Post-walk passes on `RelationResolution`:
+//! Post-walk passes on `Resolution`:
 //!
-//! - [`RelationResolution::composed_flow_edges`] rewrites each flow
+//! - [`Resolution::composed_flow_edges`] rewrites each flow
 //!   edge so its source resolves to a real (non-synthetic) reference
 //!   by walking back through CTE / derived body projections.
-//! - [`RelationResolution::real_column_refs`] filters out refs whose
+//! - [`Resolution::real_column_refs`] filters out refs whose
 //!   walk-time owner was synthetic, so the public `reads` surface
 //!   only shows real-storage references and unresolved names.
 
 use crate::extractor::column_operation_extractor::ColumnFlowKind;
 
-use super::binding::{binding_alias_key, RelationKey};
-use super::{Binding, FlowEdge, RawColumnRef, RelationResolution};
+use super::binding::{binding_alias_key, BindingKey};
+use super::{Binding, FlowEdge, RawColumnRef, Resolution};
 
 /// Recursion ceiling for `substitute_source` — guards against
 /// accidental cycles (recursive CTEs are pre-bound with empty
@@ -18,8 +18,8 @@ use super::{Binding, FlowEdge, RawColumnRef, RelationResolution};
 /// defence for unexpected loops).
 const MAX_COMPOSITION_DEPTH: usize = 64;
 
-impl RelationResolution {
-    /// Filter [`column_refs`](RelationResolution::column_refs) down
+impl Resolution {
+    /// Filter [`column_refs`](Resolution::column_refs) down
     /// to "real reads": references whose walk-time owning binding was
     /// a `Table` (or unresolved). Refs that pointed at a synthetic
     /// intermediate (`Cte` / `DerivedTable` / `TableFunction`) are
@@ -83,14 +83,14 @@ impl RelationResolution {
         let Some(col_name) = raw.parts.last() else {
             return vec![(raw.clone(), outer_kind)];
         };
-        let key = RelationKey::from_ident(col_name);
+        let key = BindingKey::from_ident(col_name);
         let mut result = Vec::new();
         for group in body_projections {
             for item in &group.items {
                 let matches = item
                     .name
                     .as_ref()
-                    .is_some_and(|n| RelationKey::from_ident(n) == key);
+                    .is_some_and(|n| BindingKey::from_ident(n) == key);
                 if !matches {
                     continue;
                 }
@@ -118,7 +118,7 @@ impl RelationResolution {
             return None;
         }
         let table = raw.resolved.as_ref()?;
-        let key = RelationKey::from_ident(&table.name);
+        let key = BindingKey::from_ident(&table.name);
         let mut current = Some(raw.scope_id);
         while let Some(id) = current {
             let scope = &self.scopes[id.0];

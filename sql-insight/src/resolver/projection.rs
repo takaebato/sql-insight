@@ -6,7 +6,7 @@ use sqlparser::ast::{Expr, Function, FunctionArguments, Ident, ObjectName, Selec
 
 use crate::extractor::column_operation_extractor::ColumnFlowKind;
 
-use super::{RawColumnRef, RelationResolver};
+use super::{RawColumnRef, Resolver};
 
 /// One SELECT's projection captured during the walk — one
 /// [`ProjectionItem`] per output column, in projection order. Set
@@ -33,7 +33,7 @@ pub(crate) struct ProjectionItem {
     pub(crate) kind: ColumnFlowKind,
 }
 
-impl<'a> RelationResolver<'a> {
+impl<'a> Resolver<'a> {
     /// Push a fully-built `ProjectionGroup` into the active query's
     /// projection buffer. Called by `visit_select` once per SELECT
     /// body.

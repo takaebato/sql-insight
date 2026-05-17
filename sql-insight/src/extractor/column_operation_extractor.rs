@@ -74,7 +74,7 @@ use crate::extractor::operation_extractor::{
     OperationDiagnostic, OperationDiagnosticCode, StatementKind,
 };
 use crate::relation::TableReference;
-use crate::resolver::{FlowTargetSpec, RawColumnRef, RelationResolution, RelationResolver};
+use crate::resolver::{FlowTargetSpec, RawColumnRef, Resolution, Resolver};
 use sqlparser::ast::{AssignmentTarget, Ident, Statement, TableFactor};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -281,7 +281,7 @@ impl ColumnOperationExtractor {
             });
         }
 
-        let resolution = RelationResolver::resolve_statement(catalog, statement)?;
+        let resolution = Resolver::resolve_statement(catalog, statement)?;
         let reads = collect_reads(&resolution);
         let writes = collect_writes(statement, &resolution)?;
         let flows = extract_flows(&resolution);
@@ -299,7 +299,7 @@ impl ColumnOperationExtractor {
 /// Map the resolver's pre-built `flow_edges` 1:1 to public
 /// `ColumnFlow`. Sources go through scope-chain resolution; targets
 /// are already fully spec'd by the resolver.
-fn extract_flows(resolution: &RelationResolution) -> Vec<ColumnFlow> {
+fn extract_flows(resolution: &Resolution) -> Vec<ColumnFlow> {
     resolution
         .flow_edges
         .iter()
@@ -331,7 +331,7 @@ fn extract_flows(resolution: &RelationResolution) -> Vec<ColumnFlow> {
 /// a 1:1 read of `(resolved, parts.last())`. Refs whose owning
 /// binding was synthetic at walk time are dropped upstream by the
 /// resolver itself before they reach the extractor — see
-/// `RelationResolution::real_column_refs`.
+/// `Resolution::real_column_refs`.
 fn resolve_raw_ref(raw: &RawColumnRef) -> Option<ColumnReference> {
     let name = raw.parts.last()?.clone();
     Some(ColumnReference {
@@ -340,7 +340,7 @@ fn resolve_raw_ref(raw: &RawColumnRef) -> Option<ColumnReference> {
     })
 }
 
-fn collect_reads(resolution: &RelationResolution) -> Vec<ColumnRead> {
+fn collect_reads(resolution: &Resolution) -> Vec<ColumnRead> {
     resolution
         .column_refs
         .iter()
@@ -400,7 +400,7 @@ fn column_ref_from_parts(parts: &[Ident]) -> Option<ColumnReference> {
 /// MERGE WHEN clause writes are deferred.
 fn collect_writes(
     statement: &Statement,
-    resolution: &RelationResolution,
+    resolution: &Resolution,
 ) -> Result<Vec<ColumnWrite>, Error> {
     let mut writes = Vec::new();
     match statement {
@@ -504,7 +504,7 @@ fn collect_writes(
 fn created_writes(
     target: &TableReference,
     explicit: &[Ident],
-    resolution: &RelationResolution,
+    resolution: &Resolution,
 ) -> Vec<ColumnWrite> {
     if !explicit.is_empty() {
         return explicit
@@ -525,10 +525,7 @@ fn created_writes(
 /// name. Used by both CREATE-as-style writes derivation and INSERT
 /// without an explicit column list (where the catalog-provided
 /// schema let the resolver pair source projections positionally).
-fn persisted_target_writes(
-    target: &TableReference,
-    resolution: &RelationResolution,
-) -> Vec<ColumnWrite> {
+fn persisted_target_writes(target: &TableReference, resolution: &Resolution) -> Vec<ColumnWrite> {
     let mut seen: Vec<Ident> = Vec::new();
     for edge in &resolution.flow_edges {
         if let FlowTargetSpec::Persisted { table, column } = &edge.target {

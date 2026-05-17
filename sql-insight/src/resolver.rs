@@ -1,14 +1,14 @@
 //! Walks a `sqlparser` `Statement` once and produces a
-//! [`RelationResolution`] carrying scope bindings, captured column
+//! [`Resolution`] carrying scope bindings, captured column
 //! references, and flow edges. Two post-passes
-//! ([`RelationResolution::composed_flow_edges`] and
-//! [`RelationResolution::real_column_refs`]) refine the raw walk
+//! ([`Resolution::composed_flow_edges`] and
+//! [`Resolution::real_column_refs`]) refine the raw walk
 //! data into the public extraction surfaces.
 //!
 //! Module layout (all sub-modules are crate-internal):
 //!
 //! - [`binding`]: scope arena, `Binding` enum, scope traversal,
-//!   binder methods on `RelationResolver`.
+//!   binder methods on `Resolver`.
 //! - [`context`]: `VisitContext` and the scoped `with_*` helpers
 //!   that mutate it.
 //! - [`column_ref`]: `RawColumnRef` and walk-time resolution of
@@ -21,7 +21,7 @@
 //!   sources and filter synthetic reads.
 //! - [`rename`]: CTE / derived column-alias renaming.
 //! - Walker modules ([`expr`], [`query`], [`statement`], [`table`]):
-//!   `visit_*` methods on `RelationResolver`, one per major AST
+//!   `visit_*` methods on `Resolver`, one per major AST
 //!   region.
 
 mod binding;
@@ -37,9 +37,7 @@ mod query;
 mod statement;
 mod table;
 
-pub(crate) use binding::{
-    Binding, Column, RelationScope, RelationSchema, ScopeId, ScopeKind, TableRole,
-};
+pub(crate) use binding::{Binding, Column, RelationSchema, Scope, ScopeId, ScopeKind, TableRole};
 pub(crate) use column_ref::RawColumnRef;
 pub(crate) use context::VisitContext;
 pub(crate) use flow::{FlowEdge, FlowTargetSpec};
@@ -51,11 +49,11 @@ pub(crate) use projection::{ProjectionGroup, ProjectionItem};
 pub(crate) use crate::extractor::column_operation_extractor::ReadKind;
 
 // Internal helpers used by walkers via `super::*`. Some are
-// resolver-internal infrastructure (`RelationKey`, `ScopeStack`,
+// resolver-internal infrastructure (`BindingKey`, `ScopeStack`,
 // binding helpers); rename helpers are surfaced for the CTE /
 // derived-table walkers in walker/query.rs and walker/table.rs.
-pub(super) use rename::{rename_projection_groups, rename_relation_schema};
 use binding::ScopeStack;
+pub(super) use rename::{rename_projection_groups, rename_relation_schema};
 
 use sqlparser::ast::Statement;
 
@@ -66,20 +64,20 @@ use crate::error::Error;
 /// The end-of-walk result the resolver produces. Holds the scope
 /// arena and the raw column refs / flow edges collected during the
 /// walk, plus accumulated diagnostics. Two post-passes inside
-/// [`RelationResolver::into_relation_resolution`] refine
+/// [`Resolver::into_resolution`] refine
 /// `column_refs` and `flow_edges` before the resolution leaves the
 /// resolver.
 #[derive(Debug)]
 #[allow(dead_code)]
-pub(crate) struct RelationResolution {
+pub(crate) struct Resolution {
     pub(crate) diagnostics: Vec<Diagnostic>,
-    pub(crate) scopes: Vec<RelationScope>,
+    pub(crate) scopes: Vec<Scope>,
     /// Column refs that survive the synthetic-binding filter (see
-    /// [`RelationResolution::real_column_refs`]).
+    /// [`Resolution::real_column_refs`]).
     pub(crate) column_refs: Vec<RawColumnRef>,
     /// Flow edges after end-to-end composition through CTE / derived
     /// intermediates (see
-    /// [`RelationResolution::composed_flow_edges`]).
+    /// [`Resolution::composed_flow_edges`]).
     pub(crate) flow_edges: Vec<FlowEdge>,
 }
 
@@ -104,7 +102,7 @@ pub(crate) struct ResolvedQuery {
 /// across the sub-modules — this is just the data shape and the
 /// top-level entry point.
 #[derive(Debug)]
-pub(crate) struct RelationResolver<'a> {
+pub(crate) struct Resolver<'a> {
     /// `None` means the resolver runs without external schema
     /// enrichment; table schemas stay `RelationSchema::Unknown` in
     /// that case.
@@ -124,7 +122,7 @@ pub(crate) struct RelationResolver<'a> {
     ctx: VisitContext,
 }
 
-impl<'a> RelationResolver<'a> {
+impl<'a> Resolver<'a> {
     fn new(catalog: Option<&'a dyn Catalog>) -> Self {
         Self {
             catalog,
@@ -140,14 +138,14 @@ impl<'a> RelationResolver<'a> {
     pub(crate) fn resolve_statement(
         catalog: Option<&'a dyn Catalog>,
         statement: &Statement,
-    ) -> Result<RelationResolution, Error> {
+    ) -> Result<Resolution, Error> {
         let mut resolver = Self::new(catalog);
         resolver.visit_statement(statement)?;
-        Ok(resolver.into_relation_resolution())
+        Ok(resolver.into_resolution())
     }
 
-    fn into_relation_resolution(self) -> RelationResolution {
-        let mut resolution = RelationResolution {
+    fn into_resolution(self) -> Resolution {
+        let mut resolution = Resolution {
             diagnostics: self.diagnostics,
             scopes: self.scopes.into_scopes(),
             column_refs: self.column_refs,
@@ -198,13 +196,13 @@ mod tests {
         }
     }
 
-    fn resolve(sql: &str, catalog: Option<&dyn Catalog>) -> RelationResolution {
+    fn resolve(sql: &str, catalog: Option<&dyn Catalog>) -> Resolution {
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql).unwrap();
-        RelationResolver::resolve_statement(catalog, &statements[0]).unwrap()
+        Resolver::resolve_statement(catalog, &statements[0]).unwrap()
     }
 
-    fn first_table_schema(resolution: &RelationResolution) -> Option<&RelationSchema> {
+    fn first_table_schema(resolution: &Resolution) -> Option<&RelationSchema> {
         resolution
             .scopes
             .iter()
