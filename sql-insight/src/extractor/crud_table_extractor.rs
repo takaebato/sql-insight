@@ -161,6 +161,22 @@ mod tests {
         }
     }
 
+    fn table(name: &str) -> TableReference {
+        TableReference {
+            catalog: None,
+            schema: None,
+            name: name.into(),
+        }
+    }
+
+    fn catalog_schema_table(catalog: &str, schema: &str, name: &str) -> TableReference {
+        TableReference {
+            catalog: Some(catalog.into()),
+            schema: Some(schema.into()),
+            name: name.into(),
+        }
+    }
+
     mod basic {
         use super::*;
 
@@ -169,11 +185,7 @@ mod tests {
             let sql = "SELECT a FROM t1";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
+                read_tables: vec![table("t1")],
                 update_tables: vec![],
                 delete_tables: vec![],
             })];
@@ -186,21 +198,13 @@ mod tests {
             let expected = vec![
                 Ok(CrudTables {
                     create_tables: vec![],
-                    read_tables: vec![TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                    }],
+                    read_tables: vec![table("t1")],
                     update_tables: vec![],
                     delete_tables: vec![],
                 }),
                 Ok(CrudTables {
                     create_tables: vec![],
-                    read_tables: vec![TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                    }],
+                    read_tables: vec![table("t2")],
                     update_tables: vec![],
                     delete_tables: vec![],
                 }),
@@ -213,11 +217,7 @@ mod tests {
             let sql = "SELECT a FROM t1 AS t1_alias";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
+                read_tables: vec![table("t1")],
                 update_tables: vec![],
                 delete_tables: vec![],
             })];
@@ -229,11 +229,7 @@ mod tests {
             let sql = "SELECT a FROM catalog.schema.table";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![TableReference {
-                    catalog: Some("catalog".into()),
-                    schema: Some("schema".into()),
-                    name: "table".into(),
-                }],
+                read_tables: vec![catalog_schema_table("catalog", "schema", "table")],
                 update_tables: vec![],
                 delete_tables: vec![],
             })];
@@ -245,11 +241,7 @@ mod tests {
             let sql = "SELECT a FROM catalog.schema.table AS table_alias";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![TableReference {
-                    catalog: Some("catalog".into()),
-                    schema: Some("schema".into()),
-                    name: "table".into(),
-                }],
+                read_tables: vec![catalog_schema_table("catalog", "schema", "table")],
                 update_tables: vec![],
                 delete_tables: vec![],
             })];
@@ -261,11 +253,7 @@ mod tests {
             let sql = "WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
+                read_tables: vec![table("t1")],
                 update_tables: vec![],
                 delete_tables: vec![],
             })];
@@ -294,11 +282,7 @@ mod tests {
                 create_tables: vec![],
                 read_tables: vec![],
                 update_tables: vec![],
-                delete_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
+                delete_tables: vec![table("t1")],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -310,11 +294,7 @@ mod tests {
                 create_tables: vec![],
                 read_tables: vec![],
                 update_tables: vec![],
-                delete_tables: vec![TableReference {
-                    catalog: Some("catalog".into()),
-                    schema: Some("schema".into()),
-                    name: "t1".into(),
-                }],
+                delete_tables: vec![catalog_schema_table("catalog", "schema", "t1")],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -326,11 +306,7 @@ mod tests {
                 create_tables: vec![],
                 read_tables: vec![],
                 update_tables: vec![],
-                delete_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
+                delete_tables: vec![table("t1")],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -340,36 +316,9 @@ mod tests {
             let sql = "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t3".into(),
-                    },
-                ],
+                read_tables: vec![table("t1"), table("t2"), table("t3")],
                 update_tables: vec![],
-                delete_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                    },
-                ],
+                delete_tables: vec![table("t1"), table("t2")],
             })];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_crud_table_extraction(
@@ -385,36 +334,9 @@ mod tests {
                 "DELETE t1_alias, t2_alias FROM t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t3".into(),
-                    },
-                ],
+                read_tables: vec![table("t1"), table("t2"), table("t3")],
                 update_tables: vec![],
-                delete_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                    },
-                ],
+                delete_tables: vec![table("t1"), table("t2")],
             })];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_crud_table_extraction(
@@ -429,36 +351,9 @@ mod tests {
             let sql = "DELETE FROM t1, t2 USING t1 INNER JOIN t2 INNER JOIN t3";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t3".into(),
-                    },
-                ],
+                read_tables: vec![table("t1"), table("t2"), table("t3")],
                 update_tables: vec![],
-                delete_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                    },
-                ],
+                delete_tables: vec![table("t1"), table("t2")],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -468,36 +363,9 @@ mod tests {
             let sql = "DELETE FROM t1_alias, t2_alias USING t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t3".into(),
-                    },
-                ],
+                read_tables: vec![table("t1"), table("t2"), table("t3")],
                 update_tables: vec![],
-                delete_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                    },
-                ],
+                delete_tables: vec![table("t1"), table("t2")],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -510,11 +378,7 @@ mod tests {
         fn test_insert_statement() {
             let sql = "INSERT INTO t1 (a) VALUES (1)";
             let expected = vec![Ok(CrudTables {
-                create_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
+                create_tables: vec![table("t1")],
                 read_tables: vec![],
                 update_tables: vec![],
                 delete_tables: vec![],
@@ -526,23 +390,8 @@ mod tests {
         fn test_insert_select_statement() {
             let sql = "INSERT INTO t1 (a) SELECT a FROM t2 AS t2_alias INNER JOIN t3 USING (id)";
             let expected = vec![Ok(CrudTables {
-                create_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
-                read_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t3".into(),
-                    },
-                ],
+                create_tables: vec![table("t1")],
+                read_tables: vec![table("t2"), table("t3")],
                 update_tables: vec![],
                 delete_tables: vec![],
             })];
@@ -562,11 +411,7 @@ mod tests {
                 vec![Ok(CrudTables {
                     create_tables: vec![],
                     read_tables: vec![],
-                    update_tables: vec![TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                    }],
+                    update_tables: vec![table("t1")],
                     delete_tables: vec![],
                 }),]
             )
@@ -581,23 +426,8 @@ mod tests {
             let sql = "UPDATE t1 AS t1_alias INNER JOIN t2 ON t1_alias.a = t2.a SET t1_alias.b = t2.b WHERE t2.c = (SELECT c FROM t3)";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t3".into(),
-                    },
-                ],
-                update_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
+                read_tables: vec![table("t2"), table("t3")],
+                update_tables: vec![table("t1")],
                 delete_tables: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
@@ -614,26 +444,10 @@ mod tests {
                          WHEN MATCHED AND t2_alias.b = 2 THEN UPDATE SET t1_alias.b = t2_alias.b \
                          WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2_alias.a, t2_alias.b)";
             let expected = vec![Ok(CrudTables {
-                create_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
-                read_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                }],
-                update_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
-                delete_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
+                create_tables: vec![table("t1")],
+                read_tables: vec![table("t2")],
+                update_tables: vec![table("t1")],
+                delete_tables: vec![table("t1")],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -647,11 +461,7 @@ mod tests {
             let sql = "CREATE TABLE t1 (a INT)";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
+                read_tables: vec![table("t1")],
                 update_tables: vec![],
                 delete_tables: vec![],
             })];
@@ -663,11 +473,7 @@ mod tests {
             let sql = "ALTER TABLE t1 ADD COLUMN a INT";
             let expected = vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                }],
+                read_tables: vec![table("t1")],
                 update_tables: vec![],
                 delete_tables: vec![],
             })];
