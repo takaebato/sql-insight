@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use crate::catalog::{Catalog, ColumnSchema};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::error::Error;
+use crate::extractor::column_operation_extractor::ReadKind;
 use crate::relation::TableReference;
 use sqlparser::ast::{Ident, ObjectName, Statement};
 
@@ -152,6 +153,11 @@ pub(crate) struct RawColumnRef {
     /// filtering and flow composition. `false` when `resolved` is
     /// `None`.
     pub(crate) synthetic: bool,
+    /// SQL-clause role(s) this reference plays — captured from the
+    /// resolver's `pending_read_kind` at record time. Typically a
+    /// single element; future multi-role cases (USING expansion etc.)
+    /// may extend.
+    pub(crate) kinds: Vec<ReadKind>,
 }
 
 impl RelationResolution {
@@ -632,6 +638,13 @@ pub(crate) struct RelationResolver<'a> {
     /// [`with_scope_kind`] for the duration of their child walk so that
     /// subqueries nested inside those clauses inherit the right kind.
     pending_scope_kind: ScopeKind,
+    /// Kind stamped on `column_refs` recorded during the next walk.
+    /// Defaults to `Projection`; filter-clause walkers
+    /// (WHERE/HAVING/QUALIFY/JOIN ON/etc.) flip it via
+    /// [`with_filter_clause`] for the duration of the clause walk.
+    /// Reset to `Projection` on `resolve_query` entry so subqueries
+    /// don't inherit the enclosing clause's kind for their own bodies.
+    pending_read_kind: ReadKind,
 }
 
 impl<'a> RelationResolver<'a> {
@@ -644,6 +657,7 @@ impl<'a> RelationResolver<'a> {
             flow_edges: Vec::new(),
             current_projections: Vec::new(),
             pending_scope_kind: ScopeKind::Body,
+            pending_read_kind: ReadKind::Projection,
         }
     }
 
@@ -721,6 +735,7 @@ impl<'a> RelationResolver<'a> {
             scope_id,
             resolved,
             synthetic,
+            kinds: vec![self.pending_read_kind],
         });
     }
 
@@ -818,6 +833,33 @@ impl<'a> RelationResolver<'a> {
         let r = f(self);
         self.pending_scope_kind = prev;
         r
+    }
+
+    /// Temporarily stamp recorded refs with `kind`, then restore. Use
+    /// around any walk where the syntactic clause changes — projection
+    /// items (default `Projection`), filter clauses (`Filter`), etc.
+    pub(crate) fn with_read_kind<R>(
+        &mut self,
+        kind: ReadKind,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let prev = std::mem::replace(&mut self.pending_read_kind, kind);
+        let r = f(self);
+        self.pending_read_kind = prev;
+        r
+    }
+
+    /// Convenience for walking a filter-position clause: stamps both
+    /// `pending_read_kind = Filter` (so column refs land with the
+    /// `Filter` kind) AND `pending_scope_kind = Predicate` (so any
+    /// subquery pushed inside is classified as a predicate scope and
+    /// thus excluded from table-flow). Used for WHERE, HAVING,
+    /// QUALIFY, JOIN ON, AsOf match, MERGE ON, CONNECT BY, pipe
+    /// `|> WHERE`, etc.
+    pub(crate) fn with_filter_clause<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.with_read_kind(ReadKind::Filter, |r| {
+            r.with_scope_kind(ScopeKind::Predicate, f)
+        })
     }
 
     pub(crate) fn resolve_statement(

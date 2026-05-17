@@ -301,7 +301,7 @@ impl<'a> RelationResolver<'a> {
                 }
                 Ok(())
             }
-            PipeOperator::Where { expr } => self.visit_expr(expr),
+            PipeOperator::Where { expr } => self.with_filter_clause(|r| r.visit_expr(expr)),
             PipeOperator::OrderBy { exprs } => {
                 for expr in exprs {
                     self.visit_order_by_expr(expr)?;

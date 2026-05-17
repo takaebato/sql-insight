@@ -1,6 +1,6 @@
 use super::{
     Column, ProjectionGroup, ProjectionItem, RelationResolver, RelationSchema, ResolvedQuery,
-    ScopeKind, TableRole,
+    TableRole,
 };
 use crate::error::Error;
 use crate::relation::TableReference;
@@ -16,6 +16,12 @@ impl<'a> RelationResolver<'a> {
         // return — so each ResolvedQuery owns exactly its own groups
         // without leaking into siblings or ancestors.
         let prev_projections = std::mem::take(&mut self.current_projections);
+        // Reset pending_read_kind to Projection inside this query body
+        // so a surrounding clause's kind (e.g. Filter, when this is a
+        // predicate subquery) doesn't taint the inner query's own
+        // projection refs.
+        let prev_read_kind =
+            std::mem::replace(&mut self.pending_read_kind, super::ReadKind::Projection);
         if let Some(with) = &query.with {
             if with.recursive {
                 for cte in &with.cte_tables {
@@ -66,6 +72,7 @@ impl<'a> RelationResolver<'a> {
         }
         self.scopes.pop_scope();
         let projections = std::mem::replace(&mut self.current_projections, prev_projections);
+        self.pending_read_kind = prev_read_kind;
         Ok(ResolvedQuery {
             scope_id,
             output_schema: body_schema,
@@ -161,13 +168,13 @@ impl<'a> RelationResolver<'a> {
         .into_iter()
         .flatten()
         {
-            self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(expr))?;
+            self.with_filter_clause(|r| r.visit_expr(expr))?;
         }
         for connect_by in &select.connect_by {
             // CONNECT BY / START WITH are predicate-style hierarchical
             // join conditions (Oracle / Snowflake) — subqueries nested
             // here do not feed the enclosing write target.
-            self.with_scope_kind(ScopeKind::Predicate, |r| match connect_by {
+            self.with_filter_clause(|r| match connect_by {
                 ConnectByKind::ConnectBy { relationships, .. } => r.visit_exprs(relationships),
                 ConnectByKind::StartWith { condition, .. } => r.visit_expr(condition),
             })?;

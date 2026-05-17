@@ -1,4 +1,4 @@
-use super::{FlowEdge, FlowTargetSpec, RelationResolver, ScopeKind, TableRole};
+use super::{FlowEdge, FlowTargetSpec, RelationResolver, TableRole};
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
@@ -295,7 +295,7 @@ impl<'a> RelationResolver<'a> {
             }
         }
         if let Some(selection) = &update.selection {
-            self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(selection))?;
+            self.with_filter_clause(|r| r.visit_expr(selection))?;
         }
         Ok(())
     }
@@ -331,7 +331,7 @@ impl<'a> RelationResolver<'a> {
             self.bind_base_table(TableReference::try_from_name(name)?, None, TableRole::Write);
         }
         if let Some(selection) = &delete.selection {
-            self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(selection))?;
+            self.with_filter_clause(|r| r.visit_expr(selection))?;
         }
         Ok(())
     }
@@ -339,10 +339,10 @@ impl<'a> RelationResolver<'a> {
     fn visit_merge(&mut self, merge: &Merge) -> Result<(), Error> {
         self.visit_table_factor(&merge.table, TableRole::Write)?;
         self.visit_table_factor(&merge.source, TableRole::Read)?;
-        self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(&merge.on))?;
+        self.with_filter_clause(|r| r.visit_expr(&merge.on))?;
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
-                self.with_scope_kind(ScopeKind::Predicate, |r| r.visit_expr(predicate))?;
+                self.with_filter_clause(|r| r.visit_expr(predicate))?;
             }
         }
         Ok(())

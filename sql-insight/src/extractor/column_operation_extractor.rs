@@ -17,7 +17,12 @@
 //!   surfaces). References whose walk-time owning binding was a CTE,
 //!   derived table, or table function (synthetic intermediates, not
 //!   real storage) are dropped from reads — only references to real
-//!   tables or unresolved names surface.
+//!   tables or unresolved names surface. Each `ColumnRead` carries a
+//!   `kinds: Vec<ReadKind>` recording the syntactic clause(s) the
+//!   reference appeared in (`Projection` for SELECT list / UPDATE SET
+//!   RHS / etc., `Filter` for WHERE / HAVING / JOIN ON / MERGE ON /
+//!   CONNECT BY / pipe `|> WHERE`). Typically `len == 1`; multi-role
+//!   refs (USING / NATURAL JOIN merged columns) are future work.
 //! - `writes`: INSERT explicit column lists scoped to the INSERT
 //!   target, and UPDATE SET targets scoped to the UPDATE table.
 //!   Projection-derived writes (CTAS / CREATE VIEW / MERGE actions)
@@ -101,10 +106,31 @@ pub struct ColumnReference {
     pub name: Ident,
 }
 
-/// A column referenced as a Read source.
+/// A column referenced as a Read source. `kinds` records the SQL
+/// clauses this reference appeared in (its syntactic role). Most refs
+/// surface a single kind, but the field is `Vec` to leave room for
+/// future cases where one ref carries multiple roles (e.g.
+/// `USING` / `NATURAL JOIN` merged columns, which are both projection
+/// and join keys). Order is walk order, duplicates suppressed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnRead {
     pub column: ColumnReference,
+    pub kinds: Vec<ReadKind>,
+}
+
+/// SQL-clause role of a [`ColumnRead`]. Captured at walk time from
+/// the clause the reference appeared in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ReadKind {
+    /// Ref appeared in a value-producing position — SELECT projection,
+    /// UPDATE SET right-hand side, INSERT VALUES expr, INSERT source
+    /// SELECT projection, scalar subquery's projection.
+    Projection,
+    /// Ref appeared in a row-selection clause — WHERE, HAVING,
+    /// QUALIFY, JOIN ON, AsOf match condition, MERGE ON,
+    /// CONNECT BY / START WITH, pipe-operator `|> WHERE`, etc.
+    Filter,
 }
 
 /// A column that the statement writes to — an INSERT target column,
@@ -283,8 +309,13 @@ fn collect_reads(resolution: &RelationResolution) -> Vec<ColumnRead> {
     resolution
         .column_refs
         .iter()
-        .filter_map(resolve_raw_ref)
-        .map(|column| ColumnRead { column })
+        .filter_map(|raw| {
+            let column = resolve_raw_ref(raw)?;
+            Some(ColumnRead {
+                column,
+                kinds: raw.kinds.clone(),
+            })
+        })
         .collect()
 }
 
@@ -415,6 +446,17 @@ mod tests {
                 table: Some(table(table_name)),
                 name: col.into(),
             },
+            kinds: vec![ReadKind::Projection],
+        }
+    }
+
+    fn filter_read(table_name: &str, col: &str) -> ColumnRead {
+        ColumnRead {
+            column: ColumnReference {
+                table: Some(table(table_name)),
+                name: col.into(),
+            },
+            kinds: vec![ReadKind::Filter],
         }
     }
 
@@ -433,8 +475,10 @@ mod tests {
                 table: None,
                 name: col.into(),
             },
+            kinds: vec![ReadKind::Projection],
         }
     }
+
 
     // ───────── reads: qualified ─────────
 
@@ -447,13 +491,14 @@ mod tests {
     #[test]
     fn qualified_join_collects_reads_from_both_sides() {
         // Resolver walks FROM (including JOIN ON) before the projection,
-        // so the predicate columns appear ahead of the projected ones.
+        // so the predicate columns appear ahead of the projected ones —
+        // and are tagged Filter while projection refs are Projection.
         let ops = extract("SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id");
         assert_eq!(
             ops.reads,
             vec![
-                read("t1", "id"),
-                read("t2", "id"),
+                filter_read("t1", "id"),
+                filter_read("t2", "id"),
                 read("t1", "a"),
                 read("t2", "b"),
             ]
@@ -475,6 +520,7 @@ mod tests {
                     table: Some(table_ref),
                     name: "a".into(),
                 },
+                kinds: vec![ReadKind::Projection],
             }]
         );
     }
@@ -482,7 +528,7 @@ mod tests {
     #[test]
     fn where_predicate_qualified_ref_is_a_read() {
         let ops = extract("SELECT t1.a FROM t1 WHERE t1.b > 0");
-        assert_eq!(ops.reads, vec![read("t1", "a"), read("t1", "b")]);
+        assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "b")]);
     }
 
     // ───────── reads: unqualified resolution ─────────
@@ -496,7 +542,7 @@ mod tests {
     #[test]
     fn unqualified_in_where_resolves_to_single_table() {
         let ops = extract("SELECT a FROM t1 WHERE b > 0");
-        assert_eq!(ops.reads, vec![read("t1", "a"), read("t1", "b")]);
+        assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "b")]);
     }
 
     #[test]
@@ -507,7 +553,11 @@ mod tests {
         let ops = extract("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id");
         assert_eq!(
             ops.reads,
-            vec![read("t1", "id"), read("t2", "id"), unresolved("a"),]
+            vec![
+                filter_read("t1", "id"),
+                filter_read("t2", "id"),
+                unresolved("a"),
+            ]
         );
     }
 
@@ -566,8 +616,9 @@ mod tests {
         // Inner subquery has its own t2 in scope; the unqualified `y`
         // inside the IN-subquery resolves to t2 even though t1 is
         // also in the outer scope. Standard SQL inner-shadows-outer.
+        // `y` is in the inner WHERE so its kind is Filter.
         let ops = extract("SELECT * FROM t1 WHERE id IN (SELECT id FROM t2 WHERE y > 0)");
-        assert!(ops.reads.contains(&read("t2", "y")));
+        assert!(ops.reads.contains(&filter_read("t2", "y")));
     }
 
     #[test]
@@ -632,11 +683,17 @@ mod tests {
 
     #[test]
     fn update_set_rhs_qualified_ref_is_a_read() {
+        // SET RHS is value-producing (Projection-like); WHERE refs are
+        // Filter-tagged.
         let ops = extract("UPDATE t1 SET a = t2.b FROM t2 WHERE t1.id = t2.id");
         assert_eq!(ops.writes, vec![write("t1", "a")]);
         assert_eq!(
             ops.reads,
-            vec![read("t2", "b"), read("t1", "id"), read("t2", "id")]
+            vec![
+                read("t2", "b"),
+                filter_read("t1", "id"),
+                filter_read("t2", "id"),
+            ]
         );
     }
 
@@ -645,8 +702,60 @@ mod tests {
     #[test]
     fn delete_qualified_predicate_is_a_read() {
         let ops = extract("DELETE FROM t1 WHERE t1.id = 5");
-        assert_eq!(ops.reads, vec![read("t1", "id")]);
+        assert_eq!(ops.reads, vec![filter_read("t1", "id")]);
         assert!(ops.writes.is_empty());
+    }
+
+    // ───────── read kinds (Phase 5.6a) ─────────
+
+    #[test]
+    fn same_column_in_projection_and_where_is_two_reads_with_different_kinds() {
+        // The two textual `a` references each get their own ColumnRead
+        // entry — one Projection, one Filter — preserving syntactic role
+        // per textual occurrence.
+        let ops = extract("SELECT a FROM t1 WHERE a > 0");
+        assert_eq!(ops.reads, vec![read("t1", "a"), filter_read("t1", "a"),]);
+    }
+
+    #[test]
+    fn subquery_where_ref_carries_filter_kind_not_outer_projection() {
+        // The IN-subquery's WHERE walker resets pending_read_kind to
+        // Filter inside the subquery; the outer Projection default
+        // doesn't leak in.
+        let ops = extract("SELECT a FROM t WHERE id IN (SELECT id FROM s WHERE flag = 1)");
+        // s.flag is in the inner subquery's WHERE → Filter.
+        assert!(
+            ops.reads.contains(&filter_read("s", "flag")),
+            "expected s.flag Filter in {:?}",
+            ops.reads
+        );
+        // Outer WHERE's LHS id → Filter, on t.
+        assert!(
+            ops.reads.contains(&filter_read("t", "id")),
+            "expected t.id Filter in {:?}",
+            ops.reads
+        );
+        // Inner subquery's projection id → Projection (the subquery's
+        // syntactic projection, even though it's an IN's RHS).
+        assert!(
+            ops.reads.contains(&read("s", "id")),
+            "expected s.id Projection in {:?}",
+            ops.reads
+        );
+        // Outer projection.
+        assert!(
+            ops.reads.contains(&read("t", "a")),
+            "expected t.a Projection in {:?}",
+            ops.reads
+        );
+    }
+
+    #[test]
+    fn merge_on_clause_carries_filter_kind() {
+        let ops =
+            extract("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a");
+        assert!(ops.reads.contains(&filter_read("t", "id")));
+        assert!(ops.reads.contains(&filter_read("s", "id")));
     }
 
     #[test]
