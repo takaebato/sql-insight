@@ -54,7 +54,7 @@ impl<'a> RelationResolver<'a> {
         }
         let body_schema = self.visit_set_expr(&query.body)?;
         if let Some(order_by) = &query.order_by {
-            self.visit_order_by(order_by)?;
+            self.with_read_kind(super::ReadKind::Sort, |r| r.visit_order_by(order_by))?;
         }
         if let Some(limit_clause) = &query.limit_clause {
             self.visit_limit_clause(limit_clause)?;
@@ -179,12 +179,22 @@ impl<'a> RelationResolver<'a> {
                 ConnectByKind::StartWith { condition, .. } => r.visit_expr(condition),
             })?;
         }
-        self.visit_group_by(&select.group_by)?;
-        self.visit_exprs(&select.cluster_by)?;
-        self.visit_exprs(&select.distribute_by)?;
-        for order_by in &select.sort_by {
-            self.visit_order_by_expr(order_by)?;
-        }
+        self.with_read_kind(super::ReadKind::GroupBy, |r| {
+            r.visit_group_by(&select.group_by)
+        })?;
+        // CLUSTER BY / DISTRIBUTE BY (Hive / Spark) are partitioning
+        // and clustering directives — they decide how rows group across
+        // shuffle, conceptually closer to GROUP BY than to value flow.
+        self.with_read_kind(super::ReadKind::GroupBy, |r| {
+            r.visit_exprs(&select.cluster_by)?;
+            r.visit_exprs(&select.distribute_by)
+        })?;
+        self.with_read_kind(super::ReadKind::Sort, |r| {
+            for order_by in &select.sort_by {
+                r.visit_order_by_expr(order_by)?;
+            }
+            Ok::<_, Error>(())
+        })?;
         for window in &select.named_window {
             if let NamedWindowExpr::WindowSpec(spec) = &window.1 {
                 self.visit_window_spec(spec)?;

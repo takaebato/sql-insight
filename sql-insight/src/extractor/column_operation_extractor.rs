@@ -131,6 +131,13 @@ pub enum ReadKind {
     /// QUALIFY, JOIN ON, AsOf match condition, MERGE ON,
     /// CONNECT BY / START WITH, pipe-operator `|> WHERE`, etc.
     Filter,
+    /// Ref appeared in a grouping clause — `GROUP BY` (incl. ROLLUP /
+    /// CUBE / GROUPING SETS modifiers) or pipe-operator `|> AGGREGATE`'s
+    /// GROUP BY part.
+    GroupBy,
+    /// Ref appeared in a row-ordering clause — `ORDER BY` / `SORT BY`
+    /// or pipe-operator `|> ORDER BY`.
+    Sort,
 }
 
 /// A column that the statement writes to — an INSERT target column,
@@ -460,6 +467,26 @@ mod tests {
         }
     }
 
+    fn group_by_read(table_name: &str, col: &str) -> ColumnRead {
+        ColumnRead {
+            column: ColumnReference {
+                table: Some(table(table_name)),
+                name: col.into(),
+            },
+            kinds: vec![ReadKind::GroupBy],
+        }
+    }
+
+    fn sort_read(table_name: &str, col: &str) -> ColumnRead {
+        ColumnRead {
+            column: ColumnReference {
+                table: Some(table(table_name)),
+                name: col.into(),
+            },
+            kinds: vec![ReadKind::Sort],
+        }
+    }
+
     fn write(table_name: &str, col: &str) -> ColumnWrite {
         ColumnWrite {
             column: ColumnReference {
@@ -747,6 +774,46 @@ mod tests {
             "expected t.a Projection in {:?}",
             ops.reads
         );
+    }
+
+    #[test]
+    fn group_by_ref_carries_group_by_kind() {
+        let ops = extract("SELECT a, COUNT(*) FROM t1 GROUP BY a");
+        assert_eq!(ops.reads, vec![read("t1", "a"), group_by_read("t1", "a"),]);
+    }
+
+    #[test]
+    fn order_by_ref_carries_sort_kind() {
+        let ops = extract("SELECT a FROM t1 ORDER BY b");
+        assert_eq!(ops.reads, vec![read("t1", "a"), sort_read("t1", "b"),]);
+    }
+
+    #[test]
+    fn group_by_with_having_separates_kinds() {
+        // GROUP BY a → GroupBy; HAVING COUNT(*) > 1 has no column ref;
+        // HAVING SUM(b) > 0 → b is Filter.
+        let ops = extract("SELECT a FROM t1 GROUP BY a HAVING SUM(b) > 0");
+        assert!(ops.reads.contains(&read("t1", "a"))); // projection
+        assert!(ops.reads.contains(&group_by_read("t1", "a"))); // GROUP BY
+        assert!(ops.reads.contains(&filter_read("t1", "b"))); // HAVING
+    }
+
+    #[test]
+    fn group_by_rollup_modifier_carries_group_by_kind() {
+        let ops = extract("SELECT a, b FROM t1 GROUP BY ROLLUP(a, b)");
+        assert!(ops.reads.contains(&group_by_read("t1", "a")));
+        assert!(ops.reads.contains(&group_by_read("t1", "b")));
+    }
+
+    #[test]
+    fn subquery_in_group_by_keeps_inner_projection_kind() {
+        // GROUP BY (SELECT max(z) FROM s) — the inner subquery's `z` is
+        // its own Projection, not the outer GroupBy. resolve_query
+        // resets current_read_kind on entry.
+        let ops = extract("SELECT a FROM t GROUP BY (SELECT z FROM s)");
+        assert!(ops.reads.contains(&read("s", "z")));
+        // Outer `a` projection still Projection.
+        assert!(ops.reads.contains(&read("t", "a")));
     }
 
     #[test]

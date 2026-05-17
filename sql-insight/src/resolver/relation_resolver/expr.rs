@@ -302,12 +302,12 @@ impl<'a> RelationResolver<'a> {
                 Ok(())
             }
             PipeOperator::Where { expr } => self.with_filter_clause(|r| r.visit_expr(expr)),
-            PipeOperator::OrderBy { exprs } => {
+            PipeOperator::OrderBy { exprs } => self.with_read_kind(super::ReadKind::Sort, |r| {
                 for expr in exprs {
-                    self.visit_order_by_expr(expr)?;
+                    r.visit_order_by_expr(expr)?;
                 }
-                Ok(())
-            }
+                Ok::<_, Error>(())
+            }),
             PipeOperator::Select { exprs } | PipeOperator::Extend { exprs } => {
                 for expr in exprs {
                     self.visit_select_item(expr)?;
@@ -324,13 +324,17 @@ impl<'a> RelationResolver<'a> {
                 full_table_exprs,
                 group_by_expr,
             } => {
+                // Aggregate args are Projection-position (default kind);
+                // GROUP BY part is GroupBy.
                 for expr in full_table_exprs {
                     self.visit_expr(&expr.expr.expr)?;
                 }
-                for expr in group_by_expr {
-                    self.visit_expr(&expr.expr.expr)?;
-                }
-                Ok(())
+                self.with_read_kind(super::ReadKind::GroupBy, |r| {
+                    for expr in group_by_expr {
+                        r.visit_expr(&expr.expr.expr)?;
+                    }
+                    Ok::<_, Error>(())
+                })
             }
             PipeOperator::TableSample { sample } => self.visit_table_sample(sample),
             PipeOperator::Union { queries, .. }
