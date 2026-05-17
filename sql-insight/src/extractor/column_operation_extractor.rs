@@ -1017,9 +1017,16 @@ mod tests {
 
         #[test]
         fn delete_qualified_predicate_is_a_read() {
-            let ops = extract("DELETE FROM t1 WHERE t1.id = 5");
-            assert_eq!(ops.reads, vec![filter_read("t1", "id")]);
-            assert!(ops.writes.is_empty());
+            assert_column_ops(
+                "DELETE FROM t1 WHERE t1.id = 5",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Delete,
+                    reads: vec![filter_read("t1", "id")],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
     }
 
@@ -1831,9 +1838,15 @@ mod tests {
             // The outer flow's source `id` resolves to cte, then composes
             // through the CTE body's projection back to t1.id. No
             // intermediate cte.id → out edge survives.
-            assert_flows(
+            assert_column_ops(
                 "WITH cte AS (SELECT id FROM t1) SELECT id FROM cte",
-                vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "id")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1842,12 +1855,18 @@ mod tests {
             // CTE body's `sum` is computed from a, b. Outer's bare `sum`
             // composes back into two flows, each marked Computed because
             // the body item is Computed (outer.bare && item.bare = false).
-            assert_flows(
+            assert_column_ops(
                 "WITH cte AS (SELECT a + b AS sum FROM t1) SELECT sum FROM cte",
-                vec![
-                    flow_computed(col("t1", "a"), out("sum", 0)),
-                    flow_computed(col("t1", "b"), out("sum", 0)),
-                ],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_computed(col("t1", "a"), out("sum", 0)),
+                        flow_computed(col("t1", "b"), out("sum", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1855,9 +1874,15 @@ mod tests {
         fn cte_to_insert_composes_end_to_end() {
             // Composition flows past the CTE boundary into the INSERT
             // target — t1.id → t2.x directly, no cte.id step.
-            assert_flows(
+            assert_column_ops(
                 "INSERT INTO t2 (x) WITH cte AS (SELECT id FROM t1) SELECT id FROM cte",
-                vec![flow_passthrough(col("t1", "id"), persisted("t2", "x"))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t1", "id")],
+                    writes: vec![write("t2", "x")],
+                    flows: vec![flow_passthrough(col("t1", "id"), persisted("t2", "x"))],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1868,9 +1893,15 @@ mod tests {
             // having both `a` and `b` in scope with the same column name
             // makes the unqualified form ambiguous under our scope model
             // (outer SELECT sees both CTE bindings, not just b).
-            assert_flows(
+            assert_column_ops(
                 "WITH a AS (SELECT id FROM t1), b AS (SELECT id FROM a) SELECT b.id FROM b",
-                vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "id")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1878,12 +1909,18 @@ mod tests {
         fn derived_table_composes_to_base_table() {
             // The outer projection's `col` composes through derived `d`'s
             // body (a + b AS col) into two Computed flows on t1.
-            assert_flows(
+            assert_column_ops(
                 "SELECT col FROM (SELECT a + b AS col FROM t1) d",
-                vec![
-                    flow_computed(col("t1", "a"), out("col", 0)),
-                    flow_computed(col("t1", "b"), out("col", 0)),
-                ],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_computed(col("t1", "a"), out("col", 0)),
+                        flow_computed(col("t1", "b"), out("col", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1891,27 +1928,50 @@ mod tests {
         fn cte_referenced_twice_composes_each_use() {
             // Each cte reference in the projection composes independently
             // back to t1.id.
-            assert_flows(
+            assert_column_ops(
                 "WITH cte AS (SELECT id FROM t1) SELECT cte.id AS a, cte.id AS b FROM cte",
-                vec![
-                    flow_passthrough(col("t1", "id"), out("a", 0)),
-                    flow_passthrough(col("t1", "id"), out("b", 1)),
-                ],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "id")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "id"), out("a", 0)),
+                        flow_passthrough(col("t1", "id"), out("b", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn recursive_cte_does_not_panic_and_skips_composition() {
             // Recursive CTEs don't carry body_projections (fixpoint is
-            // deferred), so composition falls back to leaving the ref
-            // pointing at the CTE binding — which is then dropped from
-            // reads as synthetic. No infinite recursion either.
-            let ops = extract(
+            // deferred), so composition falls back to leaving the flow
+            // source pointing at the CTE binding (`r.id`) rather than
+            // tracing into a base table. Reads still get the synthetic
+            // filter, so only `t1.id` from the non-recursive branch
+            // surfaces in reads. No infinite recursion either.
+            assert_column_ops(
                 "WITH RECURSIVE r AS (SELECT id FROM t1 UNION SELECT id FROM r) SELECT id FROM r",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "id")],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: Some(TableReference {
+                                catalog: None,
+                                schema: None,
+                                name: "r".into(),
+                            }),
+                            name: "id".into(),
+                        },
+                        target: out("id", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![],
+                },
             );
-            // Reads at least include t1.id from the recursive CTE's
-            // first branch.
-            assert!(ops.reads.contains(&read("t1", "id")));
         }
     }
 
