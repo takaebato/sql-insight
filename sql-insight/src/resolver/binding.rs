@@ -308,14 +308,20 @@ pub(super) fn synthetic_table_ref(name: &Ident) -> TableReference {
     }
 }
 
-/// Format a span as ` at L<line>:C<col>` for inclusion in diagnostic
-/// messages. Returns an empty string when the span carries no source
-/// location (sqlparser convention: `line == 0` means "unknown").
-pub(super) fn span_suffix(span: Span) -> String {
-    if span.start.line == 0 {
-        String::new()
-    } else {
-        format!(" at L{}:C{}", span.start.line, span.start.column)
+/// Convert a raw sqlparser `Span` to the `Option<Span>` shape stored on
+/// `Diagnostic`: an empty span (sqlparser convention: `line == 0`) is
+/// flattened to `None` so consumers can distinguish "no source location"
+/// from "location at (0, 0)".
+pub(super) fn normalize_span(span: Span) -> Option<Span> {
+    (span.start.line != 0).then_some(span)
+}
+
+/// Format an `Option<Span>` as ` at L<line>:C<col>` for inclusion in
+/// diagnostic messages, or an empty string when no location is known.
+pub(super) fn span_suffix(span: Option<Span>) -> String {
+    match span {
+        Some(s) => format!(" at L{}:C{}", s.start.line, s.start.column),
+        None => String::new(),
     }
 }
 
@@ -459,10 +465,12 @@ impl<'a> Resolver<'a> {
         self.record_diagnostic(Diagnostic {
             kind: DiagnosticKind::UnsupportedStatement,
             message: format!("Unsupported statement while inspecting SQL: {}", statement),
+            span: None,
         });
     }
 
     pub(super) fn record_wildcard_suppressed(&mut self, description: &str, span: Span) {
+        let span = normalize_span(span);
         self.record_diagnostic(Diagnostic {
             kind: DiagnosticKind::WildcardSuppressed,
             message: format!(
@@ -470,6 +478,7 @@ impl<'a> Resolver<'a> {
                 description,
                 span_suffix(span),
             ),
+            span,
         });
     }
 

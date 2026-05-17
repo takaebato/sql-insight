@@ -279,6 +279,7 @@ impl ColumnOperationExtractor {
                         "Unsupported statement for column operation extraction: {}",
                         statement
                     ),
+                    span: None,
                 });
             }
             return Ok(StatementColumnOperations {
@@ -1126,12 +1127,18 @@ mod tests {
         let ops = extract("SELECT * FROM t1");
         let kinds: Vec<&DiagnosticKind> = ops.diagnostics.iter().map(|d| &d.kind).collect();
         assert_eq!(kinds, vec![&DiagnosticKind::WildcardSuppressed]);
-        // Span info ("at L1:C8") makes it into the message.
+        // Span info ("at L1:C8") is duplicated in message and surfaced
+        // as structured data for programmatic consumers.
         assert!(
             ops.diagnostics[0].message.contains("at L1:C8"),
             "expected span suffix in message, got: {}",
             ops.diagnostics[0].message
         );
+        let span = ops.diagnostics[0]
+            .span
+            .expect("wildcard token carries a span");
+        assert_eq!(span.start.line, 1);
+        assert_eq!(span.start.column, 8);
     }
 
     #[test]

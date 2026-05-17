@@ -10,7 +10,7 @@ use crate::relation::TableReference;
 
 use super::binding::{
     binding_alias_key, binding_confirms_column, binding_could_contain_column,
-    binding_has_known_schema, is_synthetic_binding, span_suffix, BindingKey,
+    binding_has_known_schema, is_synthetic_binding, normalize_span, span_suffix, BindingKey,
 };
 use super::{Resolver, ScopeId};
 
@@ -167,27 +167,31 @@ impl<'a> Resolver<'a> {
         }
         if let Some((candidates, confirmed_count)) = ambiguity {
             if confirmed_count >= 2 {
+                let span = normalize_span(name.span);
                 let names: Vec<String> = candidates.iter().map(|t| t.name.value.clone()).collect();
                 self.record_diagnostic(Diagnostic {
                     kind: DiagnosticKind::AmbiguousColumn,
                     message: format!(
                         "ambiguous column `{}`{} — matches in: [{}]",
                         name.value,
-                        span_suffix(name.span),
+                        span_suffix(span),
                         names.join(", ")
                     ),
+                    span,
                 });
             }
             return (None, false);
         }
         if had_known_schemas_anywhere {
+            let span = normalize_span(name.span);
             self.record_diagnostic(Diagnostic {
                 kind: DiagnosticKind::UnresolvedColumn,
                 message: format!(
                     "unresolved column `{}`{} — no in-scope relation with a known schema contains it",
                     name.value,
-                    span_suffix(name.span),
+                    span_suffix(span),
                 ),
+                span,
             });
         }
         (None, false)

@@ -182,6 +182,7 @@ impl TableOperationExtractor {
                         "Unsupported statement for operation extraction: {}",
                         statement
                     ),
+                    span: None,
                 });
             }
         } else {

@@ -1,10 +1,19 @@
 //! Diagnostics reported during SQL inspection.
 
+use sqlparser::tokenizer::Span;
+
 /// A non-fatal diagnostic produced while inspecting SQL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     pub kind: DiagnosticKind,
     pub message: String,
+    /// Source location of the offending token, when available. `None`
+    /// when the originating AST node carries no span (sqlparser-rs
+    /// coverage is patchy outside `Ident` / `Value` / tokens), or when
+    /// the resolver couldn't reasonably attribute the diagnostic to a
+    /// single span. The same location is also formatted into `message`
+    /// (as ` at L<n>:C<n>`) for log-line display.
+    pub span: Option<Span>,
 }
 
 /// The kind of diagnostic produced while inspecting SQL.
