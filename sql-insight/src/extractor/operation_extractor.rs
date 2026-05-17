@@ -74,19 +74,47 @@ pub struct StatementTableOperations {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StatementKind {
+    /// `SELECT ...` (and other read-only queries: `TABLE foo`, `VALUES`,
+    /// `WITH ... SELECT ...`). Reads only — no writes, no flows.
     Select,
+    /// `INSERT INTO ...`. Writes to one target table; reads from the
+    /// `VALUES` / `SELECT` source. Emits source → target flows.
     Insert,
+    /// `UPDATE ... SET ...`. Reads and writes the same target table;
+    /// reads from any joined / sub-query sources. Emits flows from
+    /// SET right-hand-side sources into the target columns.
     Update,
+    /// `DELETE FROM ...`. The target table appears in both `reads`
+    /// (row source) and `writes` (deletion target). No flows.
     Delete,
+    /// `MERGE INTO ... USING ...`. The target appears in both `reads`
+    /// and `writes`; each `WHEN` clause may emit flows from the
+    /// source into the target's update / insert columns.
     Merge,
+    /// `CREATE TABLE ...`. The new table is a write target. CREATE
+    /// TABLE AS (CTAS) also reads from its SELECT and emits per-column
+    /// flows into the new table's columns.
     CreateTable,
+    /// `CREATE VIEW ... AS SELECT ...`. The new view is a write
+    /// target; reads come from the SELECT body. Per-column flows
+    /// pair the SELECT projections with the view's columns.
     CreateView,
+    /// `ALTER TABLE ...`. The altered table is a write target.
+    /// Column-level changes are not modelled in detail.
     AlterTable,
+    /// `ALTER VIEW ... AS SELECT ...`. Treated like CREATE VIEW for
+    /// extraction purposes — the view is a write target, the new
+    /// SELECT body supplies reads and per-column flows.
     AlterView,
+    /// `DROP TABLE` / `DROP VIEW` / `DROP MATERIALIZED VIEW`. The
+    /// dropped relation is a write target. Other DROP variants
+    /// (functions, schemas, indexes, etc.) classify as
+    /// [`Unsupported`](StatementKind::Unsupported).
     Drop,
+    /// `TRUNCATE TABLE ...`. The truncated table is a write target.
     Truncate,
-    /// Statement is outside the operation-extraction scope. The accompanying
-    /// `diagnostics` list explains why.
+    /// Statement is outside the operation-extraction scope. The
+    /// accompanying `diagnostics` list explains why.
     Unsupported,
 }
 

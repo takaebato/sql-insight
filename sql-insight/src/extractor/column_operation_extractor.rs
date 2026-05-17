@@ -209,7 +209,15 @@ pub struct ColumnFlow {
 /// is always set so anonymous outputs can be identified.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ColumnTarget {
+    /// A column in a real relation receiving the flow — INSERT /
+    /// UPDATE / MERGE target columns, or columns of the new relation
+    /// produced by CTAS / CREATE VIEW / ALTER VIEW.
     Persisted(ColumnReference),
+    /// A transient column produced by a top-level SELECT projection
+    /// that is not piped into a persisted relation. `name` follows
+    /// the projection's explicit alias or inferred single-column name
+    /// (`None` for expressions without a clear name); `position` is
+    /// always set so anonymous outputs remain identifiable.
     QueryOutput {
         name: Option<Ident>,
         position: usize,
@@ -234,8 +242,19 @@ pub enum ColumnTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ColumnFlowKind {
+    /// Source value is forwarded unchanged. Composition stays
+    /// `Passthrough` only when every step in the chain is also
+    /// `Passthrough`.
     Passthrough,
+    /// Source feeds an aggregate function call (e.g. `SUM`, `COUNT`,
+    /// `STRING_AGG`). Composition is aggregation-dominant: if any
+    /// step along a CTE / derived chain is `Aggregation`, the
+    /// composed flow is `Aggregation`.
     Aggregation,
+    /// Source feeds a non-aggregate expression — arithmetic, function
+    /// calls, CASE branches, casts, etc. Default fallback for chains
+    /// that mix `Passthrough` with any non-Passthrough step that
+    /// isn't itself `Aggregation`.
     Computed,
 }
 
