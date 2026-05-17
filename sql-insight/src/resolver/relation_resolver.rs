@@ -159,7 +159,7 @@ pub(crate) struct RawColumnRef {
     /// `None`.
     pub(crate) synthetic: bool,
     /// SQL-clause role(s) this reference plays — captured from the
-    /// resolver's `current_read_kind` at record time. Typically a
+    /// resolver's `ctx.read_kind` at record time. Typically a
     /// single element; future multi-role cases (USING expansion etc.)
     /// may extend.
     pub(crate) kinds: Vec<ReadKind>,
@@ -174,7 +174,7 @@ impl RelationResolution {
             .iter()
             .flat_map(|scope| scope.iter_bindings())
             .filter_map(|binding| match binding {
-                RelationBinding::Table { table, .. } => Some((**table).clone()),
+                Binding::Table { table, .. } => Some((**table).clone()),
                 _ => None,
             })
             .collect()
@@ -198,7 +198,7 @@ impl RelationResolution {
             .iter()
             .flat_map(|scope| scope.iter_bindings())
             .filter_map(|binding| match binding {
-                RelationBinding::Table { table, roles, .. } if roles.contains(&role) => {
+                Binding::Table { table, roles, .. } if roles.contains(&role) => {
                     Some((**table).clone())
                 }
                 _ => None,
@@ -215,7 +215,7 @@ impl RelationResolution {
             .filter(|scope| !self.has_predicate_ancestor(scope.id))
             .flat_map(|scope| scope.iter_bindings())
             .filter_map(|binding| match binding {
-                RelationBinding::Table { table, roles, .. } if roles.contains(&TableRole::Read) => {
+                Binding::Table { table, roles, .. } if roles.contains(&TableRole::Read) => {
                     Some((**table).clone())
                 }
                 _ => None,
@@ -258,7 +258,7 @@ impl RelationResolution {
     /// bindings. Name match is unique within IndexMap, so this avoids
     /// the column-membership ambiguity that scope-chain resolution can
     /// hit when CTEs accumulate. Returns `None` for non-synthetic refs.
-    fn synthetic_owning_binding(&self, raw: &RawColumnRef) -> Option<&RelationBinding> {
+    fn synthetic_owning_binding(&self, raw: &RawColumnRef) -> Option<&Binding> {
         if !raw.synthetic {
             return None;
         }
@@ -326,10 +326,10 @@ impl RelationResolution {
             return vec![(raw.clone(), outer_kind)];
         }
         let body_projections = match self.synthetic_owning_binding(raw) {
-            Some(RelationBinding::Cte {
+            Some(Binding::Cte {
                 body_projections, ..
             }) => body_projections,
-            Some(RelationBinding::DerivedTable {
+            Some(Binding::DerivedTable {
                 body_projections, ..
             }) => body_projections,
             _ => return vec![(raw.clone(), outer_kind)],
@@ -384,12 +384,12 @@ fn compose_flow_kinds(outer: ColumnFlowKind, inner: ColumnFlowKind) -> ColumnFlo
     }
 }
 
-fn is_synthetic_binding(binding: &RelationBinding) -> bool {
+fn is_synthetic_binding(binding: &Binding) -> bool {
     matches!(
         binding,
-        RelationBinding::Cte { .. }
-            | RelationBinding::DerivedTable { .. }
-            | RelationBinding::TableFunction { .. }
+        Binding::Cte { .. }
+            | Binding::DerivedTable { .. }
+            | Binding::TableFunction { .. }
     )
 }
 
@@ -419,33 +419,33 @@ fn table_from_qualifier_parts(parts: &[Ident]) -> Option<TableReference> {
     }
 }
 
-fn binding_alias_key(binding: &RelationBinding) -> RelationKey {
+fn binding_alias_key(binding: &Binding) -> RelationKey {
     match binding {
-        RelationBinding::Table { table, alias, .. } => {
+        Binding::Table { table, alias, .. } => {
             RelationKey::from_ident(alias.as_ref().unwrap_or(&table.name))
         }
-        RelationBinding::Cte { name, .. } => RelationKey::from_ident(name),
-        RelationBinding::DerivedTable { alias, .. }
-        | RelationBinding::TableFunction { alias, .. } => RelationKey::from_ident(alias),
+        Binding::Cte { name, .. } => RelationKey::from_ident(name),
+        Binding::DerivedTable { alias, .. }
+        | Binding::TableFunction { alias, .. } => RelationKey::from_ident(alias),
     }
 }
 
-fn binding_could_contain_column(binding: &RelationBinding, name: &Ident) -> Option<TableReference> {
+fn binding_could_contain_column(binding: &Binding, name: &Ident) -> Option<TableReference> {
     match binding {
-        RelationBinding::Table { table, schema, .. } => {
+        Binding::Table { table, schema, .. } => {
             schema_could_contain(schema, name).then(|| (**table).clone())
         }
-        RelationBinding::Cte {
+        Binding::Cte {
             name: cte_name,
             schema,
             ..
         } => schema_could_contain(schema, name).then(|| synthetic_table_ref(cte_name)),
-        RelationBinding::DerivedTable { alias, schema, .. } => {
+        Binding::DerivedTable { alias, schema, .. } => {
             schema_could_contain(schema, name).then(|| synthetic_table_ref(alias))
         }
         // TableFunction schemas are always Unknown for now, so any
         // unqualified column could plausibly come from one.
-        RelationBinding::TableFunction { alias, .. } => Some(synthetic_table_ref(alias)),
+        Binding::TableFunction { alias, .. } => Some(synthetic_table_ref(alias)),
     }
 }
 
@@ -532,7 +532,7 @@ pub(crate) struct RelationScope {
     pub(crate) id: ScopeId,
     pub(crate) parent: Option<ScopeId>,
     pub(crate) kind: ScopeKind,
-    bindings: IndexMap<RelationKey, RelationBinding>,
+    bindings: IndexMap<RelationKey, Binding>,
 }
 
 impl RelationScope {
@@ -545,16 +545,16 @@ impl RelationScope {
         }
     }
 
-    fn bind(&mut self, name: &Ident, binding: RelationBinding) {
+    fn bind(&mut self, name: &Ident, binding: Binding) {
         let key = RelationKey::from_ident(name);
         // Re-binding the same name as a Table merges roles rather
         // than replacing — this captures the `DELETE t1 FROM t1` style
         // case where a single name plays multiple roles in one statement.
         if let (
-            Some(RelationBinding::Table {
+            Some(Binding::Table {
                 roles: existing, ..
             }),
-            RelationBinding::Table { roles: new, .. },
+            Binding::Table { roles: new, .. },
         ) = (self.bindings.get_mut(&key), &binding)
         {
             for role in new {
@@ -567,11 +567,11 @@ impl RelationScope {
         self.bindings.insert(key, binding);
     }
 
-    fn resolve(&self, name: &Ident) -> Option<&RelationBinding> {
+    fn resolve(&self, name: &Ident) -> Option<&Binding> {
         self.bindings.get(&RelationKey::from_ident(name))
     }
 
-    fn iter_bindings(&self) -> impl Iterator<Item = &RelationBinding> {
+    fn iter_bindings(&self) -> impl Iterator<Item = &Binding> {
         self.bindings.values()
     }
 }
@@ -600,11 +600,11 @@ impl ScopeStack {
         self.stack.pop();
     }
 
-    fn bind_current(&mut self, name: Ident, binding: RelationBinding) {
+    fn bind_current(&mut self, name: Ident, binding: Binding) {
         self.current_scope_mut().bind(&name, binding);
     }
 
-    fn resolve_unqualified_relation(&self, relation: &ObjectName) -> Option<&RelationBinding> {
+    fn resolve_unqualified_relation(&self, relation: &ObjectName) -> Option<&Binding> {
         if relation.0.len() != 1 {
             return None;
         }
@@ -651,7 +651,7 @@ pub(crate) struct Column {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum RelationBinding {
+pub(crate) enum Binding {
     // `table` is boxed because the variant otherwise dwarfs the others
     // (TableReference is ~300B) and inflates the entire enum's size.
     Table {
@@ -721,13 +721,13 @@ pub(crate) struct ResolvedQuery {
 ///   subquery boundaries (the subquery's refs are syntactically the
 ///   subquery's own, not the outer CASE condition's).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct WalkContext {
+pub(crate) struct VisitContext {
     pub(crate) scope_kind: ScopeKind,
     pub(crate) read_kind: ReadKind,
     pub(crate) in_case_condition: bool,
 }
 
-impl Default for WalkContext {
+impl Default for VisitContext {
     fn default() -> Self {
         Self {
             scope_kind: ScopeKind::Body,
@@ -752,8 +752,8 @@ pub(crate) struct RelationResolver<'a> {
     /// `ResolvedQuery`, so each query gets exactly its own projections.
     current_projections: Vec<ProjectionGroup>,
     /// Lexical walking context (scope_kind / read_kind /
-    /// in_case_condition). See [`WalkContext`].
-    ctx: WalkContext,
+    /// in_case_condition). See [`VisitContext`].
+    ctx: VisitContext,
 }
 
 impl<'a> RelationResolver<'a> {
@@ -765,7 +765,7 @@ impl<'a> RelationResolver<'a> {
             column_refs: Vec::new(),
             flow_edges: Vec::new(),
             current_projections: Vec::new(),
-            ctx: WalkContext::default(),
+            ctx: VisitContext::default(),
         }
     }
 
@@ -915,7 +915,7 @@ impl<'a> RelationResolver<'a> {
         let mut current = Some(scope_id);
         while let Some(id) = current {
             let scope = self.scopes.scope(id);
-            let candidates: Vec<&RelationBinding> = scope
+            let candidates: Vec<&Binding> = scope
                 .iter_bindings()
                 .filter(|b| binding_could_contain_column(b, name).is_some())
                 .collect();
@@ -976,14 +976,14 @@ impl<'a> RelationResolver<'a> {
         r
     }
 
-    /// Run `f` with a temporarily-modified [`WalkContext`]. `modify`
+    /// Run `f` with a temporarily-modified [`VisitContext`]. `modify`
     /// applies in-place changes to the current `ctx` before `f` runs;
     /// the previous ctx (a Copy snapshot) is restored on return. The
     /// foundation for all the scoped clause / kind / modifier
     /// helpers below.
     pub(crate) fn with_context<R>(
         &mut self,
-        modify: impl FnOnce(&mut WalkContext),
+        modify: impl FnOnce(&mut VisitContext),
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         let prev = self.ctx;
@@ -1057,7 +1057,7 @@ impl<'a> RelationResolver<'a> {
     fn is_cte_reference(&self, relation: &ObjectName) -> bool {
         matches!(
             self.scopes.resolve_unqualified_relation(relation),
-            Some(RelationBinding::Cte { .. })
+            Some(Binding::Cte { .. })
         )
     }
 
@@ -1066,7 +1066,7 @@ impl<'a> RelationResolver<'a> {
         let schema = self.lookup_table_schema(&table);
         self.bind_relation(
             binding_name,
-            RelationBinding::Table {
+            Binding::Table {
                 table: Box::new(table),
                 alias,
                 schema,
@@ -1120,7 +1120,7 @@ impl<'a> RelationResolver<'a> {
     /// behavior.
     pub(super) fn cte_body_projections(&self, cte_name: &ObjectName) -> Vec<ProjectionGroup> {
         match self.scopes.resolve_unqualified_relation(cte_name) {
-            Some(RelationBinding::Cte {
+            Some(Binding::Cte {
                 body_projections, ..
             }) => body_projections.clone(),
             _ => Vec::new(),
@@ -1135,7 +1135,7 @@ impl<'a> RelationResolver<'a> {
     ) {
         self.bind_relation(
             name.clone(),
-            RelationBinding::Cte {
+            Binding::Cte {
                 name,
                 schema,
                 body_projections,
@@ -1151,7 +1151,7 @@ impl<'a> RelationResolver<'a> {
     ) {
         self.bind_relation(
             alias.clone(),
-            RelationBinding::DerivedTable {
+            Binding::DerivedTable {
                 alias,
                 schema,
                 body_projections,
@@ -1162,7 +1162,7 @@ impl<'a> RelationResolver<'a> {
     fn bind_table_function(&mut self, alias: Ident) {
         self.bind_relation(
             alias.clone(),
-            RelationBinding::TableFunction {
+            Binding::TableFunction {
                 alias,
                 schema: RelationSchema::Unknown,
             },
@@ -1180,7 +1180,7 @@ impl<'a> RelationResolver<'a> {
         });
     }
 
-    fn bind_relation(&mut self, name: Ident, binding: RelationBinding) {
+    fn bind_relation(&mut self, name: Ident, binding: Binding) {
         self.scopes.bind_current(name, binding);
     }
 }
@@ -1230,7 +1230,7 @@ mod tests {
             .iter()
             .flat_map(|scope| scope.bindings.values())
             .find_map(|binding| match binding {
-                RelationBinding::Table { schema, .. } => Some(schema),
+                Binding::Table { schema, .. } => Some(schema),
                 _ => None,
             })
     }
