@@ -52,11 +52,13 @@ on `sqlparser-rs`; always work against its AST, never re-parse SQL by hand.
 
 - Keep changes small and scoped. Preserve public API compatibility unless an
   API change is intentional, and update doc comments when it changes.
-- Default to writing no inline comments. Add one only when the *why* is
-  non-obvious — a hidden constraint, a subtle invariant, or surprising
-  behavior. Do not restate what the code does (good names already do that)
-  and do not reference task or PR context. Keep them short; no multi-line
-  comment blocks.
+- **Public items deserve rustdoc** (`///` on items, `//!` on
+  modules / crates). State purpose, contract, edge cases, and include
+  examples where useful — rustdoc is the published API surface and shows
+  up in `cargo doc`, docs.rs, and IDE hovers. Length is fine when it
+  earns it.
+- **Inline `//` comments**: keep them concise and well-structured. Add
+  a short example when it clarifies.
 - Prefer private modules; export through explicit re-exports in `lib.rs`.
 - Avoid `bool` or ambiguous `Option` parameters in new public APIs. Prefer
   enums, named methods, or small option structs.
