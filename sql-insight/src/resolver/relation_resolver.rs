@@ -699,6 +699,44 @@ pub(crate) struct ResolvedQuery {
     pub(crate) projections: Vec<ProjectionGroup>,
 }
 
+/// Walking-context state that varies lexically as the resolver walks
+/// expressions and clauses. All fields are `Copy`, so the whole struct
+/// is saved / restored cheaply around closure-scoped helpers
+/// ([`with_read_kind`], [`with_filter_clause`], [`with_case_condition`])
+/// via [`with_context`].
+///
+/// - `scope_kind` is stamped onto every scope pushed while this is in
+///   effect. Default `Body`; flipped to `Predicate` by filter-clause
+///   walkers so subqueries nested in WHERE / HAVING / JOIN ON etc.
+///   inherit the right kind. Propagates *through* subquery boundaries
+///   (a subquery in a predicate is itself predicate-position).
+/// - `read_kind` is stamped onto every column ref recorded while this
+///   is in effect. Default `Projection`; flipped by clause walkers to
+///   `Filter` / `GroupBy` / `Sort` / `Window`. Does *not* propagate
+///   through subquery boundaries — a subquery's own projection refs
+///   are its own kind, not the enclosing clause's.
+/// - `in_case_condition` is an additive modifier: when true, recorded
+///   refs also carry `ReadKind::Conditional`. Toggled around
+///   `Expr::Case` condition expressions. Does *not* propagate through
+///   subquery boundaries (the subquery's refs are syntactically the
+///   subquery's own, not the outer CASE condition's).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WalkContext {
+    pub(crate) scope_kind: ScopeKind,
+    pub(crate) read_kind: ReadKind,
+    pub(crate) in_case_condition: bool,
+}
+
+impl Default for WalkContext {
+    fn default() -> Self {
+        Self {
+            scope_kind: ScopeKind::Body,
+            read_kind: ReadKind::Projection,
+            in_case_condition: false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RelationResolver<'a> {
     // `None` means the resolver runs without external schema enrichment;
@@ -713,26 +751,9 @@ pub(crate) struct RelationResolver<'a> {
     /// walk and packs the collected groups into the returned
     /// `ResolvedQuery`, so each query gets exactly its own projections.
     current_projections: Vec<ProjectionGroup>,
-    /// Scope kind in effect for the current walking context — stamped
-    /// onto every scope pushed while this is set. Defaults to `Body`;
-    /// clause walkers (WHERE, HAVING, JOIN ON, …) flip it to
-    /// `Predicate` via [`with_scope_kind`] for the duration of their
-    /// child walk so subqueries nested in those clauses inherit it.
-    current_scope_kind: ScopeKind,
-    /// Read kind in effect for the current walking context — stamped
-    /// onto every column ref recorded while this is set. Defaults to
-    /// `Projection`; filter-clause walkers
-    /// (WHERE/HAVING/QUALIFY/JOIN ON/etc.) flip it via
-    /// [`with_filter_clause`] for the duration of the clause walk.
-    /// Reset to `Projection` on `resolve_query` entry so subqueries
-    /// don't inherit the enclosing clause's kind for their own bodies.
-    current_read_kind: ReadKind,
-    /// Modifier flag layered on top of `current_read_kind`: when true,
-    /// recorded refs also carry `ReadKind::Conditional` to mark them
-    /// as appearing in a CASE-WHEN condition position. Toggled by
-    /// [`with_case_condition`] around the condition walk inside
-    /// `Expr::Case` handling.
-    in_case_condition: bool,
+    /// Lexical walking context (scope_kind / read_kind /
+    /// in_case_condition). See [`WalkContext`].
+    ctx: WalkContext,
 }
 
 impl<'a> RelationResolver<'a> {
@@ -744,9 +765,7 @@ impl<'a> RelationResolver<'a> {
             column_refs: Vec::new(),
             flow_edges: Vec::new(),
             current_projections: Vec::new(),
-            current_scope_kind: ScopeKind::Body,
-            current_read_kind: ReadKind::Projection,
-            in_case_condition: false,
+            ctx: WalkContext::default(),
         }
     }
 
@@ -863,8 +882,8 @@ impl<'a> RelationResolver<'a> {
     pub(super) fn record_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.scopes.current_scope_id();
         let (resolved, synthetic) = self.resolve_ref_at_walk(&parts, scope_id);
-        let mut kinds = vec![self.current_read_kind];
-        if self.in_case_condition {
+        let mut kinds = vec![self.ctx.read_kind];
+        if self.ctx.in_case_condition {
             kinds.push(ReadKind::Conditional);
         }
         self.column_refs.push(RawColumnRef {
@@ -951,25 +970,26 @@ impl<'a> RelationResolver<'a> {
     /// in each branch resolve only against its own FROMs — matching
     /// SQL's per-SELECT name resolution.
     pub(crate) fn with_branch_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.scopes.push_query_scope(self.current_scope_kind);
+        self.scopes.push_query_scope(self.ctx.scope_kind);
         let r = f(self);
         self.scopes.pop_scope();
         r
     }
 
-    /// Temporarily set the kind to stamp on subquery scopes pushed inside
-    /// `f`, then restore. Use around walks of predicate-position clauses
-    /// (WHERE, HAVING, JOIN ON, etc.) so that nested subqueries are
-    /// classified as `Predicate`.
-    pub(crate) fn with_scope_kind<R>(
+    /// Run `f` with a temporarily-modified [`WalkContext`]. `modify`
+    /// applies in-place changes to the current `ctx` before `f` runs;
+    /// the previous ctx (a Copy snapshot) is restored on return. The
+    /// foundation for all the scoped clause / kind / modifier
+    /// helpers below.
+    pub(crate) fn with_context<R>(
         &mut self,
-        kind: ScopeKind,
+        modify: impl FnOnce(&mut WalkContext),
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let prev = self.current_scope_kind;
-        self.current_scope_kind = kind;
+        let prev = self.ctx;
+        modify(&mut self.ctx);
         let r = f(self);
-        self.current_scope_kind = prev;
+        self.ctx = prev;
         r
     }
 
@@ -981,36 +1001,31 @@ impl<'a> RelationResolver<'a> {
         kind: ReadKind,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let prev = self.current_read_kind;
-        self.current_read_kind = kind;
-        let r = f(self);
-        self.current_read_kind = prev;
-        r
+        self.with_context(|c| c.read_kind = kind, f)
     }
 
     /// Temporarily mark recorded refs as appearing in a CASE-WHEN
     /// condition position. Stacks additively on top of the current
-    /// `current_read_kind` — a column in a SELECT projection's CASE
-    /// condition ends up with `kinds = [Projection, Conditional]`.
+    /// `read_kind` — a column in a SELECT projection's CASE condition
+    /// ends up with `kinds = [Projection, Conditional]`.
     pub(crate) fn with_case_condition<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let prev = self.in_case_condition;
-        self.in_case_condition = true;
-        let r = f(self);
-        self.in_case_condition = prev;
-        r
+        self.with_context(|c| c.in_case_condition = true, f)
     }
 
     /// Convenience for walking a filter-position clause: stamps both
-    /// `current_read_kind = Filter` (so column refs land with the
-    /// `Filter` kind) AND `current_scope_kind = Predicate` (so any
-    /// subquery pushed inside is classified as a predicate scope and
-    /// thus excluded from table-flow). Used for WHERE, HAVING,
-    /// QUALIFY, JOIN ON, AsOf match, MERGE ON, CONNECT BY, pipe
-    /// `|> WHERE`, etc.
+    /// `read_kind = Filter` (so column refs land with the `Filter`
+    /// kind) AND `scope_kind = Predicate` (so any subquery pushed
+    /// inside is classified as a predicate scope and thus excluded
+    /// from table-flow). Used for WHERE, HAVING, QUALIFY, JOIN ON,
+    /// AsOf match, MERGE ON, CONNECT BY, pipe `|> WHERE`, etc.
     pub(crate) fn with_filter_clause<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.with_read_kind(ReadKind::Filter, |r| {
-            r.with_scope_kind(ScopeKind::Predicate, f)
-        })
+        self.with_context(
+            |c| {
+                c.read_kind = ReadKind::Filter;
+                c.scope_kind = ScopeKind::Predicate;
+            },
+            f,
+        )
     }
 
     pub(crate) fn resolve_statement(

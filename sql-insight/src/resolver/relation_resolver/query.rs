@@ -11,17 +11,24 @@ use sqlparser::ast::{
 
 impl<'a> RelationResolver<'a> {
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
-        let scope_id = self.scopes.push_query_scope(self.current_scope_kind);
+        let scope_id = self.scopes.push_query_scope(self.ctx.scope_kind);
         // Swap in a fresh projection buffer for this query — restored on
         // return — so each ResolvedQuery owns exactly its own groups
         // without leaking into siblings or ancestors.
         let prev_projections = std::mem::take(&mut self.current_projections);
-        // Reset current_read_kind to Projection inside this query body
-        // so a surrounding clause's kind (e.g. Filter, when this is a
-        // predicate subquery) doesn't taint the inner query's own
-        // projection refs.
-        let prev_read_kind = self.current_read_kind;
-        self.current_read_kind = super::ReadKind::Projection;
+        // Reset context fields that should NOT propagate through a
+        // subquery boundary: `read_kind` and `in_case_condition` are
+        // syntactic-position modifiers that apply only to the
+        // enclosing expression — the subquery's own projection refs
+        // are not, e.g., `Filter` (just because the subquery sat in a
+        // WHERE) and not `Conditional` (just because the subquery sat
+        // in a CASE WHEN condition). `scope_kind` is preserved
+        // because predicate-ness DOES propagate (a subquery in a
+        // predicate is itself predicate-position for table-flow
+        // exclusion).
+        let prev_ctx = self.ctx;
+        self.ctx.read_kind = super::ReadKind::Projection;
+        self.ctx.in_case_condition = false;
         if let Some(with) = &query.with {
             if with.recursive {
                 for cte in &with.cte_tables {
@@ -73,7 +80,7 @@ impl<'a> RelationResolver<'a> {
         }
         self.scopes.pop_scope();
         let projections = std::mem::replace(&mut self.current_projections, prev_projections);
-        self.current_read_kind = prev_read_kind;
+        self.ctx = prev_ctx;
         Ok(ResolvedQuery {
             scope_id,
             output_schema: body_schema,

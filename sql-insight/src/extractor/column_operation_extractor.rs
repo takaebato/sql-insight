@@ -996,6 +996,33 @@ mod tests {
     }
 
     #[test]
+    fn subquery_in_case_condition_does_not_leak_conditional_to_inner_refs() {
+        // A scalar subquery in a CASE condition position is itself
+        // the "conditional" expression. Refs INSIDE the subquery are
+        // the subquery's own projection (or its own WHERE etc.) and
+        // should NOT inherit `Conditional` from the outer CASE — the
+        // modifier resets at the subquery boundary.
+        let ops =
+            extract("SELECT CASE WHEN (SELECT x FROM s WHERE y > 0) IS NULL THEN 1 END FROM t");
+        // s.x is the subquery's projection → plain Projection.
+        assert!(
+            ops.reads
+                .iter()
+                .any(|r| r.column.name.value == "x" && r.kinds == vec![ReadKind::Projection]),
+            "s.x should be Projection only, got {:?}",
+            ops.reads
+        );
+        // s.y is the subquery's WHERE → Filter only, no Conditional.
+        assert!(
+            ops.reads
+                .iter()
+                .any(|r| r.column.name.value == "y" && r.kinds == vec![ReadKind::Filter]),
+            "s.y should be Filter only, got {:?}",
+            ops.reads
+        );
+    }
+
+    #[test]
     fn simple_case_operand_gets_conditional_modifier() {
         // `CASE x WHEN 1 THEN a WHEN 2 THEN b END` — `x` is the
         // operand (compared against each WHEN pattern), classified
