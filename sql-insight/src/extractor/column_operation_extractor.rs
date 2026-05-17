@@ -747,6 +747,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)] // transitional during whole-value migration
     fn assert_flows(sql: &str, expected: Vec<ColumnFlow>) {
         assert_eq!(extract(sql).flows, expected, "SQL: {sql}");
     }
@@ -1304,73 +1305,115 @@ mod tests {
 
         #[test]
         fn select_bare_column_emits_passthrough_flow_to_query_output() {
-            assert_flows(
+            assert_column_ops(
                 "SELECT a FROM t1",
-                vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn select_aliased_column_uses_alias_as_output_name() {
-            assert_flows(
+            assert_column_ops(
                 "SELECT a AS x FROM t1",
-                vec![flow_passthrough(col("t1", "a"), out("x", 0))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("x", 0))],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn select_computed_emits_one_flow_per_source_with_computed_kind() {
-            assert_flows(
+            assert_column_ops(
                 "SELECT a + b FROM t1",
-                vec![
-                    flow_computed(col("t1", "a"), out_anon(0)),
-                    flow_computed(col("t1", "b"), out_anon(0)),
-                ],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_computed(col("t1", "a"), out_anon(0)),
+                        flow_computed(col("t1", "b"), out_anon(0)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn select_mixed_projection_separates_targets_by_position() {
-            assert_flows(
+            assert_column_ops(
                 "SELECT a, a + b FROM t1",
-                vec![
-                    flow_passthrough(col("t1", "a"), out("a", 0)),
-                    flow_computed(col("t1", "a"), out_anon(1)),
-                    flow_computed(col("t1", "b"), out_anon(1)),
-                ],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t1", "a"), read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_computed(col("t1", "a"), out_anon(1)),
+                        flow_computed(col("t1", "b"), out_anon(1)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn select_qualified_ref_in_computed_resolves_directly() {
-            assert_flows(
+            assert_column_ops(
                 "SELECT t1.a + t1.b AS sum FROM t1",
-                vec![
-                    flow_computed(col("t1", "a"), out("sum", 0)),
-                    flow_computed(col("t1", "b"), out("sum", 0)),
-                ],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_computed(col("t1", "a"), out("sum", 0)),
+                        flow_computed(col("t1", "b"), out("sum", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn insert_select_pairs_target_cols_positionally() {
-            assert_flows(
+            assert_column_ops(
                 "INSERT INTO t1 (a, b) SELECT x, y FROM t2",
-                vec![
-                    flow_passthrough(col("t2", "x"), persisted("t1", "a")),
-                    flow_passthrough(col("t2", "y"), persisted("t1", "b")),
-                ],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t2", "x"), read("t2", "y")],
+                    writes: vec![write("t1", "a"), write("t1", "b")],
+                    flows: vec![
+                        flow_passthrough(col("t2", "x"), persisted("t1", "a")),
+                        flow_passthrough(col("t2", "y"), persisted("t1", "b")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn insert_select_computed_marks_kind_per_source() {
-            assert_flows(
+            assert_column_ops(
                 "INSERT INTO t1 (a) SELECT x + y FROM t2",
-                vec![
-                    flow_computed(col("t2", "x"), persisted("t1", "a")),
-                    flow_computed(col("t2", "y"), persisted("t1", "a")),
-                ],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t2", "x"), read("t2", "y")],
+                    writes: vec![write("t1", "a")],
+                    flows: vec![
+                        flow_computed(col("t2", "x"), persisted("t1", "a")),
+                        flow_computed(col("t2", "y"), persisted("t1", "a")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1378,17 +1421,28 @@ mod tests {
         fn insert_select_union_pairs_both_branches_with_target_cols() {
             // Both UNION branches feed the same INSERT target positions,
             // so each branch's projection should pair `position N → t.col_N`.
-            assert_flows(
+            assert_column_ops(
                 "INSERT INTO t1 (a, b) \
                  SELECT x, y FROM t2 \
                  UNION ALL \
                  SELECT p, q FROM t3",
-                vec![
-                    flow_passthrough(col("t2", "x"), persisted("t1", "a")),
-                    flow_passthrough(col("t2", "y"), persisted("t1", "b")),
-                    flow_passthrough(col("t3", "p"), persisted("t1", "a")),
-                    flow_passthrough(col("t3", "q"), persisted("t1", "b")),
-                ],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![
+                        read("t2", "x"),
+                        read("t2", "y"),
+                        read("t3", "p"),
+                        read("t3", "q"),
+                    ],
+                    writes: vec![write("t1", "a"), write("t1", "b")],
+                    flows: vec![
+                        flow_passthrough(col("t2", "x"), persisted("t1", "a")),
+                        flow_passthrough(col("t2", "y"), persisted("t1", "b")),
+                        flow_passthrough(col("t3", "p"), persisted("t1", "a")),
+                        flow_passthrough(col("t3", "q"), persisted("t1", "b")),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1396,66 +1450,145 @@ mod tests {
         fn insert_without_explicit_cols_emits_no_flows() {
             // Target column names would need catalog-driven positional
             // mapping; without catalog the resolver emits nothing.
-            assert_flows("INSERT INTO t1 SELECT x FROM t2", vec![]);
+            assert_column_ops(
+                "INSERT INTO t1 SELECT x FROM t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t2", "x")],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn insert_values_with_literals_emits_no_flows() {
-            assert_flows("INSERT INTO t1 (a, b) VALUES (1, 2)", vec![]);
+            assert_column_ops(
+                "INSERT INTO t1 (a, b) VALUES (1, 2)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![],
+                    writes: vec![write("t1", "a"), write("t1", "b")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn update_set_literal_emits_no_flow() {
-            assert_flows("UPDATE t1 SET a = 1", vec![]);
+            assert_column_ops(
+                "UPDATE t1 SET a = 1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Update,
+                    reads: vec![],
+                    writes: vec![write("t1", "a")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn delete_emits_no_flow() {
-            assert_flows("DELETE FROM t1 WHERE id = 5", vec![]);
+            assert_column_ops(
+                "DELETE FROM t1 WHERE id = 5",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Delete,
+                    reads: vec![filter_read("t1", "id")],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn wildcard_select_emits_no_flow() {
-            assert_flows("SELECT * FROM t1", vec![]);
+            assert_column_ops(
+                "SELECT * FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                },
+            );
         }
 
         #[test]
         fn update_set_passthrough_flow() {
-            assert_flows(
+            assert_column_ops(
                 "UPDATE t1 SET a = b",
-                vec![flow_passthrough(col("t1", "b"), persisted("t1", "a"))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Update,
+                    reads: vec![read("t1", "b")],
+                    writes: vec![write("t1", "a")],
+                    flows: vec![flow_passthrough(col("t1", "b"), persisted("t1", "a"))],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn update_set_computed_flow() {
-            assert_flows(
+            assert_column_ops(
                 "UPDATE t1 SET a = b + 1",
-                vec![flow_computed(col("t1", "b"), persisted("t1", "a"))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Update,
+                    reads: vec![read("t1", "b")],
+                    writes: vec![write("t1", "a")],
+                    flows: vec![flow_computed(col("t1", "b"), persisted("t1", "a"))],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn update_set_with_qualified_rhs_resolves_to_other_table() {
-            assert_flows(
+            assert_column_ops(
                 "UPDATE t1 SET a = t2.b FROM t2 WHERE t1.id = t2.id",
-                vec![flow_passthrough(col("t2", "b"), persisted("t1", "a"))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Update,
+                    reads: vec![
+                        read("t2", "b"),
+                        filter_read("t1", "id"),
+                        filter_read("t2", "id"),
+                    ],
+                    writes: vec![write("t1", "a")],
+                    flows: vec![flow_passthrough(col("t2", "b"), persisted("t1", "a"))],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn aggregate_call_in_projection_emits_aggregation_flow() {
-            assert_flows(
+            assert_column_ops(
                 "SELECT SUM(a) FROM t1",
-                vec![flow_aggregation(col("t1", "a"), out_anon(0))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![flow_aggregation(col("t1", "a"), out_anon(0))],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn aggregate_with_alias_carries_aliased_name() {
-            assert_flows(
+            assert_column_ops(
                 "SELECT COUNT(b) AS n FROM t1",
-                vec![flow_aggregation(col("t1", "b"), out("n", 0))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![flow_aggregation(col("t1", "b"), out("n", 0))],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1464,17 +1597,29 @@ mod tests {
             // `SUM(a) + 1` has BinaryOp at the top level, so the
             // projection's kind is Computed — only a bare aggregate call
             // qualifies as Aggregation.
-            assert_flows(
+            assert_column_ops(
                 "SELECT SUM(a) + 1 FROM t1",
-                vec![flow_computed(col("t1", "a"), out_anon(0))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![flow_computed(col("t1", "a"), out_anon(0))],
+                    diagnostics: vec![],
+                },
             );
         }
 
         #[test]
         fn aggregate_in_insert_select_propagates_aggregation() {
-            assert_flows(
+            assert_column_ops(
                 "INSERT INTO t2 (n) SELECT COUNT(a) FROM t1",
-                vec![flow_aggregation(col("t1", "a"), persisted("t2", "n"))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![write("t2", "n")],
+                    flows: vec![flow_aggregation(col("t1", "a"), persisted("t2", "n"))],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1483,9 +1628,15 @@ mod tests {
             // CTE body's `s` is Aggregation (SUM(a)); outer's bare `s`
             // would be Passthrough, but composition (Aggregation
             // dominates) collapses the chain to Aggregation.
-            assert_flows(
+            assert_column_ops(
                 "WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s FROM cte",
-                vec![flow_aggregation(col("t1", "a"), out("s", 0))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![flow_aggregation(col("t1", "a"), out("s", 0))],
+                    diagnostics: vec![],
+                },
             );
         }
     }
@@ -1498,26 +1649,36 @@ mod tests {
             // Outer `a` refers to cte's renamed column at position 0,
             // which body-positionally is `x` from t. Composition follows
             // the renamed name back to the body item, then to t.x.
-            let ops = extract("WITH cte (a) AS (SELECT x FROM t) SELECT a FROM cte");
-            assert_eq!(
-                ops.flows,
-                vec![flow_passthrough(col("t", "x"), out("a", 0))]
-            );
             // Reads surface only the real-table ref (CTE binding is
             // synthetic, dropped).
-            assert_eq!(ops.reads, vec![read("t", "x")]);
+            assert_column_ops(
+                "WITH cte (a) AS (SELECT x FROM t) SELECT a FROM cte",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t", "x")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t", "x"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
         }
 
         #[test]
         fn cte_column_rename_partial_keeps_remaining_body_names() {
             // Rename `(p)` covers position 0 only. Position 1's body name
             // `y` survives; outer can reference `p` or `y`.
-            assert_flows(
+            assert_column_ops(
                 "WITH cte (p) AS (SELECT x, y FROM t) SELECT p, y FROM cte",
-                vec![
-                    flow_passthrough(col("t", "x"), out("p", 0)),
-                    flow_passthrough(col("t", "y"), out("y", 1)),
-                ],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t", "x"), read("t", "y")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t", "x"), out("p", 0)),
+                        flow_passthrough(col("t", "y"), out("y", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
             );
         }
 
@@ -1525,12 +1686,16 @@ mod tests {
         fn derived_table_column_rename_composes() {
             // `(SELECT x FROM t) AS d(a)` — outer `a` resolves via d's
             // renamed column at position 0 → body item x → t.x.
-            let ops = extract("SELECT a FROM (SELECT x FROM t) d(a)");
-            assert_eq!(
-                ops.flows,
-                vec![flow_passthrough(col("t", "x"), out("a", 0))]
+            assert_column_ops(
+                "SELECT a FROM (SELECT x FROM t) d(a)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t", "x")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t", "x"), out("a", 0))],
+                    diagnostics: vec![],
+                },
             );
-            assert_eq!(ops.reads, vec![read("t", "x")]);
         }
 
         #[test]
@@ -1538,10 +1703,16 @@ mod tests {
             // `INSERT INTO t2 (col) WITH cte(a) AS (SELECT x FROM t1)
             //  SELECT a FROM cte` composes through both the CTE rename
             //  and the INSERT pairing: t1.x → t2.col.
-            assert_flows(
+            assert_column_ops(
                 "INSERT INTO t2 (col) WITH cte (a) AS (SELECT x FROM t1) \
                  SELECT a FROM cte",
-                vec![flow_passthrough(col("t1", "x"), persisted("t2", "col"))],
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t1", "x")],
+                    writes: vec![write("t2", "col")],
+                    flows: vec![flow_passthrough(col("t1", "x"), persisted("t2", "col"))],
+                    diagnostics: vec![],
+                },
             );
         }
     }
