@@ -310,23 +310,6 @@ mod tests {
     use super::*;
     use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
 
-    fn extract(sql: &str) -> StatementTableOperations {
-        extract_with(sql, &GenericDialect {})
-    }
-
-    fn extract_with(sql: &str, dialect: &dyn Dialect) -> StatementTableOperations {
-        extract_with_catalog(sql, dialect, None)
-    }
-
-    fn extract_with_catalog(
-        sql: &str,
-        dialect: &dyn Dialect,
-        catalog: Option<&dyn Catalog>,
-    ) -> StatementTableOperations {
-        let mut result = extract_table_operations(dialect, sql, catalog).unwrap();
-        result.remove(0).unwrap()
-    }
-
     fn table(name: &str) -> TableReference {
         TableReference {
             catalog: None,
@@ -358,12 +341,32 @@ mod tests {
     /// Tests that genuinely care about the message / span shape
     /// should fall back to per-field `assert_eq!`.
     fn assert_ops(sql: &str, expected: StatementTableOperations) {
-        assert_ops_with(sql, &GenericDialect {}, expected);
+        assert_nth_ops_with(sql, 0, &GenericDialect {}, expected);
     }
 
     fn assert_ops_with(sql: &str, dialect: &dyn Dialect, expected: StatementTableOperations) {
-        let mut result = extract_table_operations(dialect, sql, None).unwrap();
-        let actual = result.remove(0).unwrap();
+        assert_nth_ops_with(sql, 0, dialect, expected);
+    }
+
+    /// Like `assert_ops`, but for multi-statement SQL — pins down the
+    /// statement at `index` in the parsed batch. Compose calls to pin
+    /// down every statement in a batch separately.
+    fn assert_nth_ops(sql: &str, index: usize, expected: StatementTableOperations) {
+        assert_nth_ops_with(sql, index, &GenericDialect {}, expected);
+    }
+
+    fn assert_nth_ops_with(
+        sql: &str,
+        index: usize,
+        dialect: &dyn Dialect,
+        expected: StatementTableOperations,
+    ) {
+        let result = extract_table_operations(dialect, sql, None).unwrap();
+        let actual = result
+            .into_iter()
+            .nth(index)
+            .unwrap_or_else(|| panic!("statement {index} missing in result for SQL: {sql}"))
+            .unwrap();
         let StatementTableOperations {
             statement_kind,
             reads,
@@ -371,15 +374,27 @@ mod tests {
             flows,
             diagnostics,
         } = expected;
-        assert_eq!(actual.statement_kind, statement_kind, "kind for SQL: {sql}");
-        assert_eq!(actual.reads, reads, "reads for SQL: {sql}");
-        assert_eq!(actual.writes, writes, "writes for SQL: {sql}");
-        assert_eq!(actual.flows, flows, "flows for SQL: {sql}");
+        assert_eq!(
+            actual.statement_kind, statement_kind,
+            "kind for SQL: {sql} (statement {index})"
+        );
+        assert_eq!(
+            actual.reads, reads,
+            "reads for SQL: {sql} (statement {index})"
+        );
+        assert_eq!(
+            actual.writes, writes,
+            "writes for SQL: {sql} (statement {index})"
+        );
+        assert_eq!(
+            actual.flows, flows,
+            "flows for SQL: {sql} (statement {index})"
+        );
         let actual_kinds: Vec<_> = actual.diagnostics.iter().map(|d| d.kind.clone()).collect();
         let expected_kinds: Vec<_> = diagnostics.iter().map(|d| d.kind.clone()).collect();
         assert_eq!(
             actual_kinds, expected_kinds,
-            "diagnostic kinds for SQL: {sql}"
+            "diagnostic kinds for SQL: {sql} (statement {index})"
         );
     }
 
@@ -478,13 +493,29 @@ mod tests {
 
         #[test]
         fn multiple_statements_produce_multiple_results() {
-            let dialect = GenericDialect {};
-            let result =
-                extract_table_operations(&dialect, "SELECT * FROM t1; SELECT * FROM t2", None)
-                    .unwrap();
-            assert_eq!(result.len(), 2);
-            assert_eq!(result[0].as_ref().unwrap().reads, vec![read("t1")]);
-            assert_eq!(result[1].as_ref().unwrap().reads, vec![read("t2")]);
+            let sql = "SELECT * FROM t1; SELECT * FROM t2";
+            assert_nth_ops(
+                sql,
+                0,
+                StatementTableOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1")],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                },
+            );
+            assert_nth_ops(
+                sql,
+                1,
+                StatementTableOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t2")],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                },
+            );
         }
     }
 
@@ -553,22 +584,20 @@ mod tests {
 
         #[test]
         fn update_with_from_clause_treats_from_as_read() {
-            let ops = extract_with(
+            // FROM t2 contributes rows to the UPDATE target → t2 → t1
+            // flow. SET RHS scalar subquery from t3 feeds the new value
+            // → t3 → t1 flow. WHERE predicate subquery from t4 is
+            // predicate-only → no flow.
+            assert_ops_with(
                 "UPDATE t1 SET a = (SELECT b FROM t3) FROM t2 WHERE t1.id IN (SELECT id FROM t4)",
                 &PostgreSqlDialect {},
-            );
-            assert_eq!(ops.statement_kind, StatementKind::Update);
-            assert_eq!(ops.writes, vec![write("t1")]);
-            let read_names: std::collections::HashSet<_> = ops
-                .reads
-                .iter()
-                .map(|r| r.table.name.value.as_str())
-                .collect();
-            assert_eq!(
-                read_names,
-                ["t2", "t3", "t4"]
-                    .into_iter()
-                    .collect::<std::collections::HashSet<_>>(),
+                StatementTableOperations {
+                    statement_kind: StatementKind::Update,
+                    reads: vec![read("t2"), read("t3"), read("t4")],
+                    writes: vec![write("t1")],
+                    flows: vec![flow("t2", "t1"), flow("t3", "t1")],
+                    diagnostics: vec![],
+                },
             );
         }
     }
@@ -810,27 +839,34 @@ mod tests {
             // t3 is referenced only inside `WHERE id IN (SELECT id FROM t3)`,
             // so it must not appear as a flow source even though it does
             // appear in `reads`.
-            let ops = extract("INSERT INTO t1 SELECT * FROM t2 WHERE id IN (SELECT id FROM t3)");
-            assert_eq!(ops.flows, vec![flow("t2", "t1")]);
-            // ...but t3 is still visible as a touched table.
-            let read_names: Vec<_> = ops
-                .reads
-                .iter()
-                .map(|r| r.table.name.value.as_str())
-                .collect();
-            assert!(read_names.contains(&"t3"));
+            assert_ops(
+                "INSERT INTO t1 SELECT * FROM t2 WHERE id IN (SELECT id FROM t3)",
+                StatementTableOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t2"), read("t3")],
+                    writes: vec![write("t1")],
+                    flows: vec![flow("t2", "t1")],
+                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                },
+            );
         }
 
         #[test]
         fn join_on_predicate_does_not_promote_to_flow() {
-            let ops = extract(
+            // t4 is in JOIN ON's predicate subquery — touches as read
+            // but doesn't promote to flow (predicate position excluded
+            // from data-feeding chain).
+            assert_ops(
                 "INSERT INTO t1 SELECT * FROM t2 JOIN t3 ON t2.id = t3.id \
-             AND t2.id IN (SELECT id FROM t4)",
+                 AND t2.id IN (SELECT id FROM t4)",
+                StatementTableOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t2"), read("t3"), read("t4")],
+                    writes: vec![write("t1")],
+                    flows: vec![flow("t2", "t1"), flow("t3", "t1")],
+                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                },
             );
-            let flows: std::collections::HashSet<_> = ops.flows.into_iter().collect();
-            assert!(flows.contains(&flow("t2", "t1")));
-            assert!(flows.contains(&flow("t3", "t1")));
-            assert!(!flows.contains(&flow("t4", "t1")));
         }
 
         #[test]
@@ -906,19 +942,40 @@ mod tests {
 
         #[test]
         fn cte_data_flows_through_to_write_target() {
-            let ops = extract("INSERT INTO t1 WITH cte AS (SELECT * FROM s) SELECT * FROM cte");
-            assert!(ops.flows.contains(&flow("s", "t1")));
+            assert_ops(
+                "INSERT INTO t1 WITH cte AS (SELECT * FROM s) SELECT * FROM cte",
+                StatementTableOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("s")],
+                    writes: vec![write("t1")],
+                    flows: vec![flow("s", "t1")],
+                    diagnostics: vec![
+                        diag(DiagnosticKind::WildcardSuppressed),
+                        diag(DiagnosticKind::WildcardSuppressed),
+                    ],
+                },
+            );
         }
 
         #[test]
         fn cte_predicate_subquery_does_not_leak_into_flow() {
-            let ops = extract(
+            // x is in the CTE body's WHERE predicate subquery — touches
+            // as read but doesn't promote to flow.
+            assert_ops(
                 "INSERT INTO t1 WITH cte AS (\
                  SELECT * FROM s WHERE id IN (SELECT id FROM x)\
              ) SELECT * FROM cte",
+                StatementTableOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("s"), read("x")],
+                    writes: vec![write("t1")],
+                    flows: vec![flow("s", "t1")],
+                    diagnostics: vec![
+                        diag(DiagnosticKind::WildcardSuppressed),
+                        diag(DiagnosticKind::WildcardSuppressed),
+                    ],
+                },
             );
-            assert!(ops.flows.contains(&flow("s", "t1")));
-            assert!(!ops.flows.contains(&flow("x", "t1")));
         }
 
         #[test]
