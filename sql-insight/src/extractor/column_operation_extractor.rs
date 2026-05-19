@@ -2738,6 +2738,199 @@ mod tests {
         }
     }
 
+    mod lateral_and_correlation {
+        use super::*;
+
+        #[test]
+        fn lateral_subquery_resolves_inner_ref_to_inner_table() {
+            // The existing-style LATERAL: the inner subquery only
+            // references its own tables. The outer FROM joins it as
+            // a derived source. The inner `id` resolves to t1 from
+            // the LATERAL subquery's own scope.
+            assert_column_ops(
+                "SELECT d.id FROM LATERAL (SELECT id FROM t1) AS d JOIN t2 ON d.id = t2.id",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "id"),
+                        filter_read("t2", "id"),
+                    ],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn lateral_with_outer_scope_reference_resolves_via_scope_chain() {
+            // The interesting LATERAL case: the inner subquery references
+            // `t1.x` from the OUTER FROM. Without LATERAL this is invalid
+            // SQL, but the resolver doesn't enforce LATERAL semantics —
+            // it walks the scope chain regardless.
+            assert_column_ops(
+                "SELECT sub.x FROM t1, LATERAL (SELECT t1.a + t2.b AS x FROM t2) sub",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_computed(col("t1", "a"), out("x", 0)),
+                        flow_computed(col("t2", "b"), out("x", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn non_lateral_derived_also_resolves_outer_ref_permissively() {
+            // The resolver doesn't distinguish LATERAL from non-LATERAL
+            // — both walk the scope chain identically. This is more
+            // lenient than strict SQL semantics (where this should be
+            // an error), but reasonable for lineage purposes: a
+            // best-effort resolution is more useful than silently
+            // dropping the reference.
+            assert_column_ops(
+                "SELECT sub.x FROM t1, (SELECT t1.a + t2.b AS x FROM t2) sub",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_computed(col("t1", "a"), out("x", 0)),
+                        flow_computed(col("t2", "b"), out("x", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn correlated_where_subquery_resolves_outer_ref() {
+            // Classic correlated subquery in WHERE: the inner SELECT
+            // references the outer t1.id. The resolver walks the
+            // scope chain to find t1.id in the outer scope.
+            assert_column_ops(
+                "SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.fk = t1.id)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "a"),
+                        filter_read("t2", "fk"),
+                        filter_read("t1", "id"),
+                    ],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+    }
+
+    mod on_conflict {
+        //! ON CONFLICT (Postgres) / ON DUPLICATE KEY UPDATE (MySQL)
+        //! sit in `Insert.on: Option<OnInsert>`, which the resolver
+        //! currently does NOT walk. So the entire ON-clause is dropped:
+        //! no extra reads (EXCLUDED.<col> never surfaces), no
+        //! additional writes for the DO UPDATE SET targets, and no
+        //! flows from EXCLUDED into the persisted target.
+        //!
+        //! These tests pin that gap down so it surfaces in test diffs
+        //! the moment someone wires up `insert.on` traversal — at
+        //! which point the expected values here need to be updated.
+        use super::*;
+        use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
+
+        fn assert_column_ops_with_dialect(
+            sql: &str,
+            dialect: &dyn sqlparser::dialect::Dialect,
+            expected: StatementColumnOperations,
+        ) {
+            let actual = extract_column_operations(dialect, sql, None)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("no statements in result for SQL: {sql}"))
+                .unwrap();
+            assert_column_ops_inner(sql, 0, actual, expected);
+        }
+
+        #[test]
+        fn pg_on_conflict_do_update_set_drops_excluded_ref_and_action_writes() {
+            // The EXCLUDED.b ref in the action clause is silently
+            // dropped (no read surfaces). Writes only reflect the
+            // INSERT column list.
+            assert_column_ops_with_dialect(
+                "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
+                &PostgreSqlDialect {},
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![],
+                    writes: vec![write("t", "a"), write("t", "b")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn pg_on_conflict_do_nothing_is_indistinguishable_from_plain_insert() {
+            assert_column_ops_with_dialect(
+                "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO NOTHING",
+                &PostgreSqlDialect {},
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![],
+                    writes: vec![write("t", "a"), write("t", "b")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn pg_insert_select_with_on_conflict_keeps_source_flows() {
+            // The SELECT source is still walked normally; only the
+            // ON CONFLICT action is dropped. So flows / reads from
+            // the source SELECT survive.
+            assert_column_ops_with_dialect(
+                "INSERT INTO t (a, b) SELECT x, y FROM s \
+                 ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
+                &PostgreSqlDialect {},
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("s", "x"), read("s", "y")],
+                    writes: vec![write("t", "a"), write("t", "b")],
+                    flows: vec![
+                        flow_passthrough(col("s", "x"), persisted("t", "a")),
+                        flow_passthrough(col("s", "y"), persisted("t", "b")),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn mysql_on_duplicate_key_update_drops_action_clause_too() {
+            // ON DUPLICATE KEY UPDATE rides the same `Insert.on` field
+            // (as `OnInsert::DuplicateKeyUpdate`), so it's dropped for
+            // the same reason as Postgres ON CONFLICT.
+            assert_column_ops_with_dialect(
+                "INSERT INTO t (a, b) VALUES (1, 2) \
+                 ON DUPLICATE KEY UPDATE b = VALUES(b)",
+                &MySqlDialect {},
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![],
+                    writes: vec![write("t", "a"), write("t", "b")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+    }
+
     mod catalog_strict {
         use super::*;
         use crate::catalog::{Catalog, ColumnSchema};
