@@ -2738,6 +2738,120 @@ mod tests {
         }
     }
 
+    mod join_using_and_natural {
+        //! USING / NATURAL JOIN merge expansion is documented as
+        //! future work (resolver/column_ref.rs `RawColumnRef.kinds`;
+        //! also the module-level note in column_operation_extractor).
+        //! These tests pin down the *current* shape so when USING /
+        //! NATURAL JOIN expansion lands (with merged refs gaining a
+        //! second `ReadKind` and/or splitting into both source
+        //! tables), the diff will surface here.
+        use super::*;
+
+        #[test]
+        fn join_using_id_in_projection_is_unresolved_due_to_ambiguity() {
+            // `id` in the projection is unqualified with two candidate
+            // tables (t1, t2) — the resolver leaves it unresolved
+            // (`table: None`) because no catalog disambiguates and
+            // USING is not yet expanded into a merged-column binding.
+            assert_column_ops(
+                "SELECT id FROM t1 JOIN t2 USING (id)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![unresolved("id")],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: None,
+                            name: "id".into(),
+                        },
+                        target: out("id", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn join_using_id_in_projection_and_where_yields_two_independent_unresolved_refs() {
+            // The same `id` ref in projection vs. WHERE produces two
+            // SEPARATE RawColumnRefs, each with a single-kind `kinds`
+            // vec. There is no merge into one ref-with-multi-kinds
+            // here — that would require resolver-level tracking of
+            // ref identity across clauses, which we don't do.
+            assert_column_ops(
+                "SELECT id FROM t1 JOIN t2 USING (id) WHERE id > 0",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        unresolved("id"),
+                        ColumnRead {
+                            column: ColumnReference {
+                                table: None,
+                                name: "id".into(),
+                            },
+                            kinds: vec![ReadKind::Filter],
+                        },
+                    ],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: None,
+                            name: "id".into(),
+                        },
+                        target: out("id", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn join_using_qualified_id_resolves_to_named_table() {
+            // Qualifying the ref sidesteps the USING ambiguity: `t1.id`
+            // resolves to t1 unambiguously. Use this in real-world
+            // queries until USING expansion is available.
+            assert_column_ops(
+                "SELECT t1.id FROM t1 JOIN t2 USING (id)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "id")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn natural_join_no_catalog_leaves_unqualified_refs_unresolved() {
+            // NATURAL JOIN's merge set comes from the intersection of
+            // both tables' column lists — only knowable with a
+            // catalog. Without one, the resolver doesn't expand, and
+            // unqualified `id` is multi-candidate-unresolved (same
+            // shape as plain JOIN ON without USING).
+            assert_column_ops(
+                "SELECT id FROM t1 NATURAL JOIN t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![unresolved("id")],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: None,
+                            name: "id".into(),
+                        },
+                        target: out("id", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![],
+                },
+            );
+        }
+    }
+
     mod lateral_and_correlation {
         use super::*;
 
