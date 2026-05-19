@@ -75,7 +75,8 @@ use crate::extractor::table_operation_extractor::StatementKind;
 use crate::relation::TableReference;
 use crate::resolver::{FlowTargetSpec, RawColumnRef, Resolution, Resolver};
 use sqlparser::ast::{
-    AssignmentTarget, Ident, OnConflictAction, OnInsert, Statement, TableFactor,
+    AlterTableOperation, AssignmentTarget, Ident, OnConflictAction, OnInsert, Statement,
+    TableFactor,
 };
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -528,6 +529,19 @@ fn collect_writes(
             let target = TableReference::try_from(name)?;
             writes.extend(created_writes(&target, columns, resolution));
         }
+        Statement::AlterTable(alter) => {
+            let target = TableReference::try_from(&alter.name)?;
+            for op in &alter.operations {
+                for col_name in alter_table_op_target_columns(op) {
+                    writes.push(ColumnWrite {
+                        column: ColumnReference {
+                            table: Some(target.clone()),
+                            name: col_name,
+                        },
+                    });
+                }
+            }
+        }
         Statement::Merge(merge) => {
             use sqlparser::ast::MergeAction;
             let target = match &merge.table {
@@ -614,6 +628,34 @@ fn persisted_target_writes(target: &TableReference, resolution: &Resolution) -> 
             },
         })
         .collect()
+}
+
+/// Extract the column names an ALTER TABLE operation writes to.
+/// Schema-level changes (AddConstraint, DropConstraint, partition /
+/// projection ops, RENAME TABLE, etc.) return empty — they don't
+/// affect named columns. Rename / change return BOTH the old and new
+/// names so the lineage surface records both ends of the rename.
+fn alter_table_op_target_columns(op: &AlterTableOperation) -> Vec<Ident> {
+    match op {
+        AlterTableOperation::AddColumn { column_def, .. } => vec![column_def.name.clone()],
+        AlterTableOperation::DropColumn { column_names, .. } => column_names.clone(),
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => vec![old_column_name.clone(), new_column_name.clone()],
+        AlterTableOperation::ChangeColumn {
+            old_name, new_name, ..
+        } => {
+            if old_name == new_name {
+                vec![old_name.clone()]
+            } else {
+                vec![old_name.clone(), new_name.clone()]
+            }
+        }
+        AlterTableOperation::ModifyColumn { col_name, .. } => vec![col_name.clone()],
+        AlterTableOperation::AlterColumn { column_name, .. } => vec![column_name.clone()],
+        _ => Vec::new(),
+    }
 }
 
 /// Surface ON CONFLICT DO UPDATE SET / ON DUPLICATE KEY UPDATE
@@ -3278,6 +3320,107 @@ mod tests {
                     reads: vec![filter_read("t", "a")],
                     writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
                     flows: vec![flow_passthrough(excluded("b"), persisted("t", "b"))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+    }
+
+    mod alter_table {
+        //! ALTER TABLE produces column-level writes for column-naming
+        //! operations: ADD COLUMN, DROP COLUMN, RENAME COLUMN, CHANGE
+        //! COLUMN, MODIFY COLUMN, ALTER COLUMN. RENAME / CHANGE surface
+        //! BOTH the old and new names — both ends of the rename are
+        //! useful for downstream lineage consumers tracking column
+        //! history. Schema-level operations (constraints, partitions,
+        //! RENAME TABLE) contribute no column writes.
+        use super::*;
+
+        #[test]
+        fn alter_table_add_column_emits_write() {
+            assert_column_ops(
+                "ALTER TABLE t ADD COLUMN c INT",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::AlterTable,
+                    reads: vec![],
+                    writes: vec![write("t", "c")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn alter_table_drop_column_emits_write() {
+            assert_column_ops(
+                "ALTER TABLE t DROP COLUMN c",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::AlterTable,
+                    reads: vec![],
+                    writes: vec![write("t", "c")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn alter_table_rename_column_emits_both_old_and_new() {
+            // RENAME moves data from old to new; surface both for
+            // downstream consumers tracking column history.
+            assert_column_ops(
+                "ALTER TABLE t RENAME COLUMN a TO b",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::AlterTable,
+                    reads: vec![],
+                    writes: vec![write("t", "a"), write("t", "b")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn alter_table_alter_column_emits_write_for_target_column() {
+            assert_column_ops(
+                "ALTER TABLE t ALTER COLUMN a SET NOT NULL",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::AlterTable,
+                    reads: vec![],
+                    writes: vec![write("t", "a")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn alter_table_multiple_ops_collects_all_target_columns() {
+            // sqlparser parses multi-op ALTER as a single statement
+            // with `operations: Vec<AlterTableOperation>`.
+            assert_column_ops(
+                "ALTER TABLE t ADD COLUMN c INT, DROP COLUMN d",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::AlterTable,
+                    reads: vec![],
+                    writes: vec![write("t", "c"), write("t", "d")],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn alter_table_add_constraint_emits_no_column_writes() {
+            // AddConstraint is schema-level — no column-level writes
+            // surface (the table itself stays in table_op writes).
+            assert_column_ops(
+                "ALTER TABLE t ADD CONSTRAINT uq UNIQUE (a)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::AlterTable,
+                    reads: vec![],
+                    writes: vec![],
+                    flows: vec![],
                     diagnostics: vec![],
                 },
             );
