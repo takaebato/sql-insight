@@ -1381,6 +1381,82 @@ mod tests {
         }
 
         #[test]
+        fn group_by_cube_modifier_carries_group_by_kind() {
+            assert_column_ops(
+                "SELECT a, b FROM t1 GROUP BY CUBE(a, b)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "a"),
+                        read("t1", "b"),
+                        group_by_read("t1", "a"),
+                        group_by_read("t1", "b"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t1", "b"), out("b", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn group_by_grouping_sets_walks_each_set_member() {
+            // GROUPING SETS ((a, b), (a), ()) — every named column
+            // inside any set should be picked up with GroupBy kind.
+            // The empty set contributes nothing.
+            assert_column_ops(
+                "SELECT a, b FROM t1 GROUP BY GROUPING SETS ((a, b), (a), ())",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "a"),
+                        read("t1", "b"),
+                        group_by_read("t1", "a"),
+                        group_by_read("t1", "b"),
+                        group_by_read("t1", "a"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t1", "b"), out("b", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn group_by_mixed_plain_and_rollup_collects_both() {
+            // `GROUP BY a, ROLLUP(b, c)` — `a` is a plain GROUP BY ref;
+            // `b`, `c` are inside the ROLLUP expression. All three
+            // should carry GroupBy kind.
+            assert_column_ops(
+                "SELECT a, b, c FROM t1 GROUP BY a, ROLLUP(b, c)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "a"),
+                        read("t1", "b"),
+                        read("t1", "c"),
+                        group_by_read("t1", "a"),
+                        group_by_read("t1", "b"),
+                        group_by_read("t1", "c"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t1", "b"), out("b", 1)),
+                        flow_passthrough(col("t1", "c"), out("c", 2)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
         fn subquery_in_group_by_keeps_inner_projection_kind() {
             // GROUP BY (SELECT max(z) FROM s) — the inner subquery's `z` is
             // its own Projection, not the outer GroupBy. resolve_query
