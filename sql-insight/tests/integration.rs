@@ -450,7 +450,13 @@ mod diagnostics {
     }
 
     #[test]
-    fn wildcard_diagnostic_carries_span_info() {
+    fn wildcard_diagnostic_carries_precise_span() {
+        // Pin down line *and* column for the `*` token. The wildcard
+        // sits at column 8 of `SELECT * FROM t1` (1-indexed,
+        // immediately after `SELECT `). This pin-down means that if
+        // span propagation regresses — e.g. the resolver starts using
+        // the surrounding SELECT node's span instead of the wildcard
+        // token's — this test will fail with a concrete diff.
         let result =
             extract_column_operations(&GenericDialect {}, "SELECT * FROM t1", None).unwrap();
         let ops = result[0].as_ref().unwrap();
@@ -459,15 +465,57 @@ mod diagnostics {
             .iter()
             .find(|d| matches!(d.kind, DiagnosticKind::WildcardSuppressed))
             .expect("WildcardSuppressed not found");
-        // Message contains the source location.
         assert!(
             wildcard.message.contains("at L1:"),
-            "got: {}",
+            "message should embed source location, got: {}",
             wildcard.message
         );
-        // Structured span is also populated.
         let span = wildcard.span.expect("wildcard token carries a span");
+        assert_eq!(span.start.line, 1, "wildcard line");
+        assert_eq!(span.start.column, 8, "wildcard column");
+    }
+
+    #[test]
+    fn unresolved_column_diagnostic_carries_precise_span() {
+        // The catalog is needed to fire UnresolvedColumn — without it
+        // the resolver stays silent (Unknown schemas could contain
+        // anything). With the catalog, `missing` is unambiguously
+        // not a column of t1.
+        //
+        // `missing` starts at column 8 in `SELECT missing FROM t1`.
+        // Pinning down the column here is the regression net for span
+        // plumbing through the resolver's catalog-aware path —
+        // separate from the wildcard path, which goes through
+        // projection.rs.
+        #[derive(Debug, Default)]
+        struct C(HashMap<String, Vec<&'static str>>);
+        impl Catalog for C {
+            fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
+                self.0.get(table.name.value.as_str()).map(|cols| {
+                    cols.iter()
+                        .map(|c| ColumnSchema { name: Ident::new(*c) })
+                        .collect()
+                })
+            }
+        }
+        let mut catalog = C::default();
+        catalog.0.insert("t1".to_string(), vec!["a", "b"]);
+
+        let result = extract_column_operations(
+            &GenericDialect {},
+            "SELECT missing FROM t1",
+            Some(&catalog),
+        )
+        .unwrap();
+        let ops = result[0].as_ref().unwrap();
+        let unresolved = ops
+            .diagnostics
+            .iter()
+            .find(|d| matches!(d.kind, DiagnosticKind::UnresolvedColumn))
+            .expect("UnresolvedColumn not found");
+        let span = unresolved.span.expect("ident token carries a span");
         assert_eq!(span.start.line, 1);
+        assert_eq!(span.start.column, 8);
     }
 }
 
