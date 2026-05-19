@@ -227,12 +227,12 @@ impl<'a> Resolver<'a> {
         let (table, alias) = TableReference::from_insert_with_alias(insert)?;
         let target_table = table.clone();
         self.bind_base_table(table, alias, TableRole::Write);
-        if let Some(source) = &insert.source {
-            // Explicit column list wins; otherwise fall back to the
-            // catalog-provided schema (when present) for positional
-            // pairing. Without either, no flow edges are emitted —
-            // we have no target column names to pair against.
-            let effective_columns = self.effective_target_columns(&insert.columns, &target_table);
+        // Explicit column list wins; otherwise fall back to the
+        // catalog-provided schema (when present) for positional
+        // pairing. Without either, no flow edges are emitted —
+        // we have no target column names to pair against.
+        let effective_columns = self.effective_target_columns(&insert.columns, &target_table);
+        let source_projections = if let Some(source) = &insert.source {
             // Raw resolve_query (not the QueryOutput-emitting wrapper):
             // INSERT pairs each projection item positionally with its
             // target column instead, emitting Persisted edges. UNION
@@ -247,12 +247,15 @@ impl<'a> Resolver<'a> {
                         column: col.clone(),
                     })
             });
-        }
+            resolved.projections
+        } else {
+            Vec::new()
+        };
         for assignment in &insert.assignments {
             self.visit_expr(&assignment.value)?;
         }
         if let Some(on) = &insert.on {
-            self.visit_insert_on(on, &target_table, &insert.columns)?;
+            self.visit_insert_on(on, &target_table, &effective_columns, &source_projections)?;
         }
         Ok(())
     }
@@ -275,7 +278,8 @@ impl<'a> Resolver<'a> {
         &mut self,
         on: &OnInsert,
         target_table: &TableReference,
-        insert_columns: &[Ident],
+        effective_columns: &[Ident],
+        source_projections: &[super::ProjectionGroup],
     ) -> Result<(), Error> {
         match on {
             OnInsert::DuplicateKeyUpdate(assignments) => {
@@ -291,19 +295,34 @@ impl<'a> Resolver<'a> {
                 if let OnConflictAction::DoUpdate(do_update) = &on_conflict.action {
                     // EXCLUDED in Postgres / Sqlite exposes the
                     // would-be-inserted row as a row source. Bind it
-                    // as a synthetic derived-table with the INSERT
-                    // target's column list so `EXCLUDED.<col>` refs
-                    // filter out of the public `reads` surface while
-                    // still emitting valid Persisted flow edges.
-                    let cols = self.effective_target_columns(insert_columns, target_table);
-                    let excluded_schema = if cols.is_empty() {
+                    // as a synthetic derived-table with:
+                    // - schema: the INSERT target's column list, so
+                    //   `EXCLUDED.<col>` refs filter out of the public
+                    //   `reads` surface (like CTE / derived);
+                    // - body_projections: the INSERT source's
+                    //   projections renamed positionally to the target
+                    //   column names, so `substitute_source` composes
+                    //   `EXCLUDED.<col>` back to the actual source ref
+                    //   (e.g. `EXCLUDED.b` → source's `y` when the
+                    //   INSERT pairs (a, b) ← (x, y)).
+                    let excluded_schema = if effective_columns.is_empty() {
                         RelationSchema::Unknown
                     } else {
                         RelationSchema::Known(
-                            cols.into_iter().map(|name| Column { name }).collect(),
+                            effective_columns
+                                .iter()
+                                .cloned()
+                                .map(|name| Column { name })
+                                .collect(),
                         )
                     };
-                    self.bind_derived_table(Ident::new("EXCLUDED"), excluded_schema, Vec::new());
+                    let body_projections =
+                        excluded_body_projections(effective_columns, source_projections);
+                    self.bind_derived_table(
+                        Ident::new("EXCLUDED"),
+                        excluded_schema,
+                        body_projections,
+                    );
                     self.emit_assignment_flows(&do_update.assignments, Some(target_table))?;
                     if let Some(selection) = &do_update.selection {
                         self.with_filter_clause(|r| r.visit_expr(selection))?;
@@ -526,6 +545,35 @@ impl<'a> Resolver<'a> {
         }
         Ok(())
     }
+}
+
+/// Rename each source projection group's items positionally to the
+/// INSERT target's column names — the EXCLUDED pseudo-table exposes
+/// the would-be-inserted row, so `EXCLUDED.<target_col>` should
+/// compose back to whatever expression feeds that position of the
+/// source. Returns an empty `Vec` when there are no source
+/// projections (e.g. `INSERT ... VALUES (...) ON CONFLICT ...`),
+/// in which case `substitute_source` falls back to leaving
+/// `EXCLUDED.<col>` as the flow source.
+fn excluded_body_projections(
+    effective_columns: &[Ident],
+    source_projections: &[super::ProjectionGroup],
+) -> Vec<super::ProjectionGroup> {
+    if source_projections.is_empty() || effective_columns.is_empty() {
+        return Vec::new();
+    }
+    source_projections
+        .iter()
+        .map(|group| {
+            let mut g = group.clone();
+            for (position, item) in g.items.iter_mut().enumerate() {
+                if let Some(name) = effective_columns.get(position) {
+                    item.name = Some(name.clone());
+                }
+            }
+            g
+        })
+        .collect()
 }
 
 fn from_table_items(from: &FromTable) -> &[TableWithJoins] {

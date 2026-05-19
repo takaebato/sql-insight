@@ -3094,9 +3094,13 @@ mod tests {
         }
 
         #[test]
-        fn pg_insert_select_with_on_conflict_keeps_source_and_conflict_flows() {
-            // Source flows survive AND the conflict action emits its
-            // own EXCLUDED → target flow.
+        fn pg_insert_select_with_on_conflict_composes_excluded_to_source() {
+            // EXCLUDED's body_projections come from the INSERT source
+            // renamed to the target columns positionally. So
+            // `EXCLUDED.b` composes through to the source's position-1
+            // projection (`y` from s) — the conflict-action flow
+            // bottoms out at the same base table as the
+            // source-projection flow.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (a, b) SELECT x, y FROM s \
                  ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
@@ -3108,7 +3112,7 @@ mod tests {
                     flows: vec![
                         flow_passthrough(col("s", "x"), persisted("t", "a")),
                         flow_passthrough(col("s", "y"), persisted("t", "b")),
-                        flow_passthrough(excluded("b"), persisted("t", "b")),
+                        flow_passthrough(col("s", "y"), persisted("t", "b")),
                     ],
                     diagnostics: vec![],
                 },
@@ -3131,6 +3135,55 @@ mod tests {
                     reads: vec![read("t", "b")],
                     writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
                     flows: vec![flow_computed(col("t", "b"), persisted("t", "b"))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn pg_insert_union_with_on_conflict_excluded_fans_out_to_each_branch() {
+            // The source has TWO ProjectionGroups (one per UNION
+            // branch), so EXCLUDED's body_projections also have two
+            // groups — each with a position-0 item named after the
+            // INSERT target column. `EXCLUDED.a` then composes to
+            // BOTH branches' position-0 source refs.
+            assert_column_ops_with_dialect(
+                "INSERT INTO t (a) SELECT x FROM s1 UNION SELECT y FROM s2 \
+                 ON CONFLICT (a) DO UPDATE SET a = EXCLUDED.a",
+                &PostgreSqlDialect {},
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("s1", "x"), read("s2", "y")],
+                    writes: vec![write("t", "a"), write("t", "a")],
+                    flows: vec![
+                        flow_passthrough(col("s1", "x"), persisted("t", "a")),
+                        flow_passthrough(col("s2", "y"), persisted("t", "a")),
+                        flow_passthrough(col("s1", "x"), persisted("t", "a")),
+                        flow_passthrough(col("s2", "y"), persisted("t", "a")),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn pg_insert_aggregate_with_on_conflict_excluded_keeps_aggregation_kind() {
+            // SUM(x) marks the source projection as Aggregation kind.
+            // When EXCLUDED.total composes back, compose_flow_kinds
+            // takes the Aggregation-dominant rule → flow kind stays
+            // Aggregation even on the conflict-action path.
+            assert_column_ops_with_dialect(
+                "INSERT INTO t (total) SELECT SUM(x) FROM s \
+                 ON CONFLICT (id) DO UPDATE SET total = EXCLUDED.total",
+                &PostgreSqlDialect {},
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("s", "x")],
+                    writes: vec![write("t", "total"), write("t", "total")],
+                    flows: vec![
+                        flow_aggregation(col("s", "x"), persisted("t", "total")),
+                        flow_aggregation(col("s", "x"), persisted("t", "total")),
+                    ],
                     diagnostics: vec![],
                 },
             );
