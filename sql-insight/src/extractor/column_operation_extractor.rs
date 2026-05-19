@@ -2760,27 +2760,22 @@ mod tests {
         }
 
         #[test]
-        fn ctas_with_union_body_uses_each_branch_name_as_writes() {
-            // Surprise: when CTAS infers column names from the body
-            // projections, *each* UNION branch contributes its own
-            // inferred name. So `SELECT a ... UNION SELECT b ...`
-            // produces writes for both `dst.a` and `dst.b`, and each
-            // branch's source flows to its own persisted target.
-            //
-            // SQL semantics say the result schema follows the left
-            // branch (see resolver/query.rs `visit_set_expr`), so the
-            // right branch's name leaking into writes is a divergence
-            // from that — pinned down here so it surfaces if/when the
-            // resolver later constrains UNION-CTAS pairing to the left.
+        fn ctas_with_union_body_pairs_left_branch_names_for_all_branches() {
+            // CTAS schema follows the LEFT branch's projection names
+            // (SQL standard). The inferred-name path uses the first
+            // ProjectionGroup's item names for every branch's
+            // positional pairing — same as INSERT-SELECT-UNION. So:
+            //   - writes: only `dst.a` (left branch's name)
+            //   - flows: BOTH branches feed `Persisted(dst.a)`
             assert_column_ops(
                 "CREATE TABLE dst AS SELECT a FROM t1 UNION SELECT b FROM t2",
                 StatementColumnOperations {
                     statement_kind: StatementKind::CreateTable,
                     reads: vec![read("t1", "a"), read("t2", "b")],
-                    writes: vec![write("dst", "a"), write("dst", "b")],
+                    writes: vec![write("dst", "a")],
                     flows: vec![
                         flow_passthrough(col("t1", "a"), persisted("dst", "a")),
-                        flow_passthrough(col("t2", "b"), persisted("dst", "b")),
+                        flow_passthrough(col("t2", "b"), persisted("dst", "a")),
                     ],
                     diagnostics: vec![],
                 },

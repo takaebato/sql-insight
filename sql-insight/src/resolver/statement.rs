@@ -325,17 +325,29 @@ impl<'a> Resolver<'a> {
     /// inferred name (alias > bare ident name); items without an
     /// inferable name and no explicit slot are silently skipped.
     /// Used by CTAS, CREATE VIEW, and ALTER VIEW.
+    ///
+    /// For UNION-bodied sources the result schema follows the LEFT
+    /// branch's names (SQL standard), so the inferred-name fallback
+    /// reads the first projection group's item names rather than the
+    /// current group's — making every branch pair against the same
+    /// target column at each position. Mirrors INSERT-SELECT-UNION
+    /// positional pairing.
     fn emit_persisted_to_created(
         &mut self,
         target: &TableReference,
         explicit_columns: &[sqlparser::ast::Ident],
         resolved: &super::ResolvedQuery,
     ) {
-        self.emit_per_projection(&resolved.projections, |position, item| {
+        let inferred_left_names: Vec<Option<Ident>> = resolved
+            .projections
+            .first()
+            .map(|g| g.items.iter().map(|i| i.name.clone()).collect())
+            .unwrap_or_default();
+        self.emit_per_projection(&resolved.projections, |position, _item| {
             explicit_columns
                 .get(position)
                 .cloned()
-                .or_else(|| item.name.clone())
+                .or_else(|| inferred_left_names.get(position).cloned().flatten())
                 .map(|column| FlowTargetSpec::Persisted {
                     table: target.clone(),
                     column,
