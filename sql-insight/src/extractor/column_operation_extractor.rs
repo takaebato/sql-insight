@@ -3420,6 +3420,118 @@ mod tests {
         }
     }
 
+    mod values_as_relation {
+        //! `VALUES` can stand in for a row-source in three positions:
+        //! - INSERT … VALUES (already covered in `flows` / `on_conflict`)
+        //! - SELECT … FROM (VALUES …) AS t(x, y)   — derived table
+        //! - WITH cte(x, y) AS (VALUES …) SELECT … — CTE body
+        //!
+        //! VALUES doesn't carry projection items the resolver can
+        //! capture (literals have no source refs), so flows from these
+        //! variants bottom out at the synthetic binding — no
+        //! composition to a base table is possible.
+        use super::*;
+
+        #[test]
+        fn values_as_derived_table_with_aliases_emits_synthetic_refs_only() {
+            // The derived table `t` carries schema [x, y] from the
+            // alias rename, but its body_projections are empty (VALUES
+            // contributes no ProjectionItems). So `t.x` is recorded as
+            // a synthetic ref pointing at the derived binding; reads
+            // filter it out, and flows keep `t.x` as the source
+            // (composition can't substitute further).
+            assert_column_ops(
+                "SELECT x, y FROM (VALUES (1, 'a'), (2, 'b')) AS t(x, y)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![],
+                    writes: vec![],
+                    flows: vec![
+                        ColumnFlow {
+                            source: ColumnReference {
+                                table: Some(TableReference {
+                                    catalog: None,
+                                    schema: None,
+                                    name: "t".into(),
+                                }),
+                                name: "x".into(),
+                            },
+                            target: out("x", 0),
+                            kind: ColumnFlowKind::Passthrough,
+                        },
+                        ColumnFlow {
+                            source: ColumnReference {
+                                table: Some(TableReference {
+                                    catalog: None,
+                                    schema: None,
+                                    name: "t".into(),
+                                }),
+                                name: "y".into(),
+                            },
+                            target: out("y", 1),
+                            kind: ColumnFlowKind::Passthrough,
+                        },
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn values_as_cte_body_with_aliases_emits_synthetic_refs_only() {
+            assert_column_ops(
+                "WITH cte(id, val) AS (VALUES (1, 'a'), (2, 'b')) SELECT id FROM cte",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: Some(TableReference {
+                                catalog: None,
+                                schema: None,
+                                name: "cte".into(),
+                            }),
+                            name: "id".into(),
+                        },
+                        target: out("id", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn values_with_column_ref_in_row_picks_up_outer_ref() {
+            // A column ref inside a VALUES row (rare in practice but
+            // syntactically valid) does get walked and surfaces in
+            // reads — the outer table `t1` is in scope of the derived
+            // table per the resolver's permissive scope-chain rule.
+            assert_column_ops(
+                "SELECT v.x FROM t1, (VALUES (t1.a)) AS v(x)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: Some(TableReference {
+                                catalog: None,
+                                schema: None,
+                                name: "v".into(),
+                            }),
+                            name: "x".into(),
+                        },
+                        target: out("x", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![],
+                },
+            );
+        }
+    }
+
     mod alter_table {
         //! ALTER TABLE produces column-level writes for column-naming
         //! operations: ADD COLUMN, DROP COLUMN, RENAME COLUMN, CHANGE
