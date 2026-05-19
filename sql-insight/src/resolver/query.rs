@@ -207,7 +207,7 @@ impl<'a> Resolver<'a> {
     /// Walk a single projection item's expression and snapshot the
     /// refs it records, packaging name / source_refs / kind into a
     /// `ProjectionItem`.
-    fn build_projection_item(&mut self, item: &SelectItem) -> Result<ProjectionItem, Error> {
+    pub(super) fn build_projection_item(&mut self, item: &SelectItem) -> Result<ProjectionItem, Error> {
         let refs_before = self.column_refs_len();
         self.visit_select_item(item)?;
         let source_refs = self.column_refs_slice(refs_before).to_vec();

@@ -3208,6 +3208,139 @@ mod tests {
         }
     }
 
+    mod returning {
+        //! `RETURNING <select_items>` on INSERT / UPDATE / DELETE
+        //! (Postgres / Sqlite extension) projects from the affected
+        //! rows of the target table — treated like a top-level SELECT
+        //! projection: each item contributes refs to `reads` and a
+        //! `QueryOutput` flow edge. Walked BEFORE the ON-clause for
+        //! INSERT so any EXCLUDED binding doesn't ambify unqualified
+        //! refs that collide with INSERT column names.
+        use super::*;
+
+        #[test]
+        fn insert_values_with_returning_emits_target_reads_and_query_output() {
+            assert_column_ops(
+                "INSERT INTO t (a, b) VALUES (1, 2) RETURNING id",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t", "id")],
+                    writes: vec![write("t", "a"), write("t", "b")],
+                    flows: vec![flow_passthrough(col("t", "id"), out("id", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn returning_aliased_uses_alias_as_output_name() {
+            assert_column_ops(
+                "INSERT INTO t (a) VALUES (1) RETURNING id AS pk",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t", "id")],
+                    writes: vec![write("t", "a")],
+                    flows: vec![flow_passthrough(col("t", "id"), out("pk", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn returning_with_computed_expression_marks_kind_computed() {
+            assert_column_ops(
+                "INSERT INTO t (a) VALUES (1) RETURNING id + 1 AS bumped",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t", "id")],
+                    writes: vec![write("t", "a")],
+                    flows: vec![flow_computed(col("t", "id"), out("bumped", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn returning_wildcard_records_wildcard_suppressed_diagnostic() {
+            assert_column_ops(
+                "INSERT INTO t (a) VALUES (1) RETURNING *",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![],
+                    writes: vec![write("t", "a")],
+                    flows: vec![],
+                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                },
+            );
+        }
+
+        #[test]
+        fn update_returning_walks_target_columns() {
+            assert_column_ops(
+                "UPDATE t SET a = b + 1 WHERE id = 5 RETURNING id, a",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Update,
+                    reads: vec![
+                        read("t", "b"),
+                        filter_read("t", "id"),
+                        read("t", "id"),
+                        read("t", "a"),
+                    ],
+                    writes: vec![write("t", "a")],
+                    flows: vec![
+                        flow_computed(col("t", "b"), persisted("t", "a")),
+                        flow_passthrough(col("t", "id"), out("id", 0)),
+                        flow_passthrough(col("t", "a"), out("a", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn delete_returning_walks_target_columns() {
+            assert_column_ops(
+                "DELETE FROM t WHERE id = 5 RETURNING id, val",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Delete,
+                    reads: vec![
+                        filter_read("t", "id"),
+                        read("t", "id"),
+                        read("t", "val"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t", "id"), out("id", 0)),
+                        flow_passthrough(col("t", "val"), out("val", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn insert_select_with_returning_keeps_source_flows_and_target_returning() {
+            // Source SELECT's tables are out of scope by the time
+            // RETURNING walks (their nested scope was popped after
+            // resolve_query). So RETURNING refs resolve to the target
+            // table alone, even when the bare name `id` exists in the
+            // source too.
+            assert_column_ops(
+                "INSERT INTO t (a) SELECT x FROM s RETURNING id",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("s", "x"), read("t", "id")],
+                    writes: vec![write("t", "a")],
+                    flows: vec![
+                        flow_passthrough(col("s", "x"), persisted("t", "a")),
+                        flow_passthrough(col("t", "id"), out("id", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+    }
+
     mod catalog_strict {
         use super::*;
         use crate::catalog::{Catalog, ColumnSchema};

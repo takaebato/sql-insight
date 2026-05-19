@@ -1,9 +1,9 @@
-use super::{Column, FlowTargetSpec, RelationSchema, Resolver, TableRole};
+use super::{Column, FlowTargetSpec, ProjectionGroup, RelationSchema, Resolver, TableRole};
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
-    Delete, FromTable, Ident, Merge, ObjectType, OnConflictAction, OnInsert, Statement,
-    TableWithJoins, Update, UpdateTableFromKind,
+    Delete, FromTable, Ident, Merge, ObjectType, OnConflictAction, OnInsert, SelectItem,
+    Statement, TableWithJoins, Update, UpdateTableFromKind,
 };
 
 impl<'a> Resolver<'a> {
@@ -254,9 +254,40 @@ impl<'a> Resolver<'a> {
         for assignment in &insert.assignments {
             self.visit_expr(&assignment.value)?;
         }
+        // Walk RETURNING before the ON-clause so EXCLUDED isn't yet
+        // bound: RETURNING projects from the target table, never from
+        // the would-be-inserted pseudo-row, and an in-scope EXCLUDED
+        // would ambify unqualified refs that collide with INSERT cols.
+        self.visit_returning(insert.returning.as_deref())?;
         if let Some(on) = &insert.on {
             self.visit_insert_on(on, &target_table, &effective_columns, &source_projections)?;
         }
+        Ok(())
+    }
+
+    /// Walk a `RETURNING <select_items>` clause. Each item is treated
+    /// like a top-level SELECT projection: it contributes refs to
+    /// `column_refs` and a `QueryOutput` flow edge per item. The
+    /// target table is the only binding in scope (the source SELECT's
+    /// inner scope has been popped by the time this runs), so
+    /// unqualified refs resolve to it.
+    fn visit_returning(&mut self, returning: Option<&[SelectItem]>) -> Result<(), Error> {
+        let Some(items) = returning else {
+            return Ok(());
+        };
+        let mut projection_items = Vec::with_capacity(items.len());
+        for item in items {
+            projection_items.push(self.build_projection_item(item)?);
+        }
+        let projections = vec![ProjectionGroup {
+            items: projection_items,
+        }];
+        self.emit_per_projection(&projections, |position, item| {
+            Some(FlowTargetSpec::QueryOutput {
+                name: item.name.clone(),
+                position,
+            })
+        });
         Ok(())
     }
 
@@ -393,6 +424,7 @@ impl<'a> Resolver<'a> {
         if let Some(selection) = &update.selection {
             self.with_filter_clause(|r| r.visit_expr(selection))?;
         }
+        self.visit_returning(update.returning.as_deref())?;
         Ok(())
     }
 
@@ -462,6 +494,7 @@ impl<'a> Resolver<'a> {
         if let Some(selection) = &delete.selection {
             self.with_filter_clause(|r| r.visit_expr(selection))?;
         }
+        self.visit_returning(delete.returning.as_deref())?;
         Ok(())
     }
 
