@@ -474,6 +474,76 @@ mod tests {
         }
     }
 
+    mod set_operations {
+        use super::*;
+
+        #[test]
+        fn union_emits_read_for_each_branch_table() {
+            // Each UNION branch walks its own FROM, so both tables
+            // surface in reads. No flows: bare SELECT statements
+            // never produce table-level data movement.
+            assert_ops(
+                "SELECT a FROM t1 UNION SELECT b FROM t2",
+                StatementTableOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1"), read("t2")],
+                    writes: vec![],
+                    flows: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn intersect_and_except_match_union_shape() {
+            // SetOperator variant doesn't influence table-level
+            // surfacing — INTERSECT and EXCEPT both walk both branches.
+            for op in ["INTERSECT", "EXCEPT"] {
+                let sql = format!("SELECT a FROM t1 {op} SELECT b FROM t2");
+                assert_ops(
+                    &sql,
+                    StatementTableOperations {
+                        statement_kind: StatementKind::Select,
+                        reads: vec![read("t1"), read("t2")],
+                        writes: vec![],
+                        flows: vec![],
+                        diagnostics: vec![],
+                    },
+                );
+            }
+        }
+
+        #[test]
+        fn insert_select_union_emits_one_flow_per_branch() {
+            // INSERT-SELECT-UNION moves data from each branch into the
+            // target, so both source tables surface as flow sources.
+            assert_ops(
+                "INSERT INTO dst SELECT a FROM t1 UNION SELECT b FROM t2",
+                StatementTableOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t1"), read("t2")],
+                    writes: vec![write("dst")],
+                    flows: vec![flow("t1", "dst"), flow("t2", "dst")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn ctas_with_union_body_emits_flow_per_branch() {
+            assert_ops(
+                "CREATE TABLE dst AS SELECT a FROM t1 UNION SELECT b FROM t2",
+                StatementTableOperations {
+                    statement_kind: StatementKind::CreateTable,
+                    reads: vec![read("t1"), read("t2")],
+                    writes: vec![write("dst")],
+                    flows: vec![flow("t1", "dst"), flow("t2", "dst")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+    }
+
     mod diagnostics {
         use super::*;
 

@@ -2485,6 +2485,259 @@ mod tests {
         }
     }
 
+    mod set_operations {
+        use super::*;
+
+        #[test]
+        fn union_two_branches_emit_query_output_per_branch() {
+            // Each branch contributes its own ProjectionGroup, so both
+            // branches' projections fan out independently into
+            // QueryOutput edges. Position is per-group, so both land at
+            // position 0; name follows each branch's own projection.
+            assert_column_ops(
+                "SELECT a FROM t1 UNION SELECT b FROM t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn union_all_behaves_same_as_union() {
+            // UNION ALL only differs from UNION at runtime (dedup vs
+            // not); structurally the resolver should treat them identically.
+            assert_column_ops(
+                "SELECT a FROM t1 UNION ALL SELECT b FROM t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn intersect_behaves_same_as_union() {
+            assert_column_ops(
+                "SELECT a FROM t1 INTERSECT SELECT b FROM t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn except_behaves_same_as_union() {
+            assert_column_ops(
+                "SELECT a FROM t1 EXCEPT SELECT b FROM t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn three_way_union_emits_one_flow_per_branch() {
+            // Chained UNION parses left-associatively as
+            // `(t1 UNION t2) UNION t3`, so the resolver recursively
+            // visits each base SELECT and each contributes its own group.
+            assert_column_ops(
+                "SELECT a FROM t1 UNION SELECT b FROM t2 UNION SELECT c FROM t3",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "a"),
+                        read("t2", "b"),
+                        read("t3", "c"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                        flow_passthrough(col("t3", "c"), out("c", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn union_with_where_classifies_per_branch_kind() {
+            // Each branch's WHERE is its own filter scope, so each
+            // branch produces a Projection read plus a Filter read for
+            // its own column.
+            assert_column_ops(
+                "SELECT a FROM t1 WHERE a > 0 UNION SELECT b FROM t2 WHERE b < 10",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "a"),
+                        filter_read("t1", "a"),
+                        read("t2", "b"),
+                        filter_read("t2", "b"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn union_mixed_passthrough_and_computed_kinds() {
+            // Branch flow kinds are independent. Left passthrough,
+            // right computed; both contribute to the same output position.
+            assert_column_ops(
+                "SELECT a FROM t1 UNION SELECT b + 1 AS a FROM t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_computed(col("t2", "b"), out("a", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn union_with_aggregate_branch_emits_aggregation_flow() {
+            assert_column_ops(
+                "SELECT id FROM t1 UNION SELECT COUNT(id) AS id FROM t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "id"), read("t2", "id")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "id"), out("id", 0)),
+                        flow_aggregation(col("t2", "id"), out("id", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn union_in_subquery_emits_inner_query_output_then_outer() {
+            // The inner UNION bubbles through `SetExpr::Query`-style
+            // surface and contributes flows to its own QueryOutput
+            // slot, then the outer SELECT projects from the derived
+            // subquery and composes back to the base tables.
+            assert_column_ops(
+                "SELECT x FROM (SELECT a AS x FROM t1 UNION SELECT b AS x FROM t2) sub",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("x", 0)),
+                        flow_passthrough(col("t2", "b"), out("x", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn union_in_cte_composes_to_outer_use() {
+            // CTE body is a UNION. Outer SELECT pulls `x` from the cte.
+            // Composition should walk back through both branches to t1/t2.
+            assert_column_ops(
+                "WITH cte AS (SELECT a AS x FROM t1 UNION SELECT b AS x FROM t2) \
+                 SELECT x FROM cte",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("x", 0)),
+                        flow_passthrough(col("t2", "b"), out("x", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn ctas_with_union_body_uses_each_branch_name_as_writes() {
+            // Surprise: when CTAS infers column names from the body
+            // projections, *each* UNION branch contributes its own
+            // inferred name. So `SELECT a ... UNION SELECT b ...`
+            // produces writes for both `dst.a` and `dst.b`, and each
+            // branch's source flows to its own persisted target.
+            //
+            // SQL semantics say the result schema follows the left
+            // branch (see resolver/query.rs `visit_set_expr`), so the
+            // right branch's name leaking into writes is a divergence
+            // from that — pinned down here so it surfaces if/when the
+            // resolver later constrains UNION-CTAS pairing to the left.
+            assert_column_ops(
+                "CREATE TABLE dst AS SELECT a FROM t1 UNION SELECT b FROM t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::CreateTable,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![write("dst", "a"), write("dst", "b")],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), persisted("dst", "a")),
+                        flow_passthrough(col("t2", "b"), persisted("dst", "b")),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn ctas_with_explicit_columns_and_union_body_pairs_left_target_for_all_branches() {
+            // When CTAS specifies its own column list, both branches
+            // pair positionally against the same target columns — same
+            // pattern as INSERT-SELECT-UNION.
+            assert_column_ops(
+                "CREATE TABLE dst (x INT) AS SELECT a FROM t1 UNION SELECT b FROM t2",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::CreateTable,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![write("dst", "x")],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), persisted("dst", "x")),
+                        flow_passthrough(col("t2", "b"), persisted("dst", "x")),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+    }
+
     mod catalog_strict {
         use super::*;
         use crate::catalog::{Catalog, ColumnSchema};
