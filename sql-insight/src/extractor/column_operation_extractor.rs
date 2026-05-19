@@ -85,6 +85,43 @@ use sqlparser::parser::Parser;
 /// unqualified column resolution). Pass `None` for the lightest path —
 /// the MVP does not consult the catalog yet, but the signature is fixed
 /// so callers don't have to migrate when it does.
+///
+/// ## Example
+///
+/// ```rust
+/// use sql_insight::sqlparser::dialect::GenericDialect;
+/// use sql_insight::{
+///     extract_column_operations, ColumnFlowKind, ColumnTarget, StatementKind,
+/// };
+///
+/// let dialect = GenericDialect {};
+/// let result =
+///     extract_column_operations(&dialect, "SELECT a FROM t1", None).unwrap();
+/// let ops = result[0].as_ref().unwrap();
+///
+/// // SELECT contributes reads + flows but no writes.
+/// assert_eq!(ops.statement_kind, StatementKind::Select);
+/// assert!(ops.writes.is_empty());
+///
+/// // `t1.a` surfaces as a single read, walk-time resolved to t1.
+/// assert_eq!(ops.reads.len(), 1);
+/// let read = &ops.reads[0];
+/// assert_eq!(read.column.name.value, "a");
+/// assert_eq!(read.column.table.as_ref().unwrap().name.value, "t1");
+///
+/// // The projection emits one flow into the SELECT's QueryOutput slot,
+/// // marked Passthrough (no expression wrapping the column).
+/// assert_eq!(ops.flows.len(), 1);
+/// let flow = &ops.flows[0];
+/// assert_eq!(flow.kind, ColumnFlowKind::Passthrough);
+/// match &flow.target {
+///     ColumnTarget::QueryOutput { name, position } => {
+///         assert_eq!(name.as_ref().unwrap().value, "a");
+///         assert_eq!(*position, 0);
+///     }
+///     other => panic!("expected QueryOutput, got {other:?}"),
+/// }
+/// ```
 pub fn extract_column_operations(
     dialect: &dyn Dialect,
     sql: &str,
