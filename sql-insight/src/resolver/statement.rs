@@ -1,8 +1,9 @@
-use super::{FlowTargetSpec, Resolver, TableRole};
+use super::{Column, FlowTargetSpec, RelationSchema, Resolver, TableRole};
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
-    Delete, FromTable, Merge, ObjectType, Statement, TableWithJoins, Update, UpdateTableFromKind,
+    Delete, FromTable, Ident, Merge, ObjectType, OnConflictAction, OnInsert, Statement,
+    TableWithJoins, Update, UpdateTableFromKind,
 };
 
 impl<'a> Resolver<'a> {
@@ -249,6 +250,70 @@ impl<'a> Resolver<'a> {
         }
         for assignment in &insert.assignments {
             self.visit_expr(&assignment.value)?;
+        }
+        if let Some(on) = &insert.on {
+            self.visit_insert_on(on, &target_table, &insert.columns)?;
+        }
+        Ok(())
+    }
+
+    /// Walk the optional ON-clause attached to an `INSERT`:
+    /// `ON CONFLICT ... DO UPDATE SET ...` (Postgres / Sqlite) or
+    /// `ON DUPLICATE KEY UPDATE ...` (MySQL). Both update-style
+    /// actions reuse [`Self::emit_assignment_flows`] so each
+    /// assignment's RHS feeds a Persisted flow into the INSERT
+    /// target's column, identical to a standalone `UPDATE`.
+    ///
+    /// The `EXCLUDED` pseudo-table (Postgres) is bound as a synthetic
+    /// derived-table with the INSERT target's column list as its
+    /// schema, so `EXCLUDED.<col>` refs filter out of the public
+    /// `reads` surface (matching how CTE / derived refs behave) while
+    /// still emitting valid flow sources for the assignment edges.
+    /// MySQL's equivalent (`VALUES(<col>)`) is a function-call form
+    /// that visit_expr already walks; no extra binding needed.
+    fn visit_insert_on(
+        &mut self,
+        on: &OnInsert,
+        target_table: &TableReference,
+        insert_columns: &[Ident],
+    ) -> Result<(), Error> {
+        match on {
+            OnInsert::DuplicateKeyUpdate(assignments) => {
+                // MySQL ON DUPLICATE KEY UPDATE doesn't expose the
+                // would-be-inserted row as a pseudo-table; `VALUES(col)`
+                // is the implicit-row form, parsed as a regular
+                // function call. Don't bind EXCLUDED here — doing so
+                // would make unqualified column refs inside the SET
+                // expressions ambiguous against the INSERT target.
+                self.emit_assignment_flows(assignments, Some(target_table))?;
+            }
+            OnInsert::OnConflict(on_conflict) => {
+                if let OnConflictAction::DoUpdate(do_update) = &on_conflict.action {
+                    // EXCLUDED in Postgres / Sqlite exposes the
+                    // would-be-inserted row as a row source. Bind it
+                    // as a synthetic derived-table with the INSERT
+                    // target's column list so `EXCLUDED.<col>` refs
+                    // filter out of the public `reads` surface while
+                    // still emitting valid Persisted flow edges.
+                    let cols = self.effective_target_columns(insert_columns, target_table);
+                    let excluded_schema = if cols.is_empty() {
+                        RelationSchema::Unknown
+                    } else {
+                        RelationSchema::Known(
+                            cols.into_iter().map(|name| Column { name }).collect(),
+                        )
+                    };
+                    self.bind_derived_table(Ident::new("EXCLUDED"), excluded_schema, Vec::new());
+                    self.emit_assignment_flows(&do_update.assignments, Some(target_table))?;
+                    if let Some(selection) = &do_update.selection {
+                        self.with_filter_clause(|r| r.visit_expr(selection))?;
+                    }
+                }
+            }
+            // `OnInsert` is `#[non_exhaustive]` in sqlparser. New
+            // variants land silently here — revisit when sqlparser
+            // grows another conflict-action shape.
+            _ => {}
         }
         Ok(())
     }

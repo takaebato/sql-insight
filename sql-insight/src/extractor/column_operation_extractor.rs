@@ -74,7 +74,9 @@ use crate::error::Error;
 use crate::extractor::table_operation_extractor::StatementKind;
 use crate::relation::TableReference;
 use crate::resolver::{FlowTargetSpec, RawColumnRef, Resolution, Resolver};
-use sqlparser::ast::{AssignmentTarget, Ident, Statement, TableFactor};
+use sqlparser::ast::{
+    AssignmentTarget, Ident, OnConflictAction, OnInsert, Statement, TableFactor,
+};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
@@ -487,6 +489,11 @@ fn collect_writes(
                 // those off to surface the implicit writes.
                 writes.extend(persisted_target_writes(&target, resolution));
             }
+            // ON CONFLICT DO UPDATE SET / ON DUPLICATE KEY UPDATE
+            // assignment targets become writes too — each SET column
+            // is updated on conflict, same role as a standalone UPDATE
+            // SET target.
+            writes.extend(insert_on_action_writes(insert, &target));
         }
         Statement::Update(update) => {
             let default_table = match &update.table.relation {
@@ -606,6 +613,32 @@ fn persisted_target_writes(target: &TableReference, resolution: &Resolution) -> 
                 name,
             },
         })
+        .collect()
+}
+
+/// Surface ON CONFLICT DO UPDATE SET / ON DUPLICATE KEY UPDATE
+/// assignment targets as writes on the INSERT target table.
+/// Returns an empty `Vec` when the INSERT carries no on-clause, or
+/// when the on-clause is `DO NOTHING` (no SET targets to surface).
+fn insert_on_action_writes(
+    insert: &sqlparser::ast::Insert,
+    target: &TableReference,
+) -> Vec<ColumnWrite> {
+    let assignments: &[sqlparser::ast::Assignment] = match insert.on.as_ref() {
+        Some(OnInsert::DuplicateKeyUpdate(a)) => a,
+        Some(OnInsert::OnConflict(c)) => match &c.action {
+            OnConflictAction::DoUpdate(do_update) => &do_update.assignments,
+            OnConflictAction::DoNothing => return Vec::new(),
+        },
+        // `OnInsert` is `#[non_exhaustive]` — unknown variants
+        // surface no writes until we model them explicitly.
+        Some(_) => return Vec::new(),
+        None => return Vec::new(),
+    };
+    assignments
+        .iter()
+        .filter_map(|a| column_ref_from_assignment_target(&a.target, Some(target)))
+        .map(|column| ColumnWrite { column })
         .collect()
 }
 
@@ -2980,16 +3013,24 @@ mod tests {
     }
 
     mod on_conflict {
-        //! ON CONFLICT (Postgres) / ON DUPLICATE KEY UPDATE (MySQL)
-        //! sit in `Insert.on: Option<OnInsert>`, which the resolver
-        //! currently does NOT walk. So the entire ON-clause is dropped:
-        //! no extra reads (EXCLUDED.<col> never surfaces), no
-        //! additional writes for the DO UPDATE SET targets, and no
-        //! flows from EXCLUDED into the persisted target.
+        //! ON CONFLICT (Postgres / Sqlite) and ON DUPLICATE KEY UPDATE
+        //! (MySQL) both sit in `Insert.on: Option<OnInsert>`. The
+        //! resolver walks both, with subtle differences:
         //!
-        //! These tests pin that gap down so it surfaces in test diffs
-        //! the moment someone wires up `insert.on` traversal — at
-        //! which point the expected values here need to be updated.
+        //! - Postgres: `EXCLUDED.<col>` is a pseudo-table for the
+        //!   would-be-inserted row. Bound as synthetic so refs
+        //!   through it filter out of `reads` but still emit valid
+        //!   Persisted flow edges into the target. The synthetic
+        //!   binding's columns mirror the INSERT target's columns.
+        //! - MySQL: `VALUES(<col>)` is a function-call form for the
+        //!   same concept. No EXCLUDED binding (it would make
+        //!   unqualified refs ambiguous against the INSERT target);
+        //!   the inner ref resolves to the INSERT target like a
+        //!   regular self-reference.
+        //!
+        //! DO UPDATE SET targets become writes on the INSERT target
+        //! table — same role as a standalone UPDATE SET. The optional
+        //! DO UPDATE WHERE clause walks in filter context.
         use super::*;
         use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
 
@@ -3007,19 +3048,36 @@ mod tests {
             assert_column_ops_inner(sql, 0, actual, expected);
         }
 
+        /// Construct a `ColumnReference` for the synthetic EXCLUDED
+        /// pseudo-table — used only as a Source in flow edges, not
+        /// as a real table.
+        fn excluded(name: &str) -> ColumnReference {
+            ColumnReference {
+                table: Some(TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "EXCLUDED".into(),
+                }),
+                name: name.into(),
+            }
+        }
+
         #[test]
-        fn pg_on_conflict_do_update_set_drops_excluded_ref_and_action_writes() {
-            // The EXCLUDED.b ref in the action clause is silently
-            // dropped (no read surfaces). Writes only reflect the
-            // INSERT column list.
+        fn pg_on_conflict_do_update_set_excluded_emits_flow_and_write() {
+            // DO UPDATE SET b = EXCLUDED.b
+            //   - writes: t.a, t.b from INSERT columns plus another
+            //     t.b for the SET target.
+            //   - reads: empty (EXCLUDED is synthetic-filtered;
+            //     VALUES (1, 2) are literals).
+            //   - flows: EXCLUDED.b → Persisted(t.b), Passthrough.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
                 &PostgreSqlDialect {},
                 StatementColumnOperations {
                     statement_kind: StatementKind::Insert,
                     reads: vec![],
-                    writes: vec![write("t", "a"), write("t", "b")],
-                    flows: vec![],
+                    writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
+                    flows: vec![flow_passthrough(excluded("b"), persisted("t", "b"))],
                     diagnostics: vec![],
                 },
             );
@@ -3041,10 +3099,9 @@ mod tests {
         }
 
         #[test]
-        fn pg_insert_select_with_on_conflict_keeps_source_flows() {
-            // The SELECT source is still walked normally; only the
-            // ON CONFLICT action is dropped. So flows / reads from
-            // the source SELECT survive.
+        fn pg_insert_select_with_on_conflict_keeps_source_and_conflict_flows() {
+            // Source flows survive AND the conflict action emits its
+            // own EXCLUDED → target flow.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (a, b) SELECT x, y FROM s \
                  ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
@@ -3052,10 +3109,11 @@ mod tests {
                 StatementColumnOperations {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("s", "x"), read("s", "y")],
-                    writes: vec![write("t", "a"), write("t", "b")],
+                    writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
                     flows: vec![
                         flow_passthrough(col("s", "x"), persisted("t", "a")),
                         flow_passthrough(col("s", "y"), persisted("t", "b")),
+                        flow_passthrough(excluded("b"), persisted("t", "b")),
                     ],
                     diagnostics: vec![],
                 },
@@ -3063,19 +3121,39 @@ mod tests {
         }
 
         #[test]
-        fn mysql_on_duplicate_key_update_drops_action_clause_too() {
-            // ON DUPLICATE KEY UPDATE rides the same `Insert.on` field
-            // (as `OnInsert::DuplicateKeyUpdate`), so it's dropped for
-            // the same reason as Postgres ON CONFLICT.
+        fn mysql_on_duplicate_key_update_values_func_self_references_target() {
+            // MySQL `VALUES(<col>)` is the implicit-row form. Without
+            // an EXCLUDED binding, the inner `b` ref resolves to t.b
+            // (the INSERT target). Result: t.b shows up as a read
+            // (the VALUES function call is a Computed wrapper) and
+            // the SET clause adds a Persisted flow t.b → t.b.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (a, b) VALUES (1, 2) \
                  ON DUPLICATE KEY UPDATE b = VALUES(b)",
                 &MySqlDialect {},
                 StatementColumnOperations {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![],
-                    writes: vec![write("t", "a"), write("t", "b")],
-                    flows: vec![],
+                    reads: vec![read("t", "b")],
+                    writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
+                    flows: vec![flow_computed(col("t", "b"), persisted("t", "b"))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn pg_on_conflict_do_update_with_where_clause_emits_filter_read() {
+            // DO UPDATE ... WHERE walks in filter context, so refs in
+            // the WHERE expression get `ReadKind::Filter`.
+            assert_column_ops_with_dialect(
+                "INSERT INTO t (a, b) VALUES (1, 2) \
+                 ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b WHERE t.a > 0",
+                &PostgreSqlDialect {},
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![filter_read("t", "a")],
+                    writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
+                    flows: vec![flow_passthrough(excluded("b"), persisted("t", "b"))],
                     diagnostics: vec![],
                 },
             );
