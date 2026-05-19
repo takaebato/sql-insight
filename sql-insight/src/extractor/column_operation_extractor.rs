@@ -1005,6 +1005,100 @@ mod tests {
         }
 
         #[test]
+        fn catalog_qualified_ref_resolves_to_catalog_dot_schema_dot_table() {
+            // `c1.s1.t1.a` — 4-part ref. parts.last() is the column;
+            // the preceding 3 parts decode into TableReference's
+            // catalog / schema / name fields.
+            let table_ref = TableReference {
+                catalog: Some("c1".into()),
+                schema: Some("s1".into()),
+                name: "t1".into(),
+            };
+            assert_column_ops(
+                "SELECT c1.s1.t1.a FROM c1.s1.t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![ColumnRead {
+                        column: ColumnReference {
+                            table: Some(table_ref.clone()),
+                            name: "a".into(),
+                        },
+                        kinds: vec![ReadKind::Projection],
+                    }],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(
+                        ColumnReference {
+                            table: Some(table_ref),
+                            name: "a".into(),
+                        },
+                        out("a", 0),
+                    )],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn unqualified_ref_against_catalog_qualified_table_inherits_full_qualifier() {
+            // `SELECT a FROM c1.s1.t1` — the unqualified `a` resolves
+            // to the catalog-qualified binding, picking up the full
+            // qualifier in the ColumnReference.
+            let table_ref = TableReference {
+                catalog: Some("c1".into()),
+                schema: Some("s1".into()),
+                name: "t1".into(),
+            };
+            assert_column_ops(
+                "SELECT a FROM c1.s1.t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![ColumnRead {
+                        column: ColumnReference {
+                            table: Some(table_ref.clone()),
+                            name: "a".into(),
+                        },
+                        kinds: vec![ReadKind::Projection],
+                    }],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(
+                        ColumnReference {
+                            table: Some(table_ref),
+                            name: "a".into(),
+                        },
+                        out("a", 0),
+                    )],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn five_part_ref_overshoots_qualifier_decoder_and_is_unresolved() {
+            // sqlparser parses `extra.c1.s1.t1.a` into 5 parts. The
+            // qualifier decoder caps at 3 parts (catalog / schema /
+            // name) — anything longer is a struct-field access on a
+            // fully qualified column, which we don't model. The ref
+            // is recorded with `table: None`.
+            assert_column_ops(
+                "SELECT extra.c1.s1.t1.a FROM c1.s1.t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![unresolved("a")],
+                    writes: vec![],
+                    flows: vec![ColumnFlow {
+                        source: ColumnReference {
+                            table: None,
+                            name: "a".into(),
+                        },
+                        target: out("a", 0),
+                        kind: ColumnFlowKind::Passthrough,
+                    }],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
         fn where_predicate_qualified_ref_is_a_read() {
             assert_column_ops(
                 "SELECT t1.a FROM t1 WHERE t1.b > 0",
