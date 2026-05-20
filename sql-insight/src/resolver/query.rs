@@ -116,7 +116,15 @@ impl<'a> Resolver<'a> {
             | SetExpr::Update(statement)
             | SetExpr::Delete(statement)
             | SetExpr::Merge(statement) => {
-                self.visit_statement(statement)?;
+                // `WITH cte AS (...) <DML>` — the DML statement runs in
+                // its own scope so its target binding doesn't share the
+                // enclosing query's scope with the CTEs. Without this,
+                // an unqualified predicate ref like `id` in
+                // `DELETE FROM t WHERE id IN (SELECT id FROM cte)`
+                // would see both `t` and `cte` in one scope and resolve
+                // ambiguously to None. CTEs stay reachable via the
+                // parent-scope walk-up.
+                self.with_branch_scope(|r| r.visit_statement(statement))?;
                 Ok(RelationSchema::Unknown)
             }
             SetExpr::Table(table) => {

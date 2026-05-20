@@ -78,14 +78,31 @@ impl<'a> Resolver<'a> {
                 ..
             } => {
                 if self.is_cte_reference(name) {
-                    if let Some(alias) = alias {
-                        // Carry the original CTE's body_projections to
-                        // the alias-bound Cte so flow composition works
-                        // through the alias too (`FROM cte AS c` →
-                        // `c.col` still composes to the body's source).
-                        let body = self.cte_body_projections(name);
-                        self.bind_cte(alias.name.clone(), RelationSchema::Unknown, body);
-                    }
+                    // Carry the original CTE's schema + body_projections
+                    // to the local binding so:
+                    //  1. flow composition works through the use site
+                    //     (`FROM cte AS c` → `c.col` and `FROM cte` →
+                    //     `cte.col` both compose to the body's source);
+                    //  2. catalog-aware strictness still applies — refs
+                    //     against a Known schema that doesn't list the
+                    //     column still surface as unresolved instead of
+                    //     getting absorbed by the synthetic binding;
+                    //  3. unqualified refs in the current scope have a
+                    //     single in-scope candidate — without this
+                    //     re-bind, bare refs in `WITH cte AS (...)
+                    //     INSERT INTO t ... SELECT x FROM cte` would
+                    //     walk up and ambify against the outer-bound
+                    //     INSERT target.
+                    let body = self.cte_body_projections(name);
+                    let schema = self.cte_schema(name);
+                    let bind_name = match alias {
+                        Some(a) => a.name.clone(),
+                        // `is_cte_reference` already returned true,
+                        // so `name` is a single-segment ObjectName
+                        // whose head is an Ident.
+                        None => name.0[0].as_ident().cloned().unwrap(),
+                    };
+                    self.bind_cte(bind_name, schema, body);
                     return Ok(());
                 }
                 let (table, alias_ident) =

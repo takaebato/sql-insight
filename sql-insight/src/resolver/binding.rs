@@ -416,6 +416,17 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Look up an in-scope CTE's schema (companion to
+    /// [`Self::cte_body_projections`]). Returns `RelationSchema::Unknown`
+    /// when the lookup misses — same fallthrough semantics as the
+    /// body-projections accessor.
+    pub(super) fn cte_schema(&self, cte_name: &ObjectName) -> RelationSchema {
+        match self.scopes.resolve_unqualified_relation(cte_name) {
+            Some(Binding::Cte { schema, .. }) => schema.clone(),
+            _ => RelationSchema::Unknown,
+        }
+    }
+
     pub(super) fn bind_cte(
         &mut self,
         name: Ident,

@@ -279,9 +279,21 @@ fn is_data_moving(kind: &StatementKind) -> bool {
 }
 
 pub(super) fn classify_statement(statement: &Statement) -> StatementKind {
-    use sqlparser::ast::ObjectType;
+    use sqlparser::ast::{ObjectType, SetExpr};
     match statement {
-        Statement::Query(_) => StatementKind::Select,
+        // `WITH cte AS (...) INSERT/UPDATE/DELETE/MERGE ...` is parsed
+        // by sqlparser as a top-level Query whose body is a
+        // `SetExpr::Insert/Update/Delete/Merge` wrapping the actual
+        // DML statement. Reclassify against the inner statement so
+        // the public StatementKind matches the verb the user wrote,
+        // not the parser-level wrapper.
+        Statement::Query(query) => match query.body.as_ref() {
+            SetExpr::Insert(stmt)
+            | SetExpr::Update(stmt)
+            | SetExpr::Delete(stmt)
+            | SetExpr::Merge(stmt) => classify_statement(stmt),
+            _ => StatementKind::Select,
+        },
         Statement::Insert(_) => StatementKind::Insert,
         Statement::Update(_) => StatementKind::Update,
         Statement::Delete(_) => StatementKind::Delete,

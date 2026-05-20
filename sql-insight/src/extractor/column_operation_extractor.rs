@@ -470,6 +470,20 @@ fn collect_writes(
     statement: &Statement,
     resolution: &Resolution,
 ) -> Result<Vec<ColumnWrite>, Error> {
+    // `WITH cte AS (...) <DML>` parses as a top-level `Statement::Query`
+    // wrapping a `SetExpr::{Insert|Update|Delete|Merge}` around the
+    // real DML statement. Unwrap that here so writes follow the inner
+    // verb, matching what `classify_statement` already does for kind.
+    if let Statement::Query(query) = statement {
+        use sqlparser::ast::SetExpr;
+        if let SetExpr::Insert(inner)
+        | SetExpr::Update(inner)
+        | SetExpr::Delete(inner)
+        | SetExpr::Merge(inner) = query.body.as_ref()
+        {
+            return collect_writes(inner, resolution);
+        }
+    }
     let mut writes = Vec::new();
     match statement {
         Statement::Insert(insert) => {
@@ -1785,6 +1799,54 @@ mod tests {
         }
 
         #[test]
+        fn window_with_literal_frame_bounds_does_not_add_refs() {
+            // Frame bounds with literal integers (`3 PRECEDING`,
+            // `CURRENT ROW`) walk via visit_expr but produce no
+            // column refs — same shape as the no-frame version.
+            assert_column_ops(
+                "SELECT SUM(x) OVER (PARTITION BY p ORDER BY o \
+                                     ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "x"),
+                        window_read("t1", "p"),
+                        window_read("t1", "o"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_aggregation(col("t1", "x"), out_anon(0)),
+                        flow_aggregation(col("t1", "p"), out_anon(0)),
+                        flow_aggregation(col("t1", "o"), out_anon(0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn window_with_unbounded_frame_bounds_does_not_add_refs() {
+            // UNBOUNDED PRECEDING / UNBOUNDED FOLLOWING are bound
+            // variants without an associated expr — visit_window_frame_bound
+            // returns Ok without walking anything.
+            assert_column_ops(
+                "SELECT SUM(x) OVER (ORDER BY o \
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) \
+                 FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "x"), window_read("t1", "o")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_aggregation(col("t1", "x"), out_anon(0)),
+                        flow_aggregation(col("t1", "o"), out_anon(0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
         fn merge_on_clause_carries_filter_kind() {
             assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a",
@@ -2332,6 +2394,100 @@ mod tests {
                     reads: vec![read("t1", "x")],
                     writes: vec![write("t2", "col")],
                     flows: vec![flow_passthrough(col("t1", "x"), persisted("t2", "col"))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+    }
+
+    mod with_in_dml {
+        //! `WITH cte AS (...) <DML>` — Postgres / Sqlite / standard
+        //! SQL syntax for binding CTEs visible to a DML statement.
+        //! sqlparser typically parses these as Query-with-WITH at the
+        //! source level for INSERT, and wraps Update / Delete in
+        //! various ways. These tests pin down what actually surfaces
+        //! through the resolver.
+        use super::*;
+
+        #[test]
+        fn with_in_insert_select_composes_cte_to_target() {
+            assert_column_ops(
+                "WITH cte AS (SELECT x FROM s) INSERT INTO t (a) SELECT x FROM cte",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("s", "x")],
+                    writes: vec![write("t", "a")],
+                    flows: vec![flow_passthrough(col("s", "x"), persisted("t", "a"))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn with_in_update_via_scalar_subquery_composes() {
+            // CTE is referenced from the SET RHS scalar subquery. The
+            // scalar subquery emits its own QueryOutput edge (standard
+            // behavior for any subquery resolved via the
+            // QueryOutput-emitting path), composed through cte to s.x;
+            // the UPDATE SET assignment emits the Persisted edge. Both
+            // carry Aggregation kind (max(x) marks the cte body).
+            assert_column_ops(
+                "WITH cte AS (SELECT max(x) AS m FROM s) \
+                 UPDATE t SET a = (SELECT m FROM cte) WHERE id = 1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Update,
+                    reads: vec![read("s", "x"), filter_read("t", "id")],
+                    writes: vec![write("t", "a")],
+                    flows: vec![
+                        flow_aggregation(col("s", "x"), out("m", 0)),
+                        flow_aggregation(col("s", "x"), persisted("t", "a")),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn with_in_delete_via_predicate_subquery_keeps_cte_source_as_filter_read() {
+            // The DELETE target `t` now lives in its own scope (the
+            // SetExpr DML scope), so the outer predicate `id` resolves
+            // unambiguously to `t`. The predicate subquery
+            // `(SELECT id FROM cte)` still emits its own QueryOutput
+            // edge, composed through cte back to s.id — this is the
+            // standard subquery-projection behavior, independent of
+            // whether the subquery feeds a write target (it doesn't
+            // here; DELETE has no column flows of its own).
+            assert_column_ops(
+                "WITH cte AS (SELECT id FROM s WHERE flag) \
+                 DELETE FROM t WHERE id IN (SELECT id FROM cte)",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Delete,
+                    reads: vec![
+                        read("s", "id"),
+                        filter_read("s", "flag"),
+                        filter_read("t", "id"),
+                    ],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("s", "id"), out("id", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn with_multiple_ctes_chained_into_insert() {
+            // Two CTEs where `b` references `a`. INSERT then pulls
+            // from `b`. Composition walks back through both layers
+            // to the base table.
+            assert_column_ops(
+                "WITH a AS (SELECT id FROM t1), \
+                      b AS (SELECT id + 1 AS x FROM a) \
+                 INSERT INTO t2 (col) SELECT x FROM b",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![read("t1", "id")],
+                    writes: vec![write("t2", "col")],
+                    flows: vec![flow_computed(col("t1", "id"), persisted("t2", "col"))],
                     diagnostics: vec![],
                 },
             );
