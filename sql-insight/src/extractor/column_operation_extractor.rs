@@ -1459,6 +1459,65 @@ mod tests {
         }
 
         #[test]
+        fn scalar_subquery_in_projection_emits_inner_and_outer_flows() {
+            // `SELECT a, (SELECT max(x) FROM s) AS m FROM t`:
+            //  - the scalar subquery emits its own QueryOutput edge
+            //    (s.x → out(<inner>, 0), Aggregation from max());
+            //  - the outer projection captures the subquery's source
+            //    refs and pairs `m` at position 1. Its kind is
+            //    Computed, not Aggregation: from the outer scope the
+            //    item is a *subquery* expression (Computed), and the
+            //    inner aggregate kind doesn't propagate — composition
+            //    only merges kinds through CTE / derived bindings, not
+            //    through a scalar subquery in projection.
+            //  - `a` is a plain passthrough at position 0.
+            assert_column_ops(
+                "SELECT a, (SELECT max(x) FROM s) AS m FROM t",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t", "a"), read("s", "x")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_aggregation(col("s", "x"), out_anon(0)),
+                        flow_passthrough(col("t", "a"), out("a", 0)),
+                        flow_computed(col("s", "x"), out("m", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn is_null_predicate_ref_carries_filter_kind() {
+            // `WHERE x IS NULL` — x is in a row-selection predicate,
+            // so it's a Filter read like any other WHERE ref.
+            assert_column_ops(
+                "SELECT a FROM t1 WHERE b IS NULL",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), filter_read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn is_not_null_predicate_ref_carries_filter_kind() {
+            assert_column_ops(
+                "SELECT a FROM t1 WHERE b IS NOT NULL",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), filter_read("t1", "b")],
+                    writes: vec![],
+                    flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
         fn group_by_ref_carries_group_by_kind() {
             assert_column_ops(
                 "SELECT a, COUNT(*) FROM t1 GROUP BY a",
@@ -1729,6 +1788,42 @@ mod tests {
                     writes: vec![],
                     flows: vec![
                         flow_computed(col("t1", "x"), out_anon(0)),
+                        flow_computed(col("t1", "a"), out_anon(0)),
+                        flow_computed(col("t1", "b"), out_anon(0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn simple_case_with_column_when_pattern_marks_both_conditional() {
+            // `CASE x WHEN y THEN a ELSE b END` — both the operand `x`
+            // and the WHEN-pattern column `y` are conditional inputs
+            // (compared), so both carry Conditional. `a` (THEN) and
+            // `b` (ELSE) are value results — plain Projection.
+            assert_column_ops(
+                "SELECT CASE x WHEN y THEN a ELSE b END FROM t1",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read_with_kinds(
+                            "t1",
+                            "x",
+                            vec![ReadKind::Projection, ReadKind::Conditional],
+                        ),
+                        read_with_kinds(
+                            "t1",
+                            "y",
+                            vec![ReadKind::Projection, ReadKind::Conditional],
+                        ),
+                        read("t1", "a"),
+                        read("t1", "b"),
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_computed(col("t1", "x"), out_anon(0)),
+                        flow_computed(col("t1", "y"), out_anon(0)),
                         flow_computed(col("t1", "a"), out_anon(0)),
                         flow_computed(col("t1", "b"), out_anon(0)),
                     ],
@@ -3164,6 +3259,56 @@ mod tests {
                     flows: vec![
                         flow_passthrough(col("t1", "a"), persisted("dst", "x")),
                         flow_passthrough(col("t2", "b"), persisted("dst", "x")),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn union_with_trailing_order_by_ref_is_unresolved() {
+            // ORDER BY on the whole UNION is visited in the outer query
+            // scope, AFTER both branch scopes have been popped. The
+            // ORDER BY column refers to a UNION output column, not a
+            // base table — so `a` resolves to None (no in-scope
+            // binding) and carries Sort kind.
+            assert_column_ops(
+                "SELECT a FROM t1 UNION SELECT b FROM t2 ORDER BY a",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "a"),
+                        read("t2", "b"),
+                        ColumnRead {
+                            column: ColumnReference {
+                                table: None,
+                                name: "a".into(),
+                            },
+                            kinds: vec![ReadKind::Sort],
+                        },
+                    ],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn union_with_trailing_limit_literal_adds_nothing() {
+            // LIMIT 10 is a literal — no column refs, no extra flows.
+            assert_column_ops(
+                "SELECT a FROM t1 UNION SELECT b FROM t2 LIMIT 10",
+                StatementColumnOperations {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t2", "b")],
+                    writes: vec![],
+                    flows: vec![
+                        flow_passthrough(col("t1", "a"), out("a", 0)),
+                        flow_passthrough(col("t2", "b"), out("b", 0)),
                     ],
                     diagnostics: vec![],
                 },
