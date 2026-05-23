@@ -86,8 +86,8 @@ impl CrudTableExtractor {
 
     fn extract_from_statement(statement: &Statement) -> Result<CrudTables, Error> {
         let ops = TableOperationExtractor::extract_from_statement(statement, None)?;
-        let reads: Vec<_> = ops.reads.into_iter().map(|r| r.table).collect();
-        let writes: Vec<_> = ops.writes.into_iter().map(|w| w.table).collect();
+        let reads = ops.reads;
+        let writes = ops.writes;
 
         let mut crud = CrudTables::default();
         match ops.statement_kind {

@@ -24,16 +24,8 @@ fn main() {
     for (i, result) in results.iter().enumerate() {
         let ops = result.as_ref().expect("parse + resolve succeeded");
         println!("--- statement {} ({:?}) ---", i + 1, ops.statement_kind);
-        let reads: Vec<&str> = ops
-            .reads
-            .iter()
-            .map(|r| r.table.name.value.as_str())
-            .collect();
-        let writes: Vec<&str> = ops
-            .writes
-            .iter()
-            .map(|w| w.table.name.value.as_str())
-            .collect();
+        let reads: Vec<&str> = ops.reads.iter().map(|r| r.name.value.as_str()).collect();
+        let writes: Vec<&str> = ops.writes.iter().map(|w| w.name.value.as_str()).collect();
         println!("reads:  {:?}", reads);
         println!("writes: {:?}", writes);
         println!("flows:  {} edge(s)", ops.flows.len());

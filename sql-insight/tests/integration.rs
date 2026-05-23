@@ -214,7 +214,7 @@ mod extract_table_operations {
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.statement_kind, StatementKind::Select);
         assert_eq!(ops.reads.len(), 1);
-        assert_eq!(ops.reads[0].table, table("t1"));
+        assert_eq!(ops.reads[0], table("t1"));
         assert!(ops.writes.is_empty());
         assert!(ops.flows.is_empty());
     }
@@ -225,14 +225,8 @@ mod extract_table_operations {
         let result = extract_table_operations(&GenericDialect {}, sql, None).unwrap();
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.statement_kind, StatementKind::Insert);
-        assert_eq!(
-            ops.reads.iter().map(|r| &r.table).collect::<Vec<_>>(),
-            vec![&table("staging")]
-        );
-        assert_eq!(
-            ops.writes.iter().map(|w| &w.table).collect::<Vec<_>>(),
-            vec![&table("orders")]
-        );
+        assert_eq!(ops.reads, vec![table("staging")]);
+        assert_eq!(ops.writes, vec![table("orders")]);
         assert_eq!(ops.flows.len(), 1);
         assert_eq!(ops.flows[0].source, table("staging"));
         assert_eq!(ops.flows[0].target, table("orders"));
@@ -647,9 +641,9 @@ mod invariants {
         for sql in corpus() {
             for (idx, pair) in extract_paired(sql).into_iter().enumerate() {
                 let table_op_reads: HashSet<_> =
-                    table_set(pair.tab.reads.clone(), |r| Some(r.table.clone()));
+                    table_set(pair.tab.reads.clone(), |r| Some(r.clone()));
                 let table_op_writes: HashSet<_> =
-                    table_set(pair.tab.writes.clone(), |w| Some(w.table.clone()));
+                    table_set(pair.tab.writes.clone(), |w| Some(w.clone()));
                 let known: HashSet<_> = table_op_reads.union(&table_op_writes).cloned().collect();
                 let column_op_read_tables = table_set(pair.col.reads.clone(), column_read_table);
                 for t in &column_op_read_tables {
@@ -669,7 +663,7 @@ mod invariants {
     fn column_op_write_tables_appear_in_table_op_writes() {
         for sql in corpus() {
             for (idx, pair) in extract_paired(sql).into_iter().enumerate() {
-                let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.table.clone()));
+                let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.clone()));
                 let column_op_write_tables = table_set(pair.col.writes.clone(), column_write_table);
                 for t in &column_op_write_tables {
                     assert!(
@@ -687,7 +681,7 @@ mod invariants {
     fn persisted_flow_targets_resolve_to_known_write_tables() {
         for sql in corpus() {
             for (idx, pair) in extract_paired(sql).into_iter().enumerate() {
-                let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.table.clone()));
+                let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.clone()));
                 for f in &pair.col.flows {
                     if let Some(target_table) = flow_persisted_table(f) {
                         assert!(

@@ -46,7 +46,7 @@ use sqlparser::parser::Parser;
 /// let ops = result[0].as_ref().unwrap();
 /// assert_eq!(ops.statement_kind, StatementKind::Select);
 /// assert_eq!(ops.reads.len(), 1);
-/// assert_eq!(ops.reads[0].table.name.value, "users");
+/// assert_eq!(ops.reads[0].name.value, "users");
 /// assert!(ops.writes.is_empty());
 /// ```
 pub fn extract_table_operations(
@@ -61,8 +61,8 @@ pub fn extract_table_operations(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementTableOperations {
     pub statement_kind: StatementKind,
-    pub reads: Vec<TableRead>,
-    pub writes: Vec<TableWrite>,
+    pub reads: Vec<TableReference>,
+    pub writes: Vec<TableReference>,
     pub flows: Vec<TableFlow>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -116,25 +116,6 @@ pub enum StatementKind {
     /// Statement is outside the operation-extraction scope. The
     /// accompanying `diagnostics` list explains why.
     Unsupported,
-}
-
-/// A table referenced as a Read source.
-///
-/// Carried in [`StatementTableOperations::reads`]. The struct exists to
-/// give future positional / usage enrichment (FROM vs Predicate vs Join)
-/// a natural home; the MVP carries only `table`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TableRead {
-    pub table: TableReference,
-}
-
-/// A table referenced as a Write target (insert / update / delete /
-/// merge / create / drop / alter / truncate target).
-///
-/// Carried in [`StatementTableOperations::writes`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TableWrite {
-    pub table: TableReference,
 }
 
 /// A source-to-target table flow inferred from the statement structure.
@@ -216,16 +197,8 @@ impl TableOperationExtractor {
         } else {
             // A multi-role table (e.g. `DELETE t1 FROM t1` — t1 is both
             // deletion target and row source) appears in both lists.
-            reads = resolution
-                .read_tables()
-                .into_iter()
-                .map(|table| TableRead { table })
-                .collect();
-            writes = resolution
-                .write_tables()
-                .into_iter()
-                .map(|table| TableWrite { table })
-                .collect();
+            reads = resolution.read_tables();
+            writes = resolution.write_tables();
         }
 
         let flows = extract_table_flows(&resolution, &kind);
@@ -330,12 +303,6 @@ mod tests {
         }
     }
 
-    fn read(name: &str) -> TableRead {
-        TableRead { table: table(name) }
-    }
-    fn write(name: &str) -> TableWrite {
-        TableWrite { table: table(name) }
-    }
     fn flow(source: &str, target: &str) -> TableFlow {
         TableFlow {
             source: table(source),
@@ -430,7 +397,7 @@ mod tests {
                 "SELECT id FROM users",
                 StatementTableOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("users")],
+                    reads: vec![table("users")],
                     writes: vec![],
                     flows: vec![],
                     diagnostics: vec![],
@@ -448,7 +415,7 @@ mod tests {
                 "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",
                 StatementTableOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1"), read("t2")],
+                    reads: vec![table("t1"), table("t2")],
                     writes: vec![],
                     flows: vec![],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
@@ -462,7 +429,7 @@ mod tests {
                 "SELECT t1.a FROM t1 WHERE id IN (SELECT id FROM t2)",
                 StatementTableOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1"), read("t2")],
+                    reads: vec![table("t1"), table("t2")],
                     writes: vec![],
                     flows: vec![],
                     diagnostics: vec![],
@@ -477,7 +444,7 @@ mod tests {
                 "WITH t2 AS (SELECT id FROM t1) SELECT t2.id FROM t2",
                 StatementTableOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1")],
+                    reads: vec![table("t1")],
                     writes: vec![],
                     flows: vec![],
                     diagnostics: vec![],
@@ -498,7 +465,7 @@ mod tests {
                 "SELECT a FROM t1 UNION SELECT b FROM t2",
                 StatementTableOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1"), read("t2")],
+                    reads: vec![table("t1"), table("t2")],
                     writes: vec![],
                     flows: vec![],
                     diagnostics: vec![],
@@ -516,7 +483,7 @@ mod tests {
                     &sql,
                     StatementTableOperations {
                         statement_kind: StatementKind::Select,
-                        reads: vec![read("t1"), read("t2")],
+                        reads: vec![table("t1"), table("t2")],
                         writes: vec![],
                         flows: vec![],
                         diagnostics: vec![],
@@ -533,8 +500,8 @@ mod tests {
                 "INSERT INTO dst SELECT a FROM t1 UNION SELECT b FROM t2",
                 StatementTableOperations {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![read("t1"), read("t2")],
-                    writes: vec![write("dst")],
+                    reads: vec![table("t1"), table("t2")],
+                    writes: vec![table("dst")],
                     flows: vec![flow("t1", "dst"), flow("t2", "dst")],
                     diagnostics: vec![],
                 },
@@ -547,8 +514,8 @@ mod tests {
                 "CREATE TABLE dst AS SELECT a FROM t1 UNION SELECT b FROM t2",
                 StatementTableOperations {
                     statement_kind: StatementKind::CreateTable,
-                    reads: vec![read("t1"), read("t2")],
-                    writes: vec![write("dst")],
+                    reads: vec![table("t1"), table("t2")],
+                    writes: vec![table("dst")],
                     flows: vec![flow("t1", "dst"), flow("t2", "dst")],
                     diagnostics: vec![],
                 },
@@ -581,7 +548,7 @@ mod tests {
                 0,
                 StatementTableOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1")],
+                    reads: vec![table("t1")],
                     writes: vec![],
                     flows: vec![],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
@@ -592,7 +559,7 @@ mod tests {
                 1,
                 StatementTableOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t2")],
+                    reads: vec![table("t2")],
                     writes: vec![],
                     flows: vec![],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
@@ -611,7 +578,7 @@ mod tests {
                 StatementTableOperations {
                     statement_kind: StatementKind::Insert,
                     reads: vec![],
-                    writes: vec![write("t1")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -624,8 +591,8 @@ mod tests {
                 "INSERT INTO t1 SELECT * FROM t2",
                 StatementTableOperations {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("t2", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
@@ -643,7 +610,7 @@ mod tests {
                 StatementTableOperations {
                     statement_kind: StatementKind::Update,
                     reads: vec![],
-                    writes: vec![write("t1")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -656,8 +623,8 @@ mod tests {
                 "UPDATE t1 SET a = 1 WHERE id IN (SELECT id FROM t2)",
                 StatementTableOperations {
                     statement_kind: StatementKind::Update,
-                    reads: vec![read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -675,8 +642,8 @@ mod tests {
                 &PostgreSqlDialect {},
                 StatementTableOperations {
                     statement_kind: StatementKind::Update,
-                    reads: vec![read("t2"), read("t3"), read("t4")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2"), table("t3"), table("t4")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("t2", "t1"), flow("t3", "t1")],
                     diagnostics: vec![],
                 },
@@ -694,7 +661,7 @@ mod tests {
                 StatementTableOperations {
                     statement_kind: StatementKind::Delete,
                     reads: vec![],
-                    writes: vec![write("t1")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -707,8 +674,8 @@ mod tests {
                 "DELETE FROM t1 WHERE id IN (SELECT id FROM t2)",
                 StatementTableOperations {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -724,8 +691,8 @@ mod tests {
                 &MySqlDialect {},
                 StatementTableOperations {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![read("t1"), read("t2"), read("t3")],
-                    writes: vec![write("t1"), write("t2")],
+                    reads: vec![table("t1"), table("t2"), table("t3")],
+                    writes: vec![table("t1"), table("t2")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -738,8 +705,8 @@ mod tests {
                 "DELETE FROM t1, t2 USING t1 INNER JOIN t2 INNER JOIN t3",
                 StatementTableOperations {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![read("t1"), read("t2"), read("t3")],
-                    writes: vec![write("t1"), write("t2")],
+                    reads: vec![table("t1"), table("t2"), table("t3")],
+                    writes: vec![table("t1"), table("t2")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -753,8 +720,8 @@ mod tests {
                 &MySqlDialect {},
                 StatementTableOperations {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![read("t1"), read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t1"), table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -772,8 +739,8 @@ mod tests {
                  WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
                 StatementTableOperations {
                     statement_kind: StatementKind::Merge,
-                    reads: vec![read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("t2", "t1")],
                     diagnostics: vec![],
                 },
@@ -791,7 +758,7 @@ mod tests {
                 StatementTableOperations {
                     statement_kind: StatementKind::CreateTable,
                     reads: vec![],
-                    writes: vec![write("t1")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -804,8 +771,8 @@ mod tests {
                 "CREATE TABLE t1 AS SELECT * FROM t2",
                 StatementTableOperations {
                     statement_kind: StatementKind::CreateTable,
-                    reads: vec![read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("t2", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
@@ -818,8 +785,8 @@ mod tests {
                 "CREATE VIEW v1 AS SELECT * FROM t1",
                 StatementTableOperations {
                     statement_kind: StatementKind::CreateView,
-                    reads: vec![read("t1")],
-                    writes: vec![write("v1")],
+                    reads: vec![table("t1")],
+                    writes: vec![table("v1")],
                     flows: vec![flow("t1", "v1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
@@ -833,7 +800,7 @@ mod tests {
                 StatementTableOperations {
                     statement_kind: StatementKind::AlterTable,
                     reads: vec![],
-                    writes: vec![write("t1")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -847,7 +814,7 @@ mod tests {
                 StatementTableOperations {
                     statement_kind: StatementKind::Drop,
                     reads: vec![],
-                    writes: vec![write("t1"), write("t2")],
+                    writes: vec![table("t1"), table("t2")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -861,7 +828,7 @@ mod tests {
                 StatementTableOperations {
                     statement_kind: StatementKind::Truncate,
                     reads: vec![],
-                    writes: vec![write("t1"), write("t2")],
+                    writes: vec![table("t1"), table("t2")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -894,8 +861,8 @@ mod tests {
                 "INSERT INTO t1 SELECT * FROM t2",
                 StatementTableOperations {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("t2", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
@@ -908,8 +875,8 @@ mod tests {
                 "INSERT INTO t1 SELECT * FROM t2 JOIN t3 ON t2.id = t3.id",
                 StatementTableOperations {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![read("t2"), read("t3")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2"), table("t3")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("t2", "t1"), flow("t3", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
@@ -925,8 +892,8 @@ mod tests {
                 "INSERT INTO t1 SELECT * FROM t2 WHERE id IN (SELECT id FROM t3)",
                 StatementTableOperations {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![read("t2"), read("t3")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2"), table("t3")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("t2", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
@@ -943,8 +910,8 @@ mod tests {
                  AND t2.id IN (SELECT id FROM t4)",
                 StatementTableOperations {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![read("t2"), read("t3"), read("t4")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2"), table("t3"), table("t4")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("t2", "t1"), flow("t3", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
@@ -957,8 +924,8 @@ mod tests {
                 "UPDATE t1 SET col = (SELECT v FROM t2)",
                 StatementTableOperations {
                     statement_kind: StatementKind::Update,
-                    reads: vec![read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("t2", "t1")],
                     diagnostics: vec![],
                 },
@@ -971,8 +938,8 @@ mod tests {
                 "UPDATE t1 SET col = 1 WHERE id IN (SELECT id FROM t2)",
                 StatementTableOperations {
                     statement_kind: StatementKind::Update,
-                    reads: vec![read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -985,8 +952,8 @@ mod tests {
                 "CREATE TABLE t1 AS SELECT * FROM t2",
                 StatementTableOperations {
                     statement_kind: StatementKind::CreateTable,
-                    reads: vec![read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("t2", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
@@ -999,8 +966,8 @@ mod tests {
                 "CREATE VIEW v1 AS SELECT * FROM t1",
                 StatementTableOperations {
                     statement_kind: StatementKind::CreateView,
-                    reads: vec![read("t1")],
-                    writes: vec![write("v1")],
+                    reads: vec![table("t1")],
+                    writes: vec![table("v1")],
                     flows: vec![flow("t1", "v1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
@@ -1014,8 +981,8 @@ mod tests {
                  WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
                 StatementTableOperations {
                     statement_kind: StatementKind::Merge,
-                    reads: vec![read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("t2", "t1")],
                     diagnostics: vec![],
                 },
@@ -1028,8 +995,8 @@ mod tests {
                 "INSERT INTO t1 WITH cte AS (SELECT * FROM s) SELECT * FROM cte",
                 StatementTableOperations {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![read("s")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("s")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("s", "t1")],
                     diagnostics: vec![
                         diag(DiagnosticKind::WildcardSuppressed),
@@ -1049,8 +1016,8 @@ mod tests {
              ) SELECT * FROM cte",
                 StatementTableOperations {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![read("s"), read("x")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("s"), table("x")],
+                    writes: vec![table("t1")],
                     flows: vec![flow("s", "t1")],
                     diagnostics: vec![
                         diag(DiagnosticKind::WildcardSuppressed),
@@ -1066,7 +1033,7 @@ mod tests {
                 "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",
                 StatementTableOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1"), read("t2")],
+                    reads: vec![table("t1"), table("t2")],
                     writes: vec![],
                     flows: vec![],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
@@ -1081,7 +1048,7 @@ mod tests {
                 StatementTableOperations {
                     statement_kind: StatementKind::Insert,
                     reads: vec![],
-                    writes: vec![write("t1")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -1096,8 +1063,8 @@ mod tests {
                 "DELETE FROM t1 WHERE id IN (SELECT id FROM t2)",
                 StatementTableOperations {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![read("t2")],
-                    writes: vec![write("t1")],
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
@@ -1111,7 +1078,7 @@ mod tests {
                 StatementTableOperations {
                     statement_kind: StatementKind::Truncate,
                     reads: vec![],
-                    writes: vec![write("t1")],
+                    writes: vec![table("t1")],
                     flows: vec![],
                     diagnostics: vec![],
                 },
