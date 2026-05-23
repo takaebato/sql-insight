@@ -18,10 +18,11 @@ and normalization.
 - **Table-level Operation Extraction**: `reads` / `writes` / `flows`
   surfaces with statement-kind classification per parsed statement.
 - **Column-level Operation Extraction**: the same three surfaces at
-  column granularity, with clause-role (`Projection` / `Filter` /
-  `GroupBy` / `Sort` / `Window`) and flow-kind (`Passthrough` /
-  `Aggregation` / `Computed`) metadata. Column flows form a
-  source → target graph suitable for lineage-style analyses.
+  column granularity. `reads` / `writes` are plain occurrence lists
+  of column references; `flows` form a source → target graph with a
+  flow-kind (`Passthrough` vs `Transformation`). The value-vs-filter
+  distinction is structural — a value contributor is a `flows`
+  source, a filter-only column is in `reads` but not `flows`.
 - **Optional Catalog**: supply a schema provider to make resolution
   strict — catch typos as unresolved references, pair INSERT
   positional values with target columns. Every extractor still
@@ -86,7 +87,7 @@ let result = extract_column_operations(
     None,
 ).unwrap();
 let ops = result[0].as_ref().unwrap();
-// One flow per target column: id → id (Passthrough), amount → total (Aggregation).
+// One flow per target column: id → id (Passthrough), amount → total (Transformation, via SUM).
 assert_eq!(ops.flows.len(), 2);
 ```
 
@@ -193,9 +194,9 @@ Runnable examples under
   table-level `reads` / `writes` / `flows` across a multi-statement
   batch, with `StatementKind`-based dispatch.
 - [`column_operations.rs`](sql-insight/examples/column_operations.rs) —
-  per-column reads with clause-role tagging, and flows classified by
-  `ColumnFlowKind` (Passthrough / Aggregation / Computed) into
-  `Persisted` vs `QueryOutput` targets.
+  per-column reads and flows classified by `ColumnFlowKind`
+  (Passthrough vs Transformation) into `Persisted` vs `QueryOutput`
+  targets.
 - [`with_catalog.rs`](sql-insight/examples/with_catalog.rs) — supplying
   a `Catalog` enables INSERT positional column pairing and surfaces
   `AmbiguousColumn` / `UnresolvedColumn` diagnostics that stay silent

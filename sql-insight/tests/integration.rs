@@ -282,21 +282,21 @@ mod extract_column_operations {
     }
 
     #[test]
-    fn select_collects_per_column_reads_with_clause_role() {
+    fn select_collects_per_column_reads() {
         let sql = "SELECT a FROM t1 WHERE b > 0";
         let result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
         let ops = result[0].as_ref().unwrap();
-        // a → Projection, b → Filter
-        let by_name: HashMap<_, _> = ops
-            .reads
+        // Both the projection `a` and the filter `b` surface as reads
+        // (occurrence list, no clause tag). value-vs-filter is
+        // recovered structurally: `a` is also a flow source, `b` is not.
+        let names: Vec<_> = ops.reads.iter().map(|r| r.name.value.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+        let flow_sources: Vec<_> = ops
+            .flows
             .iter()
-            .map(|r| (r.column.name.value.as_str(), r.kinds.clone()))
+            .map(|f| f.source.name.value.as_str())
             .collect();
-        assert_eq!(
-            by_name.get("a"),
-            Some(&vec![sql_insight::ReadKind::Projection])
-        );
-        assert_eq!(by_name.get("b"), Some(&vec![sql_insight::ReadKind::Filter]));
+        assert_eq!(flow_sources, vec!["a"]); // `b` (filter) is not a flow source
     }
 
     #[test]
@@ -313,13 +313,15 @@ mod extract_column_operations {
     }
 
     #[test]
-    fn aggregate_projection_marks_flow_aggregation() {
+    fn aggregate_projection_marks_flow_transformation() {
         let sql = "INSERT INTO summary (total) SELECT SUM(amount) FROM staging";
         let result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.flows.len(), 1);
         assert_eq!(ops.flows[0].source, col("staging", "amount"));
-        assert!(matches!(ops.flows[0].kind, ColumnFlowKind::Aggregation));
+        // SUM changes the value → Transformation (the 2-way kind no
+        // longer distinguishes aggregation from other transforms).
+        assert!(matches!(ops.flows[0].kind, ColumnFlowKind::Transformation));
     }
 
     #[test]
@@ -493,7 +495,9 @@ mod diagnostics {
             fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
                 self.0.get(table.name.value.as_str()).map(|cols| {
                     cols.iter()
-                        .map(|c| ColumnSchema { name: Ident::new(*c) })
+                        .map(|c| ColumnSchema {
+                            name: Ident::new(*c),
+                        })
                         .collect()
                 })
             }
@@ -501,12 +505,9 @@ mod diagnostics {
         let mut catalog = C::default();
         catalog.0.insert("t1".to_string(), vec!["a", "b"]);
 
-        let result = extract_column_operations(
-            &GenericDialect {},
-            "SELECT missing FROM t1",
-            Some(&catalog),
-        )
-        .unwrap();
+        let result =
+            extract_column_operations(&GenericDialect {}, "SELECT missing FROM t1", Some(&catalog))
+                .unwrap();
         let ops = result[0].as_ref().unwrap();
         let unresolved = ops
             .diagnostics
@@ -530,8 +531,9 @@ mod diagnostics {
 /// what changed.
 mod invariants {
     use super::*;
-    use sql_insight::{ColumnFlow, ColumnRead, ColumnWrite, StatementColumnOperations,
-        StatementTableOperations};
+    use sql_insight::{
+        ColumnFlow, ColumnReference, StatementColumnOperations, StatementTableOperations,
+    };
     use std::collections::HashSet;
 
     /// Curated corpus chosen to stress the major shapes the resolver
@@ -594,19 +596,22 @@ mod invariants {
             .collect()
     }
 
-    fn table_set<I, T>(items: I, mut key: impl FnMut(&T) -> Option<TableReference>) -> HashSet<TableReference>
+    fn table_set<I, T>(
+        items: I,
+        mut key: impl FnMut(&T) -> Option<TableReference>,
+    ) -> HashSet<TableReference>
     where
         I: IntoIterator<Item = T>,
     {
         items.into_iter().filter_map(|i| key(&i)).collect()
     }
 
-    fn column_read_table(r: &ColumnRead) -> Option<TableReference> {
-        r.column.table.clone()
+    fn column_read_table(r: &ColumnReference) -> Option<TableReference> {
+        r.table.clone()
     }
 
-    fn column_write_table(w: &ColumnWrite) -> Option<TableReference> {
-        w.column.table.clone()
+    fn column_write_table(w: &ColumnReference) -> Option<TableReference> {
+        w.table.clone()
     }
 
     fn flow_persisted_table(f: &ColumnFlow) -> Option<TableReference> {
@@ -665,8 +670,7 @@ mod invariants {
         for sql in corpus() {
             for (idx, pair) in extract_paired(sql).into_iter().enumerate() {
                 let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.table.clone()));
-                let column_op_write_tables =
-                    table_set(pair.col.writes.clone(), column_write_table);
+                let column_op_write_tables = table_set(pair.col.writes.clone(), column_write_table);
                 for t in &column_op_write_tables {
                     assert!(
                         table_op_writes.contains(t),

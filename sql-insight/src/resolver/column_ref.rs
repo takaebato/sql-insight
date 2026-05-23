@@ -1,11 +1,10 @@
 //! `RawColumnRef` — column references captured during the walk —
 //! plus the walk-time resolution that fills its `resolved` /
-//! `synthetic` / `kinds` fields.
+//! `synthetic` fields.
 
 use sqlparser::ast::Ident;
 
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::extractor::column_operation_extractor::ReadKind;
 use crate::relation::TableReference;
 
 use super::binding::{
@@ -37,11 +36,6 @@ pub(crate) struct RawColumnRef {
     /// filtering and flow composition. `false` when `resolved` is
     /// `None`.
     pub(crate) synthetic: bool,
-    /// SQL-clause role(s) this reference plays — captured from the
-    /// resolver's `ctx.read_kind` at record time. Typically a single
-    /// element; future multi-role cases (USING expansion etc.) may
-    /// extend.
-    pub(crate) kinds: Vec<ReadKind>,
 }
 
 /// Decode a qualified ref's leading parts (everything before the
@@ -87,16 +81,11 @@ impl<'a> Resolver<'a> {
     pub(super) fn record_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.scopes_mut().current_scope_id();
         let (resolved, synthetic) = self.resolve_ref_at_walk(&parts, scope_id);
-        let mut kinds = vec![self.ctx.read_kind];
-        if self.ctx.in_case_condition {
-            kinds.push(ReadKind::Conditional);
-        }
         self.column_refs.push(RawColumnRef {
             parts,
             scope_id,
             resolved,
             synthetic,
-            kinds,
         });
     }
 

@@ -16,19 +16,10 @@ impl<'a> Resolver<'a> {
         // return — so each ResolvedQuery owns exactly its own groups
         // without leaking into siblings or ancestors.
         let prev_projections = std::mem::take(&mut self.current_projections);
-        // Reset context fields that should NOT propagate through a
-        // subquery boundary: `read_kind` and `in_case_condition` are
-        // syntactic-position modifiers that apply only to the
-        // enclosing expression — the subquery's own projection refs
-        // are not, e.g., `Filter` (just because the subquery sat in a
-        // WHERE) and not `Conditional` (just because the subquery sat
-        // in a CASE WHEN condition). `scope_kind` is preserved
-        // because predicate-ness DOES propagate (a subquery in a
+        // `ctx` now carries only `scope_kind`, which intentionally
+        // propagates through the subquery boundary (a subquery in a
         // predicate is itself predicate-position for table-flow
-        // exclusion).
-        let prev_ctx = self.ctx;
-        self.ctx.read_kind = super::ReadKind::Projection;
-        self.ctx.in_case_condition = false;
+        // exclusion). Nothing to reset/restore around the body.
         if let Some(with) = &query.with {
             if with.recursive {
                 for cte in &with.cte_tables {
@@ -62,7 +53,7 @@ impl<'a> Resolver<'a> {
         }
         let body_schema = self.visit_set_expr(&query.body)?;
         if let Some(order_by) = &query.order_by {
-            self.with_read_kind(super::ReadKind::Sort, |r| r.visit_order_by(order_by))?;
+            self.visit_order_by(order_by)?;
         }
         if let Some(limit_clause) = &query.limit_clause {
             self.visit_limit_clause(limit_clause)?;
@@ -80,7 +71,6 @@ impl<'a> Resolver<'a> {
         }
         self.scopes.pop_scope();
         let projections = std::mem::replace(&mut self.current_projections, prev_projections);
-        self.ctx = prev_ctx;
         Ok(ResolvedQuery {
             scope_id,
             output_schema: body_schema,
@@ -188,22 +178,14 @@ impl<'a> Resolver<'a> {
                 ConnectByKind::StartWith { condition, .. } => r.visit_expr(condition),
             })?;
         }
-        self.with_read_kind(super::ReadKind::GroupBy, |r| {
-            r.visit_group_by(&select.group_by)
-        })?;
-        // CLUSTER BY / DISTRIBUTE BY (Hive / Spark) are partitioning
-        // and clustering directives — they decide how rows group across
-        // shuffle, conceptually closer to GROUP BY than to value flow.
-        self.with_read_kind(super::ReadKind::GroupBy, |r| {
-            r.visit_exprs(&select.cluster_by)?;
-            r.visit_exprs(&select.distribute_by)
-        })?;
-        self.with_read_kind(super::ReadKind::Sort, |r| {
-            for order_by in &select.sort_by {
-                r.visit_order_by_expr(order_by)?;
-            }
-            Ok::<_, Error>(())
-        })?;
+        self.visit_group_by(&select.group_by)?;
+        // CLUSTER BY / DISTRIBUTE BY (Hive / Spark) — partitioning /
+        // clustering directives, walked as plain reads.
+        self.visit_exprs(&select.cluster_by)?;
+        self.visit_exprs(&select.distribute_by)?;
+        for order_by in &select.sort_by {
+            self.visit_order_by_expr(order_by)?;
+        }
         for window in &select.named_window {
             if let NamedWindowExpr::WindowSpec(spec) = &window.1 {
                 self.visit_window_spec(spec)?;
@@ -215,7 +197,10 @@ impl<'a> Resolver<'a> {
     /// Walk a single projection item's expression and snapshot the
     /// refs it records, packaging name / source_refs / kind into a
     /// `ProjectionItem`.
-    pub(super) fn build_projection_item(&mut self, item: &SelectItem) -> Result<ProjectionItem, Error> {
+    pub(super) fn build_projection_item(
+        &mut self,
+        item: &SelectItem,
+    ) -> Result<ProjectionItem, Error> {
         let refs_before = self.column_refs_len();
         self.visit_select_item(item)?;
         let source_refs = self.column_refs_slice(refs_before).to_vec();

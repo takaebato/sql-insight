@@ -6,8 +6,8 @@
 //!
 //! The output mirrors `StatementTableOperations` — three parallel
 //! surfaces (`reads`, `writes`, `flows`) — plus a small enrichment on
-//! flow edges to distinguish passthrough projections from computed
-//! expressions.
+//! flow edges to distinguish passthrough projections from
+//! value-changing transformations.
 //!
 //! **Current coverage** (column tracking is rolling in incrementally):
 //! - `reads`: qualified column references decompose directly to
@@ -17,14 +17,13 @@
 //!   surfaces). References whose walk-time owning binding was a CTE,
 //!   derived table, or table function (synthetic intermediates, not
 //!   real storage) are dropped from reads — only references to real
-//!   tables or unresolved names surface. Each `ColumnRead` carries a
-//!   `kinds: Vec<ReadKind>` recording the syntactic clause(s) the
-//!   reference appeared in (`Projection` for SELECT list / UPDATE SET
-//!   RHS / etc., `Filter` for WHERE / HAVING / JOIN ON / MERGE ON /
-//!   CONNECT BY / pipe `|> WHERE`, `GroupBy` / `Sort` / `Window`,
-//!   plus a `Conditional` modifier layered on the surrounding clause
-//!   for CASE-WHEN condition refs). Typically `len == 1`; multi-role
-//!   refs (USING / NATURAL JOIN merged columns) are future work.
+//!   tables or unresolved names surface. `reads` is a plain
+//!   occurrence list of `ColumnReference`s in walk order: a column
+//!   referenced more than once appears more than once, with no
+//!   syntactic clause tag. (Whether a reference contributes a value
+//!   or merely influences the result — e.g. a `WHERE` predicate — is
+//!   recovered structurally: value contributors are `flows` sources,
+//!   filter-only columns are in `reads` but not `flows`.)
 //! - `writes`: INSERT target columns (explicit list when given;
 //!   when omitted and the catalog provides the target's schema,
 //!   the columns the resolver paired with source projections via
@@ -46,13 +45,12 @@
 //!   intermediate's body projections recursively, so a SELECT through
 //!   a chain of CTEs surfaces flows whose sources are the underlying
 //!   base tables. Each edge is tagged with a `ColumnFlowKind`:
-//!   `Passthrough` (bare ref), `Aggregation` (top-level aggregate
-//!   function call — detected via SQL-spec structural markers like
-//!   `FILTER (WHERE ...)` / `WITHIN GROUP (...)` / `DISTINCT` in
-//!   args, plus a name list of common aggregates across major
-//!   dialects), or `Computed` (anything else). Composition is
-//!   `Aggregation`-dominant: any aggregation step in a CTE / derived
-//!   chain makes the resulting flow `Aggregation`. CTAS / CREATE
+//!   `Passthrough` (the value is forwarded unchanged — a bare column
+//!   ref, rename included) or `Transformation` (any expression that
+//!   changes the value: arithmetic, function calls, aggregates,
+//!   window functions, CASE, casts, …). Composition yields
+//!   `Transformation` whenever any step in a CTE / derived chain is a
+//!   transformation. CTAS / CREATE
 //!   VIEW / ALTER VIEW emit Persisted flows from source projections
 //!   to the created relation's columns. MERGE emits per-clause
 //!   Persisted flows for WHEN MATCHED UPDATE (per assignment) and
@@ -109,8 +107,8 @@ use sqlparser::parser::Parser;
 /// // `t1.a` surfaces as a single read, walk-time resolved to t1.
 /// assert_eq!(ops.reads.len(), 1);
 /// let read = &ops.reads[0];
-/// assert_eq!(read.column.name.value, "a");
-/// assert_eq!(read.column.table.as_ref().unwrap().name.value, "t1");
+/// assert_eq!(read.name.value, "a");
+/// assert_eq!(read.table.as_ref().unwrap().name.value, "t1");
 ///
 /// // The projection emits one flow into the SELECT's QueryOutput slot,
 /// // marked Passthrough (no expression wrapping the column).
@@ -141,8 +139,14 @@ pub fn extract_column_operations(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementColumnOperations {
     pub statement_kind: StatementKind,
-    pub reads: Vec<ColumnRead>,
-    pub writes: Vec<ColumnWrite>,
+    /// Columns read by the statement, in walk order. Occurrence-based:
+    /// a column referenced more than once appears more than once
+    /// (e.g. `SELECT a FROM t WHERE a > 0` yields `t.a` twice). A
+    /// consumer wanting the distinct set dedups via a `HashSet`.
+    pub reads: Vec<ColumnReference>,
+    /// Columns written by the statement, in walk order. Occurrence-based
+    /// like `reads`.
+    pub writes: Vec<ColumnReference>,
     pub flows: Vec<ColumnFlow>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -162,68 +166,14 @@ pub struct ColumnReference {
     pub name: Ident,
 }
 
-/// A column referenced as a Read source. `kinds` records the SQL
-/// clauses this reference appeared in (its syntactic role). Most refs
-/// surface a single kind, but the field is `Vec` to leave room for
-/// future cases where one ref carries multiple roles (e.g.
-/// `USING` / `NATURAL JOIN` merged columns, which are both projection
-/// and join keys). Order is walk order, duplicates suppressed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ColumnRead {
-    pub column: ColumnReference,
-    pub kinds: Vec<ReadKind>,
-}
-
-/// SQL-clause role of a [`ColumnRead`]. Captured at walk time from
-/// the clause the reference appeared in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ReadKind {
-    /// Ref appeared in a value-producing position — SELECT projection,
-    /// UPDATE SET right-hand side, INSERT VALUES expr, INSERT source
-    /// SELECT projection, scalar subquery's projection.
-    Projection,
-    /// Ref appeared in a row-selection clause — WHERE, HAVING,
-    /// QUALIFY, JOIN ON, AsOf match condition, MERGE ON,
-    /// CONNECT BY / START WITH, pipe-operator `|> WHERE`, etc.
-    Filter,
-    /// Ref appeared in a grouping clause — `GROUP BY` (incl. ROLLUP /
-    /// CUBE / GROUPING SETS modifiers) or pipe-operator `|> AGGREGATE`'s
-    /// GROUP BY part.
-    GroupBy,
-    /// Ref appeared in a row-ordering clause — `ORDER BY` / `SORT BY`
-    /// or pipe-operator `|> ORDER BY`.
-    Sort,
-    /// Ref appeared inside an `OVER (...)` window spec — `PARTITION BY`,
-    /// the window's `ORDER BY`, or a window-frame bound expression.
-    /// Refs in the aggregate function's arguments (e.g., `x` in
-    /// `SUM(x) OVER (...)`) stay `Projection` since they're
-    /// value-producing.
-    Window,
-    /// Ref appeared as a CASE-WHEN condition expression (`CASE WHEN
-    /// <cond> THEN ...`). Layered on top of the surrounding clause
-    /// kind — a column in `SELECT CASE WHEN a > 0 THEN b END FROM t`
-    /// gets `kinds = [Projection, Conditional]` for `a`. Result and
-    /// ELSE expressions stay at the surrounding kind.
-    Conditional,
-}
-
-/// A column that the statement writes to — an INSERT target column,
-/// an UPDATE SET target, a MERGE WHEN clause target, or a column of
-/// the new relation produced by CTAS / CREATE VIEW.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ColumnWrite {
-    pub column: ColumnReference,
-}
-
 /// A column-level flow edge: data from `source` contributes to
 /// `target`. Emitted for both persisted-target statements (INSERT /
 /// UPDATE / MERGE / CTAS / CREATE VIEW) and bare SELECT (where target
 /// is a `ColumnTarget::QueryOutput`).
 ///
 /// One edge per (source, target) pair: `SELECT a + b FROM t1` emits two
-/// flows, both from `t1.a` and `t1.b` to the same query-output target,
-/// each tagged `Computed`.
+/// flows, from `t1.a` and `t1.b` to the same query-output target, each
+/// tagged `Transformation`.
 ///
 /// Statements that physically move data emit composed end-to-end flows
 /// — `INSERT INTO t1 (col) SELECT b FROM t2` emits `t2.b → t1.col`
@@ -264,21 +214,24 @@ pub enum ColumnTarget {
     },
 }
 
-/// How a source column contributes to its target.
+/// How a source column contributes to its target — the one clean,
+/// exclusive distinction: is the value forwarded unchanged, or
+/// derived?
 ///
 /// - `Passthrough` — the source value is forwarded unchanged
-///   (`SELECT a FROM t1`, `INSERT INTO t1 (a) SELECT b FROM t2`).
-/// - `Aggregation` — the projection's top-level expression is an
-///   aggregate function call (`SUM(a)`, `COUNT(b)`, etc.), and the
-///   source feeds it. Composition propagates: if any step along the
-///   flow chain is an aggregation, the resulting flow is
-///   `Aggregation`.
-/// - `Computed` — the source feeds any other non-aggregate
-///   expression (`SELECT a + b FROM t1`, both `a` and `b` are
-///   `Computed`).
+///   (`SELECT a FROM t1`, `INSERT INTO t1 (a) SELECT b FROM t2`). A
+///   rename (`SELECT a AS b`) is still `Passthrough`; detect it by
+///   comparing the source `name` to the target `name`.
+/// - `Transformation` — the source feeds any expression that changes
+///   the value: arithmetic, function calls, CASE branches, casts,
+///   aggregates (`SUM`, `STRING_AGG`), window functions, etc.
 ///
-/// Future variants (`Conditional`, etc.) may further split
-/// `Computed` as later phases tighten the classification.
+/// Finer sub-classification of `Transformation` (aggregate vs scalar,
+/// cardinality, etc.) is deliberately not modelled here — it is lossy
+/// for edge cases (window aggregates, value-preserving `STRING_AGG`)
+/// and not load-bearing for the core dependency / impact-analysis use
+/// case. The enum is `#[non_exhaustive]`, so a finer variant can be
+/// added (SemVer-minor) if a concrete consumer needs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ColumnFlowKind {
@@ -286,16 +239,10 @@ pub enum ColumnFlowKind {
     /// `Passthrough` only when every step in the chain is also
     /// `Passthrough`.
     Passthrough,
-    /// Source feeds an aggregate function call (e.g. `SUM`, `COUNT`,
-    /// `STRING_AGG`). Composition is aggregation-dominant: if any
-    /// step along a CTE / derived chain is `Aggregation`, the
-    /// composed flow is `Aggregation`.
-    Aggregation,
-    /// Source feeds a non-aggregate expression — arithmetic, function
-    /// calls, CASE branches, casts, etc. Default fallback for chains
-    /// that mix `Passthrough` with any non-Passthrough step that
-    /// isn't itself `Aggregation`.
-    Computed,
+    /// Source feeds an expression that changes the value. Composition
+    /// yields `Transformation` whenever any step in the chain is a
+    /// transformation.
+    Transformation,
 }
 
 /// Extracts column-level operations from SQL.
@@ -408,17 +355,11 @@ fn resolve_raw_ref(raw: &RawColumnRef) -> Option<ColumnReference> {
     })
 }
 
-fn collect_reads(resolution: &Resolution) -> Vec<ColumnRead> {
+fn collect_reads(resolution: &Resolution) -> Vec<ColumnReference> {
     resolution
         .column_refs
         .iter()
-        .filter_map(|raw| {
-            let column = resolve_raw_ref(raw)?;
-            Some(ColumnRead {
-                column,
-                kinds: raw.kinds.clone(),
-            })
-        })
+        .filter_map(resolve_raw_ref)
         .collect()
 }
 
@@ -469,7 +410,7 @@ fn column_ref_from_parts(parts: &[Ident]) -> Option<ColumnReference> {
 fn collect_writes(
     statement: &Statement,
     resolution: &Resolution,
-) -> Result<Vec<ColumnWrite>, Error> {
+) -> Result<Vec<ColumnReference>, Error> {
     // `WITH cte AS (...) <DML>` parses as a top-level `Statement::Query`
     // wrapping a `SetExpr::{Insert|Update|Delete|Merge}` around the
     // real DML statement. Unwrap that here so writes follow the inner
@@ -490,11 +431,9 @@ fn collect_writes(
             let target = TableReference::try_from(insert)?;
             if !insert.columns.is_empty() {
                 for col in &insert.columns {
-                    writes.push(ColumnWrite {
-                        column: ColumnReference {
-                            table: Some(target.clone()),
-                            name: col.clone(),
-                        },
+                    writes.push(ColumnReference {
+                        table: Some(target.clone()),
+                        name: col.clone(),
                     });
                 }
             } else {
@@ -521,7 +460,7 @@ fn collect_writes(
                 if let Some(column) =
                     column_ref_from_assignment_target(&assignment.target, default_table.as_ref())
                 {
-                    writes.push(ColumnWrite { column });
+                    writes.push(column);
                 }
             }
         }
@@ -547,11 +486,9 @@ fn collect_writes(
             let target = TableReference::try_from(&alter.name)?;
             for op in &alter.operations {
                 for col_name in alter_table_op_target_columns(op) {
-                    writes.push(ColumnWrite {
-                        column: ColumnReference {
-                            table: Some(target.clone()),
-                            name: col_name,
-                        },
+                    writes.push(ColumnReference {
+                        table: Some(target.clone()),
+                        name: col_name,
                     });
                 }
             }
@@ -570,11 +507,9 @@ fn collect_writes(
                             let Some(ident) = col_obj.0.last().and_then(|p| p.as_ident()) else {
                                 continue;
                             };
-                            writes.push(ColumnWrite {
-                                column: ColumnReference {
-                                    table: Some(target.clone()),
-                                    name: ident.clone(),
-                                },
+                            writes.push(ColumnReference {
+                                table: Some(target.clone()),
+                                name: ident.clone(),
                             });
                         }
                     }
@@ -584,7 +519,7 @@ fn collect_writes(
                                 &assignment.target,
                                 target.as_ref(),
                             ) {
-                                writes.push(ColumnWrite { column });
+                                writes.push(column);
                             }
                         }
                     }
@@ -605,15 +540,13 @@ fn created_writes(
     target: &TableReference,
     explicit: &[Ident],
     resolution: &Resolution,
-) -> Vec<ColumnWrite> {
+) -> Vec<ColumnReference> {
     if !explicit.is_empty() {
         return explicit
             .iter()
-            .map(|c| ColumnWrite {
-                column: ColumnReference {
-                    table: Some(target.clone()),
-                    name: c.clone(),
-                },
+            .map(|c| ColumnReference {
+                table: Some(target.clone()),
+                name: c.clone(),
             })
             .collect();
     }
@@ -625,7 +558,10 @@ fn created_writes(
 /// name. Used by both CREATE-as-style writes derivation and INSERT
 /// without an explicit column list (where the catalog-provided
 /// schema let the resolver pair source projections positionally).
-fn persisted_target_writes(target: &TableReference, resolution: &Resolution) -> Vec<ColumnWrite> {
+fn persisted_target_writes(
+    target: &TableReference,
+    resolution: &Resolution,
+) -> Vec<ColumnReference> {
     let mut seen: Vec<Ident> = Vec::new();
     for edge in &resolution.flow_edges {
         if let FlowTargetSpec::Persisted { table, column } = &edge.target {
@@ -635,11 +571,9 @@ fn persisted_target_writes(target: &TableReference, resolution: &Resolution) -> 
         }
     }
     seen.into_iter()
-        .map(|name| ColumnWrite {
-            column: ColumnReference {
-                table: Some(target.clone()),
-                name,
-            },
+        .map(|name| ColumnReference {
+            table: Some(target.clone()),
+            name,
         })
         .collect()
 }
@@ -679,7 +613,7 @@ fn alter_table_op_target_columns(op: &AlterTableOperation) -> Vec<Ident> {
 fn insert_on_action_writes(
     insert: &sqlparser::ast::Insert,
     target: &TableReference,
-) -> Vec<ColumnWrite> {
+) -> Vec<ColumnReference> {
     let assignments: &[sqlparser::ast::Assignment] = match insert.on.as_ref() {
         Some(OnInsert::DuplicateKeyUpdate(a)) => a,
         Some(OnInsert::OnConflict(c)) => match &c.action {
@@ -694,7 +628,6 @@ fn insert_on_action_writes(
     assignments
         .iter()
         .filter_map(|a| column_ref_from_assignment_target(&a.target, Some(target)))
-        .map(|column| ColumnWrite { column })
         .collect()
 }
 
@@ -742,82 +675,29 @@ mod tests {
         }
     }
 
-    fn read(table_name: &str, col: &str) -> ColumnRead {
-        ColumnRead {
-            column: ColumnReference {
-                table: Some(table(table_name)),
-                name: col.into(),
-            },
-            kinds: vec![ReadKind::Projection],
+    // reads / writes are now plain `Vec<ColumnReference>` (occurrence
+    // based, no clause kind), so all the read/write builders return a
+    // `ColumnReference`. `read` and `col` are interchangeable; both are
+    // kept for callsite readability (`read` in reads lists, `col` as a
+    // flow source / target inner).
+    fn read(table_name: &str, col: &str) -> ColumnReference {
+        ColumnReference {
+            table: Some(table(table_name)),
+            name: col.into(),
         }
     }
 
-    fn filter_read(table_name: &str, col: &str) -> ColumnRead {
-        ColumnRead {
-            column: ColumnReference {
-                table: Some(table(table_name)),
-                name: col.into(),
-            },
-            kinds: vec![ReadKind::Filter],
+    fn write(table_name: &str, col: &str) -> ColumnReference {
+        ColumnReference {
+            table: Some(table(table_name)),
+            name: col.into(),
         }
     }
 
-    fn group_by_read(table_name: &str, col: &str) -> ColumnRead {
-        ColumnRead {
-            column: ColumnReference {
-                table: Some(table(table_name)),
-                name: col.into(),
-            },
-            kinds: vec![ReadKind::GroupBy],
-        }
-    }
-
-    fn sort_read(table_name: &str, col: &str) -> ColumnRead {
-        ColumnRead {
-            column: ColumnReference {
-                table: Some(table(table_name)),
-                name: col.into(),
-            },
-            kinds: vec![ReadKind::Sort],
-        }
-    }
-
-    fn window_read(table_name: &str, col: &str) -> ColumnRead {
-        ColumnRead {
-            column: ColumnReference {
-                table: Some(table(table_name)),
-                name: col.into(),
-            },
-            kinds: vec![ReadKind::Window],
-        }
-    }
-
-    fn read_with_kinds(table_name: &str, col: &str, kinds: Vec<ReadKind>) -> ColumnRead {
-        ColumnRead {
-            column: ColumnReference {
-                table: Some(table(table_name)),
-                name: col.into(),
-            },
-            kinds,
-        }
-    }
-
-    fn write(table_name: &str, col: &str) -> ColumnWrite {
-        ColumnWrite {
-            column: ColumnReference {
-                table: Some(table(table_name)),
-                name: col.into(),
-            },
-        }
-    }
-
-    fn unresolved(col: &str) -> ColumnRead {
-        ColumnRead {
-            column: ColumnReference {
-                table: None,
-                name: col.into(),
-            },
-            kinds: vec![ReadKind::Projection],
+    fn unresolved(col: &str) -> ColumnReference {
+        ColumnReference {
+            table: None,
+            name: col.into(),
         }
     }
 
@@ -857,19 +737,11 @@ mod tests {
         }
     }
 
-    fn flow_aggregation(source: ColumnReference, target: ColumnTarget) -> ColumnFlow {
+    fn flow_transformation(source: ColumnReference, target: ColumnTarget) -> ColumnFlow {
         ColumnFlow {
             source,
             target,
-            kind: ColumnFlowKind::Aggregation,
-        }
-    }
-
-    fn flow_computed(source: ColumnReference, target: ColumnTarget) -> ColumnFlow {
-        ColumnFlow {
-            source,
-            target,
-            kind: ColumnFlowKind::Computed,
+            kind: ColumnFlowKind::Transformation,
         }
     }
 
@@ -972,8 +844,8 @@ mod tests {
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![
-                        filter_read("t1", "id"),
-                        filter_read("t2", "id"),
+                        read("t1", "id"),
+                        read("t2", "id"),
                         read("t1", "a"),
                         read("t2", "b"),
                     ],
@@ -998,12 +870,9 @@ mod tests {
                 "SELECT s1.t1.a FROM s1.t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![ColumnRead {
-                        column: ColumnReference {
-                            table: Some(table_ref.clone()),
-                            name: "a".into(),
-                        },
-                        kinds: vec![ReadKind::Projection],
+                    reads: vec![ColumnReference {
+                        table: Some(table_ref.clone()),
+                        name: "a".into(),
                     }],
                     writes: vec![],
                     flows: vec![flow_passthrough(
@@ -1032,12 +901,9 @@ mod tests {
                 "SELECT c1.s1.t1.a FROM c1.s1.t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![ColumnRead {
-                        column: ColumnReference {
-                            table: Some(table_ref.clone()),
-                            name: "a".into(),
-                        },
-                        kinds: vec![ReadKind::Projection],
+                    reads: vec![ColumnReference {
+                        table: Some(table_ref.clone()),
+                        name: "a".into(),
                     }],
                     writes: vec![],
                     flows: vec![flow_passthrough(
@@ -1066,12 +932,9 @@ mod tests {
                 "SELECT a FROM c1.s1.t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![ColumnRead {
-                        column: ColumnReference {
-                            table: Some(table_ref.clone()),
-                            name: "a".into(),
-                        },
-                        kinds: vec![ReadKind::Projection],
+                    reads: vec![ColumnReference {
+                        table: Some(table_ref.clone()),
+                        name: "a".into(),
                     }],
                     writes: vec![],
                     flows: vec![flow_passthrough(
@@ -1118,7 +981,7 @@ mod tests {
                 "SELECT t1.a FROM t1 WHERE t1.b > 0",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1", "a"), filter_read("t1", "b")],
+                    reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
@@ -1149,7 +1012,7 @@ mod tests {
                 "SELECT a FROM t1 WHERE b > 0",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1", "a"), filter_read("t1", "b")],
+                    reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
@@ -1166,11 +1029,7 @@ mod tests {
                 "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        filter_read("t1", "id"),
-                        filter_read("t2", "id"),
-                        unresolved("a"),
-                    ],
+                    reads: vec![read("t1", "id"), read("t2", "id"), unresolved("a")],
                     writes: vec![],
                     flows: vec![ColumnFlow {
                         source: ColumnReference {
@@ -1252,21 +1111,16 @@ mod tests {
             // Inner subquery has its own t2 in scope; the unqualified `y`
             // inside the IN-subquery resolves to t2 even though t1 is
             // also in the outer scope. Standard SQL inner-shadows-outer.
-            // `y` is in the inner WHERE so its kind is Filter. The inner
-            // subquery's projection `id` also produces a flow into a
-            // QueryOutput slot of the inner SELECT — that flow surfaces
-            // even though the outer wraps it.
+            // The predicate subquery emits no flow (it feeds a filter);
+            // it still surfaces its refs in reads. The outer `*` is a
+            // suppressed wildcard, so there is no flow at all.
             assert_column_ops(
                 "SELECT * FROM t1 WHERE id IN (SELECT id FROM t2 WHERE y > 0)",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        filter_read("t1", "id"),
-                        read("t2", "id"),
-                        filter_read("t2", "y"),
-                    ],
+                    reads: vec![read("t1", "id"), read("t2", "id"), read("t2", "y")],
                     writes: vec![],
-                    flows: vec![flow_passthrough(col("t2", "id"), out("id", 0))],
+                    flows: vec![],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -1276,21 +1130,17 @@ mod tests {
         fn unqualified_correlated_walks_to_outer_when_inner_has_no_candidate() {
             // Inner CTE has Known schema [zz]; `outer_col` doesn't fit it,
             // so resolution walks to the outer scope and picks the t1
-            // (Unknown) binding. The innermost SELECT's projection `zz`
-            // also produces a flow that surfaces.
+            // (Unknown) binding. The predicate subquery emits no flow;
+            // the outer `*` is a suppressed wildcard, so no flow at all.
             assert_column_ops(
                 "SELECT * FROM t1 WHERE id IN (\
                 WITH inner_cte AS (SELECT zz FROM t1) \
                 SELECT zz FROM inner_cte WHERE outer_col > 0)",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        filter_read("t1", "id"),
-                        read("t1", "zz"),
-                        filter_read("t1", "outer_col"),
-                    ],
+                    reads: vec![read("t1", "id"), read("t1", "zz"), read("t1", "outer_col")],
                     writes: vec![],
-                    flows: vec![flow_passthrough(col("t1", "zz"), out("zz", 0))],
+                    flows: vec![],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -1381,11 +1231,7 @@ mod tests {
                 "UPDATE t1 SET a = t2.b FROM t2 WHERE t1.id = t2.id",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Update,
-                    reads: vec![
-                        read("t2", "b"),
-                        filter_read("t1", "id"),
-                        filter_read("t2", "id"),
-                    ],
+                    reads: vec![read("t2", "b"), read("t1", "id"), read("t2", "id")],
                     writes: vec![write("t1", "a")],
                     flows: vec![flow_passthrough(col("t2", "b"), persisted("t1", "a"))],
                     diagnostics: vec![],
@@ -1403,7 +1249,7 @@ mod tests {
                 "DELETE FROM t1 WHERE t1.id = 5",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![filter_read("t1", "id")],
+                    reads: vec![read("t1", "id")],
                     writes: vec![],
                     flows: vec![],
                     diagnostics: vec![],
@@ -1412,19 +1258,23 @@ mod tests {
         }
     }
 
-    mod read_kinds {
+    // Columns from every clause (projection / WHERE / GROUP BY /
+    // ORDER BY / OVER / CASE / HAVING / …) surface in `reads` as plain
+    // occurrence entries — `reads` no longer tags a syntactic clause.
+    // These tests pin down WHICH refs surface (occurrence-based, dups
+    // kept) and the flows they produce.
+    mod reads_by_clause {
         use super::*;
 
         #[test]
-        fn same_column_in_projection_and_where_is_two_reads_with_different_kinds() {
-            // The two textual `a` references each get their own ColumnRead
-            // entry — one Projection, one Filter — preserving syntactic role
-            // per textual occurrence.
+        fn same_column_in_projection_and_where_is_two_reads() {
+            // The two textual `a` references each get their own `reads`
+            // entry (occurrence-based — duplicates are kept).
             assert_column_ops(
                 "SELECT a FROM t1 WHERE a > 0",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1", "a"), filter_read("t1", "a")],
+                    reads: vec![read("t1", "a"), read("t1", "a")],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
@@ -1433,43 +1283,36 @@ mod tests {
         }
 
         #[test]
-        fn subquery_where_ref_carries_filter_kind_not_outer_projection() {
-            // The IN-subquery's WHERE walker resets current_read_kind to
-            // Filter inside the subquery; the outer Projection default
-            // doesn't leak in. Inner subquery's flow is emitted first
-            // (during inner SELECT walk), then the outer projection's.
+        fn predicate_subquery_surfaces_reads_but_no_flow() {
+            // The IN-subquery feeds a filter, so it emits NO flow
+            // (Option B: nested subqueries resolve raw, no intermediate
+            // QueryOutput edge). Its refs (s.id, s.flag) still surface
+            // in reads. Only the outer projection `a` flows.
             assert_column_ops(
                 "SELECT a FROM t WHERE id IN (SELECT id FROM s WHERE flag = 1)",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![
                         read("t", "a"),
-                        filter_read("t", "id"),
+                        read("t", "id"),
                         read("s", "id"),
-                        filter_read("s", "flag"),
+                        read("s", "flag"),
                     ],
                     writes: vec![],
-                    flows: vec![
-                        flow_passthrough(col("s", "id"), out("id", 0)),
-                        flow_passthrough(col("t", "a"), out("a", 0)),
-                    ],
+                    flows: vec![flow_passthrough(col("t", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
         }
 
         #[test]
-        fn scalar_subquery_in_projection_emits_inner_and_outer_flows() {
+        fn scalar_subquery_in_projection_flows_only_to_outer() {
             // `SELECT a, (SELECT max(x) FROM s) AS m FROM t`:
-            //  - the scalar subquery emits its own QueryOutput edge
-            //    (s.x → out(<inner>, 0), Aggregation from max());
-            //  - the outer projection captures the subquery's source
-            //    refs and pairs `m` at position 1. Its kind is
-            //    Computed, not Aggregation: from the outer scope the
-            //    item is a *subquery* expression (Computed), and the
-            //    inner aggregate kind doesn't propagate — composition
-            //    only merges kinds through CTE / derived bindings, not
-            //    through a scalar subquery in projection.
+            //  - the scalar subquery does NOT emit its own QueryOutput
+            //    edge (Option B: raw resolve). Its source `s.x` is
+            //    captured by the enclosing projection item, which emits
+            //    the single meaningful edge `s.x → out("m", 1)`,
+            //    Transformation (the item is a subquery expression).
             //  - `a` is a plain passthrough at position 0.
             assert_column_ops(
                 "SELECT a, (SELECT max(x) FROM s) AS m FROM t",
@@ -1478,9 +1321,8 @@ mod tests {
                     reads: vec![read("t", "a"), read("s", "x")],
                     writes: vec![],
                     flows: vec![
-                        flow_aggregation(col("s", "x"), out_anon(0)),
                         flow_passthrough(col("t", "a"), out("a", 0)),
-                        flow_computed(col("s", "x"), out("m", 1)),
+                        flow_transformation(col("s", "x"), out("m", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1488,14 +1330,14 @@ mod tests {
         }
 
         #[test]
-        fn is_null_predicate_ref_carries_filter_kind() {
-            // `WHERE x IS NULL` — x is in a row-selection predicate,
-            // so it's a Filter read like any other WHERE ref.
+        fn is_null_predicate_ref_surfaces_as_read() {
+            // `WHERE x IS NULL` — x surfaces in reads like any other
+            // WHERE ref; it is not a flow source (predicate-only).
             assert_column_ops(
                 "SELECT a FROM t1 WHERE b IS NULL",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1", "a"), filter_read("t1", "b")],
+                    reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
@@ -1504,12 +1346,12 @@ mod tests {
         }
 
         #[test]
-        fn is_not_null_predicate_ref_carries_filter_kind() {
+        fn is_not_null_predicate_ref_surfaces_as_read() {
             assert_column_ops(
                 "SELECT a FROM t1 WHERE b IS NOT NULL",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1", "a"), filter_read("t1", "b")],
+                    reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
@@ -1518,12 +1360,12 @@ mod tests {
         }
 
         #[test]
-        fn group_by_ref_carries_group_by_kind() {
+        fn group_by_ref_surfaces_as_read() {
             assert_column_ops(
                 "SELECT a, COUNT(*) FROM t1 GROUP BY a",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1", "a"), group_by_read("t1", "a")],
+                    reads: vec![read("t1", "a"), read("t1", "a")],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
@@ -1532,12 +1374,12 @@ mod tests {
         }
 
         #[test]
-        fn order_by_ref_carries_sort_kind() {
+        fn order_by_ref_surfaces_as_read() {
             assert_column_ops(
                 "SELECT a FROM t1 ORDER BY b",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1", "a"), sort_read("t1", "b")],
+                    reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
@@ -1546,8 +1388,8 @@ mod tests {
         }
 
         #[test]
-        fn group_by_with_having_separates_kinds() {
-            // GROUP BY a → GroupBy; HAVING SUM(b) > 0 → b is Filter.
+        fn group_by_and_having_refs_both_surface() {
+            // `a` (projection + GROUP BY) and `b` (HAVING) all surface.
             // Walk order: projection → HAVING → GROUP BY (the visitor
             // hits HAVING before GROUP BY), so the read order reflects
             // that, not the textual SQL order.
@@ -1555,11 +1397,7 @@ mod tests {
                 "SELECT a FROM t1 GROUP BY a HAVING SUM(b) > 0",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        read("t1", "a"),
-                        filter_read("t1", "b"),
-                        group_by_read("t1", "a"),
-                    ],
+                    reads: vec![read("t1", "a"), read("t1", "b"), read("t1", "a")],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
@@ -1568,7 +1406,7 @@ mod tests {
         }
 
         #[test]
-        fn group_by_rollup_modifier_carries_group_by_kind() {
+        fn group_by_rollup_modifier_refs_surface() {
             assert_column_ops(
                 "SELECT a, b FROM t1 GROUP BY ROLLUP(a, b)",
                 StatementColumnOperations {
@@ -1576,8 +1414,8 @@ mod tests {
                     reads: vec![
                         read("t1", "a"),
                         read("t1", "b"),
-                        group_by_read("t1", "a"),
-                        group_by_read("t1", "b"),
+                        read("t1", "a"),
+                        read("t1", "b"),
                     ],
                     writes: vec![],
                     flows: vec![
@@ -1590,7 +1428,7 @@ mod tests {
         }
 
         #[test]
-        fn group_by_cube_modifier_carries_group_by_kind() {
+        fn group_by_cube_modifier_refs_surface() {
             assert_column_ops(
                 "SELECT a, b FROM t1 GROUP BY CUBE(a, b)",
                 StatementColumnOperations {
@@ -1598,8 +1436,8 @@ mod tests {
                     reads: vec![
                         read("t1", "a"),
                         read("t1", "b"),
-                        group_by_read("t1", "a"),
-                        group_by_read("t1", "b"),
+                        read("t1", "a"),
+                        read("t1", "b"),
                     ],
                     writes: vec![],
                     flows: vec![
@@ -1614,8 +1452,8 @@ mod tests {
         #[test]
         fn group_by_grouping_sets_walks_each_set_member() {
             // GROUPING SETS ((a, b), (a), ()) — every named column
-            // inside any set should be picked up with GroupBy kind.
-            // The empty set contributes nothing.
+            // inside any set surfaces as a read. The empty set
+            // contributes nothing.
             assert_column_ops(
                 "SELECT a, b FROM t1 GROUP BY GROUPING SETS ((a, b), (a), ())",
                 StatementColumnOperations {
@@ -1623,9 +1461,9 @@ mod tests {
                     reads: vec![
                         read("t1", "a"),
                         read("t1", "b"),
-                        group_by_read("t1", "a"),
-                        group_by_read("t1", "b"),
-                        group_by_read("t1", "a"),
+                        read("t1", "a"),
+                        read("t1", "b"),
+                        read("t1", "a"),
                     ],
                     writes: vec![],
                     flows: vec![
@@ -1641,7 +1479,7 @@ mod tests {
         fn group_by_mixed_plain_and_rollup_collects_both() {
             // `GROUP BY a, ROLLUP(b, c)` — `a` is a plain GROUP BY ref;
             // `b`, `c` are inside the ROLLUP expression. All three
-            // should carry GroupBy kind.
+            // surface as reads.
             assert_column_ops(
                 "SELECT a, b, c FROM t1 GROUP BY a, ROLLUP(b, c)",
                 StatementColumnOperations {
@@ -1650,9 +1488,9 @@ mod tests {
                         read("t1", "a"),
                         read("t1", "b"),
                         read("t1", "c"),
-                        group_by_read("t1", "a"),
-                        group_by_read("t1", "b"),
-                        group_by_read("t1", "c"),
+                        read("t1", "a"),
+                        read("t1", "b"),
+                        read("t1", "c"),
                     ],
                     writes: vec![],
                     flows: vec![
@@ -1666,49 +1504,37 @@ mod tests {
         }
 
         #[test]
-        fn subquery_in_group_by_keeps_inner_projection_kind() {
-            // GROUP BY (SELECT max(z) FROM s) — the inner subquery's `z` is
-            // its own Projection, not the outer GroupBy. resolve_query
-            // resets current_read_kind on entry. Inner flow emitted
-            // first, then outer projection's.
+        fn subquery_in_group_by_surfaces_reads_but_no_inner_flow() {
+            // GROUP BY (SELECT z FROM s) — the subquery's `z` surfaces in
+            // reads, but the subquery emits no flow (Option B: raw
+            // resolve, no intermediate QueryOutput). Only the outer
+            // projection `a` flows.
             assert_column_ops(
                 "SELECT a FROM t GROUP BY (SELECT z FROM s)",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t", "a"), read("s", "z")],
                     writes: vec![],
-                    flows: vec![
-                        flow_passthrough(col("s", "z"), out("z", 0)),
-                        flow_passthrough(col("t", "a"), out("a", 0)),
-                    ],
+                    flows: vec![flow_passthrough(col("t", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
         }
 
         #[test]
-        fn case_when_condition_in_projection_gets_conditional_modifier() {
-            // `a` is the WHEN condition → [Projection, Conditional];
-            // `b` is the THEN result → [Projection];
-            // `c` is the ELSE result → [Projection].
+        fn case_in_projection_refs_surface_and_flow_as_transformation() {
+            // Condition (`a`), THEN (`b`), and ELSE (`c`) all surface as
+            // reads and flow into the CASE output as Transformation.
             assert_column_ops(
                 "SELECT CASE WHEN a > 0 THEN b ELSE c END FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        read_with_kinds(
-                            "t1",
-                            "a",
-                            vec![ReadKind::Projection, ReadKind::Conditional],
-                        ),
-                        read("t1", "b"),
-                        read("t1", "c"),
-                    ],
+                    reads: vec![read("t1", "a"), read("t1", "b"), read("t1", "c")],
                     writes: vec![],
                     flows: vec![
-                        flow_computed(col("t1", "a"), out_anon(0)),
-                        flow_computed(col("t1", "b"), out_anon(0)),
-                        flow_computed(col("t1", "c"), out_anon(0)),
+                        flow_transformation(col("t1", "a"), out_anon(0)),
+                        flow_transformation(col("t1", "b"), out_anon(0)),
+                        flow_transformation(col("t1", "c"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1716,20 +1542,19 @@ mod tests {
         }
 
         #[test]
-        fn case_when_condition_in_where_layers_with_filter() {
-            // `x` is in WHERE's CASE WHEN condition → [Filter, Conditional];
-            // `y` is the THEN result (inside WHERE) → [Filter];
-            // `z` is the ELSE result (inside WHERE) → [Filter];
-            // `b` is the outer projection → [Projection].
+        fn case_in_where_refs_surface_as_reads() {
+            // The CASE sits in WHERE: its condition (`x`) and results
+            // (`y`, `z`) surface as reads (not flow sources — the CASE
+            // feeds a predicate). `b` is the outer projection.
             assert_column_ops(
                 "SELECT b FROM t WHERE CASE WHEN x > 0 THEN y ELSE z END = 1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![
                         read("t", "b"),
-                        read_with_kinds("t", "x", vec![ReadKind::Filter, ReadKind::Conditional]),
-                        filter_read("t", "y"),
-                        filter_read("t", "z"),
+                        read("t", "x"),
+                        read("t", "y"),
+                        read("t", "z"),
                     ],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t", "b"), out("b", 0))],
@@ -1739,28 +1564,22 @@ mod tests {
         }
 
         #[test]
-        fn subquery_in_case_condition_does_not_leak_conditional_to_inner_refs() {
-            // A scalar subquery in a CASE condition position is itself
-            // the "conditional" expression. Refs INSIDE the subquery are
-            // the subquery's own projection (or its own WHERE etc.) and
-            // should NOT inherit `Conditional` from the outer CASE — the
-            // modifier resets at the subquery boundary.
-            //
-            // Flow shape (surfaced by whole-value):
-            //   1. inner subquery's projection: s.x → out("x", 0) Passthrough
-            //   2-3. outer CASE composes the scalar subquery's projection
-            //        AND its WHERE refs as Computed flows into the
-            //        outer anonymous output. Both s.x and s.y appear.
+        fn scalar_subquery_in_case_condition_composes_to_outer_only() {
+            // A scalar subquery in a CASE condition emits no flow of its
+            // own (Option B: raw resolve). The outer CASE projection
+            // item captures the subquery's refs (`s.x` from its
+            // projection, `s.y` from its WHERE) as its source refs, so
+            // both flow into the outer anonymous output as
+            // Transformation. Refs still surface in reads.
             assert_column_ops(
                 "SELECT CASE WHEN (SELECT x FROM s WHERE y > 0) IS NULL THEN 1 END FROM t",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("s", "x"), filter_read("s", "y")],
+                    reads: vec![read("s", "x"), read("s", "y")],
                     writes: vec![],
                     flows: vec![
-                        flow_passthrough(col("s", "x"), out("x", 0)),
-                        flow_computed(col("s", "x"), out_anon(0)),
-                        flow_computed(col("s", "y"), out_anon(0)),
+                        flow_transformation(col("s", "x"), out_anon(0)),
+                        flow_transformation(col("s", "y"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1768,28 +1587,20 @@ mod tests {
         }
 
         #[test]
-        fn simple_case_operand_gets_conditional_modifier() {
-            // `CASE x WHEN 1 THEN a WHEN 2 THEN b END` — `x` is the
-            // operand (compared against each WHEN pattern), classified
-            // Conditional. `a` / `b` are results, plain Projection.
+        fn simple_case_operand_and_results_surface() {
+            // `CASE x WHEN 1 THEN a WHEN 2 THEN b END` — the operand
+            // `x` and the results `a` / `b` all surface as reads and
+            // flow into the CASE output as Transformation.
             assert_column_ops(
                 "SELECT CASE x WHEN 1 THEN a WHEN 2 THEN b END FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        read_with_kinds(
-                            "t1",
-                            "x",
-                            vec![ReadKind::Projection, ReadKind::Conditional],
-                        ),
-                        read("t1", "a"),
-                        read("t1", "b"),
-                    ],
+                    reads: vec![read("t1", "x"), read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     flows: vec![
-                        flow_computed(col("t1", "x"), out_anon(0)),
-                        flow_computed(col("t1", "a"), out_anon(0)),
-                        flow_computed(col("t1", "b"), out_anon(0)),
+                        flow_transformation(col("t1", "x"), out_anon(0)),
+                        flow_transformation(col("t1", "a"), out_anon(0)),
+                        flow_transformation(col("t1", "b"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1797,35 +1608,26 @@ mod tests {
         }
 
         #[test]
-        fn simple_case_with_column_when_pattern_marks_both_conditional() {
-            // `CASE x WHEN y THEN a ELSE b END` — both the operand `x`
-            // and the WHEN-pattern column `y` are conditional inputs
-            // (compared), so both carry Conditional. `a` (THEN) and
-            // `b` (ELSE) are value results — plain Projection.
+        fn simple_case_with_column_when_pattern_all_surface() {
+            // `CASE x WHEN y THEN a ELSE b END` — operand `x`,
+            // WHEN-pattern `y`, and results `a` / `b` all surface as
+            // reads and flow into the CASE output as Transformation.
             assert_column_ops(
                 "SELECT CASE x WHEN y THEN a ELSE b END FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![
-                        read_with_kinds(
-                            "t1",
-                            "x",
-                            vec![ReadKind::Projection, ReadKind::Conditional],
-                        ),
-                        read_with_kinds(
-                            "t1",
-                            "y",
-                            vec![ReadKind::Projection, ReadKind::Conditional],
-                        ),
+                        read("t1", "x"),
+                        read("t1", "y"),
                         read("t1", "a"),
                         read("t1", "b"),
                     ],
                     writes: vec![],
                     flows: vec![
-                        flow_computed(col("t1", "x"), out_anon(0)),
-                        flow_computed(col("t1", "y"), out_anon(0)),
-                        flow_computed(col("t1", "a"), out_anon(0)),
-                        flow_computed(col("t1", "b"), out_anon(0)),
+                        flow_transformation(col("t1", "x"), out_anon(0)),
+                        flow_transformation(col("t1", "y"), out_anon(0)),
+                        flow_transformation(col("t1", "a"), out_anon(0)),
+                        flow_transformation(col("t1", "b"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1833,21 +1635,20 @@ mod tests {
         }
 
         #[test]
-        fn window_partition_by_carries_window_kind() {
-            // OVER (PARTITION BY p) — p's read kind is Window; the
-            // aggregate arg `x` stays Projection on the read. But on
-            // the flow side, BOTH x AND p contribute as Aggregation
-            // sources (the whole SUM(...) OVER (...) expression
-            // classifies as an aggregate-shaped flow producer).
+        fn window_partition_by_refs_surface_and_flow_as_transformation() {
+            // OVER (PARTITION BY p) — both the aggregate arg `x` and
+            // the partition key `p` surface as reads, and both flow
+            // into the window output as Transformation (the whole
+            // SUM(...) OVER (...) expression is value-changing).
             assert_column_ops(
                 "SELECT SUM(x) OVER (PARTITION BY p) FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1", "x"), window_read("t1", "p")],
+                    reads: vec![read("t1", "x"), read("t1", "p")],
                     writes: vec![],
                     flows: vec![
-                        flow_aggregation(col("t1", "x"), out_anon(0)),
-                        flow_aggregation(col("t1", "p"), out_anon(0)),
+                        flow_transformation(col("t1", "x"), out_anon(0)),
+                        flow_transformation(col("t1", "p"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1855,16 +1656,16 @@ mod tests {
         }
 
         #[test]
-        fn window_order_by_carries_window_kind() {
+        fn window_order_by_refs_surface_and_flow_as_transformation() {
             assert_column_ops(
                 "SELECT SUM(x) OVER (ORDER BY o) FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1", "x"), window_read("t1", "o")],
+                    reads: vec![read("t1", "x"), read("t1", "o")],
                     writes: vec![],
                     flows: vec![
-                        flow_aggregation(col("t1", "x"), out_anon(0)),
-                        flow_aggregation(col("t1", "o"), out_anon(0)),
+                        flow_transformation(col("t1", "x"), out_anon(0)),
+                        flow_transformation(col("t1", "o"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1872,21 +1673,17 @@ mod tests {
         }
 
         #[test]
-        fn window_partition_and_order_both_classified() {
+        fn window_partition_and_order_refs_all_surface_and_flow() {
             assert_column_ops(
                 "SELECT SUM(x) OVER (PARTITION BY p ORDER BY o) FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        read("t1", "x"),
-                        window_read("t1", "p"),
-                        window_read("t1", "o"),
-                    ],
+                    reads: vec![read("t1", "x"), read("t1", "p"), read("t1", "o")],
                     writes: vec![],
                     flows: vec![
-                        flow_aggregation(col("t1", "x"), out_anon(0)),
-                        flow_aggregation(col("t1", "p"), out_anon(0)),
-                        flow_aggregation(col("t1", "o"), out_anon(0)),
+                        flow_transformation(col("t1", "x"), out_anon(0)),
+                        flow_transformation(col("t1", "p"), out_anon(0)),
+                        flow_transformation(col("t1", "o"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1903,16 +1700,12 @@ mod tests {
                                      ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        read("t1", "x"),
-                        window_read("t1", "p"),
-                        window_read("t1", "o"),
-                    ],
+                    reads: vec![read("t1", "x"), read("t1", "p"), read("t1", "o")],
                     writes: vec![],
                     flows: vec![
-                        flow_aggregation(col("t1", "x"), out_anon(0)),
-                        flow_aggregation(col("t1", "p"), out_anon(0)),
-                        flow_aggregation(col("t1", "o"), out_anon(0)),
+                        flow_transformation(col("t1", "x"), out_anon(0)),
+                        flow_transformation(col("t1", "p"), out_anon(0)),
+                        flow_transformation(col("t1", "o"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1930,11 +1723,11 @@ mod tests {
                  FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![read("t1", "x"), window_read("t1", "o")],
+                    reads: vec![read("t1", "x"), read("t1", "o")],
                     writes: vec![],
                     flows: vec![
-                        flow_aggregation(col("t1", "x"), out_anon(0)),
-                        flow_aggregation(col("t1", "o"), out_anon(0)),
+                        flow_transformation(col("t1", "x"), out_anon(0)),
+                        flow_transformation(col("t1", "o"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1942,16 +1735,12 @@ mod tests {
         }
 
         #[test]
-        fn merge_on_clause_carries_filter_kind() {
+        fn merge_on_clause_refs_surface_as_reads_not_flows() {
             assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Merge,
-                    reads: vec![
-                        filter_read("t", "id"),
-                        filter_read("s", "id"),
-                        read("s", "a"),
-                    ],
+                    reads: vec![read("t", "id"), read("s", "id"), read("s", "a")],
                     writes: vec![write("t", "a")],
                     flows: vec![flow_passthrough(col("s", "a"), persisted("t", "a"))],
                     diagnostics: vec![],
@@ -2110,7 +1899,7 @@ mod tests {
         }
 
         #[test]
-        fn select_computed_emits_one_flow_per_source_with_computed_kind() {
+        fn select_arithmetic_emits_one_transformation_flow_per_source() {
             assert_column_ops(
                 "SELECT a + b FROM t1",
                 StatementColumnOperations {
@@ -2118,8 +1907,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     flows: vec![
-                        flow_computed(col("t1", "a"), out_anon(0)),
-                        flow_computed(col("t1", "b"), out_anon(0)),
+                        flow_transformation(col("t1", "a"), out_anon(0)),
+                        flow_transformation(col("t1", "b"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2136,8 +1925,8 @@ mod tests {
                     writes: vec![],
                     flows: vec![
                         flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_computed(col("t1", "a"), out_anon(1)),
-                        flow_computed(col("t1", "b"), out_anon(1)),
+                        flow_transformation(col("t1", "a"), out_anon(1)),
+                        flow_transformation(col("t1", "b"), out_anon(1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2145,7 +1934,7 @@ mod tests {
         }
 
         #[test]
-        fn select_qualified_ref_in_computed_resolves_directly() {
+        fn select_qualified_ref_in_expression_resolves_directly() {
             assert_column_ops(
                 "SELECT t1.a + t1.b AS sum FROM t1",
                 StatementColumnOperations {
@@ -2153,8 +1942,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     flows: vec![
-                        flow_computed(col("t1", "a"), out("sum", 0)),
-                        flow_computed(col("t1", "b"), out("sum", 0)),
+                        flow_transformation(col("t1", "a"), out("sum", 0)),
+                        flow_transformation(col("t1", "b"), out("sum", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2179,7 +1968,7 @@ mod tests {
         }
 
         #[test]
-        fn insert_select_computed_marks_kind_per_source() {
+        fn insert_select_transformation_marks_kind_per_source() {
             assert_column_ops(
                 "INSERT INTO t1 (a) SELECT x + y FROM t2",
                 StatementColumnOperations {
@@ -2187,8 +1976,8 @@ mod tests {
                     reads: vec![read("t2", "x"), read("t2", "y")],
                     writes: vec![write("t1", "a")],
                     flows: vec![
-                        flow_computed(col("t2", "x"), persisted("t1", "a")),
-                        flow_computed(col("t2", "y"), persisted("t1", "a")),
+                        flow_transformation(col("t2", "x"), persisted("t1", "a")),
+                        flow_transformation(col("t2", "y"), persisted("t1", "a")),
                     ],
                     diagnostics: vec![],
                 },
@@ -2274,7 +2063,7 @@ mod tests {
                 "DELETE FROM t1 WHERE id = 5",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![filter_read("t1", "id")],
+                    reads: vec![read("t1", "id")],
                     writes: vec![],
                     flows: vec![],
                     diagnostics: vec![],
@@ -2311,14 +2100,14 @@ mod tests {
         }
 
         #[test]
-        fn update_set_computed_flow() {
+        fn update_set_transformation_flow() {
             assert_column_ops(
                 "UPDATE t1 SET a = b + 1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Update,
                     reads: vec![read("t1", "b")],
                     writes: vec![write("t1", "a")],
-                    flows: vec![flow_computed(col("t1", "b"), persisted("t1", "a"))],
+                    flows: vec![flow_transformation(col("t1", "b"), persisted("t1", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -2330,11 +2119,7 @@ mod tests {
                 "UPDATE t1 SET a = t2.b FROM t2 WHERE t1.id = t2.id",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Update,
-                    reads: vec![
-                        read("t2", "b"),
-                        filter_read("t1", "id"),
-                        filter_read("t2", "id"),
-                    ],
+                    reads: vec![read("t2", "b"), read("t1", "id"), read("t2", "id")],
                     writes: vec![write("t1", "a")],
                     flows: vec![flow_passthrough(col("t2", "b"), persisted("t1", "a"))],
                     diagnostics: vec![],
@@ -2343,14 +2128,14 @@ mod tests {
         }
 
         #[test]
-        fn aggregate_call_in_projection_emits_aggregation_flow() {
+        fn aggregate_call_in_projection_emits_transformation_flow() {
             assert_column_ops(
                 "SELECT SUM(a) FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    flows: vec![flow_aggregation(col("t1", "a"), out_anon(0))],
+                    flows: vec![flow_transformation(col("t1", "a"), out_anon(0))],
                     diagnostics: vec![],
                 },
             );
@@ -2364,55 +2149,55 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "b")],
                     writes: vec![],
-                    flows: vec![flow_aggregation(col("t1", "b"), out("n", 0))],
+                    flows: vec![flow_transformation(col("t1", "b"), out("n", 0))],
                     diagnostics: vec![],
                 },
             );
         }
 
         #[test]
-        fn aggregate_wrapped_in_expression_falls_back_to_computed() {
-            // `SUM(a) + 1` has BinaryOp at the top level, so the
-            // projection's kind is Computed — only a bare aggregate call
-            // qualifies as Aggregation.
+        fn aggregate_wrapped_in_expression_is_transformation() {
+            // `SUM(a) + 1` is a value-changing expression, so the flow
+            // is Transformation — same kind a bare aggregate call would
+            // produce, since the model no longer sub-classifies them.
             assert_column_ops(
                 "SELECT SUM(a) + 1 FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    flows: vec![flow_computed(col("t1", "a"), out_anon(0))],
+                    flows: vec![flow_transformation(col("t1", "a"), out_anon(0))],
                     diagnostics: vec![],
                 },
             );
         }
 
         #[test]
-        fn aggregate_in_insert_select_propagates_aggregation() {
+        fn aggregate_in_insert_select_propagates_transformation() {
             assert_column_ops(
                 "INSERT INTO t2 (n) SELECT COUNT(a) FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t1", "a")],
                     writes: vec![write("t2", "n")],
-                    flows: vec![flow_aggregation(col("t1", "a"), persisted("t2", "n"))],
+                    flows: vec![flow_transformation(col("t1", "a"), persisted("t2", "n"))],
                     diagnostics: vec![],
                 },
             );
         }
 
         #[test]
-        fn cte_aggregate_composes_to_outer_as_aggregation() {
-            // CTE body's `s` is Aggregation (SUM(a)); outer's bare `s`
-            // would be Passthrough, but composition (Aggregation
-            // dominates) collapses the chain to Aggregation.
+        fn cte_aggregate_composes_to_outer_as_transformation() {
+            // CTE body's `s` is Transformation (SUM(a)); outer's bare `s`
+            // would be Passthrough, but composition keeps the chain a
+            // Transformation (any transforming step dominates).
             assert_column_ops(
                 "WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s FROM cte",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    flows: vec![flow_aggregation(col("t1", "a"), out("s", 0))],
+                    flows: vec![flow_transformation(col("t1", "a"), out("s", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -2520,50 +2305,41 @@ mod tests {
 
         #[test]
         fn with_in_update_via_scalar_subquery_composes() {
-            // CTE is referenced from the SET RHS scalar subquery. The
-            // scalar subquery emits its own QueryOutput edge (standard
-            // behavior for any subquery resolved via the
-            // QueryOutput-emitting path), composed through cte to s.x;
-            // the UPDATE SET assignment emits the Persisted edge. Both
-            // carry Aggregation kind (max(x) marks the cte body).
+            // CTE referenced from the SET RHS scalar subquery. The
+            // subquery emits no QueryOutput edge of its own (Option B);
+            // the UPDATE SET assignment captures its source (composed
+            // through cte to s.x) and emits the single Persisted edge.
+            // Transformation (the value is derived through max + the
+            // subquery wrapping).
             assert_column_ops(
                 "WITH cte AS (SELECT max(x) AS m FROM s) \
                  UPDATE t SET a = (SELECT m FROM cte) WHERE id = 1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Update,
-                    reads: vec![read("s", "x"), filter_read("t", "id")],
+                    reads: vec![read("s", "x"), read("t", "id")],
                     writes: vec![write("t", "a")],
-                    flows: vec![
-                        flow_aggregation(col("s", "x"), out("m", 0)),
-                        flow_aggregation(col("s", "x"), persisted("t", "a")),
-                    ],
+                    flows: vec![flow_transformation(col("s", "x"), persisted("t", "a"))],
                     diagnostics: vec![],
                 },
             );
         }
 
         #[test]
-        fn with_in_delete_via_predicate_subquery_keeps_cte_source_as_filter_read() {
-            // The DELETE target `t` now lives in its own scope (the
-            // SetExpr DML scope), so the outer predicate `id` resolves
-            // unambiguously to `t`. The predicate subquery
-            // `(SELECT id FROM cte)` still emits its own QueryOutput
-            // edge, composed through cte back to s.id — this is the
-            // standard subquery-projection behavior, independent of
-            // whether the subquery feeds a write target (it doesn't
-            // here; DELETE has no column flows of its own).
+        fn with_in_delete_via_predicate_subquery_keeps_cte_source_as_read() {
+            // The DELETE target `t` lives in its own scope (the SetExpr
+            // DML scope), so the outer predicate `id` resolves
+            // unambiguously to `t`. The predicate subquery feeds a
+            // filter, so it emits no flow (Option B); its refs (s.id
+            // via the cte) still surface in reads. DELETE has no column
+            // flows of its own — so flows is empty.
             assert_column_ops(
                 "WITH cte AS (SELECT id FROM s WHERE flag) \
                  DELETE FROM t WHERE id IN (SELECT id FROM cte)",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![
-                        read("s", "id"),
-                        filter_read("s", "flag"),
-                        filter_read("t", "id"),
-                    ],
+                    reads: vec![read("s", "id"), read("s", "flag"), read("t", "id")],
                     writes: vec![],
-                    flows: vec![flow_passthrough(col("s", "id"), out("id", 0))],
+                    flows: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -2582,7 +2358,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t1", "id")],
                     writes: vec![write("t2", "col")],
-                    flows: vec![flow_computed(col("t1", "id"), persisted("t2", "col"))],
+                    flows: vec![flow_transformation(col("t1", "id"), persisted("t2", "col"))],
                     diagnostics: vec![],
                 },
             );
@@ -2598,11 +2374,7 @@ mod tests {
                 "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Merge,
-                    reads: vec![
-                        filter_read("t", "id"),
-                        filter_read("s", "id"),
-                        read("s", "a"),
-                    ],
+                    reads: vec![read("t", "id"), read("s", "id"), read("s", "a")],
                     writes: vec![write("t", "a")],
                     flows: vec![flow_passthrough(col("s", "a"), persisted("t", "a"))],
                     diagnostics: vec![],
@@ -2618,8 +2390,8 @@ mod tests {
                 StatementColumnOperations {
                     statement_kind: StatementKind::Merge,
                     reads: vec![
-                        filter_read("t", "id"),
-                        filter_read("s", "id"),
+                        read("t", "id"),
+                        read("s", "id"),
                         read("s", "id"),
                         read("s", "a"),
                     ],
@@ -2639,7 +2411,7 @@ mod tests {
                 "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Merge,
-                    reads: vec![filter_read("t", "id"), filter_read("s", "id")],
+                    reads: vec![read("t", "id"), read("s", "id")],
                     writes: vec![],
                     flows: vec![],
                     diagnostics: vec![],
@@ -2656,8 +2428,8 @@ mod tests {
                 StatementColumnOperations {
                     statement_kind: StatementKind::Merge,
                     reads: vec![
-                        filter_read("t", "id"),
-                        filter_read("s", "id"),
+                        read("t", "id"),
+                        read("s", "id"),
                         read("s", "a"),
                         read("s", "id"),
                         read("s", "a"),
@@ -2674,19 +2446,15 @@ mod tests {
         }
 
         #[test]
-        fn merge_update_computed_kind_propagates() {
+        fn merge_update_transformation_kind_propagates() {
             assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id \
                  WHEN MATCHED THEN UPDATE SET t.a = s.a + 1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Merge,
-                    reads: vec![
-                        filter_read("t", "id"),
-                        filter_read("s", "id"),
-                        read("s", "a"),
-                    ],
+                    reads: vec![read("t", "id"), read("s", "id"), read("s", "a")],
                     writes: vec![write("t", "a")],
-                    flows: vec![flow_computed(col("s", "a"), persisted("t", "a"))],
+                    flows: vec![flow_transformation(col("s", "a"), persisted("t", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -2735,14 +2503,14 @@ mod tests {
         }
 
         #[test]
-        fn ctas_propagates_aggregation_kind() {
+        fn ctas_propagates_transformation_kind() {
             assert_column_ops(
                 "CREATE TABLE t AS SELECT SUM(x) AS total FROM s",
                 StatementColumnOperations {
                     statement_kind: StatementKind::CreateTable,
                     reads: vec![read("s", "x")],
                     writes: vec![write("t", "total")],
-                    flows: vec![flow_aggregation(col("s", "x"), persisted("t", "total"))],
+                    flows: vec![flow_transformation(col("s", "x"), persisted("t", "total"))],
                     diagnostics: vec![],
                 },
             );
@@ -2814,16 +2582,15 @@ mod tests {
 
         #[test]
         fn aggregate_with_distinct_args_marker() {
-            // COUNT(DISTINCT user_id) — DISTINCT inside function args is
-            // aggregate-only per SQL spec, classified as Aggregation even
-            // if the function name weren't in the list.
+            // COUNT(DISTINCT user_id) — an aggregate call, so the source
+            // flows into the output as a Transformation.
             assert_column_ops(
                 "SELECT COUNT(DISTINCT user_id) FROM t1",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "user_id")],
                     writes: vec![],
-                    flows: vec![flow_aggregation(col("t1", "user_id"), out_anon(0))],
+                    flows: vec![flow_transformation(col("t1", "user_id"), out_anon(0))],
                     diagnostics: vec![],
                 },
             );
@@ -2831,15 +2598,11 @@ mod tests {
 
         #[test]
         fn aggregate_with_filter_clause_marker() {
-            // FILTER (WHERE ...) is aggregate-only per SQL spec.
-            // Surprises surfaced by whole-value compare:
-            //  - `y` inside the aggregate's FILTER clause is classified
-            //    Projection, not Filter — the resolver treats FILTER
-            //    contents as part of the aggregate's argument scope.
-            //  - `y` ALSO contributes as an Aggregation flow source,
-            //    not just `x`. Anything mentioned inside the aggregate's
-            //    syntactic boundary (args + FILTER predicate) flows
-            //    into the aggregate's output.
+            // SUM(x) FILTER (WHERE y > 0) — both `x` and `y` surface as
+            // reads, and both flow into the aggregate's output as
+            // Transformation. Anything mentioned inside the aggregate's
+            // syntactic boundary (args + FILTER predicate) is a flow
+            // source, not just the bare argument.
             assert_column_ops(
                 "SELECT SUM(x) FILTER (WHERE y > 0) FROM t1",
                 StatementColumnOperations {
@@ -2847,8 +2610,8 @@ mod tests {
                     reads: vec![read("t1", "x"), read("t1", "y")],
                     writes: vec![],
                     flows: vec![
-                        flow_aggregation(col("t1", "x"), out_anon(0)),
-                        flow_aggregation(col("t1", "y"), out_anon(0)),
+                        flow_transformation(col("t1", "x"), out_anon(0)),
+                        flow_transformation(col("t1", "y"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2856,17 +2619,17 @@ mod tests {
         }
 
         #[test]
-        fn cte_aggregate_then_outer_compute_still_aggregation() {
-            // Outer wraps the CTE column in a computed expression
-            // (s + 1) — composition: outer Computed × inner Aggregation =
-            // Aggregation (Aggregation dominates Computed).
+        fn cte_aggregate_then_outer_expression_still_transformation() {
+            // Outer wraps the CTE column in an expression (s + 1) —
+            // composition: outer Transformation × inner Transformation =
+            // Transformation.
             assert_column_ops(
                 "WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s + 1 FROM cte",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    flows: vec![flow_aggregation(col("t1", "a"), out_anon(0))],
+                    flows: vec![flow_transformation(col("t1", "a"), out_anon(0))],
                     diagnostics: vec![],
                 },
             );
@@ -2894,10 +2657,10 @@ mod tests {
         }
 
         #[test]
-        fn cte_computed_propagates_computed_kind_after_composition() {
-            // CTE body's `sum` is computed from a, b. Outer's bare `sum`
-            // composes back into two flows, each marked Computed because
-            // the body item is Computed (outer.bare && item.bare = false).
+        fn cte_transformation_propagates_kind_after_composition() {
+            // CTE body's `sum` is a transformation of a, b. Outer's bare
+            // `sum` composes back into two flows, each Transformation
+            // because the body item is (outer.bare && item.bare = false).
             assert_column_ops(
                 "WITH cte AS (SELECT a + b AS sum FROM t1) SELECT sum FROM cte",
                 StatementColumnOperations {
@@ -2905,8 +2668,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     flows: vec![
-                        flow_computed(col("t1", "a"), out("sum", 0)),
-                        flow_computed(col("t1", "b"), out("sum", 0)),
+                        flow_transformation(col("t1", "a"), out("sum", 0)),
+                        flow_transformation(col("t1", "b"), out("sum", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2951,7 +2714,7 @@ mod tests {
         #[test]
         fn derived_table_composes_to_base_table() {
             // The outer projection's `col` composes through derived `d`'s
-            // body (a + b AS col) into two Computed flows on t1.
+            // body (a + b AS col) into two Transformation flows on t1.
             assert_column_ops(
                 "SELECT col FROM (SELECT a + b AS col FROM t1) d",
                 StatementColumnOperations {
@@ -2959,8 +2722,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     flows: vec![
-                        flow_computed(col("t1", "a"), out("col", 0)),
-                        flow_computed(col("t1", "b"), out("col", 0)),
+                        flow_transformation(col("t1", "a"), out("col", 0)),
+                        flow_transformation(col("t1", "b"), out("col", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3104,11 +2867,7 @@ mod tests {
                 "SELECT a FROM t1 UNION SELECT b FROM t2 UNION SELECT c FROM t3",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        read("t1", "a"),
-                        read("t2", "b"),
-                        read("t3", "c"),
-                    ],
+                    reads: vec![read("t1", "a"), read("t2", "b"), read("t3", "c")],
                     writes: vec![],
                     flows: vec![
                         flow_passthrough(col("t1", "a"), out("a", 0)),
@@ -3131,9 +2890,9 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![
                         read("t1", "a"),
-                        filter_read("t1", "a"),
+                        read("t1", "a"),
                         read("t2", "b"),
-                        filter_read("t2", "b"),
+                        read("t2", "b"),
                     ],
                     writes: vec![],
                     flows: vec![
@@ -3146,9 +2905,9 @@ mod tests {
         }
 
         #[test]
-        fn union_mixed_passthrough_and_computed_kinds() {
-            // Branch flow kinds are independent. Left passthrough,
-            // right computed; both contribute to the same output position.
+        fn union_mixed_passthrough_and_transformation_kinds() {
+            // Branch flow kinds are independent. Left passthrough, right
+            // transformation; both contribute to the same output position.
             assert_column_ops(
                 "SELECT a FROM t1 UNION SELECT b + 1 AS a FROM t2",
                 StatementColumnOperations {
@@ -3157,7 +2916,7 @@ mod tests {
                     writes: vec![],
                     flows: vec![
                         flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_computed(col("t2", "b"), out("a", 0)),
+                        flow_transformation(col("t2", "b"), out("a", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3165,7 +2924,7 @@ mod tests {
         }
 
         #[test]
-        fn union_with_aggregate_branch_emits_aggregation_flow() {
+        fn union_with_aggregate_branch_emits_transformation_flow() {
             assert_column_ops(
                 "SELECT id FROM t1 UNION SELECT COUNT(id) AS id FROM t2",
                 StatementColumnOperations {
@@ -3174,7 +2933,7 @@ mod tests {
                     writes: vec![],
                     flows: vec![
                         flow_passthrough(col("t1", "id"), out("id", 0)),
-                        flow_aggregation(col("t2", "id"), out("id", 0)),
+                        flow_transformation(col("t2", "id"), out("id", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3182,11 +2941,11 @@ mod tests {
         }
 
         #[test]
-        fn union_in_subquery_emits_inner_query_output_then_outer() {
-            // The inner UNION bubbles through `SetExpr::Query`-style
-            // surface and contributes flows to its own QueryOutput
-            // slot, then the outer SELECT projects from the derived
-            // subquery and composes back to the base tables.
+        fn union_in_subquery_composes_both_branches_to_outer() {
+            // The inner UNION lives in a derived subquery; the outer
+            // SELECT projects from it and composes back to the base
+            // tables of both branches — no intermediate QueryOutput
+            // edge for the subquery survives.
             assert_column_ops(
                 "SELECT x FROM (SELECT a AS x FROM t1 UNION SELECT b AS x FROM t2) sub",
                 StatementColumnOperations {
@@ -3271,22 +3030,12 @@ mod tests {
             // scope, AFTER both branch scopes have been popped. The
             // ORDER BY column refers to a UNION output column, not a
             // base table — so `a` resolves to None (no in-scope
-            // binding) and carries Sort kind.
+            // binding).
             assert_column_ops(
                 "SELECT a FROM t1 UNION SELECT b FROM t2 ORDER BY a",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        read("t1", "a"),
-                        read("t2", "b"),
-                        ColumnRead {
-                            column: ColumnReference {
-                                table: None,
-                                name: "a".into(),
-                            },
-                            kinds: vec![ReadKind::Sort],
-                        },
-                    ],
+                    reads: vec![read("t1", "a"), read("t2", "b"), unresolved("a")],
                     writes: vec![],
                     flows: vec![
                         flow_passthrough(col("t1", "a"), out("a", 0)),
@@ -3318,12 +3067,11 @@ mod tests {
 
     mod join_using_and_natural {
         //! USING / NATURAL JOIN merge expansion is documented as
-        //! future work (resolver/column_ref.rs `RawColumnRef.kinds`;
-        //! also the module-level note in column_operation_extractor).
-        //! These tests pin down the *current* shape so when USING /
-        //! NATURAL JOIN expansion lands (with merged refs gaining a
-        //! second `ReadKind` and/or splitting into both source
-        //! tables), the diff will surface here.
+        //! future work (see the module-level note in
+        //! column_operation_extractor). These tests pin down the
+        //! *current* shape so when USING / NATURAL JOIN expansion lands
+        //! (merged refs splitting into both source tables), the diff
+        //! will surface here.
         use super::*;
 
         #[test]
@@ -3362,16 +3110,7 @@ mod tests {
                 "SELECT id FROM t1 JOIN t2 USING (id) WHERE id > 0",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        unresolved("id"),
-                        ColumnRead {
-                            column: ColumnReference {
-                                table: None,
-                                name: "id".into(),
-                            },
-                            kinds: vec![ReadKind::Filter],
-                        },
-                    ],
+                    reads: vec![unresolved("id"), unresolved("id")],
                     writes: vec![],
                     flows: vec![ColumnFlow {
                         source: ColumnReference {
@@ -3443,10 +3182,7 @@ mod tests {
                 "SELECT d.id FROM LATERAL (SELECT id FROM t1) AS d JOIN t2 ON d.id = t2.id",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        read("t1", "id"),
-                        filter_read("t2", "id"),
-                    ],
+                    reads: vec![read("t1", "id"), read("t2", "id")],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t1", "id"), out("id", 0))],
                     diagnostics: vec![],
@@ -3467,8 +3203,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     flows: vec![
-                        flow_computed(col("t1", "a"), out("x", 0)),
-                        flow_computed(col("t2", "b"), out("x", 0)),
+                        flow_transformation(col("t1", "a"), out("x", 0)),
+                        flow_transformation(col("t2", "b"), out("x", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3490,8 +3226,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     flows: vec![
-                        flow_computed(col("t1", "a"), out("x", 0)),
-                        flow_computed(col("t2", "b"), out("x", 0)),
+                        flow_transformation(col("t1", "a"), out("x", 0)),
+                        flow_transformation(col("t2", "b"), out("x", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3507,11 +3243,7 @@ mod tests {
                 "SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.fk = t1.id)",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        read("t1", "a"),
-                        filter_read("t2", "fk"),
-                        filter_read("t1", "id"),
-                    ],
+                    reads: vec![read("t1", "a"), read("t2", "fk"), read("t1", "id")],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
@@ -3637,7 +3369,7 @@ mod tests {
             // MySQL `VALUES(<col>)` is the implicit-row form. Without
             // an EXCLUDED binding, the inner `b` ref resolves to t.b
             // (the INSERT target). Result: t.b shows up as a read
-            // (the VALUES function call is a Computed wrapper) and
+            // (the VALUES function call is a value-changing wrapper) and
             // the SET clause adds a Persisted flow t.b → t.b.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (a, b) VALUES (1, 2) \
@@ -3647,7 +3379,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t", "b")],
                     writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
-                    flows: vec![flow_computed(col("t", "b"), persisted("t", "b"))],
+                    flows: vec![flow_transformation(col("t", "b"), persisted("t", "b"))],
                     diagnostics: vec![],
                 },
             );
@@ -3680,11 +3412,11 @@ mod tests {
         }
 
         #[test]
-        fn pg_insert_aggregate_with_on_conflict_excluded_keeps_aggregation_kind() {
-            // SUM(x) marks the source projection as Aggregation kind.
-            // When EXCLUDED.total composes back, compose_flow_kinds
-            // takes the Aggregation-dominant rule → flow kind stays
-            // Aggregation even on the conflict-action path.
+        fn pg_insert_aggregate_with_on_conflict_excluded_keeps_transformation_kind() {
+            // SUM(x) makes the source projection a Transformation. When
+            // EXCLUDED.total composes back, compose_flow_kinds keeps the
+            // transforming step → flow kind stays Transformation even on
+            // the conflict-action path.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (total) SELECT SUM(x) FROM s \
                  ON CONFLICT (id) DO UPDATE SET total = EXCLUDED.total",
@@ -3694,8 +3426,8 @@ mod tests {
                     reads: vec![read("s", "x")],
                     writes: vec![write("t", "total"), write("t", "total")],
                     flows: vec![
-                        flow_aggregation(col("s", "x"), persisted("t", "total")),
-                        flow_aggregation(col("s", "x"), persisted("t", "total")),
+                        flow_transformation(col("s", "x"), persisted("t", "total")),
+                        flow_transformation(col("s", "x"), persisted("t", "total")),
                     ],
                     diagnostics: vec![],
                 },
@@ -3703,16 +3435,16 @@ mod tests {
         }
 
         #[test]
-        fn pg_on_conflict_do_update_with_where_clause_emits_filter_read() {
-            // DO UPDATE ... WHERE walks in filter context, so refs in
-            // the WHERE expression get `ReadKind::Filter`.
+        fn pg_on_conflict_do_update_with_where_clause_emits_read() {
+            // DO UPDATE ... WHERE walks in filter context: `t.a` in the
+            // WHERE expression surfaces as a read but not a flow source.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (a, b) VALUES (1, 2) \
                  ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b WHERE t.a > 0",
                 &PostgreSqlDialect {},
                 StatementColumnOperations {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![filter_read("t", "a")],
+                    reads: vec![read("t", "a")],
                     writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
                     flows: vec![flow_passthrough(excluded("b"), persisted("t", "b"))],
                     diagnostics: vec![],
@@ -3973,14 +3705,14 @@ mod tests {
         }
 
         #[test]
-        fn returning_with_computed_expression_marks_kind_computed() {
+        fn returning_with_expression_marks_kind_transformation() {
             assert_column_ops(
                 "INSERT INTO t (a) VALUES (1) RETURNING id + 1 AS bumped",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t", "id")],
                     writes: vec![write("t", "a")],
-                    flows: vec![flow_computed(col("t", "id"), out("bumped", 0))],
+                    flows: vec![flow_transformation(col("t", "id"), out("bumped", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -4008,13 +3740,13 @@ mod tests {
                     statement_kind: StatementKind::Update,
                     reads: vec![
                         read("t", "b"),
-                        filter_read("t", "id"),
+                        read("t", "id"),
                         read("t", "id"),
                         read("t", "a"),
                     ],
                     writes: vec![write("t", "a")],
                     flows: vec![
-                        flow_computed(col("t", "b"), persisted("t", "a")),
+                        flow_transformation(col("t", "b"), persisted("t", "a")),
                         flow_passthrough(col("t", "id"), out("id", 0)),
                         flow_passthrough(col("t", "a"), out("a", 1)),
                     ],
@@ -4029,11 +3761,7 @@ mod tests {
                 "DELETE FROM t WHERE id = 5 RETURNING id, val",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![
-                        filter_read("t", "id"),
-                        read("t", "id"),
-                        read("t", "val"),
-                    ],
+                    reads: vec![read("t", "id"), read("t", "id"), read("t", "val")],
                     writes: vec![],
                     flows: vec![
                         flow_passthrough(col("t", "id"), out("id", 0)),
@@ -4231,8 +3959,8 @@ mod tests {
                 StatementColumnOperations {
                     statement_kind: StatementKind::Merge,
                     reads: vec![
-                        filter_read("t", "id"),
-                        filter_read("s", "id"),
+                        read("t", "id"),
+                        read("s", "id"),
                         read("s", "id"),
                         read("s", "a"),
                     ],
@@ -4259,11 +3987,7 @@ mod tests {
                 &catalog,
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        filter_read("t1", "id"),
-                        filter_read("t2", "id"),
-                        read("t2", "a"),
-                    ],
+                    reads: vec![read("t1", "id"), read("t2", "id"), read("t2", "a")],
                     writes: vec![],
                     flows: vec![flow_passthrough(col("t2", "a"), out("a", 0))],
                     diagnostics: vec![],
@@ -4287,11 +4011,7 @@ mod tests {
                 &catalog,
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        filter_read("t1", "a"),
-                        filter_read("t2", "a"),
-                        unresolved("a"),
-                    ],
+                    reads: vec![read("t1", "a"), read("t2", "a"), unresolved("a")],
                     writes: vec![],
                     flows: vec![ColumnFlow {
                         source: ColumnReference {
@@ -4371,11 +4091,7 @@ mod tests {
                 "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id",
                 StatementColumnOperations {
                     statement_kind: StatementKind::Select,
-                    reads: vec![
-                        filter_read("t1", "id"),
-                        filter_read("t2", "id"),
-                        unresolved("a"),
-                    ],
+                    reads: vec![read("t1", "id"), read("t2", "id"), unresolved("a")],
                     writes: vec![],
                     flows: vec![ColumnFlow {
                         source: ColumnReference {

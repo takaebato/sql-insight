@@ -133,16 +133,14 @@ impl Resolution {
     }
 }
 
-/// Combine two flow kinds along a substitution edge: `Aggregation`
-/// dominates (any aggregation step makes the whole chain Aggregation);
-/// otherwise `Passthrough` survives only when both sides agree; any
-/// other mix collapses to `Computed`.
+/// Combine two flow kinds along a substitution edge: the result is
+/// `Passthrough` only when both sides are `Passthrough`; any
+/// `Transformation` step makes the whole composed chain a
+/// `Transformation`.
 fn compose_flow_kinds(outer: ColumnFlowKind, inner: ColumnFlowKind) -> ColumnFlowKind {
-    if outer == ColumnFlowKind::Aggregation || inner == ColumnFlowKind::Aggregation {
-        ColumnFlowKind::Aggregation
-    } else if outer == ColumnFlowKind::Passthrough && inner == ColumnFlowKind::Passthrough {
+    if outer == ColumnFlowKind::Passthrough && inner == ColumnFlowKind::Passthrough {
         ColumnFlowKind::Passthrough
     } else {
-        ColumnFlowKind::Computed
+        ColumnFlowKind::Transformation
     }
 }

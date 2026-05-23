@@ -11,14 +11,19 @@ impl<'a> Resolver<'a> {
     pub(super) fn visit_expr(&mut self, expr: &Expr) -> Result<(), Error> {
         // Keep this match exhaustive so sqlparser Expr additions are reviewed here.
         match expr {
-            Expr::Subquery(query) => self.resolve_query_emitting_query_output(query).map(|_| ()),
-            Expr::Exists { subquery, .. } => self
-                .resolve_query_emitting_query_output(subquery)
-                .map(|_| ()),
+            // Subqueries in expression position (scalar / EXISTS / IN)
+            // resolve with raw `resolve_query`, NOT the
+            // QueryOutput-emitting wrapper — their transient projection
+            // is an intermediate, not a statement output. A scalar
+            // subquery in a projection has its source refs absorbed by
+            // the enclosing projection item (which emits the meaningful
+            // edge); a predicate subquery produces reads but no flow.
+            // Same disposition as CTE / derived bodies.
+            Expr::Subquery(query) => self.resolve_query(query).map(|_| ()),
+            Expr::Exists { subquery, .. } => self.resolve_query(subquery).map(|_| ()),
             Expr::InSubquery { expr, subquery, .. } => {
                 self.visit_expr(expr)?;
-                self.resolve_query_emitting_query_output(subquery)
-                    .map(|_| ())
+                self.resolve_query(subquery).map(|_| ())
             }
             Expr::BinaryOp { left, right, .. }
             | Expr::IsDistinctFrom(left, right)
@@ -153,19 +158,15 @@ impl<'a> Resolver<'a> {
                 else_result,
                 ..
             } => {
-                // `CASE x WHEN ...`: the operand acts as a
-                // conditional input (compared against each WHEN
-                // pattern), parallel to the condition exprs in the
-                // searched form.
+                // All CASE sub-expressions (operand, WHEN conditions,
+                // THEN/ELSE results) are walked the same way — refs no
+                // longer carry a clause kind, so there is nothing to
+                // distinguish the condition position from the result.
                 if let Some(expr) = operand {
-                    self.with_case_condition(|r| r.visit_expr(expr))?;
+                    self.visit_expr(expr)?;
                 }
                 for condition in conditions {
-                    // `WHEN <cond>` part — Conditional modifier on
-                    // top of the surrounding clause kind.
-                    self.with_case_condition(|r| r.visit_expr(&condition.condition))?;
-                    // `THEN <result>` part is a value expression —
-                    // keep the surrounding kind unchanged.
+                    self.visit_expr(&condition.condition)?;
                     self.visit_expr(&condition.result)?;
                 }
                 if let Some(expr) = else_result {
@@ -310,12 +311,12 @@ impl<'a> Resolver<'a> {
                 Ok(())
             }
             PipeOperator::Where { expr } => self.with_filter_clause(|r| r.visit_expr(expr)),
-            PipeOperator::OrderBy { exprs } => self.with_read_kind(super::ReadKind::Sort, |r| {
+            PipeOperator::OrderBy { exprs } => {
                 for expr in exprs {
-                    r.visit_order_by_expr(expr)?;
+                    self.visit_order_by_expr(expr)?;
                 }
-                Ok::<_, Error>(())
-            }),
+                Ok(())
+            }
             PipeOperator::Select { exprs } | PipeOperator::Extend { exprs } => {
                 for expr in exprs {
                     self.visit_select_item(expr)?;
@@ -332,17 +333,13 @@ impl<'a> Resolver<'a> {
                 full_table_exprs,
                 group_by_expr,
             } => {
-                // Aggregate args are Projection-position (default kind);
-                // GROUP BY part is GroupBy.
                 for expr in full_table_exprs {
                     self.visit_expr(&expr.expr.expr)?;
                 }
-                self.with_read_kind(super::ReadKind::GroupBy, |r| {
-                    for expr in group_by_expr {
-                        r.visit_expr(&expr.expr.expr)?;
-                    }
-                    Ok::<_, Error>(())
-                })
+                for expr in group_by_expr {
+                    self.visit_expr(&expr.expr.expr)?;
+                }
+                Ok(())
             }
             PipeOperator::TableSample { sample } => self.visit_table_sample(sample),
             PipeOperator::Union { queries, .. }
@@ -408,9 +405,9 @@ impl<'a> Resolver<'a> {
     fn visit_function_arguments(&mut self, arguments: &FunctionArguments) -> Result<(), Error> {
         match arguments {
             FunctionArguments::None => Ok(()),
-            FunctionArguments::Subquery(query) => {
-                self.resolve_query_emitting_query_output(query).map(|_| ())
-            }
+            // A subquery as a function argument is an intermediate, not
+            // a statement output — raw resolve (no QueryOutput edge).
+            FunctionArguments::Subquery(query) => self.resolve_query(query).map(|_| ()),
             FunctionArguments::List(args) => self.visit_function_argument_list(args),
         }
     }
@@ -521,21 +518,19 @@ impl<'a> Resolver<'a> {
     }
 
     pub(super) fn visit_window_spec(&mut self, spec: &WindowSpec) -> Result<(), Error> {
-        // OVER (...) shapes the window — every ref inside (PARTITION
-        // BY, ORDER BY, frame bounds) is Window kind, not value flow.
-        self.with_read_kind(super::ReadKind::Window, |r| {
-            r.visit_exprs(&spec.partition_by)?;
-            for expr in &spec.order_by {
-                r.visit_order_by_expr(expr)?;
+        // OVER (...) — PARTITION BY / ORDER BY / frame-bound refs are
+        // all walked as plain reads (no clause kind is recorded).
+        self.visit_exprs(&spec.partition_by)?;
+        for expr in &spec.order_by {
+            self.visit_order_by_expr(expr)?;
+        }
+        if let Some(frame) = &spec.window_frame {
+            self.visit_window_frame_bound(&frame.start_bound)?;
+            if let Some(bound) = &frame.end_bound {
+                self.visit_window_frame_bound(bound)?;
             }
-            if let Some(frame) = &spec.window_frame {
-                r.visit_window_frame_bound(&frame.start_bound)?;
-                if let Some(bound) = &frame.end_bound {
-                    r.visit_window_frame_bound(bound)?;
-                }
-            }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     fn visit_window_frame_bound(&mut self, bound: &WindowFrameBound) -> Result<(), Error> {

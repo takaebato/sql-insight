@@ -14,7 +14,7 @@
 //! - [`column_ref`]: `RawColumnRef` and walk-time resolution of
 //!   identifier parts to owning tables.
 //! - [`projection`]: `ProjectionGroup` / `ProjectionItem` and the
-//!   classification helpers (aggregate / passthrough / computed).
+//!   passthrough-vs-transformation classification helper.
 //! - [`flow`]: `FlowEdge` / `FlowTargetSpec` and the emit helpers
 //!   that drive INSERT / CTAS / QueryOutput edge construction.
 //! - [`composition`]: post-walk passes that substitute synthetic
@@ -42,11 +42,6 @@ pub(crate) use column_ref::RawColumnRef;
 pub(crate) use context::VisitContext;
 pub(crate) use flow::{FlowEdge, FlowTargetSpec};
 pub(crate) use projection::{ProjectionGroup, ProjectionItem};
-
-// `ReadKind` lives in the column extractor but is referenced from
-// walkers via `super::ReadKind`. Re-export here so walker paths
-// stay short and don't reach across crate-module boundaries.
-pub(crate) use crate::extractor::column_operation_extractor::ReadKind;
 
 // Internal helpers used by walkers via `super::*`. Some are
 // resolver-internal infrastructure (`BindingKey`, `ScopeStack`,
@@ -117,8 +112,7 @@ pub(crate) struct Resolver<'a> {
     /// the returned `ResolvedQuery`, so each query gets exactly its
     /// own projections.
     current_projections: Vec<ProjectionGroup>,
-    /// Lexical walking context (scope_kind / read_kind /
-    /// in_case_condition). See [`VisitContext`].
+    /// Lexical walking context (`scope_kind`). See [`VisitContext`].
     ctx: VisitContext,
 }
 

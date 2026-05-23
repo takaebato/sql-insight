@@ -344,9 +344,8 @@ impl<'a> Resolver<'a> {
                 }
                 Ok(())
             }
-            PivotValueSource::Subquery(query) => {
-                self.resolve_query_emitting_query_output(query).map(|_| ())
-            }
+            // PIVOT value subquery is an intermediate — raw resolve.
+            PivotValueSource::Subquery(query) => self.resolve_query(query).map(|_| ()),
         }
     }
 }

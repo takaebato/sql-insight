@@ -26,15 +26,11 @@ fn main() {
     println!("\nreads ({}):", ops.reads.len());
     for read in &ops.reads {
         let table = read
-            .column
             .table
             .as_ref()
             .map(|t| t.name.value.as_str())
             .unwrap_or("<unresolved>");
-        println!(
-            "  {}.{} kinds={:?}",
-            table, read.column.name.value, read.kinds
-        );
+        println!("  {}.{}", table, read.name.value);
     }
 
     println!("\nflows ({}):", ops.flows.len());
@@ -66,23 +62,21 @@ fn main() {
         println!("  {} -> {} ({:?})", source, target, flow.kind);
     }
 
-    // Bucket flows by kind so consumers can answer questions like
-    // "did any aggregation happen on the way to this column?".
+    // Bucket flows by kind: is the value forwarded unchanged, or
+    // derived? (`direct copy` vs `transformed`).
     let mut passthrough = 0usize;
-    let mut aggregation = 0usize;
-    let mut computed = 0usize;
+    let mut transformation = 0usize;
     for flow in &ops.flows {
         match flow.kind {
             ColumnFlowKind::Passthrough => passthrough += 1,
-            ColumnFlowKind::Aggregation => aggregation += 1,
-            ColumnFlowKind::Computed => computed += 1,
+            ColumnFlowKind::Transformation => transformation += 1,
             // ColumnFlowKind is #[non_exhaustive] — future variants
             // fall here. Skipping is fine for the per-kind count.
             _ => {}
         }
     }
     println!(
-        "\nflow kinds — Passthrough={}, Aggregation={}, Computed={}",
-        passthrough, aggregation, computed
+        "\nflow kinds — Passthrough={}, Transformation={}",
+        passthrough, transformation
     );
 }

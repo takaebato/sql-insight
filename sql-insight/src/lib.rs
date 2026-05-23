@@ -23,10 +23,13 @@
 //!   `flows` surfaces with [`StatementKind`] classification. See
 //!   [`extract_table_operations`].
 //! - **Column-level Operation Extraction** — the same three
-//!   surfaces at column granularity, with clause-role
-//!   ([`ReadKind`]) and flow-kind ([`ColumnFlowKind`]) metadata.
-//!   Column flows form a source → target graph suitable for
-//!   lineage-style analyses. See [`extract_column_operations`].
+//!   surfaces at column granularity. `reads` / `writes` are plain
+//!   occurrence lists of [`ColumnReference`]s; `flows` form a
+//!   source → target graph carrying [`ColumnFlowKind`]
+//!   (`Passthrough` vs `Transformation`). The value-vs-filter
+//!   distinction is structural: a value contributor is a `flows`
+//!   source, a filter-only column is in `reads` but not `flows`.
+//!   See [`extract_column_operations`].
 //! - **Optional [`Catalog`]** — supply a schema provider to make
 //!   resolution strict (catch typos as
 //!   [`UnresolvedColumn`](DiagnosticKind::UnresolvedColumn),
@@ -84,12 +87,16 @@
 //!   statements that physically move data (`INSERT` / `UPDATE` /
 //!   `MERGE` / `CREATE TABLE AS` / `CREATE VIEW`).
 //!
-//! For column-level flows, [`ColumnFlowKind`] distinguishes
-//! `Passthrough` (raw move), `Aggregation` (through `SUM` / `COUNT`
-//! / etc.) and `Computed` (through expressions). Reads carry a
-//! [`Vec<ReadKind>`](ReadKind) describing where in the statement
-//! they appeared (`Projection` / `Filter` / `GroupBy` / `Sort` /
-//! `Window`, plus a `Conditional` modifier for `CASE WHEN`).
+//! For column-level flows, [`ColumnFlowKind`] makes one clean
+//! distinction: `Passthrough` (the value is forwarded unchanged; a
+//! rename still counts) vs `Transformation` (any expression that
+//! changes the value — arithmetic, function calls, aggregates,
+//! window functions, CASE, casts, …). `reads` / `writes` are plain
+//! occurrence lists of column references with no clause tag; whether
+//! a column contributes a value or merely influences the result
+//! (e.g. a `WHERE` predicate) is recovered structurally — value
+//! contributors appear as `flows` sources, filter-only columns do
+//! not.
 //!
 //! ## Limitations
 //!
@@ -109,13 +116,12 @@
 //! - **Recursive CTE bodies** are pre-bound under a stub for
 //!   self-reference; their projection composition is deferred, so
 //!   `flows` won't trace through them end-to-end.
-//! - **Aggregate detection** combines structural markers
-//!   (`FILTER (WHERE ...)`, `WITHIN GROUP (...)`, `DISTINCT` in
-//!   args — all aggregate-only per SQL standard) with a built-in
-//!   union of common aggregate names across major dialects.
-//!   Dialect-specific UDAFs outside that list are misclassified as
-//!   `Computed`. Window-only functions (`ROW_NUMBER`, `RANK`,
-//!   `LAG`, `LEAD`, …) are intentionally excluded.
+//! - **Flow kind is coarse** (`Passthrough` vs `Transformation`).
+//!   Aggregates, window functions, arithmetic, casts, etc. are all
+//!   `Transformation` — the model deliberately does not sub-classify
+//!   "changed" values (that distinction is lossy for edge cases like
+//!   window aggregates and value-preserving `STRING_AGG`, and not
+//!   needed for the core dependency / impact-analysis use case).
 //! - **Multi-segment qualifiers** (`s.t.col`): only the head `s`
 //!   is matched against in-scope bindings for synthetic-vs-real
 //!   classification — schema- / catalog-qualified shapes resolve
@@ -148,7 +154,7 @@
 //! - **Public enums are `#[non_exhaustive]`** so future variants
 //!   stay SemVer-minor — consumers must include a wildcard arm when
 //!   matching on [`DiagnosticKind`] / [`StatementKind`] /
-//!   [`ReadKind`] / [`ColumnFlowKind`] / [`ColumnTarget`].
+//!   [`ColumnFlowKind`] / [`ColumnTarget`].
 
 pub mod catalog;
 pub mod diagnostic;

@@ -2,8 +2,8 @@ use super::{Column, FlowTargetSpec, ProjectionGroup, RelationSchema, Resolver, T
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
-    Delete, FromTable, Ident, Merge, ObjectType, OnConflictAction, OnInsert, SelectItem,
-    Statement, TableWithJoins, Update, UpdateTableFromKind,
+    Delete, FromTable, Ident, Merge, ObjectType, OnConflictAction, OnInsert, SelectItem, Statement,
+    TableWithJoins, Update, UpdateTableFromKind,
 };
 
 impl<'a> Resolver<'a> {
