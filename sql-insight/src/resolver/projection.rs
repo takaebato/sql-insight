@@ -24,7 +24,7 @@ pub(crate) struct ProjectionGroup {
 /// name (explicit alias > bare ident name > `None`). `kind`
 /// classifies how the source refs turn into the output value
 /// (`Passthrough` for a bare forwarded column, `Transformation` for
-/// anything value-changing); composed with the outer flow's kind when
+/// anything value-changing); composed with the outer edge's kind when
 /// this item participates in a CTE / derived table substitution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectionItem {
@@ -62,7 +62,7 @@ pub(super) fn projection_item_output_name(item: &SelectItem) -> Option<Ident> {
 }
 
 /// Classify a projection item for `ColumnLineageKind`. Wildcards don't
-/// emit flow edges currently, so the fallback `Transformation` here is
+/// emit lineage edges currently, so the fallback `Transformation` here is
 /// safe; if/when wildcard expansion lands, items will be classified
 /// individually instead.
 pub(super) fn projection_item_kind(item: &SelectItem) -> ColumnLineageKind {

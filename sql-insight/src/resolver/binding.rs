@@ -26,7 +26,7 @@ pub(crate) struct ScopeId(pub(super) usize);
 
 /// Whether a scope contributes data to its enclosing write target.
 ///
-/// - `Body`: data flows through — query bodies, CTE bodies, derived
+/// - `Body`: data moves through — query bodies, CTE bodies, derived
 ///   tables, INSERT/MERGE sources, scalar subqueries in projection or
 ///   SET. Tables bound here participate in `TableLineageEdge` edges when the
 ///   statement has a write target.

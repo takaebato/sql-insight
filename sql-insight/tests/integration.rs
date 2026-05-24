@@ -286,15 +286,15 @@ mod extract_column_operations {
         let ops = result[0].as_ref().unwrap();
         // Both the projection `a` and the filter `b` surface as reads
         // (occurrence list, no clause tag). value-vs-filter is
-        // recovered structurally: `a` is also a flow source, `b` is not.
+        // recovered structurally: `a` is also a lineage source, `b` is not.
         let names: Vec<_> = ops.reads.iter().map(|r| r.name.value.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
-        let flow_sources: Vec<_> = ops
+        let lineage_sources: Vec<_> = ops
             .lineage
             .iter()
             .map(|f| f.source.name.value.as_str())
             .collect();
-        assert_eq!(flow_sources, vec!["a"]); // `b` (filter) is not a flow source
+        assert_eq!(lineage_sources, vec!["a"]); // `b` (filter) is not a lineage source
     }
 
     #[test]
@@ -304,9 +304,9 @@ mod extract_column_operations {
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.lineage.len(), 2);
         // Both lineage edges are Passthrough into Relation targets.
-        for flow in &ops.lineage {
-            assert!(matches!(flow.kind, ColumnLineageKind::Passthrough));
-            assert!(matches!(flow.target, ColumnTarget::Relation(_)));
+        for edge in &ops.lineage {
+            assert!(matches!(edge.kind, ColumnLineageKind::Passthrough));
+            assert!(matches!(edge.target, ColumnTarget::Relation(_)));
         }
     }
 
@@ -691,7 +691,7 @@ mod invariants {
                     if let Some(target_table) = edge_relation_table(f) {
                         assert!(
                             table_op_writes.contains(&target_table),
-                            "Relation flow target {target_table:?} not in table_op writes \
+                            "Relation lineage target {target_table:?} not in table_op writes \
                              for statement {idx} of SQL: {sql}\n\
                              table_op writes: {table_op_writes:?}"
                         );

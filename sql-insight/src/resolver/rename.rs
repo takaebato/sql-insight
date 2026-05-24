@@ -1,6 +1,6 @@
 //! Column-list rename for `WITH cte(a, b) AS (...)` and
 //! `(SELECT ...) d(a, b)` aliases. Applied to both the body's
-//! `output_schema` and its `projection_groups` so flow composition's
+//! `output_schema` and its `projection_groups` so lineage composition's
 //! name-match lookup finds the renamed columns.
 
 use super::{Column, ProjectionGroup, RelationSchema};
@@ -44,7 +44,7 @@ pub(crate) fn rename_relation_schema(
 }
 
 /// Apply the same rename to the projection items' inferred names so
-/// flow composition's name-match lookup finds the renamed columns.
+/// lineage composition's name-match lookup finds the renamed columns.
 /// Position N in the rename list overrides position N's item name;
 /// positions beyond the list keep their body-inferred names. Each
 /// `ProjectionGroup` (set-op branch) is renamed independently.

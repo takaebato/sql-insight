@@ -66,11 +66,11 @@ fn main() {
         let results = extract_column_operations(&dialect, sql, Some(&catalog)).unwrap();
         let ops = results[0].as_ref().unwrap();
         println!("--- 1. INSERT without explicit column list ---");
-        for flow in &ops.lineage {
-            if let ColumnTarget::Relation(target) = &flow.target {
+        for edge in &ops.lineage {
+            if let ColumnTarget::Relation(target) = &edge.target {
                 println!(
                     "  {} -> orders.{} ({:?})",
-                    flow.source.name.value, target.name.value, flow.kind
+                    edge.source.name.value, target.name.value, edge.kind
                 );
             }
         }

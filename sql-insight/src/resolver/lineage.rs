@@ -18,7 +18,7 @@ use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolv
 /// goes through a synthetic intermediate).
 ///
 /// Created by callers from [`ProjectionGroup`]s (for SELECT-style
-/// flows — INSERT pairs with target columns, top-level / nested
+/// lineage edges — INSERT pairs with target columns, top-level / nested
 /// SELECTs emit `QueryOutput`) or directly by UPDATE / similar
 /// walkers that already know their write target.
 #[derive(Debug, Clone)]

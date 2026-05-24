@@ -33,7 +33,7 @@ pub(crate) struct RawColumnRef {
     pub(crate) resolved: Option<TableReference>,
     /// True iff the walk-time owning binding was synthetic
     /// (`Cte` / `DerivedTable` / `TableFunction`). Drives reads
-    /// filtering and flow composition. `false` when `resolved` is
+    /// filtering and lineage composition. `false` when `resolved` is
     /// `None`.
     pub(crate) synthetic: bool,
 }

@@ -17,7 +17,7 @@ impl<'a> Resolver<'a> {
             // is an intermediate, not a statement output. A scalar
             // subquery in a projection has its source refs absorbed by
             // the enclosing projection item (which emits the meaningful
-            // edge); a predicate subquery produces reads but no flow.
+            // edge); a predicate subquery produces reads but no lineage.
             // Same disposition as CTE / derived bodies.
             Expr::Subquery(query) => self.resolve_query(query).map(|_| ()),
             Expr::Exists { subquery, .. } => self.resolve_query(subquery).map(|_| ()),

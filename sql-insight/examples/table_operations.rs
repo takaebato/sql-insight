@@ -29,8 +29,8 @@ fn main() {
         println!("reads:  {:?}", reads);
         println!("writes: {:?}", writes);
         println!("lineage:  {} edge(s)", ops.lineage.len());
-        for flow in &ops.lineage {
-            println!("  {} -> {}", flow.source.name.value, flow.target.name.value);
+        for edge in &ops.lineage {
+            println!("  {} -> {}", edge.source.name.value, edge.target.name.value);
         }
         if !ops.diagnostics.is_empty() {
             println!("diagnostics: {} non-fatal item(s)", ops.diagnostics.len());

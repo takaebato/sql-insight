@@ -1,7 +1,7 @@
 //! Extracts the column-level operations a SQL statement performs.
 //!
 //! Where [`extract_table_operations`](crate::extract_table_operations)
-//! answers "what tables does this statement touch / write / flow", this
+//! answers "what tables does this statement touch / write / lineage", this
 //! module answers the same questions at column granularity.
 //!
 //! The output mirrors `TableOperation` — three parallel
@@ -111,12 +111,12 @@ use sqlparser::parser::Parser;
 /// assert_eq!(read.name.value, "a");
 /// assert_eq!(read.table.as_ref().unwrap().name.value, "t1");
 ///
-/// // The projection emits one flow into the SELECT's QueryOutput slot,
+/// // The projection emits one lineage edge into the SELECT's QueryOutput slot,
 /// // marked Passthrough (no expression wrapping the column).
 /// assert_eq!(ops.lineage.len(), 1);
-/// let flow = &ops.lineage[0];
-/// assert_eq!(flow.kind, ColumnLineageKind::Passthrough);
-/// match &flow.target {
+/// let edge = &ops.lineage[0];
+/// assert_eq!(edge.kind, ColumnLineageKind::Passthrough);
+/// match &edge.target {
 ///     ColumnTarget::QueryOutput { name, position } => {
 ///         assert_eq!(name.as_ref().unwrap().value, "a");
 ///         assert_eq!(*position, 0);
@@ -201,7 +201,7 @@ pub struct ColumnLineageEdge {
 /// is always set so anonymous outputs can be identified.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ColumnTarget {
-    /// A column in a real relation receiving the flow — INSERT /
+    /// A column in a real relation receiving the inbound lineage edge — INSERT /
     /// UPDATE / MERGE target columns, or columns of the new relation
     /// produced by CTAS / CREATE VIEW / ALTER VIEW.
     Relation(ColumnReference),
@@ -1112,9 +1112,9 @@ mod tests {
             // Inner subquery has its own t2 in scope; the unqualified `y`
             // inside the IN-subquery resolves to t2 even though t1 is
             // also in the outer scope. Standard SQL inner-shadows-outer.
-            // The predicate subquery emits no flow (it feeds a filter);
+            // The predicate subquery emits no lineage (it feeds a filter);
             // it still surfaces its refs in reads. The outer `*` is a
-            // suppressed wildcard, so there is no flow at all.
+            // suppressed wildcard, so there is no lineage at all.
             assert_column_ops(
                 "SELECT * FROM t1 WHERE id IN (SELECT id FROM t2 WHERE y > 0)",
                 ColumnOperation {
@@ -1131,8 +1131,8 @@ mod tests {
         fn unqualified_correlated_walks_to_outer_when_inner_has_no_candidate() {
             // Inner CTE has Known schema [zz]; `outer_col` doesn't fit it,
             // so resolution walks to the outer scope and picks the t1
-            // (Unknown) binding. The predicate subquery emits no flow;
-            // the outer `*` is a suppressed wildcard, so no flow at all.
+            // (Unknown) binding. The predicate subquery emits no lineage;
+            // the outer `*` is a suppressed wildcard, so no lineage at all.
             assert_column_ops(
                 "SELECT * FROM t1 WHERE id IN (\
                 WITH inner_cte AS (SELECT zz FROM t1) \
@@ -1285,10 +1285,10 @@ mod tests {
 
         #[test]
         fn predicate_subquery_surfaces_reads_but_no_lineage() {
-            // The IN-subquery feeds a filter, so it emits NO flow
+            // The IN-subquery feeds a filter, so it emits NO lineage
             // (Option B: nested subqueries resolve raw, no intermediate
             // QueryOutput edge). Its refs (s.id, s.flag) still surface
-            // in reads. Only the outer projection `a` flows.
+            // in reads. Only the outer projection `a` contributes a lineage edge.
             assert_column_ops(
                 "SELECT a FROM t WHERE id IN (SELECT id FROM s WHERE flag = 1)",
                 ColumnOperation {
@@ -1507,9 +1507,9 @@ mod tests {
         #[test]
         fn subquery_in_group_by_surfaces_reads_but_no_inner_lineage() {
             // GROUP BY (SELECT z FROM s) — the subquery's `z` surfaces in
-            // reads, but the subquery emits no flow (Option B: raw
+            // reads, but the subquery emits no lineage (Option B: raw
             // resolve, no intermediate QueryOutput). Only the outer
-            // projection `a` flows.
+            // projection `a` contributes a lineage edge.
             assert_column_ops(
                 "SELECT a FROM t GROUP BY (SELECT z FROM s)",
                 ColumnOperation {
@@ -1525,7 +1525,7 @@ mod tests {
         #[test]
         fn case_in_projection_refs_surface_and_transform() {
             // Condition (`a`), THEN (`b`), and ELSE (`c`) all surface as
-            // reads and flow into the CASE output as Transformation.
+            // reads and feed into the CASE output as Transformation.
             assert_column_ops(
                 "SELECT CASE WHEN a > 0 THEN b ELSE c END FROM t1",
                 ColumnOperation {
@@ -1566,11 +1566,11 @@ mod tests {
 
         #[test]
         fn scalar_subquery_in_case_condition_composes_to_outer_only() {
-            // A scalar subquery in a CASE condition emits no flow of its
+            // A scalar subquery in a CASE condition emits no lineage of its
             // own (Option B: raw resolve). The outer CASE projection
             // item captures the subquery's refs (`s.x` from its
             // projection, `s.y` from its WHERE) as its source refs, so
-            // both flow into the outer anonymous output as
+            // both feed into the outer anonymous output as
             // Transformation. Refs still surface in reads.
             assert_column_ops(
                 "SELECT CASE WHEN (SELECT x FROM s WHERE y > 0) IS NULL THEN 1 END FROM t",
@@ -1591,7 +1591,7 @@ mod tests {
         fn simple_case_operand_and_results_surface() {
             // `CASE x WHEN 1 THEN a WHEN 2 THEN b END` — the operand
             // `x` and the results `a` / `b` all surface as reads and
-            // flow into the CASE output as Transformation.
+            // feed into the CASE output as Transformation.
             assert_column_ops(
                 "SELECT CASE x WHEN 1 THEN a WHEN 2 THEN b END FROM t1",
                 ColumnOperation {
@@ -1612,7 +1612,7 @@ mod tests {
         fn simple_case_with_column_when_pattern_all_surface() {
             // `CASE x WHEN y THEN a ELSE b END` — operand `x`,
             // WHEN-pattern `y`, and results `a` / `b` all surface as
-            // reads and flow into the CASE output as Transformation.
+            // reads and feed into the CASE output as Transformation.
             assert_column_ops(
                 "SELECT CASE x WHEN y THEN a ELSE b END FROM t1",
                 ColumnOperation {
@@ -1638,7 +1638,7 @@ mod tests {
         #[test]
         fn window_partition_by_refs_surface_and_transform() {
             // OVER (PARTITION BY p) — both the aggregate arg `x` and
-            // the partition key `p` surface as reads, and both flow
+            // the partition key `p` surface as reads, and both feed
             // into the window output as Transformation (the whole
             // SUM(...) OVER (...) expression is value-changing).
             assert_column_ops(
@@ -2158,7 +2158,7 @@ mod tests {
 
         #[test]
         fn aggregate_wrapped_in_expression_is_transformation() {
-            // `SUM(a) + 1` is a value-changing expression, so the flow
+            // `SUM(a) + 1` is a value-changing expression, so the lineage edge
             // is Transformation — same kind a bare aggregate call would
             // produce, since the model no longer sub-classifies them.
             assert_column_ops(
@@ -2330,7 +2330,7 @@ mod tests {
             // The DELETE target `t` lives in its own scope (the SetExpr
             // DML scope), so the outer predicate `id` resolves
             // unambiguously to `t`. The predicate subquery feeds a
-            // filter, so it emits no flow (Option B); its refs (s.id
+            // filter, so it emits no lineage (Option B); its refs (s.id
             // via the cte) still surface in reads. DELETE has no column
             // lineage of its own — so lineage is empty.
             assert_column_ops(
@@ -2568,7 +2568,7 @@ mod tests {
         #[test]
         fn ctas_unnamed_projection_yields_no_paired_lineage() {
             // `SELECT 1` has no column ref and no inferable name, so the
-            // CTAS source produces no flow / no write for that slot.
+            // CTAS source produces no lineage / no write for that slot.
             assert_column_ops(
                 "CREATE TABLE t AS SELECT 1 FROM s",
                 ColumnOperation {
@@ -2584,7 +2584,7 @@ mod tests {
         #[test]
         fn aggregate_with_distinct_args_marker() {
             // COUNT(DISTINCT user_id) — an aggregate call, so the source
-            // flows into the output as a Transformation.
+            // feeds into the output as a Transformation.
             assert_column_ops(
                 "SELECT COUNT(DISTINCT user_id) FROM t1",
                 ColumnOperation {
@@ -2600,9 +2600,9 @@ mod tests {
         #[test]
         fn aggregate_with_filter_clause_marker() {
             // SUM(x) FILTER (WHERE y > 0) — both `x` and `y` surface as
-            // reads, and both flow into the aggregate's output as
+            // reads, and both feed into the aggregate's output as
             // Transformation. Anything mentioned inside the aggregate's
-            // syntactic boundary (args + FILTER predicate) is a flow
+            // syntactic boundary (args + FILTER predicate) is a lineage
             // source, not just the bare argument.
             assert_column_ops(
                 "SELECT SUM(x) FILTER (WHERE y > 0) FROM t1",
@@ -2642,7 +2642,7 @@ mod tests {
 
         #[test]
         fn cte_passthrough_composes_to_base_table() {
-            // The outer flow's source `id` resolves to cte, then composes
+            // The outer edge's source `id` resolves to cte, then composes
             // through the CTE body's projection back to t1.id. No
             // intermediate cte.id → out edge survives.
             assert_column_ops(
@@ -2679,7 +2679,7 @@ mod tests {
 
         #[test]
         fn cte_to_insert_composes_end_to_end() {
-            // Composition flows past the CTE boundary into the INSERT
+            // Composition reaches past the CTE boundary into the INSERT
             // target — t1.id → t2.x directly, no cte.id step.
             assert_column_ops(
                 "INSERT INTO t2 (x) WITH cte AS (SELECT id FROM t1) SELECT id FROM cte",
@@ -2753,7 +2753,7 @@ mod tests {
         #[test]
         fn recursive_cte_does_not_panic_and_skips_composition() {
             // Recursive CTEs don't carry body_projections (fixpoint is
-            // deferred), so composition falls back to leaving the flow
+            // deferred), so composition falls back to leaving the lineage edge
             // source pointing at the CTE binding (`r.id`) rather than
             // tracing into a base table. Reads still get the synthetic
             // filter, so only `t1.id` from the non-recursive branch
@@ -3344,9 +3344,9 @@ mod tests {
             // EXCLUDED's body_projections come from the INSERT source
             // renamed to the target columns positionally. So
             // `EXCLUDED.b` composes through to the source's position-1
-            // projection (`y` from s) — the conflict-action flow
+            // projection (`y` from s) — the conflict-action lineage edge
             // bottoms out at the same base table as the
-            // source-projection flow.
+            // source-projection lineage edge.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (a, b) SELECT x, y FROM s \
                  ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
@@ -3371,7 +3371,7 @@ mod tests {
             // an EXCLUDED binding, the inner `b` ref resolves to t.b
             // (the INSERT target). Result: t.b shows up as a read
             // (the VALUES function call is a value-changing wrapper) and
-            // the SET clause adds a Relation flow t.b → t.b.
+            // the SET clause adds a Relation-target lineage edge t.b → t.b.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (a, b) VALUES (1, 2) \
                  ON DUPLICATE KEY UPDATE b = VALUES(b)",
@@ -3416,7 +3416,7 @@ mod tests {
         fn pg_insert_aggregate_with_on_conflict_excluded_keeps_transformation_kind() {
             // SUM(x) makes the source projection a Transformation. When
             // EXCLUDED.total composes back, compose_lineage_kinds keeps the
-            // transforming step → flow kind stays Transformation even on
+            // transforming step → lineage kind stays Transformation even on
             // the conflict-action path.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (total) SELECT SUM(x) FROM s \
@@ -3889,7 +3889,7 @@ mod tests {
             // INSERT INTO t SELECT a, b FROM s — no explicit column
             // list. With t = [x, y, z] in catalog, the resolver pairs
             // source projections positionally (s.a → t.x, s.b → t.y).
-            // Unpaired catalog cols (z) get no flow / no write.
+            // Unpaired catalog cols (z) get no lineage / no write.
             let catalog = TestCatalog::default().with("t", vec!["x", "y", "z"]);
             assert_column_ops_with_catalog(
                 "INSERT INTO t SELECT a, b FROM s",
@@ -3910,7 +3910,7 @@ mod tests {
         #[test]
         fn catalog_insert_without_explicit_columns_source_longer_than_target() {
             // 3 source projections vs t = [x, y] — pair what fits,
-            // surplus source column gets no flow.
+            // surplus source column gets no lineage.
             let catalog = TestCatalog::default().with("t", vec!["x", "y"]);
             assert_column_ops_with_catalog(
                 "INSERT INTO t SELECT a, b, c FROM s",

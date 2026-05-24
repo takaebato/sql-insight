@@ -18,7 +18,7 @@ impl<'a> Resolver<'a> {
         let prev_projections = std::mem::take(&mut self.current_projections);
         // `ctx` now carries only `scope_kind`, which intentionally
         // propagates through the subquery boundary (a subquery in a
-        // predicate is itself predicate-position for table-flow
+        // predicate is itself predicate-position for table-lineage
         // exclusion). Nothing to reset/restore around the body.
         if let Some(with) = &query.with {
             if with.recursive {
@@ -36,11 +36,11 @@ impl<'a> Resolver<'a> {
             } else {
                 for cte in &with.cte_tables {
                     // Raw resolve_query: the body's projections are
-                    // stored in the binding for flow composition, and
+                    // stored in the binding for lineage composition, and
                     // no intermediate QueryOutput edges are emitted
                     // since the CTE output isn't a query result on its
                     // own — references through the CTE compose end to
-                    // end at flow-emission time.
+                    // end at lineage-emission time.
                     let resolved = self.resolve_query(&cte.query)?;
                     let renames = &cte.alias.columns;
                     let renamed_schema =

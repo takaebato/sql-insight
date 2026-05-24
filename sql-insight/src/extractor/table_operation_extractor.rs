@@ -501,7 +501,7 @@ mod tests {
         #[test]
         fn insert_select_union_emits_one_lineage_edge_per_branch() {
             // INSERT-SELECT-UNION moves data from each branch into the
-            // target, so both source tables surface as flow sources.
+            // target, so both source tables surface as lineage sources.
             assert_ops(
                 "INSERT INTO dst SELECT a FROM t1 UNION SELECT b FROM t2",
                 TableOperation {
@@ -640,9 +640,9 @@ mod tests {
         #[test]
         fn update_with_from_clause_treats_from_as_read() {
             // FROM t2 contributes rows to the UPDATE target → t2 → t1
-            // flow. SET RHS scalar subquery from t3 feeds the new value
-            // → t3 → t1 flow. WHERE predicate subquery from t4 is
-            // predicate-only → no flow.
+            // lineage edge. SET RHS scalar subquery from t3 feeds the new
+            // value → t3 → t1 lineage edge. WHERE predicate subquery from
+            // t4 is predicate-only → no lineage.
             assert_ops_with(
                 "UPDATE t1 SET a = (SELECT b FROM t3) FROM t2 WHERE t1.id IN (SELECT id FROM t4)",
                 &PostgreSqlDialect {},
@@ -892,7 +892,7 @@ mod tests {
         #[test]
         fn predicate_subquery_does_not_feed_lineage() {
             // t3 is referenced only inside `WHERE id IN (SELECT id FROM t3)`,
-            // so it must not appear as a flow source even though it does
+            // so it must not appear as a lineage source even though it does
             // appear in `reads`.
             assert_ops(
                 "INSERT INTO t1 SELECT * FROM t2 WHERE id IN (SELECT id FROM t3)",
@@ -909,7 +909,7 @@ mod tests {
         #[test]
         fn join_on_predicate_does_not_promote_to_lineage() {
             // t4 is in JOIN ON's predicate subquery — touches as read
-            // but doesn't promote to flow (predicate position excluded
+            // but doesn't promote to a lineage edge (predicate position excluded
             // from data-feeding chain).
             assert_ops(
                 "INSERT INTO t1 SELECT * FROM t2 JOIN t3 ON t2.id = t3.id \
@@ -1012,7 +1012,7 @@ mod tests {
         #[test]
         fn cte_predicate_subquery_does_not_leak_into_lineage() {
             // x is in the CTE body's WHERE predicate subquery — touches
-            // as read but doesn't promote to flow.
+            // as read but doesn't promote to a lineage edge.
             assert_ops(
                 "INSERT INTO t1 WITH cte AS (\
                  SELECT * FROM s WHERE id IN (SELECT id FROM x)\
@@ -1057,7 +1057,7 @@ mod tests {
 
         #[test]
         fn delete_with_subquery_predicate_emits_no_lineage() {
-            // DELETE doesn't move data — no flow, even when a subquery
+            // DELETE doesn't move data — no lineage, even when a subquery
             // references another table.
             assert_ops(
                 "DELETE FROM t1 WHERE id IN (SELECT id FROM t2)",

@@ -80,7 +80,7 @@ impl<'a> Resolver<'a> {
                 if self.is_cte_reference(name) {
                     // Carry the original CTE's schema + body_projections
                     // to the local binding so:
-                    //  1. flow composition works through the use site
+                    //  1. lineage composition works through the use site
                     //     (`FROM cte AS c` → `c.col` and `FROM cte` →
                     //     `cte.col` both compose to the body's source);
                     //  2. catalog-aware strictness still applies — refs
@@ -130,7 +130,7 @@ impl<'a> Resolver<'a> {
                 // Raw resolve_query — same rationale as CTE bodies:
                 // the derived subquery's projection isn't a query
                 // result on its own, and storing its projections on
-                // the binding lets flow composition substitute
+                // the binding lets lineage composition substitute
                 // through the derived alias.
                 let resolved = self.resolve_query(subquery)?;
                 if let Some(alias) = alias {

@@ -33,17 +33,17 @@ fn main() {
     }
 
     println!("\nlineage ({}):", ops.lineage.len());
-    for flow in &ops.lineage {
+    for edge in &ops.lineage {
         let source = format!(
             "{}.{}",
-            flow.source
+            edge.source
                 .table
                 .as_ref()
                 .map(|t| t.name.value.as_str())
                 .unwrap_or("?"),
-            flow.source.name.value
+            edge.source.name.value
         );
-        let target = match &flow.target {
+        let target = match &edge.target {
             ColumnTarget::Relation(c) => format!(
                 "{}.{}",
                 c.table
@@ -58,15 +58,15 @@ fn main() {
                 name.as_ref().map(|n| n.value.as_str()).unwrap_or("anon")
             ),
         };
-        println!("  {} -> {} ({:?})", source, target, flow.kind);
+        println!("  {} -> {} ({:?})", source, target, edge.kind);
     }
 
     // Bucket lineage by kind: is the value forwarded unchanged, or
     // derived? (`direct copy` vs `transformed`).
     let mut passthrough = 0usize;
     let mut transformation = 0usize;
-    for flow in &ops.lineage {
-        match flow.kind {
+    for edge in &ops.lineage {
+        match edge.kind {
             ColumnLineageKind::Passthrough => passthrough += 1,
             ColumnLineageKind::Transformation => transformation += 1,
         }

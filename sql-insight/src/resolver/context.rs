@@ -13,12 +13,12 @@ use super::{Resolver, ScopeKind};
 /// - `scope_kind` is stamped onto every scope pushed while this is in
 ///   effect. Default `Body`; flipped to `Predicate` by filter-clause
 ///   walkers so subqueries nested in WHERE / HAVING / JOIN ON etc.
-///   inherit the right kind and are excluded from table-flow.
+///   inherit the right kind and are excluded from table-lineage.
 ///   Propagates *through* subquery boundaries (a subquery in a
 ///   predicate is itself predicate-position).
 ///
 /// `scope_kind` is the only field: it is structural (it gates
-/// table-flow exclusion). Column refs carry no syntactic clause tag —
+/// table-lineage exclusion). Column refs carry no syntactic clause tag —
 /// `reads` is a plain occurrence list — so nothing else needs to ride
 /// along the walk.
 #[derive(Debug, Clone, Copy)]
@@ -66,7 +66,7 @@ impl<'a> Resolver<'a> {
 
     /// Walk a filter-position clause with `scope_kind = Predicate`, so
     /// any subquery pushed inside is classified as a predicate scope
-    /// and thus excluded from table-flow. Used for WHERE, HAVING,
+    /// and thus excluded from table-lineage. Used for WHERE, HAVING,
     /// QUALIFY, JOIN ON, AsOf match, MERGE ON, CONNECT BY, pipe
     /// `|> WHERE`, etc.
     pub(crate) fn with_filter_clause<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
