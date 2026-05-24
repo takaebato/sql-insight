@@ -1284,7 +1284,7 @@ mod tests {
         }
 
         #[test]
-        fn predicate_subquery_surfaces_reads_but_no_flow() {
+        fn predicate_subquery_surfaces_reads_but_no_lineage() {
             // The IN-subquery feeds a filter, so it emits NO flow
             // (Option B: nested subqueries resolve raw, no intermediate
             // QueryOutput edge). Its refs (s.id, s.flag) still surface
@@ -1307,7 +1307,7 @@ mod tests {
         }
 
         #[test]
-        fn scalar_subquery_in_projection_flows_only_to_outer() {
+        fn scalar_subquery_in_projection_feeds_only_outer() {
             // `SELECT a, (SELECT max(x) FROM s) AS m FROM t`:
             //  - the scalar subquery does NOT emit its own QueryOutput
             //    edge (Option B: raw resolve). Its source `s.x` is
@@ -1505,7 +1505,7 @@ mod tests {
         }
 
         #[test]
-        fn subquery_in_group_by_surfaces_reads_but_no_inner_flow() {
+        fn subquery_in_group_by_surfaces_reads_but_no_inner_lineage() {
             // GROUP BY (SELECT z FROM s) — the subquery's `z` surfaces in
             // reads, but the subquery emits no flow (Option B: raw
             // resolve, no intermediate QueryOutput). Only the outer
@@ -1523,7 +1523,7 @@ mod tests {
         }
 
         #[test]
-        fn case_in_projection_refs_surface_and_flow_as_transformation() {
+        fn case_in_projection_refs_surface_and_transform() {
             // Condition (`a`), THEN (`b`), and ELSE (`c`) all surface as
             // reads and flow into the CASE output as Transformation.
             assert_column_ops(
@@ -1636,7 +1636,7 @@ mod tests {
         }
 
         #[test]
-        fn window_partition_by_refs_surface_and_flow_as_transformation() {
+        fn window_partition_by_refs_surface_and_transform() {
             // OVER (PARTITION BY p) — both the aggregate arg `x` and
             // the partition key `p` surface as reads, and both flow
             // into the window output as Transformation (the whole
@@ -1657,7 +1657,7 @@ mod tests {
         }
 
         #[test]
-        fn window_order_by_refs_surface_and_flow_as_transformation() {
+        fn window_order_by_refs_surface_and_transform() {
             assert_column_ops(
                 "SELECT SUM(x) OVER (ORDER BY o) FROM t1",
                 ColumnOperation {
@@ -1674,7 +1674,7 @@ mod tests {
         }
 
         #[test]
-        fn window_partition_and_order_refs_all_surface_and_flow() {
+        fn window_partition_and_order_refs_all_surface_and_transform() {
             assert_column_ops(
                 "SELECT SUM(x) OVER (PARTITION BY p ORDER BY o) FROM t1",
                 ColumnOperation {
@@ -1872,7 +1872,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn select_bare_column_emits_passthrough_flow_to_query_output() {
+        fn select_bare_column_emits_passthrough_edge_to_query_output() {
             assert_column_ops(
                 "SELECT a FROM t1",
                 ColumnOperation {
@@ -1900,7 +1900,7 @@ mod tests {
         }
 
         #[test]
-        fn select_arithmetic_emits_one_transformation_flow_per_source() {
+        fn select_arithmetic_emits_one_transformation_edge_per_source() {
             assert_column_ops(
                 "SELECT a + b FROM t1",
                 ColumnOperation {
@@ -2045,7 +2045,7 @@ mod tests {
         }
 
         #[test]
-        fn update_set_literal_emits_no_flow() {
+        fn update_set_literal_emits_no_lineage() {
             assert_column_ops(
                 "UPDATE t1 SET a = 1",
                 ColumnOperation {
@@ -2059,7 +2059,7 @@ mod tests {
         }
 
         #[test]
-        fn delete_emits_no_flow() {
+        fn delete_emits_no_lineage() {
             assert_column_ops(
                 "DELETE FROM t1 WHERE id = 5",
                 ColumnOperation {
@@ -2073,7 +2073,7 @@ mod tests {
         }
 
         #[test]
-        fn wildcard_select_emits_no_flow() {
+        fn wildcard_select_emits_no_lineage() {
             assert_column_ops(
                 "SELECT * FROM t1",
                 ColumnOperation {
@@ -2087,7 +2087,7 @@ mod tests {
         }
 
         #[test]
-        fn update_set_passthrough_flow() {
+        fn update_set_passthrough_lineage() {
             assert_column_ops(
                 "UPDATE t1 SET a = b",
                 ColumnOperation {
@@ -2101,7 +2101,7 @@ mod tests {
         }
 
         #[test]
-        fn update_set_transformation_flow() {
+        fn update_set_transformation_lineage() {
             assert_column_ops(
                 "UPDATE t1 SET a = b + 1",
                 ColumnOperation {
@@ -2129,7 +2129,7 @@ mod tests {
         }
 
         #[test]
-        fn aggregate_call_in_projection_emits_transformation_flow() {
+        fn aggregate_call_in_projection_emits_transformation_edge() {
             assert_column_ops(
                 "SELECT SUM(a) FROM t1",
                 ColumnOperation {
@@ -2370,7 +2370,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn merge_when_matched_update_emits_flow_and_write() {
+        fn merge_when_matched_update_emits_lineage_and_write() {
             assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a",
                 ColumnOperation {
@@ -2384,7 +2384,7 @@ mod tests {
         }
 
         #[test]
-        fn merge_when_not_matched_insert_emits_flow_and_write() {
+        fn merge_when_not_matched_insert_emits_lineage_and_write() {
             assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id \
                  WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a)",
@@ -2407,7 +2407,7 @@ mod tests {
         }
 
         #[test]
-        fn merge_delete_action_emits_no_flow_no_write() {
+        fn merge_delete_action_emits_no_lineage_no_write() {
             assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
                 ColumnOperation {
@@ -2421,7 +2421,7 @@ mod tests {
         }
 
         #[test]
-        fn merge_combined_clauses_emit_per_clause_flows_and_writes() {
+        fn merge_combined_clauses_emit_per_clause_lineage_and_writes() {
             assert_column_ops(
                 "MERGE INTO t USING s ON t.id = s.id \
                  WHEN MATCHED THEN UPDATE SET t.a = s.a \
@@ -2566,7 +2566,7 @@ mod tests {
         }
 
         #[test]
-        fn ctas_unnamed_projection_yields_no_paired_flow() {
+        fn ctas_unnamed_projection_yields_no_paired_lineage() {
             // `SELECT 1` has no column ref and no inferable name, so the
             // CTAS source produces no flow / no write for that slot.
             assert_column_ops(
@@ -2860,7 +2860,7 @@ mod tests {
         }
 
         #[test]
-        fn three_way_union_emits_one_flow_per_branch() {
+        fn three_way_union_emits_one_lineage_edge_per_branch() {
             // Chained UNION parses left-associatively as
             // `(t1 UNION t2) UNION t3`, so the resolver recursively
             // visits each base SELECT and each contributes its own group.
@@ -2925,7 +2925,7 @@ mod tests {
         }
 
         #[test]
-        fn union_with_aggregate_branch_emits_transformation_flow() {
+        fn union_with_aggregate_branch_emits_transformation_edge() {
             assert_column_ops(
                 "SELECT id FROM t1 UNION SELECT COUNT(id) AS id FROM t2",
                 ColumnOperation {
@@ -3304,7 +3304,7 @@ mod tests {
         }
 
         #[test]
-        fn pg_on_conflict_do_update_set_excluded_emits_flow_and_write() {
+        fn pg_on_conflict_do_update_set_excluded_emits_lineage_and_write() {
             // DO UPDATE SET b = EXCLUDED.b
             //   - writes: t.a, t.b from INSERT columns plus another
             //     t.b for the SET target.
@@ -3774,7 +3774,7 @@ mod tests {
         }
 
         #[test]
-        fn insert_select_with_returning_keeps_source_flows_and_target_returning() {
+        fn insert_select_with_returning_keeps_source_lineage_and_target_returning() {
             // Source SELECT's tables are out of scope by the time
             // RETURNING walks (their nested scope was popped after
             // resolve_query). So RETURNING refs resolve to the target

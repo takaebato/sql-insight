@@ -224,7 +224,7 @@ mod extract_table_operations {
     }
 
     #[test]
-    fn insert_select_emits_source_to_target_flow() {
+    fn insert_select_emits_source_to_target_lineage() {
         let sql = "INSERT INTO orders (id, total) SELECT id, amount FROM staging";
         let result = extract_table_operations(&GenericDialect {}, sql, None).unwrap();
         let ops = result[0].as_ref().unwrap();
@@ -311,7 +311,7 @@ mod extract_column_operations {
     }
 
     #[test]
-    fn aggregate_projection_marks_flow_transformation() {
+    fn aggregate_projection_marks_transformation() {
         let sql = "INSERT INTO summary (total) SELECT SUM(amount) FROM staging";
         let result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
         let ops = result[0].as_ref().unwrap();
@@ -613,7 +613,7 @@ mod invariants {
         w.table.clone()
     }
 
-    fn flow_relation_table(f: &ColumnLineageEdge) -> Option<TableReference> {
+    fn edge_relation_table(f: &ColumnLineageEdge) -> Option<TableReference> {
         match &f.target {
             ColumnTarget::Relation(c) => c.table.clone(),
             ColumnTarget::QueryOutput { .. } => None,
@@ -683,12 +683,12 @@ mod invariants {
     }
 
     #[test]
-    fn relation_flow_targets_resolve_to_known_write_tables() {
+    fn relation_lineage_targets_resolve_to_known_write_tables() {
         for sql in corpus() {
             for (idx, pair) in extract_paired(sql).into_iter().enumerate() {
                 let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.clone()));
                 for f in &pair.col.lineage {
-                    if let Some(target_table) = flow_relation_table(f) {
+                    if let Some(target_table) = edge_relation_table(f) {
                         assert!(
                             table_op_writes.contains(&target_table),
                             "Relation flow target {target_table:?} not in table_op writes \

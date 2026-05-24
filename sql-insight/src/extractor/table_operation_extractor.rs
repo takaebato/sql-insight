@@ -499,7 +499,7 @@ mod tests {
         }
 
         #[test]
-        fn insert_select_union_emits_one_flow_per_branch() {
+        fn insert_select_union_emits_one_lineage_edge_per_branch() {
             // INSERT-SELECT-UNION moves data from each branch into the
             // target, so both source tables surface as flow sources.
             assert_ops(
@@ -515,7 +515,7 @@ mod tests {
         }
 
         #[test]
-        fn ctas_with_union_body_emits_flow_per_branch() {
+        fn ctas_with_union_body_emits_lineage_per_branch() {
             assert_ops(
                 "CREATE TABLE dst AS SELECT a FROM t1 UNION SELECT b FROM t2",
                 TableOperation {
@@ -862,7 +862,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn insert_select_emits_flow_from_source_to_target() {
+        fn insert_select_emits_lineage_from_source_to_target() {
             assert_ops(
                 "INSERT INTO t1 SELECT * FROM t2",
                 TableOperation {
@@ -876,7 +876,7 @@ mod tests {
         }
 
         #[test]
-        fn insert_select_join_emits_one_flow_per_source() {
+        fn insert_select_join_emits_one_lineage_edge_per_source() {
             assert_ops(
                 "INSERT INTO t1 SELECT * FROM t2 JOIN t3 ON t2.id = t3.id",
                 TableOperation {
@@ -890,7 +890,7 @@ mod tests {
         }
 
         #[test]
-        fn predicate_subquery_does_not_feed_flow() {
+        fn predicate_subquery_does_not_feed_lineage() {
             // t3 is referenced only inside `WHERE id IN (SELECT id FROM t3)`,
             // so it must not appear as a flow source even though it does
             // appear in `reads`.
@@ -907,7 +907,7 @@ mod tests {
         }
 
         #[test]
-        fn join_on_predicate_does_not_promote_to_flow() {
+        fn join_on_predicate_does_not_promote_to_lineage() {
             // t4 is in JOIN ON's predicate subquery — touches as read
             // but doesn't promote to flow (predicate position excluded
             // from data-feeding chain).
@@ -925,7 +925,7 @@ mod tests {
         }
 
         #[test]
-        fn update_scalar_subquery_in_set_feeds_flow() {
+        fn update_scalar_subquery_in_set_feeds_lineage() {
             assert_ops(
                 "UPDATE t1 SET col = (SELECT v FROM t2)",
                 TableOperation {
@@ -939,7 +939,7 @@ mod tests {
         }
 
         #[test]
-        fn update_predicate_subquery_does_not_feed_flow() {
+        fn update_predicate_subquery_does_not_feed_lineage() {
             assert_ops(
                 "UPDATE t1 SET col = 1 WHERE id IN (SELECT id FROM t2)",
                 TableOperation {
@@ -953,7 +953,7 @@ mod tests {
         }
 
         #[test]
-        fn create_table_as_select_emits_flow() {
+        fn create_table_as_select_emits_lineage() {
             assert_ops(
                 "CREATE TABLE t1 AS SELECT * FROM t2",
                 TableOperation {
@@ -967,7 +967,7 @@ mod tests {
         }
 
         #[test]
-        fn create_view_emits_flow() {
+        fn create_view_emits_lineage() {
             assert_ops(
                 "CREATE VIEW v1 AS SELECT * FROM t1",
                 TableOperation {
@@ -981,7 +981,7 @@ mod tests {
         }
 
         #[test]
-        fn merge_emits_flow_from_source_to_target() {
+        fn merge_emits_lineage_from_source_to_target() {
             assert_ops(
                 "MERGE INTO t1 USING t2 ON t1.id = t2.id \
                  WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
@@ -996,7 +996,7 @@ mod tests {
         }
 
         #[test]
-        fn cte_data_flows_through_to_write_target() {
+        fn cte_data_reaches_write_target() {
             assert_ops(
                 "INSERT INTO t1 WITH cte AS (SELECT * FROM s) SELECT * FROM cte",
                 TableOperation {
@@ -1010,7 +1010,7 @@ mod tests {
         }
 
         #[test]
-        fn cte_predicate_subquery_does_not_leak_into_flow() {
+        fn cte_predicate_subquery_does_not_leak_into_lineage() {
             // x is in the CTE body's WHERE predicate subquery — touches
             // as read but doesn't promote to flow.
             assert_ops(
@@ -1042,7 +1042,7 @@ mod tests {
         }
 
         #[test]
-        fn insert_values_emits_no_flow() {
+        fn insert_values_emits_no_lineage() {
             assert_ops(
                 "INSERT INTO t1 VALUES (1, 2)",
                 TableOperation {
@@ -1056,7 +1056,7 @@ mod tests {
         }
 
         #[test]
-        fn delete_with_subquery_predicate_emits_no_flow() {
+        fn delete_with_subquery_predicate_emits_no_lineage() {
             // DELETE doesn't move data — no flow, even when a subquery
             // references another table.
             assert_ops(
@@ -1072,7 +1072,7 @@ mod tests {
         }
 
         #[test]
-        fn truncate_emits_no_flow() {
+        fn truncate_emits_no_lineage() {
             assert_ops(
                 "TRUNCATE TABLE t1",
                 TableOperation {
