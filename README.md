@@ -19,10 +19,10 @@ and normalization.
   surfaces with statement-kind classification per parsed statement.
 - **Column-level Operation Extraction**: the same three surfaces at
   column granularity. `reads` / `writes` are plain occurrence lists
-  of column references; `lineage` form a source → target graph with a
-  flow-kind (`Passthrough` vs `Transformation`). The value-vs-filter
-  distinction is structural — a value contributor is a `lineage`
-  source, a filter-only column is in `reads` but not `lineage`.
+  of column references; `lineage` forms a source → target graph, each
+  edge carrying a kind (`Passthrough` vs `Transformation`). The
+  value-vs-filter distinction is structural — a value contributor is a
+  `lineage` source, a filter-only column is in `reads` but not `lineage`.
 - **Optional Catalog**: supply a schema provider to make resolution
   strict — catch typos as unresolved references, pair INSERT
   positional values with target columns. Every extractor still
@@ -75,8 +75,8 @@ assert_eq!(ops.lineage.len(), 1);   // staging → orders
 ### Column-level Operation Extraction
 
 Same surfaces, at column granularity. `reads` / `writes` are plain
-occurrence lists of column references; `lineage` edges carry a flow
-kind (`Passthrough` vs `Transformation`) describing how each source
+occurrence lists of column references; `lineage` edges carry a kind
+(`Passthrough` vs `Transformation`) describing how each source
 reaches its target:
 
 ```rust
@@ -170,7 +170,7 @@ you can rely on:
   diagnostic.
 - **TableFunction schemas stay `Unknown`** (`UNNEST`, `JSON_TABLE`,
   etc.) — catalog enrichment doesn't reach them yet.
-- **Recursive CTE bodies** are pre-bound under a stub; flow
+- **Recursive CTE bodies** are pre-bound under a stub; lineage
   composition through them is deferred.
 - **Catalog is optional, but load-bearing for column lineage.**
   Table-level extraction is robust catalog-free (a table's identity
