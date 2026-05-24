@@ -1,4 +1,4 @@
-use super::{Column, LineageTargetSpec, ProjectionGroup, RelationSchema, Resolver, TableRole};
+use super::{LineageTargetSpec, ProjectionGroup, RelationSchema, Resolver, TableRole};
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
@@ -339,13 +339,7 @@ impl<'a> Resolver<'a> {
                     let excluded_schema = if effective_columns.is_empty() {
                         RelationSchema::Unknown
                     } else {
-                        RelationSchema::Known(
-                            effective_columns
-                                .iter()
-                                .cloned()
-                                .map(|name| Column { name })
-                                .collect(),
-                        )
+                        RelationSchema::Known(effective_columns.to_vec())
                     };
                     let body_projections =
                         excluded_body_projections(effective_columns, source_projections);

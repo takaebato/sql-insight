@@ -3,7 +3,7 @@
 //! `output_schema` and its `projection_groups` so lineage composition's
 //! name-match lookup finds the renamed columns.
 
-use super::{Column, ProjectionGroup, RelationSchema};
+use super::{ProjectionGroup, RelationSchema};
 
 /// Apply a column alias rename list to a body's `output_schema`. The
 /// alias at position N overrides the body's inferred column at
@@ -20,22 +20,15 @@ pub(crate) fn rename_relation_schema(
         return schema;
     }
     match schema {
-        RelationSchema::Unknown => RelationSchema::Known(
-            renames
-                .iter()
-                .map(|r| Column {
-                    name: r.name.clone(),
-                })
-                .collect(),
-        ),
+        RelationSchema::Unknown => {
+            RelationSchema::Known(renames.iter().map(|r| r.name.clone()).collect())
+        }
         RelationSchema::Known(mut cols) => {
             for (position, rename) in renames.iter().enumerate() {
                 if let Some(col) = cols.get_mut(position) {
-                    col.name = rename.name.clone();
+                    *col = rename.name.clone();
                 } else {
-                    cols.push(Column {
-                        name: rename.name.clone(),
-                    });
+                    cols.push(rename.name.clone());
                 }
             }
             RelationSchema::Known(cols)

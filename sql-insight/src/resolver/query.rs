@@ -1,11 +1,9 @@
 use super::projection::{projection_item_kind, projection_item_output_name};
-use super::{
-    Column, ProjectionGroup, ProjectionItem, RelationSchema, ResolvedQuery, Resolver, TableRole,
-};
+use super::{ProjectionGroup, ProjectionItem, RelationSchema, ResolvedQuery, Resolver, TableRole};
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
-    ConnectByKind, Distinct, Expr, GroupByExpr, GroupByWithModifier, NamedWindowExpr, Query,
+    ConnectByKind, Distinct, Expr, GroupByExpr, GroupByWithModifier, Ident, NamedWindowExpr, Query,
     Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Table, TopQuantity, Values,
 };
 
@@ -13,15 +11,14 @@ impl<'a> Resolver<'a> {
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
         // Push a fresh scope for the query body (the returned id isn't
         // needed — bindings resolve via the stack walk).
-        self.scopes.push_query_scope(self.ctx.scope_kind);
+        self.scopes.push_query_scope(self.scope_kind);
         // Swap in a fresh projection buffer for this query — restored on
         // return — so each ResolvedQuery owns exactly its own groups
         // without leaking into siblings or ancestors.
         let prev_projections = std::mem::take(&mut self.current_projections);
-        // `ctx` now carries only `scope_kind`, which intentionally
-        // propagates through the subquery boundary (a subquery in a
-        // predicate is itself predicate-position for table-lineage
-        // exclusion). Nothing to reset/restore around the body.
+        // `scope_kind` intentionally propagates through the subquery
+        // boundary (a subquery in a predicate is itself predicate-position
+        // for table-lineage exclusion), so nothing to reset/restore here.
         if let Some(with) = &query.with {
             if with.recursive {
                 for cte in &with.cte_tables {
@@ -302,22 +299,18 @@ fn projection_schema(projection: &[SelectItem]) -> RelationSchema {
     RelationSchema::Known(columns)
 }
 
-fn column_from_select_item(item: &SelectItem) -> Option<Column> {
+fn column_from_select_item(item: &SelectItem) -> Option<Ident> {
     match item {
-        SelectItem::ExprWithAlias { alias, .. } => Some(Column {
-            name: alias.clone(),
-        }),
+        SelectItem::ExprWithAlias { alias, .. } => Some(alias.clone()),
         SelectItem::UnnamedExpr(expr) => column_from_expr(expr),
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
     }
 }
 
-fn column_from_expr(expr: &Expr) -> Option<Column> {
+fn column_from_expr(expr: &Expr) -> Option<Ident> {
     match expr {
-        Expr::Identifier(ident) => Some(Column {
-            name: ident.clone(),
-        }),
-        Expr::CompoundIdentifier(parts) => parts.last().cloned().map(|name| Column { name }),
+        Expr::Identifier(ident) => Some(ident.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().cloned(),
         _ => None,
     }
 }

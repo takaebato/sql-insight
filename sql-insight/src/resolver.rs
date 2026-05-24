@@ -9,8 +9,8 @@
 //!
 //! - [`binding`]: scope arena, `Binding` enum, scope traversal,
 //!   binder methods on `Resolver`.
-//! - [`context`]: `VisitContext` and the scoped `with_*` helpers
-//!   that mutate it.
+//! - [`context`]: the scoped `with_*` helpers that save / restore
+//!   `scope_kind` around a clause walk.
 //! - [`column_ref`]: `RawColumnRef` and walk-time resolution of
 //!   identifier parts to owning tables.
 //! - [`projection`]: `ProjectionGroup` / `ProjectionItem` and the
@@ -37,9 +37,8 @@ mod query;
 mod statement;
 mod table;
 
-pub(crate) use binding::{Binding, Column, RelationSchema, Scope, ScopeId, ScopeKind, TableRole};
+pub(crate) use binding::{Binding, RelationSchema, Scope, ScopeId, ScopeKind, TableRole};
 pub(crate) use column_ref::RawColumnRef;
-pub(crate) use context::VisitContext;
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
 pub(crate) use projection::{ProjectionGroup, ProjectionItem};
 
@@ -87,7 +86,7 @@ pub(crate) struct ResolvedQuery {
 }
 
 /// The walker. Owns the scope stack, the in-progress refs / edges,
-/// the current projection buffer, and the [`VisitContext`]. All
+/// the current projection buffer, and the lexical `scope_kind`. All
 /// `visit_*` methods (in the walker sub-modules) and the various
 /// `bind_*` / `record_*` / `with_*` helpers live as `impl` blocks
 /// across the sub-modules — this is just the data shape and the
@@ -108,8 +107,13 @@ pub(crate) struct Resolver<'a> {
     /// the returned `ResolvedQuery`, so each query gets exactly its
     /// own projections.
     current_projections: Vec<ProjectionGroup>,
-    /// Lexical walking context (`scope_kind`). See [`VisitContext`].
-    ctx: VisitContext,
+    /// Lexical context stamped onto every scope pushed while it is in
+    /// effect: `Body` by default, flipped to `Predicate` by
+    /// [`Resolver::with_filter_clause`] so subqueries nested in WHERE /
+    /// HAVING / JOIN ON etc. are excluded from table-lineage. Propagates
+    /// *through* subquery boundaries (a subquery in a predicate is itself
+    /// predicate-position).
+    scope_kind: ScopeKind,
 }
 
 impl<'a> Resolver<'a> {
@@ -121,7 +125,7 @@ impl<'a> Resolver<'a> {
             column_refs: Vec::new(),
             lineage_edges: Vec::new(),
             current_projections: Vec::new(),
-            ctx: VisitContext::default(),
+            scope_kind: ScopeKind::Body,
         }
     }
 
@@ -210,8 +214,8 @@ mod tests {
         match first_table_schema(&resolution) {
             Some(RelationSchema::Known(cols)) => {
                 assert_eq!(cols.len(), 2);
-                assert_eq!(cols[0].name.value, "id");
-                assert_eq!(cols[1].name.value, "email");
+                assert_eq!(cols[0].value, "id");
+                assert_eq!(cols[1].value, "email");
             }
             other => panic!("expected RelationSchema::Known(...), got {:?}", other),
         }

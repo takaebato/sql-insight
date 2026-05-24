@@ -59,13 +59,11 @@ impl BindingKey {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RelationSchema {
-    Known(Vec<Column>),
+    /// Column names of a relation with a known schema (from the
+    /// catalog). Just the names — the resolver needs identity, not
+    /// types.
+    Known(Vec<Ident>),
     Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Column {
-    pub(crate) name: Ident,
 }
 
 /// What's bound to a name in a [`Scope`] — a real Table or
@@ -267,7 +265,7 @@ pub(super) fn binding_confirms_column(binding: &Binding, name: &Ident) -> bool {
     matches!(
         binding_schema(binding),
         RelationSchema::Known(cols)
-            if cols.iter().any(|c| BindingKey::from_ident(&c.name) == BindingKey::from_ident(name))
+            if cols.iter().any(|c| BindingKey::from_ident(c) == BindingKey::from_ident(name))
     )
 }
 
@@ -292,7 +290,7 @@ fn schema_could_contain(schema: &RelationSchema, name: &Ident) -> bool {
         RelationSchema::Unknown => true,
         RelationSchema::Known(cols) => cols
             .iter()
-            .any(|c| BindingKey::from_ident(&c.name) == BindingKey::from_ident(name)),
+            .any(|c| BindingKey::from_ident(c) == BindingKey::from_ident(name)),
     }
 }
 
@@ -367,11 +365,9 @@ impl<'a> Resolver<'a> {
         };
         let lookup_key = table.clone();
         match catalog.columns(&lookup_key) {
-            Some(cols) => RelationSchema::Known(
-                cols.into_iter()
-                    .map(|ColumnSchema { name }| Column { name })
-                    .collect(),
-            ),
+            Some(cols) => {
+                RelationSchema::Known(cols.into_iter().map(|ColumnSchema { name }| name).collect())
+            }
             None => RelationSchema::Unknown,
         }
     }
@@ -391,7 +387,7 @@ impl<'a> Resolver<'a> {
             return explicit.to_vec();
         }
         match self.lookup_table_schema(target) {
-            RelationSchema::Known(cols) => cols.into_iter().map(|c| c.name).collect(),
+            RelationSchema::Known(cols) => cols,
             RelationSchema::Unknown => Vec::new(),
         }
     }
