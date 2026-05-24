@@ -1,7 +1,7 @@
 //! Walks a `sqlparser` `Statement` once and produces a
 //! [`Resolution`] carrying scope bindings, captured column
-//! references, and flow edges. Two post-passes
-//! ([`Resolution::composed_flow_edges`] and
+//! references, and lineage edges. Two post-passes
+//! ([`Resolution::composed_lineage_edges`] and
 //! [`Resolution::real_column_refs`]) refine the raw walk
 //! data into the public extraction surfaces.
 //!
@@ -15,8 +15,8 @@
 //!   identifier parts to owning tables.
 //! - [`projection`]: `ProjectionGroup` / `ProjectionItem` and the
 //!   passthrough-vs-transformation classification helper.
-//! - [`flow`]: `FlowEdge` / `FlowTargetSpec` and the emit helpers
-//!   that drive INSERT / CTAS / QueryOutput edge construction.
+//! - [`lineage`]: `LineageEdge` / `LineageTargetSpec` and the emit
+//!   helpers that drive INSERT / CTAS / QueryOutput edge construction.
 //! - [`composition`]: post-walk passes that substitute synthetic
 //!   sources and filter synthetic reads.
 //! - [`rename`]: CTE / derived column-alias renaming.
@@ -28,7 +28,7 @@ mod binding;
 mod column_ref;
 mod composition;
 mod context;
-mod flow;
+mod lineage;
 mod projection;
 mod rename;
 
@@ -40,7 +40,7 @@ mod table;
 pub(crate) use binding::{Binding, Column, RelationSchema, Scope, ScopeId, ScopeKind, TableRole};
 pub(crate) use column_ref::RawColumnRef;
 pub(crate) use context::VisitContext;
-pub(crate) use flow::{FlowEdge, FlowTargetSpec};
+pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
 pub(crate) use projection::{ProjectionGroup, ProjectionItem};
 
 // Internal helpers used by walkers via `super::*`. Some are
@@ -57,10 +57,10 @@ use crate::diagnostic::ColumnLevelDiagnostic;
 use crate::error::Error;
 
 /// The end-of-walk result the resolver produces. Holds the scope
-/// arena and the raw column refs / flow edges collected during the
+/// arena and the raw column refs / lineage edges collected during the
 /// walk, plus accumulated diagnostics. Two post-passes inside
 /// [`Resolver::into_resolution`] refine
-/// `column_refs` and `flow_edges` before the resolution leaves the
+/// `column_refs` and `lineage_edges` before the resolution leaves the
 /// resolver.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -70,17 +70,17 @@ pub(crate) struct Resolution {
     /// Column refs that survive the synthetic-binding filter (see
     /// [`Resolution::real_column_refs`]).
     pub(crate) column_refs: Vec<RawColumnRef>,
-    /// Flow edges after end-to-end composition through CTE / derived
+    /// Lineage edges after end-to-end composition through CTE / derived
     /// intermediates (see
-    /// [`Resolution::composed_flow_edges`]).
-    pub(crate) flow_edges: Vec<FlowEdge>,
+    /// [`Resolution::composed_lineage_edges`]).
+    pub(crate) lineage_edges: Vec<LineageEdge>,
 }
 
 /// What `resolve_query` returns: the scope id pushed for this query
 /// (mostly informational), the body's `output_schema`, and the body
 /// projections per top-level SELECT (one entry, or one per UNION
 /// branch). Callers decide whether to emit `QueryOutput` edges
-/// (default), pair positionally with persisted target columns
+/// (default), pair positionally with relation target columns
 /// (INSERT / CTAS), or bubble them through `SetExpr::Query`.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -105,7 +105,7 @@ pub(crate) struct Resolver<'a> {
     diagnostics: Vec<ColumnLevelDiagnostic>,
     scopes: ScopeStack,
     column_refs: Vec<RawColumnRef>,
-    flow_edges: Vec<FlowEdge>,
+    lineage_edges: Vec<LineageEdge>,
     /// Per-query buffer of projection groups collected by
     /// `visit_select`. `resolve_query` swaps a fresh buffer in for
     /// the duration of its walk and packs the collected groups into
@@ -123,7 +123,7 @@ impl<'a> Resolver<'a> {
             diagnostics: Vec::new(),
             scopes: ScopeStack::default(),
             column_refs: Vec::new(),
-            flow_edges: Vec::new(),
+            lineage_edges: Vec::new(),
             current_projections: Vec::new(),
             ctx: VisitContext::default(),
         }
@@ -143,14 +143,14 @@ impl<'a> Resolver<'a> {
             diagnostics: self.diagnostics,
             scopes: self.scopes.into_scopes(),
             column_refs: self.column_refs,
-            flow_edges: self.flow_edges,
+            lineage_edges: self.lineage_edges,
         };
         // Two post-passes, both rely on the scope arena being final:
-        // - compose flow edges so synthetic-binding (Cte/Derived)
+        // - compose lineage edges so synthetic-binding (Cte/Derived)
         //   sources are substituted with their body's source refs;
         // - filter column refs so synthetic-owned ones don't surface
         //   in the public reads list.
-        resolution.flow_edges = resolution.composed_flow_edges();
+        resolution.lineage_edges = resolution.composed_lineage_edges();
         resolution.column_refs = resolution.real_column_refs();
         resolution
     }

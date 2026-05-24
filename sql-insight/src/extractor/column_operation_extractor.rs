@@ -6,7 +6,7 @@
 //!
 //! The output mirrors `TableOperation` — three parallel
 //! surfaces (`reads`, `writes`, `lineage`) — plus a small enrichment on
-//! flow edges to distinguish passthrough projections from
+//! lineage edges to distinguish passthrough projections from
 //! value-changing transformations.
 //!
 //! **Current coverage** (column tracking is rolling in incrementally):
@@ -72,7 +72,7 @@ use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::error::Error;
 use crate::extractor::table_operation_extractor::StatementKind;
 use crate::relation::TableReference;
-use crate::resolver::{FlowTargetSpec, RawColumnRef, Resolution, Resolver};
+use crate::resolver::{LineageTargetSpec, RawColumnRef, Resolution, Resolver};
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, Ident, OnConflictAction, OnInsert, Statement,
     TableFactor,
@@ -312,21 +312,21 @@ impl ColumnOperationExtractor {
     }
 }
 
-/// Map the resolver's pre-built `flow_edges` 1:1 to public
+/// Map the resolver's pre-built `lineage_edges` 1:1 to public
 /// `ColumnLineageEdge`. Sources go through scope-chain resolution; targets
 /// are already fully spec'd by the resolver.
 fn extract_lineage(resolution: &Resolution) -> Vec<ColumnLineageEdge> {
     resolution
-        .flow_edges
+        .lineage_edges
         .iter()
         .filter_map(|edge| {
             let source = resolve_raw_ref(&edge.source)?;
             let target = match &edge.target {
-                FlowTargetSpec::QueryOutput { name, position } => ColumnTarget::QueryOutput {
+                LineageTargetSpec::QueryOutput { name, position } => ColumnTarget::QueryOutput {
                     name: name.clone(),
                     position: *position,
                 },
-                FlowTargetSpec::Persisted { table, column } => {
+                LineageTargetSpec::Relation { table, column } => {
                     ColumnTarget::Relation(ColumnReference {
                         table: Some(table.clone()),
                         name: column.clone(),
@@ -405,7 +405,7 @@ fn column_ref_from_parts(parts: &[Ident]) -> Option<ColumnReference> {
 /// - CTAS / CREATE VIEW / ALTER VIEW → writes follow the created
 ///   relation's columns (explicit list when given, otherwise the
 ///   columns the resolver derived from the source projection — read
-///   off the resolution's `Persisted` flow edges to that target).
+///   off the resolution's `Relation` lineage edges to that target).
 ///
 /// MERGE WHEN clause writes are deferred.
 fn collect_writes(
@@ -440,9 +440,9 @@ fn collect_writes(
             } else {
                 // INSERT without an explicit column list — when the
                 // catalog provided the target schema, the resolver
-                // emitted Persisted lineage to each paired column. Read
+                // emitted Relation lineage to each paired column. Read
                 // those off to surface the implicit writes.
-                writes.extend(persisted_target_writes(&target, resolution));
+                writes.extend(relation_target_writes(&target, resolution));
             }
             // ON CONFLICT DO UPDATE SET / ON DUPLICATE KEY UPDATE
             // assignment targets become writes too — each SET column
@@ -535,8 +535,8 @@ fn collect_writes(
 
 /// Writes for a CREATE-as-style target: when an explicit column list
 /// is given, use it verbatim; otherwise delegate to
-/// [`persisted_target_writes`] to recover the columns from the
-/// resolver's flow edges.
+/// [`relation_target_writes`] to recover the columns from the
+/// resolver's lineage edges.
 fn created_writes(
     target: &TableReference,
     explicit: &[Ident],
@@ -551,21 +551,21 @@ fn created_writes(
             })
             .collect();
     }
-    persisted_target_writes(target, resolution)
+    relation_target_writes(target, resolution)
 }
 
-/// Scan the resolution's `Persisted` flow edges for any pointing at
+/// Scan the resolution's `Relation` lineage edges for any pointing at
 /// `target`, returning a deduped `ColumnWrite` per unique column
 /// name. Used by both CREATE-as-style writes derivation and INSERT
 /// without an explicit column list (where the catalog-provided
 /// schema let the resolver pair source projections positionally).
-fn persisted_target_writes(
+fn relation_target_writes(
     target: &TableReference,
     resolution: &Resolution,
 ) -> Vec<ColumnReference> {
     let mut seen: Vec<Ident> = Vec::new();
-    for edge in &resolution.flow_edges {
-        if let FlowTargetSpec::Persisted { table, column } = &edge.target {
+    for edge in &resolution.lineage_edges {
+        if let LineageTargetSpec::Relation { table, column } = &edge.target {
             if table == target && !seen.iter().any(|n| n.value == column.value) {
                 seen.push(column.clone());
             }
@@ -680,7 +680,7 @@ mod tests {
     // based, no clause kind), so all the read/write builders return a
     // `ColumnReference`. `read` and `col` are interchangeable; both are
     // kept for callsite readability (`read` in reads lists, `col` as a
-    // flow source / target inner).
+    // lineage source / target inner).
     fn read(table_name: &str, col: &str) -> ColumnReference {
         ColumnReference {
             table: Some(table(table_name)),
@@ -1025,7 +1025,7 @@ mod tests {
         fn unqualified_with_multiple_tables_stays_unresolved() {
             // Two `Unknown`-schema tables — without a catalog the resolver
             // cannot tell which `a` belongs to, so the ref surfaces with
-            // `table: None`. The flow source also stays unresolved.
+            // `table: None`. The lineage source also stays unresolved.
             assert_column_ops(
                 "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id",
                 ColumnOperation {
@@ -1333,7 +1333,7 @@ mod tests {
         #[test]
         fn is_null_predicate_ref_surfaces_as_read() {
             // `WHERE x IS NULL` — x surfaces in reads like any other
-            // WHERE ref; it is not a flow source (predicate-only).
+            // WHERE ref; it is not a lineage source (predicate-only).
             assert_column_ops(
                 "SELECT a FROM t1 WHERE b IS NULL",
                 ColumnOperation {
@@ -1545,7 +1545,7 @@ mod tests {
         #[test]
         fn case_in_where_refs_surface_as_reads() {
             // The CASE sits in WHERE: its condition (`x`) and results
-            // (`y`, `z`) surface as reads (not flow sources — the CASE
+            // (`y`, `z`) surface as reads (not lineage sources — the CASE
             // feeds a predicate). `b` is the outer projection.
             assert_column_ops(
                 "SELECT b FROM t WHERE CASE WHEN x > 0 THEN y ELSE z END = 1",
@@ -2309,7 +2309,7 @@ mod tests {
             // CTE referenced from the SET RHS scalar subquery. The
             // subquery emits no QueryOutput edge of its own (Option B);
             // the UPDATE SET assignment captures its source (composed
-            // through cte to s.x) and emits the single Persisted edge.
+            // through cte to s.x) and emits the single Relation edge.
             // Transformation (the value is derived through max + the
             // subquery wrapping).
             assert_column_ops(
@@ -2907,7 +2907,7 @@ mod tests {
 
         #[test]
         fn union_mixed_passthrough_and_transformation_kinds() {
-            // Branch flow kinds are independent. Left passthrough, right
+            // Branch lineage kinds are independent. Left passthrough, right
             // transformation; both contribute to the same output position.
             assert_column_ops(
                 "SELECT a FROM t1 UNION SELECT b + 1 AS a FROM t2",
@@ -3261,7 +3261,7 @@ mod tests {
         //! - Postgres: `EXCLUDED.<col>` is a pseudo-table for the
         //!   would-be-inserted row. Bound as synthetic so refs
         //!   through it filter out of `reads` but still emit valid
-        //!   Persisted flow edges into the target. The synthetic
+        //!   Relation lineage edges into the target. The synthetic
         //!   binding's columns mirror the INSERT target's columns.
         //! - MySQL: `VALUES(<col>)` is a function-call form for the
         //!   same concept. No EXCLUDED binding (it would make
@@ -3290,7 +3290,7 @@ mod tests {
         }
 
         /// Construct a `ColumnReference` for the synthetic EXCLUDED
-        /// pseudo-table — used only as a Source in flow edges, not
+        /// pseudo-table — used only as a Source in lineage edges, not
         /// as a real table.
         fn excluded(name: &str) -> ColumnReference {
             ColumnReference {
@@ -3371,7 +3371,7 @@ mod tests {
             // an EXCLUDED binding, the inner `b` ref resolves to t.b
             // (the INSERT target). Result: t.b shows up as a read
             // (the VALUES function call is a value-changing wrapper) and
-            // the SET clause adds a Persisted flow t.b → t.b.
+            // the SET clause adds a Relation flow t.b → t.b.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (a, b) VALUES (1, 2) \
                  ON DUPLICATE KEY UPDATE b = VALUES(b)",
@@ -3415,7 +3415,7 @@ mod tests {
         #[test]
         fn pg_insert_aggregate_with_on_conflict_excluded_keeps_transformation_kind() {
             // SUM(x) makes the source projection a Transformation. When
-            // EXCLUDED.total composes back, compose_flow_kinds keeps the
+            // EXCLUDED.total composes back, compose_lineage_kinds keeps the
             // transforming step → flow kind stays Transformation even on
             // the conflict-action path.
             assert_column_ops_with_dialect(
@@ -3438,7 +3438,7 @@ mod tests {
         #[test]
         fn pg_on_conflict_do_update_with_where_clause_emits_read() {
             // DO UPDATE ... WHERE walks in filter context: `t.a` in the
-            // WHERE expression surfaces as a read but not a flow source.
+            // WHERE expression surfaces as a read but not a lineage source.
             assert_column_ops_with_dialect(
                 "INSERT INTO t (a, b) VALUES (1, 2) \
                  ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b WHERE t.a > 0",
@@ -3672,7 +3672,7 @@ mod tests {
         //! (Postgres / Sqlite extension) projects from the affected
         //! rows of the target table — treated like a top-level SELECT
         //! projection: each item contributes refs to `reads` and a
-        //! `QueryOutput` flow edge. Walked BEFORE the ON-clause for
+        //! `QueryOutput` lineage edge. Walked BEFORE the ON-clause for
         //! INSERT so any EXCLUDED binding doesn't ambify unqualified
         //! refs that collide with INSERT column names.
         use super::*;
@@ -4087,7 +4087,7 @@ mod tests {
             // suppressed in this mode: AmbiguousColumn (no confirmed
             // matches) and UnresolvedColumn (no Known schemas in scope).
             // The resolution itself still returns None for the column,
-            // and the flow source is also unresolved.
+            // and the lineage source is also unresolved.
             assert_column_ops(
                 "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id",
                 ColumnOperation {

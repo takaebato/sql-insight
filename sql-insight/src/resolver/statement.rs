@@ -1,4 +1,4 @@
-use super::{Column, FlowTargetSpec, ProjectionGroup, RelationSchema, Resolver, TableRole};
+use super::{Column, LineageTargetSpec, ProjectionGroup, RelationSchema, Resolver, TableRole};
 use crate::error::Error;
 use crate::relation::TableReference;
 use sqlparser::ast::{
@@ -29,7 +29,7 @@ impl<'a> Resolver<'a> {
                         .map(|c| c.name.clone())
                         .collect();
                     let resolved = self.resolve_query(query)?;
-                    self.emit_persisted_to_created(&target, &explicit, &resolved);
+                    self.emit_relation_to_created(&target, &explicit, &resolved);
                 }
                 Ok(())
             }
@@ -39,7 +39,7 @@ impl<'a> Resolver<'a> {
                 let explicit: Vec<sqlparser::ast::Ident> =
                     create_view.columns.iter().map(|c| c.name.clone()).collect();
                 let resolved = self.resolve_query(&create_view.query)?;
-                self.emit_persisted_to_created(&target, &explicit, &resolved);
+                self.emit_relation_to_created(&target, &explicit, &resolved);
                 if let Some(to) = &create_view.to {
                     self.bind_base_table(TableReference::try_from(to)?, None, TableRole::Write);
                 }
@@ -54,7 +54,7 @@ impl<'a> Resolver<'a> {
                 let target = TableReference::try_from(name)?;
                 self.bind_base_table(target.clone(), None, TableRole::Write);
                 let resolved = self.resolve_query(query)?;
-                self.emit_persisted_to_created(&target, columns, &resolved);
+                self.emit_relation_to_created(&target, columns, &resolved);
                 Ok(())
             }
             Statement::CreateVirtualTable { name, .. } => {
@@ -229,20 +229,20 @@ impl<'a> Resolver<'a> {
         self.bind_base_table(table, alias, TableRole::Write);
         // Explicit column list wins; otherwise fall back to the
         // catalog-provided schema (when present) for positional
-        // pairing. Without either, no flow edges are emitted —
+        // pairing. Without either, no lineage edges are emitted —
         // we have no target column names to pair against.
         let effective_columns = self.effective_target_columns(&insert.columns, &target_table);
         let source_projections = if let Some(source) = &insert.source {
             // Raw resolve_query (not the QueryOutput-emitting wrapper):
             // INSERT pairs each projection item positionally with its
-            // target column instead, emitting Persisted edges. UNION
+            // target column instead, emitting Relation edges. UNION
             // sources surface as multiple projection groups, so each
             // branch pairs against the same target columns naturally.
             let resolved = self.resolve_query(source)?;
             self.emit_per_projection(&resolved.projections, |position, _item| {
                 effective_columns
                     .get(position)
-                    .map(|col| FlowTargetSpec::Persisted {
+                    .map(|col| LineageTargetSpec::Relation {
                         table: target_table.clone(),
                         column: col.clone(),
                     })
@@ -267,7 +267,7 @@ impl<'a> Resolver<'a> {
 
     /// Walk a `RETURNING <select_items>` clause. Each item is treated
     /// like a top-level SELECT projection: it contributes refs to
-    /// `column_refs` and a `QueryOutput` flow edge per item. The
+    /// `column_refs` and a `QueryOutput` lineage edge per item. The
     /// target table is the only binding in scope (the source SELECT's
     /// inner scope has been popped by the time this runs), so
     /// unqualified refs resolve to it.
@@ -283,7 +283,7 @@ impl<'a> Resolver<'a> {
             items: projection_items,
         }];
         self.emit_per_projection(&projections, |position, item| {
-            Some(FlowTargetSpec::QueryOutput {
+            Some(LineageTargetSpec::QueryOutput {
                 name: item.name.clone(),
                 position,
             })
@@ -295,14 +295,14 @@ impl<'a> Resolver<'a> {
     /// `ON CONFLICT ... DO UPDATE SET ...` (Postgres / Sqlite) or
     /// `ON DUPLICATE KEY UPDATE ...` (MySQL). Both update-style
     /// actions reuse [`Self::emit_assignment_lineage`] so each
-    /// assignment's RHS feeds a Persisted flow into the INSERT
-    /// target's column, identical to a standalone `UPDATE`.
+    /// assignment's RHS feeds a Relation-target lineage edge into the
+    /// INSERT target's column, identical to a standalone `UPDATE`.
     ///
     /// The `EXCLUDED` pseudo-table (Postgres) is bound as a synthetic
     /// derived-table with the INSERT target's column list as its
     /// schema, so `EXCLUDED.<col>` refs filter out of the public
     /// `reads` surface (matching how CTE / derived refs behave) while
-    /// still emitting valid flow sources for the assignment edges.
+    /// still emitting valid lineage sources for the assignment edges.
     /// MySQL's equivalent (`VALUES(<col>)`) is a function-call form
     /// that visit_expr already walks; no extra binding needed.
     fn visit_insert_on(
@@ -368,7 +368,7 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
-    /// Emit Persisted flow edges for a CREATE-AS source: each
+    /// Emit Relation lineage edges for a CREATE-AS source: each
     /// projection item pairs with the created relation's column at
     /// the same position. Target column name comes from the explicit
     /// column list when present, otherwise from the projection's
@@ -382,7 +382,7 @@ impl<'a> Resolver<'a> {
     /// current group's — making every branch pair against the same
     /// target column at each position. Mirrors INSERT-SELECT-UNION
     /// positional pairing.
-    fn emit_persisted_to_created(
+    fn emit_relation_to_created(
         &mut self,
         target: &TableReference,
         explicit_columns: &[sqlparser::ast::Ident],
@@ -398,7 +398,7 @@ impl<'a> Resolver<'a> {
                 .get(position)
                 .cloned()
                 .or_else(|| inferred_left_names.get(position).cloned().flatten())
-                .map(|column| FlowTargetSpec::Persisted {
+                .map(|column| LineageTargetSpec::Relation {
                     table: target.clone(),
                     column,
                 })
@@ -429,7 +429,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// Walk each SET-style assignment's RHS expression and emit
-    /// Persisted flow edges from any newly recorded source refs into
+    /// Relation lineage edges from any newly recorded source refs into
     /// the assignment's target column. Shared by `visit_update` and
     /// MERGE's `WHEN MATCHED UPDATE` branch — both have identical
     /// per-assignment semantics. Target column qualifier resolution:
@@ -452,7 +452,7 @@ impl<'a> Resolver<'a> {
             else {
                 continue;
             };
-            let target = FlowTargetSpec::Persisted {
+            let target = LineageTargetSpec::Relation {
                 table: target_table_ref,
                 column: target_parts.last().cloned().unwrap(),
             };
@@ -528,14 +528,14 @@ impl<'a> Resolver<'a> {
                     self.emit_assignment_lineage(&update_expr.assignments, target_table.as_ref())?;
                 }
                 MergeAction::Delete { .. } => {
-                    // DELETE has no column-level value flow.
+                    // DELETE has no column-level value lineage.
                 }
             }
         }
         Ok(())
     }
 
-    /// Emit per-position Persisted flow edges for MERGE's
+    /// Emit per-position Relation lineage edges for MERGE's
     /// `WHEN NOT MATCHED THEN INSERT (cols) VALUES (...)`. Each value
     /// expression's source refs pair with the column at the same
     /// position in `columns`. Walks values with default `Projection`
@@ -569,7 +569,7 @@ impl<'a> Resolver<'a> {
                 else {
                     continue;
                 };
-                let target = FlowTargetSpec::Persisted {
+                let target = LineageTargetSpec::Relation {
                     table: target_table.clone(),
                     column: col_ident.clone(),
                 };
@@ -587,7 +587,7 @@ impl<'a> Resolver<'a> {
 /// source. Returns an empty `Vec` when there are no source
 /// projections (e.g. `INSERT ... VALUES (...) ON CONFLICT ...`),
 /// in which case `substitute_source` falls back to leaving
-/// `EXCLUDED.<col>` as the flow source.
+/// `EXCLUDED.<col>` as the lineage source.
 fn excluded_body_projections(
     effective_columns: &[Ident],
     source_projections: &[super::ProjectionGroup],

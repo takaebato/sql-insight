@@ -1,6 +1,6 @@
 //! Post-walk passes on `Resolution`:
 //!
-//! - [`Resolution::composed_flow_edges`] rewrites each flow
+//! - [`Resolution::composed_lineage_edges`] rewrites each lineage
 //!   edge so its source resolves to a real (non-synthetic) reference
 //!   by walking back through CTE / derived body projections.
 //! - [`Resolution::real_column_refs`] filters out refs whose
@@ -10,7 +10,7 @@
 use crate::extractor::column_operation_extractor::ColumnLineageKind;
 
 use super::binding::{binding_alias_key, BindingKey};
-use super::{Binding, FlowEdge, RawColumnRef, Resolution};
+use super::{Binding, LineageEdge, RawColumnRef, Resolution};
 
 /// Recursion ceiling for `substitute_source` — guards against
 /// accidental cycles (recursive CTEs are pre-bound with empty
@@ -33,24 +33,24 @@ impl Resolution {
             .collect()
     }
 
-    /// Compose every flow edge so its source resolves to a real
+    /// Compose every lineage edge so its source resolves to a real
     /// (non-synthetic) reference. References whose walk-time owner
     /// is a Cte / DerivedTable with non-empty `body_projections` get
     /// substituted by walking that body's matching `ProjectionItem`
     /// and emitting one edge per inner source ref — recursively,
     /// until the chain bottoms out at a real table or an unresolvable
     /// ref. The outer edge's `kind` is combined with each body
-    /// item's kind via [`compose_flow_kinds`] (Aggregation dominates;
-    /// Passthrough is preserved only when both sides are
-    /// Passthrough). Bounded by [`MAX_COMPOSITION_DEPTH`] as a cycle
-    /// guard.
-    pub(crate) fn composed_flow_edges(&self) -> Vec<FlowEdge> {
-        self.flow_edges
+    /// item's kind via [`compose_lineage_kinds`] (Passthrough is
+    /// preserved only when both sides are Passthrough; any transforming
+    /// step yields Transformation). Bounded by [`MAX_COMPOSITION_DEPTH`]
+    /// as a cycle guard.
+    pub(crate) fn composed_lineage_edges(&self) -> Vec<LineageEdge> {
+        self.lineage_edges
             .iter()
             .flat_map(|edge| {
                 self.substitute_source(&edge.source, edge.kind, 0)
                     .into_iter()
-                    .map(|(source, kind)| FlowEdge {
+                    .map(|(source, kind)| LineageEdge {
                         source,
                         target: edge.target.clone(),
                         kind,
@@ -94,7 +94,7 @@ impl Resolution {
                 if !matches {
                     continue;
                 }
-                let composed = compose_flow_kinds(outer_kind, item.kind);
+                let composed = compose_lineage_kinds(outer_kind, item.kind);
                 for source in &item.source_refs {
                     result.extend(self.substitute_source(source, composed, depth + 1));
                 }
@@ -133,11 +133,11 @@ impl Resolution {
     }
 }
 
-/// Combine two flow kinds along a substitution edge: the result is
+/// Combine two lineage kinds along a substitution edge: the result is
 /// `Passthrough` only when both sides are `Passthrough`; any
 /// `Transformation` step makes the whole composed chain a
 /// `Transformation`.
-fn compose_flow_kinds(outer: ColumnLineageKind, inner: ColumnLineageKind) -> ColumnLineageKind {
+fn compose_lineage_kinds(outer: ColumnLineageKind, inner: ColumnLineageKind) -> ColumnLineageKind {
     if outer == ColumnLineageKind::Passthrough && inner == ColumnLineageKind::Passthrough {
         ColumnLineageKind::Passthrough
     } else {

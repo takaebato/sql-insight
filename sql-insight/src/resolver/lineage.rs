@@ -1,5 +1,5 @@
-//! `FlowEdge` / `FlowTargetSpec` and the resolver helpers that emit
-//! them — directly into the `flow_edges` buffer, or fanned out from
+//! `LineageEdge` / `LineageTargetSpec` and the resolver helpers that emit
+//! them — directly into the `lineage_edges` buffer, or fanned out from
 //! a snapshot of recorded column refs, or driven by a projection
 //! group via a closure-supplied target.
 
@@ -11,10 +11,10 @@ use crate::relation::TableReference;
 
 use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolver};
 
-/// A pre-resolution column flow record. `source` still needs
+/// A pre-resolution column lineage record. `source` still needs
 /// scope-chain resolution (for unqualified parts); `target` is fully
 /// spec'd by the resolver; `kind` is the public `ColumnLineageKind` to
-/// surface (composed further by `composed_flow_edges` when the source
+/// surface (composed further by `composed_lineage_edges` when the source
 /// goes through a synthetic intermediate).
 ///
 /// Created by callers from [`ProjectionGroup`]s (for SELECT-style
@@ -22,33 +22,33 @@ use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolv
 /// SELECTs emit `QueryOutput`) or directly by UPDATE / similar
 /// walkers that already know their write target.
 #[derive(Debug, Clone)]
-pub(crate) struct FlowEdge {
+pub(crate) struct LineageEdge {
     pub(crate) source: RawColumnRef,
-    pub(crate) target: FlowTargetSpec,
+    pub(crate) target: LineageTargetSpec,
     pub(crate) kind: ColumnLineageKind,
 }
 
-/// Target spec for a [`FlowEdge`]. `QueryOutput` is for transient
-/// SELECT output columns; `Persisted` is for INSERT / UPDATE / etc.
+/// Target spec for a [`LineageEdge`]. `QueryOutput` is for transient
+/// SELECT output columns; `Relation` is for INSERT / UPDATE / etc.
 /// target columns that live in a real relation.
 #[derive(Debug, Clone)]
-pub(crate) enum FlowTargetSpec {
+pub(crate) enum LineageTargetSpec {
     QueryOutput {
         name: Option<Ident>,
         position: usize,
     },
-    Persisted {
+    Relation {
         table: TableReference,
         column: Ident,
     },
 }
 
 impl<'a> Resolver<'a> {
-    pub(super) fn push_flow_edge(&mut self, edge: FlowEdge) {
-        self.flow_edges.push(edge);
+    pub(super) fn push_lineage_edge(&mut self, edge: LineageEdge) {
+        self.lineage_edges.push(edge);
     }
 
-    /// Emit one `FlowEdge` per `RawColumnRef` recorded into
+    /// Emit one `LineageEdge` per `RawColumnRef` recorded into
     /// `column_refs` since position `since`, all pointing to the same
     /// `target` with the given `kind`. The typical caller snapshots
     /// `column_refs_len()` before walking an expression, walks it,
@@ -58,12 +58,12 @@ impl<'a> Resolver<'a> {
     pub(super) fn push_edges_from_refs_since(
         &mut self,
         since: usize,
-        target: FlowTargetSpec,
+        target: LineageTargetSpec,
         kind: ColumnLineageKind,
     ) {
         for offset in 0..(self.column_refs_len() - since) {
             let source = self.column_refs_slice(since)[offset].clone();
-            self.push_flow_edge(FlowEdge {
+            self.push_lineage_edge(LineageEdge {
                 source,
                 target: target.clone(),
                 kind,
@@ -72,8 +72,8 @@ impl<'a> Resolver<'a> {
     }
 
     /// For each `(group, position, item)` in `projections`, ask
-    /// `target_for(position, item)` to produce a `FlowTargetSpec`;
-    /// when it returns `Some(target)`, fan out one `FlowEdge` per
+    /// `target_for(position, item)` to produce a `LineageTargetSpec`;
+    /// when it returns `Some(target)`, fan out one `LineageEdge` per
     /// `item.source_refs` to that target, carrying the item's
     /// `ColumnLineageKind`. The closure shape lets the same loop drive
     /// `QueryOutput` emission, INSERT positional pairing, and CTAS /
@@ -83,7 +83,7 @@ impl<'a> Resolver<'a> {
         projections: &[ProjectionGroup],
         mut target_for: F,
     ) where
-        F: FnMut(usize, &ProjectionItem) -> Option<FlowTargetSpec>,
+        F: FnMut(usize, &ProjectionItem) -> Option<LineageTargetSpec>,
     {
         for group in projections {
             for (position, item) in group.items.iter().enumerate() {
@@ -91,7 +91,7 @@ impl<'a> Resolver<'a> {
                     continue;
                 };
                 for source in &item.source_refs {
-                    self.push_flow_edge(FlowEdge {
+                    self.push_lineage_edge(LineageEdge {
                         source: source.clone(),
                         target: target.clone(),
                         kind: item.kind,
@@ -101,13 +101,13 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// Emit `QueryOutput` flow edges for every projection item in
+    /// Emit `QueryOutput` lineage edges for every projection item in
     /// `resolved`. The default disposition for queries whose output
-    /// is not bound to a persisted target (top-level SELECT, scalar
+    /// is not bound to a relation target (top-level SELECT, scalar
     /// subqueries, derived tables, CTE bodies, predicate subqueries).
     pub(super) fn emit_query_output_edges(&mut self, resolved: &ResolvedQuery) {
         self.emit_per_projection(&resolved.projections, |position, item| {
-            Some(FlowTargetSpec::QueryOutput {
+            Some(LineageTargetSpec::QueryOutput {
                 name: item.name.clone(),
                 position,
             })

@@ -117,7 +117,7 @@
 //! - **Recursive CTE bodies** are pre-bound under a stub for
 //!   self-reference; their projection composition is deferred, so
 //!   `lineage` won't trace through them end-to-end.
-//! - **Flow kind is coarse** (`Passthrough` vs `Transformation`).
+//! - **Lineage kind is coarse** (`Passthrough` vs `Transformation`).
 //!   Aggregates, window functions, arithmetic, casts, etc. are all
 //!   `Transformation` — the model deliberately does not sub-classify
 //!   "changed" values (that distinction is lossy for edge cases like

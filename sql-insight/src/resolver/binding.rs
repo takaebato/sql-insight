@@ -91,9 +91,9 @@ pub(crate) enum Binding {
     Cte {
         name: Ident,
         schema: RelationSchema,
-        /// The CTE body's projection groups, captured so that flow
+        /// The CTE body's projection groups, captured so that lineage
         /// composition can substitute references to `cte.col` with the
-        /// body's source refs (transitive source → target flow).
+        /// body's source refs (transitive source → target lineage).
         /// Empty for recursive CTEs where the body is walked under a
         /// pre-bound stub and fixpoint-aware projection capture is
         /// deferred.
@@ -103,7 +103,7 @@ pub(crate) enum Binding {
         alias: Ident,
         schema: RelationSchema,
         /// Same role as `Cte::body_projections` — captured at the
-        /// derived subquery walk and consumed by flow composition.
+        /// derived subquery walk and consumed by lineage composition.
         body_projections: Vec<ProjectionGroup>,
     },
     TableFunction {
@@ -385,7 +385,7 @@ impl<'a> Resolver<'a> {
     /// positional pairing: explicit list wins when non-empty,
     /// otherwise the catalog-provided schema if known. Returns an
     /// empty `Vec` when neither path yields names — the caller then
-    /// emits no Persisted edges (matches the no-catalog
+    /// emits no Relation edges (matches the no-catalog
     /// column-list-less INSERT behavior).
     pub(super) fn effective_target_columns(
         &self,
