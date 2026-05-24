@@ -7,6 +7,15 @@
 //! provided, those holes stay `RelationSchema::Unknown` and surface as diagnostics
 //! once consumers (e.g. column-level operations) start reading them.
 //!
+//! The catalog is treated as **open-world**: a table it returns no columns
+//! for is taken as *schema unknown*, not *nonexistent*. A misspelled or
+//! unknown table name is therefore never flagged — it surfaces as an
+//! ordinary read / write carrying an unknown schema. Strictness is
+//! column-level and local: `UnresolvedColumn` / `AmbiguousColumn` only fire
+//! where a known schema is in scope. (Treating absence as nonexistence
+//! would require promising the catalog is exhaustive, which most providers
+//! cannot, so it is not the default.)
+//!
 //! Implementations typically wrap an `information_schema` query, an ORM
 //! model registry, or a static map produced from `CREATE TABLE` statements.
 
@@ -29,11 +38,18 @@ pub trait Catalog: fmt::Debug {
     /// carry an alias, but implementations should treat the catalog/schema/
     /// name triplet as the identity — the alias is callsite-only metadata.
     ///
-    /// Identifier case-folding is the implementation's responsibility: the
-    /// resolver passes the name as written in the SQL and does not
-    /// normalize it. An implementation wanting case-insensitive lookup
-    /// (most dialects) must fold both its stored keys and the incoming
-    /// `table` name.
+    /// Identifier case-folding *for this table lookup* is the
+    /// implementation's responsibility: the resolver passes the table name
+    /// as written in the SQL and does not normalize it, so an
+    /// implementation wanting case-insensitive lookup (most dialects) must
+    /// fold both its stored keys and the incoming `table` name.
+    ///
+    /// That is the only matching the implementation governs. The returned
+    /// column names are then matched against the SQL's column references
+    /// by the resolver's own fixed normalization rule (unquoted folds to
+    /// lowercase, quoted is exact) — independent of this implementation
+    /// and of the dialect. So supplying a catalog changes *which columns
+    /// exist*, never *how a column name compares*.
     fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>>;
 }
 
