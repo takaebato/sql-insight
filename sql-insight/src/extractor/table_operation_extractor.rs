@@ -309,7 +309,7 @@ mod tests {
         }
     }
 
-    fn flow(source: &str, target: &str) -> TableLineageEdge {
+    fn edge(source: &str, target: &str) -> TableLineageEdge {
         TableLineageEdge {
             source: table(source),
             target: table(target),
@@ -508,7 +508,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t1"), table("t2")],
                     writes: vec![table("dst")],
-                    lineage: vec![flow("t1", "dst"), flow("t2", "dst")],
+                    lineage: vec![edge("t1", "dst"), edge("t2", "dst")],
                     diagnostics: vec![],
                 },
             );
@@ -522,7 +522,7 @@ mod tests {
                     statement_kind: StatementKind::CreateTable,
                     reads: vec![table("t1"), table("t2")],
                     writes: vec![table("dst")],
-                    lineage: vec![flow("t1", "dst"), flow("t2", "dst")],
+                    lineage: vec![edge("t1", "dst"), edge("t2", "dst")],
                     diagnostics: vec![],
                 },
             );
@@ -599,7 +599,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("t2", "t1")],
+                    lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -650,7 +650,7 @@ mod tests {
                     statement_kind: StatementKind::Update,
                     reads: vec![table("t2"), table("t3"), table("t4")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("t2", "t1"), flow("t3", "t1")],
+                    lineage: vec![edge("t2", "t1"), edge("t3", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -747,7 +747,7 @@ mod tests {
                     statement_kind: StatementKind::Merge,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("t2", "t1")],
+                    lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -779,7 +779,7 @@ mod tests {
                     statement_kind: StatementKind::CreateTable,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("t2", "t1")],
+                    lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -793,7 +793,7 @@ mod tests {
                     statement_kind: StatementKind::CreateView,
                     reads: vec![table("t1")],
                     writes: vec![table("v1")],
-                    lineage: vec![flow("t1", "v1")],
+                    lineage: vec![edge("t1", "v1")],
                     diagnostics: vec![],
                 },
             );
@@ -869,7 +869,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("t2", "t1")],
+                    lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -883,7 +883,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t2"), table("t3")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("t2", "t1"), flow("t3", "t1")],
+                    lineage: vec![edge("t2", "t1"), edge("t3", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -900,7 +900,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t2"), table("t3")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("t2", "t1")],
+                    lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -918,7 +918,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t2"), table("t3"), table("t4")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("t2", "t1"), flow("t3", "t1")],
+                    lineage: vec![edge("t2", "t1"), edge("t3", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -932,7 +932,7 @@ mod tests {
                     statement_kind: StatementKind::Update,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("t2", "t1")],
+                    lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -960,7 +960,7 @@ mod tests {
                     statement_kind: StatementKind::CreateTable,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("t2", "t1")],
+                    lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -974,7 +974,7 @@ mod tests {
                     statement_kind: StatementKind::CreateView,
                     reads: vec![table("t1")],
                     writes: vec![table("v1")],
-                    lineage: vec![flow("t1", "v1")],
+                    lineage: vec![edge("t1", "v1")],
                     diagnostics: vec![],
                 },
             );
@@ -989,7 +989,7 @@ mod tests {
                     statement_kind: StatementKind::Merge,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("t2", "t1")],
+                    lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -1003,7 +1003,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("s")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("s", "t1")],
+                    lineage: vec![edge("s", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -1021,7 +1021,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("s"), table("x")],
                     writes: vec![table("t1")],
-                    lineage: vec![flow("s", "t1")],
+                    lineage: vec![edge("s", "t1")],
                     diagnostics: vec![],
                 },
             );

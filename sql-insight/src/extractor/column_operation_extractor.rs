@@ -730,7 +730,7 @@ mod tests {
         }
     }
 
-    fn flow_passthrough(source: ColumnReference, target: ColumnTarget) -> ColumnLineageEdge {
+    fn passthrough(source: ColumnReference, target: ColumnTarget) -> ColumnLineageEdge {
         ColumnLineageEdge {
             source,
             target,
@@ -738,7 +738,7 @@ mod tests {
         }
     }
 
-    fn flow_transformation(source: ColumnReference, target: ColumnTarget) -> ColumnLineageEdge {
+    fn transformation(source: ColumnReference, target: ColumnTarget) -> ColumnLineageEdge {
         ColumnLineageEdge {
             source,
             target,
@@ -827,8 +827,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t1", "b"), out("b", 1)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t1", "b"), out("b", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -852,8 +852,8 @@ mod tests {
                     ],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t2", "b"), out("b", 1)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t2", "b"), out("b", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -876,7 +876,7 @@ mod tests {
                         name: "a".into(),
                     }],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(
+                    lineage: vec![passthrough(
                         ColumnReference {
                             table: Some(table_ref),
                             name: "a".into(),
@@ -907,7 +907,7 @@ mod tests {
                         name: "a".into(),
                     }],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(
+                    lineage: vec![passthrough(
                         ColumnReference {
                             table: Some(table_ref),
                             name: "a".into(),
@@ -938,7 +938,7 @@ mod tests {
                         name: "a".into(),
                     }],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(
+                    lineage: vec![passthrough(
                         ColumnReference {
                             table: Some(table_ref),
                             name: "a".into(),
@@ -984,7 +984,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -999,8 +999,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t1", "b"), out("b", 1)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t1", "b"), out("b", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1015,7 +1015,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1055,7 +1055,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1076,7 +1076,7 @@ mod tests {
                     reads: vec![read("t1", "id"), unresolved("unknown_col")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "id"), out("id", 0)),
+                        passthrough(col("t1", "id"), out("id", 0)),
                         ColumnLineageEdge {
                             source: ColumnReference {
                                 table: None,
@@ -1101,7 +1101,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "id")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                    lineage: vec![passthrough(col("t1", "id"), out("id", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1173,7 +1173,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t2", "b")],
                     writes: vec![write("t1", "a")],
-                    lineage: vec![flow_passthrough(col("t2", "b"), relation("t1", "a"))],
+                    lineage: vec![passthrough(col("t2", "b"), relation("t1", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -1234,7 +1234,7 @@ mod tests {
                     statement_kind: StatementKind::Update,
                     reads: vec![read("t2", "b"), read("t1", "id"), read("t2", "id")],
                     writes: vec![write("t1", "a")],
-                    lineage: vec![flow_passthrough(col("t2", "b"), relation("t1", "a"))],
+                    lineage: vec![passthrough(col("t2", "b"), relation("t1", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -1277,7 +1277,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a"), read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1300,7 +1300,7 @@ mod tests {
                         read("s", "flag"),
                     ],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1322,8 +1322,8 @@ mod tests {
                     reads: vec![read("t", "a"), read("s", "x")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t", "a"), out("a", 0)),
-                        flow_transformation(col("s", "x"), out("m", 1)),
+                        passthrough(col("t", "a"), out("a", 0)),
+                        transformation(col("s", "x"), out("m", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1340,7 +1340,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1354,7 +1354,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1368,7 +1368,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a"), read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1382,7 +1382,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1400,7 +1400,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a"), read("t1", "b"), read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1420,8 +1420,8 @@ mod tests {
                     ],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t1", "b"), out("b", 1)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t1", "b"), out("b", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1442,8 +1442,8 @@ mod tests {
                     ],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t1", "b"), out("b", 1)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t1", "b"), out("b", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1468,8 +1468,8 @@ mod tests {
                     ],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t1", "b"), out("b", 1)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t1", "b"), out("b", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1495,9 +1495,9 @@ mod tests {
                     ],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t1", "b"), out("b", 1)),
-                        flow_passthrough(col("t1", "c"), out("c", 2)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t1", "b"), out("b", 1)),
+                        passthrough(col("t1", "c"), out("c", 2)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1516,7 +1516,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t", "a"), read("s", "z")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1533,9 +1533,9 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "b"), read("t1", "c")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "a"), out_anon(0)),
-                        flow_transformation(col("t1", "b"), out_anon(0)),
-                        flow_transformation(col("t1", "c"), out_anon(0)),
+                        transformation(col("t1", "a"), out_anon(0)),
+                        transformation(col("t1", "b"), out_anon(0)),
+                        transformation(col("t1", "c"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1558,7 +1558,7 @@ mod tests {
                         read("t", "z"),
                     ],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t", "b"), out("b", 0))],
+                    lineage: vec![passthrough(col("t", "b"), out("b", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1579,8 +1579,8 @@ mod tests {
                     reads: vec![read("s", "x"), read("s", "y")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("s", "x"), out_anon(0)),
-                        flow_transformation(col("s", "y"), out_anon(0)),
+                        transformation(col("s", "x"), out_anon(0)),
+                        transformation(col("s", "y"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1599,9 +1599,9 @@ mod tests {
                     reads: vec![read("t1", "x"), read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "x"), out_anon(0)),
-                        flow_transformation(col("t1", "a"), out_anon(0)),
-                        flow_transformation(col("t1", "b"), out_anon(0)),
+                        transformation(col("t1", "x"), out_anon(0)),
+                        transformation(col("t1", "a"), out_anon(0)),
+                        transformation(col("t1", "b"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1625,10 +1625,10 @@ mod tests {
                     ],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "x"), out_anon(0)),
-                        flow_transformation(col("t1", "y"), out_anon(0)),
-                        flow_transformation(col("t1", "a"), out_anon(0)),
-                        flow_transformation(col("t1", "b"), out_anon(0)),
+                        transformation(col("t1", "x"), out_anon(0)),
+                        transformation(col("t1", "y"), out_anon(0)),
+                        transformation(col("t1", "a"), out_anon(0)),
+                        transformation(col("t1", "b"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1648,8 +1648,8 @@ mod tests {
                     reads: vec![read("t1", "x"), read("t1", "p")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "x"), out_anon(0)),
-                        flow_transformation(col("t1", "p"), out_anon(0)),
+                        transformation(col("t1", "x"), out_anon(0)),
+                        transformation(col("t1", "p"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1665,8 +1665,8 @@ mod tests {
                     reads: vec![read("t1", "x"), read("t1", "o")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "x"), out_anon(0)),
-                        flow_transformation(col("t1", "o"), out_anon(0)),
+                        transformation(col("t1", "x"), out_anon(0)),
+                        transformation(col("t1", "o"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1682,9 +1682,9 @@ mod tests {
                     reads: vec![read("t1", "x"), read("t1", "p"), read("t1", "o")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "x"), out_anon(0)),
-                        flow_transformation(col("t1", "p"), out_anon(0)),
-                        flow_transformation(col("t1", "o"), out_anon(0)),
+                        transformation(col("t1", "x"), out_anon(0)),
+                        transformation(col("t1", "p"), out_anon(0)),
+                        transformation(col("t1", "o"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1704,9 +1704,9 @@ mod tests {
                     reads: vec![read("t1", "x"), read("t1", "p"), read("t1", "o")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "x"), out_anon(0)),
-                        flow_transformation(col("t1", "p"), out_anon(0)),
-                        flow_transformation(col("t1", "o"), out_anon(0)),
+                        transformation(col("t1", "x"), out_anon(0)),
+                        transformation(col("t1", "p"), out_anon(0)),
+                        transformation(col("t1", "o"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1727,8 +1727,8 @@ mod tests {
                     reads: vec![read("t1", "x"), read("t1", "o")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "x"), out_anon(0)),
-                        flow_transformation(col("t1", "o"), out_anon(0)),
+                        transformation(col("t1", "x"), out_anon(0)),
+                        transformation(col("t1", "o"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1743,7 +1743,7 @@ mod tests {
                     statement_kind: StatementKind::Merge,
                     reads: vec![read("t", "id"), read("s", "id"), read("s", "a")],
                     writes: vec![write("t", "a")],
-                    lineage: vec![flow_passthrough(col("s", "a"), relation("t", "a"))],
+                    lineage: vec![passthrough(col("s", "a"), relation("t", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -1836,7 +1836,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1847,7 +1847,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t2", "b")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t2", "b"), out("b", 0))],
+                    lineage: vec![passthrough(col("t2", "b"), out("b", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1879,7 +1879,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1893,7 +1893,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("x", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("x", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -1908,8 +1908,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "a"), out_anon(0)),
-                        flow_transformation(col("t1", "b"), out_anon(0)),
+                        transformation(col("t1", "a"), out_anon(0)),
+                        transformation(col("t1", "b"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1925,9 +1925,9 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_transformation(col("t1", "a"), out_anon(1)),
-                        flow_transformation(col("t1", "b"), out_anon(1)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        transformation(col("t1", "a"), out_anon(1)),
+                        transformation(col("t1", "b"), out_anon(1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1943,8 +1943,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "a"), out("sum", 0)),
-                        flow_transformation(col("t1", "b"), out("sum", 0)),
+                        transformation(col("t1", "a"), out("sum", 0)),
+                        transformation(col("t1", "b"), out("sum", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -1960,8 +1960,8 @@ mod tests {
                     reads: vec![read("t2", "x"), read("t2", "y")],
                     writes: vec![write("t1", "a"), write("t1", "b")],
                     lineage: vec![
-                        flow_passthrough(col("t2", "x"), relation("t1", "a")),
-                        flow_passthrough(col("t2", "y"), relation("t1", "b")),
+                        passthrough(col("t2", "x"), relation("t1", "a")),
+                        passthrough(col("t2", "y"), relation("t1", "b")),
                     ],
                     diagnostics: vec![],
                 },
@@ -1977,8 +1977,8 @@ mod tests {
                     reads: vec![read("t2", "x"), read("t2", "y")],
                     writes: vec![write("t1", "a")],
                     lineage: vec![
-                        flow_transformation(col("t2", "x"), relation("t1", "a")),
-                        flow_transformation(col("t2", "y"), relation("t1", "a")),
+                        transformation(col("t2", "x"), relation("t1", "a")),
+                        transformation(col("t2", "y"), relation("t1", "a")),
                     ],
                     diagnostics: vec![],
                 },
@@ -2004,10 +2004,10 @@ mod tests {
                     ],
                     writes: vec![write("t1", "a"), write("t1", "b")],
                     lineage: vec![
-                        flow_passthrough(col("t2", "x"), relation("t1", "a")),
-                        flow_passthrough(col("t2", "y"), relation("t1", "b")),
-                        flow_passthrough(col("t3", "p"), relation("t1", "a")),
-                        flow_passthrough(col("t3", "q"), relation("t1", "b")),
+                        passthrough(col("t2", "x"), relation("t1", "a")),
+                        passthrough(col("t2", "y"), relation("t1", "b")),
+                        passthrough(col("t3", "p"), relation("t1", "a")),
+                        passthrough(col("t3", "q"), relation("t1", "b")),
                     ],
                     diagnostics: vec![],
                 },
@@ -2094,7 +2094,7 @@ mod tests {
                     statement_kind: StatementKind::Update,
                     reads: vec![read("t1", "b")],
                     writes: vec![write("t1", "a")],
-                    lineage: vec![flow_passthrough(col("t1", "b"), relation("t1", "a"))],
+                    lineage: vec![passthrough(col("t1", "b"), relation("t1", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -2108,7 +2108,7 @@ mod tests {
                     statement_kind: StatementKind::Update,
                     reads: vec![read("t1", "b")],
                     writes: vec![write("t1", "a")],
-                    lineage: vec![flow_transformation(col("t1", "b"), relation("t1", "a"))],
+                    lineage: vec![transformation(col("t1", "b"), relation("t1", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -2122,7 +2122,7 @@ mod tests {
                     statement_kind: StatementKind::Update,
                     reads: vec![read("t2", "b"), read("t1", "id"), read("t2", "id")],
                     writes: vec![write("t1", "a")],
-                    lineage: vec![flow_passthrough(col("t2", "b"), relation("t1", "a"))],
+                    lineage: vec![passthrough(col("t2", "b"), relation("t1", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -2136,7 +2136,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_transformation(col("t1", "a"), out_anon(0))],
+                    lineage: vec![transformation(col("t1", "a"), out_anon(0))],
                     diagnostics: vec![],
                 },
             );
@@ -2150,7 +2150,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "b")],
                     writes: vec![],
-                    lineage: vec![flow_transformation(col("t1", "b"), out("n", 0))],
+                    lineage: vec![transformation(col("t1", "b"), out("n", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -2167,7 +2167,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_transformation(col("t1", "a"), out_anon(0))],
+                    lineage: vec![transformation(col("t1", "a"), out_anon(0))],
                     diagnostics: vec![],
                 },
             );
@@ -2181,7 +2181,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t1", "a")],
                     writes: vec![write("t2", "n")],
-                    lineage: vec![flow_transformation(col("t1", "a"), relation("t2", "n"))],
+                    lineage: vec![transformation(col("t1", "a"), relation("t2", "n"))],
                     diagnostics: vec![],
                 },
             );
@@ -2198,7 +2198,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_transformation(col("t1", "a"), out("s", 0))],
+                    lineage: vec![transformation(col("t1", "a"), out("s", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -2221,7 +2221,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t", "x")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t", "x"), out("a", 0))],
+                    lineage: vec![passthrough(col("t", "x"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -2238,8 +2238,8 @@ mod tests {
                     reads: vec![read("t", "x"), read("t", "y")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t", "x"), out("p", 0)),
-                        flow_passthrough(col("t", "y"), out("y", 1)),
+                        passthrough(col("t", "x"), out("p", 0)),
+                        passthrough(col("t", "y"), out("y", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2256,7 +2256,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t", "x")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t", "x"), out("a", 0))],
+                    lineage: vec![passthrough(col("t", "x"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -2274,7 +2274,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t1", "x")],
                     writes: vec![write("t2", "col")],
-                    lineage: vec![flow_passthrough(col("t1", "x"), relation("t2", "col"))],
+                    lineage: vec![passthrough(col("t1", "x"), relation("t2", "col"))],
                     diagnostics: vec![],
                 },
             );
@@ -2298,7 +2298,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("s", "x")],
                     writes: vec![write("t", "a")],
-                    lineage: vec![flow_passthrough(col("s", "x"), relation("t", "a"))],
+                    lineage: vec![passthrough(col("s", "x"), relation("t", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -2319,7 +2319,7 @@ mod tests {
                     statement_kind: StatementKind::Update,
                     reads: vec![read("s", "x"), read("t", "id")],
                     writes: vec![write("t", "a")],
-                    lineage: vec![flow_transformation(col("s", "x"), relation("t", "a"))],
+                    lineage: vec![transformation(col("s", "x"), relation("t", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -2359,7 +2359,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t1", "id")],
                     writes: vec![write("t2", "col")],
-                    lineage: vec![flow_transformation(col("t1", "id"), relation("t2", "col"))],
+                    lineage: vec![transformation(col("t1", "id"), relation("t2", "col"))],
                     diagnostics: vec![],
                 },
             );
@@ -2377,7 +2377,7 @@ mod tests {
                     statement_kind: StatementKind::Merge,
                     reads: vec![read("t", "id"), read("s", "id"), read("s", "a")],
                     writes: vec![write("t", "a")],
-                    lineage: vec![flow_passthrough(col("s", "a"), relation("t", "a"))],
+                    lineage: vec![passthrough(col("s", "a"), relation("t", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -2398,8 +2398,8 @@ mod tests {
                     ],
                     writes: vec![write("t", "id"), write("t", "a")],
                     lineage: vec![
-                        flow_passthrough(col("s", "id"), relation("t", "id")),
-                        flow_passthrough(col("s", "a"), relation("t", "a")),
+                        passthrough(col("s", "id"), relation("t", "id")),
+                        passthrough(col("s", "a"), relation("t", "a")),
                     ],
                     diagnostics: vec![],
                 },
@@ -2437,9 +2437,9 @@ mod tests {
                     ],
                     writes: vec![write("t", "a"), write("t", "id"), write("t", "a")],
                     lineage: vec![
-                        flow_passthrough(col("s", "a"), relation("t", "a")),
-                        flow_passthrough(col("s", "id"), relation("t", "id")),
-                        flow_passthrough(col("s", "a"), relation("t", "a")),
+                        passthrough(col("s", "a"), relation("t", "a")),
+                        passthrough(col("s", "id"), relation("t", "id")),
+                        passthrough(col("s", "a"), relation("t", "a")),
                     ],
                     diagnostics: vec![],
                 },
@@ -2455,7 +2455,7 @@ mod tests {
                     statement_kind: StatementKind::Merge,
                     reads: vec![read("t", "id"), read("s", "id"), read("s", "a")],
                     writes: vec![write("t", "a")],
-                    lineage: vec![flow_transformation(col("s", "a"), relation("t", "a"))],
+                    lineage: vec![transformation(col("s", "a"), relation("t", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -2477,8 +2477,8 @@ mod tests {
                     reads: vec![read("s", "x"), read("s", "y")],
                     writes: vec![write("t", "a"), write("t", "y")],
                     lineage: vec![
-                        flow_passthrough(col("s", "x"), relation("t", "a")),
-                        flow_passthrough(col("s", "y"), relation("t", "y")),
+                        passthrough(col("s", "x"), relation("t", "a")),
+                        passthrough(col("s", "y"), relation("t", "y")),
                     ],
                     diagnostics: vec![],
                 },
@@ -2495,8 +2495,8 @@ mod tests {
                     reads: vec![read("s", "x"), read("s", "y")],
                     writes: vec![write("t", "p"), write("t", "q")],
                     lineage: vec![
-                        flow_passthrough(col("s", "x"), relation("t", "p")),
-                        flow_passthrough(col("s", "y"), relation("t", "q")),
+                        passthrough(col("s", "x"), relation("t", "p")),
+                        passthrough(col("s", "y"), relation("t", "q")),
                     ],
                     diagnostics: vec![],
                 },
@@ -2511,7 +2511,7 @@ mod tests {
                     statement_kind: StatementKind::CreateTable,
                     reads: vec![read("s", "x")],
                     writes: vec![write("t", "total")],
-                    lineage: vec![flow_transformation(col("s", "x"), relation("t", "total"))],
+                    lineage: vec![transformation(col("s", "x"), relation("t", "total"))],
                     diagnostics: vec![],
                 },
             );
@@ -2526,8 +2526,8 @@ mod tests {
                     reads: vec![read("s", "x"), read("s", "y")],
                     writes: vec![write("v", "a"), write("v", "y")],
                     lineage: vec![
-                        flow_passthrough(col("s", "x"), relation("v", "a")),
-                        flow_passthrough(col("s", "y"), relation("v", "y")),
+                        passthrough(col("s", "x"), relation("v", "a")),
+                        passthrough(col("s", "y"), relation("v", "y")),
                     ],
                     diagnostics: vec![],
                 },
@@ -2543,8 +2543,8 @@ mod tests {
                     reads: vec![read("s", "x"), read("s", "y")],
                     writes: vec![write("v", "a"), write("v", "b")],
                     lineage: vec![
-                        flow_passthrough(col("s", "x"), relation("v", "a")),
-                        flow_passthrough(col("s", "y"), relation("v", "b")),
+                        passthrough(col("s", "x"), relation("v", "a")),
+                        passthrough(col("s", "y"), relation("v", "b")),
                     ],
                     diagnostics: vec![],
                 },
@@ -2559,7 +2559,7 @@ mod tests {
                     statement_kind: StatementKind::AlterView,
                     reads: vec![read("s", "x")],
                     writes: vec![write("v", "a")],
-                    lineage: vec![flow_passthrough(col("s", "x"), relation("v", "a"))],
+                    lineage: vec![passthrough(col("s", "x"), relation("v", "a"))],
                     diagnostics: vec![],
                 },
             );
@@ -2591,7 +2591,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "user_id")],
                     writes: vec![],
-                    lineage: vec![flow_transformation(col("t1", "user_id"), out_anon(0))],
+                    lineage: vec![transformation(col("t1", "user_id"), out_anon(0))],
                     diagnostics: vec![],
                 },
             );
@@ -2611,8 +2611,8 @@ mod tests {
                     reads: vec![read("t1", "x"), read("t1", "y")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "x"), out_anon(0)),
-                        flow_transformation(col("t1", "y"), out_anon(0)),
+                        transformation(col("t1", "x"), out_anon(0)),
+                        transformation(col("t1", "y"), out_anon(0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2630,7 +2630,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_transformation(col("t1", "a"), out_anon(0))],
+                    lineage: vec![transformation(col("t1", "a"), out_anon(0))],
                     diagnostics: vec![],
                 },
             );
@@ -2651,7 +2651,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "id")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                    lineage: vec![passthrough(col("t1", "id"), out("id", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -2669,8 +2669,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "a"), out("sum", 0)),
-                        flow_transformation(col("t1", "b"), out("sum", 0)),
+                        transformation(col("t1", "a"), out("sum", 0)),
+                        transformation(col("t1", "b"), out("sum", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2687,7 +2687,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t1", "id")],
                     writes: vec![write("t2", "x")],
-                    lineage: vec![flow_passthrough(col("t1", "id"), relation("t2", "x"))],
+                    lineage: vec![passthrough(col("t1", "id"), relation("t2", "x"))],
                     diagnostics: vec![],
                 },
             );
@@ -2706,7 +2706,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "id")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                    lineage: vec![passthrough(col("t1", "id"), out("id", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -2723,8 +2723,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t1", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "a"), out("col", 0)),
-                        flow_transformation(col("t1", "b"), out("col", 0)),
+                        transformation(col("t1", "a"), out("col", 0)),
+                        transformation(col("t1", "b"), out("col", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2742,8 +2742,8 @@ mod tests {
                     reads: vec![read("t1", "id")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "id"), out("a", 0)),
-                        flow_passthrough(col("t1", "id"), out("b", 1)),
+                        passthrough(col("t1", "id"), out("a", 0)),
+                        passthrough(col("t1", "id"), out("b", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2798,8 +2798,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t2", "b"), out("b", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2817,8 +2817,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t2", "b"), out("b", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2834,8 +2834,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t2", "b"), out("b", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2851,8 +2851,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t2", "b"), out("b", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2871,9 +2871,9 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b"), read("t3", "c")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t2", "b"), out("b", 0)),
-                        flow_passthrough(col("t3", "c"), out("c", 0)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t2", "b"), out("b", 0)),
+                        passthrough(col("t3", "c"), out("c", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2897,8 +2897,8 @@ mod tests {
                     ],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t2", "b"), out("b", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2916,8 +2916,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_transformation(col("t2", "b"), out("a", 0)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        transformation(col("t2", "b"), out("a", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2933,8 +2933,8 @@ mod tests {
                     reads: vec![read("t1", "id"), read("t2", "id")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "id"), out("id", 0)),
-                        flow_transformation(col("t2", "id"), out("id", 0)),
+                        passthrough(col("t1", "id"), out("id", 0)),
+                        transformation(col("t2", "id"), out("id", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2954,8 +2954,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("x", 0)),
-                        flow_passthrough(col("t2", "b"), out("x", 0)),
+                        passthrough(col("t1", "a"), out("x", 0)),
+                        passthrough(col("t2", "b"), out("x", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2974,8 +2974,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("x", 0)),
-                        flow_passthrough(col("t2", "b"), out("x", 0)),
+                        passthrough(col("t1", "a"), out("x", 0)),
+                        passthrough(col("t2", "b"), out("x", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -2997,8 +2997,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![write("dst", "a")],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), relation("dst", "a")),
-                        flow_passthrough(col("t2", "b"), relation("dst", "a")),
+                        passthrough(col("t1", "a"), relation("dst", "a")),
+                        passthrough(col("t2", "b"), relation("dst", "a")),
                     ],
                     diagnostics: vec![],
                 },
@@ -3017,8 +3017,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![write("dst", "x")],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), relation("dst", "x")),
-                        flow_passthrough(col("t2", "b"), relation("dst", "x")),
+                        passthrough(col("t1", "a"), relation("dst", "x")),
+                        passthrough(col("t2", "b"), relation("dst", "x")),
                     ],
                     diagnostics: vec![],
                 },
@@ -3039,8 +3039,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b"), unresolved("a")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t2", "b"), out("b", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3057,8 +3057,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t1", "a"), out("a", 0)),
-                        flow_passthrough(col("t2", "b"), out("b", 0)),
+                        passthrough(col("t1", "a"), out("a", 0)),
+                        passthrough(col("t2", "b"), out("b", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3137,7 +3137,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "id")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                    lineage: vec![passthrough(col("t1", "id"), out("id", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -3185,7 +3185,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "id"), read("t2", "id")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "id"), out("id", 0))],
+                    lineage: vec![passthrough(col("t1", "id"), out("id", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -3204,8 +3204,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "a"), out("x", 0)),
-                        flow_transformation(col("t2", "b"), out("x", 0)),
+                        transformation(col("t1", "a"), out("x", 0)),
+                        transformation(col("t2", "b"), out("x", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3227,8 +3227,8 @@ mod tests {
                     reads: vec![read("t1", "a"), read("t2", "b")],
                     writes: vec![],
                     lineage: vec![
-                        flow_transformation(col("t1", "a"), out("x", 0)),
-                        flow_transformation(col("t2", "b"), out("x", 0)),
+                        transformation(col("t1", "a"), out("x", 0)),
+                        transformation(col("t2", "b"), out("x", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3246,7 +3246,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a"), read("t2", "fk"), read("t1", "id")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -3318,7 +3318,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![],
                     writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
-                    lineage: vec![flow_passthrough(excluded("b"), relation("t", "b"))],
+                    lineage: vec![passthrough(excluded("b"), relation("t", "b"))],
                     diagnostics: vec![],
                 },
             );
@@ -3356,9 +3356,9 @@ mod tests {
                     reads: vec![read("s", "x"), read("s", "y")],
                     writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
                     lineage: vec![
-                        flow_passthrough(col("s", "x"), relation("t", "a")),
-                        flow_passthrough(col("s", "y"), relation("t", "b")),
-                        flow_passthrough(col("s", "y"), relation("t", "b")),
+                        passthrough(col("s", "x"), relation("t", "a")),
+                        passthrough(col("s", "y"), relation("t", "b")),
+                        passthrough(col("s", "y"), relation("t", "b")),
                     ],
                     diagnostics: vec![],
                 },
@@ -3380,7 +3380,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t", "b")],
                     writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
-                    lineage: vec![flow_transformation(col("t", "b"), relation("t", "b"))],
+                    lineage: vec![transformation(col("t", "b"), relation("t", "b"))],
                     diagnostics: vec![],
                 },
             );
@@ -3402,10 +3402,10 @@ mod tests {
                     reads: vec![read("s1", "x"), read("s2", "y")],
                     writes: vec![write("t", "a"), write("t", "a")],
                     lineage: vec![
-                        flow_passthrough(col("s1", "x"), relation("t", "a")),
-                        flow_passthrough(col("s2", "y"), relation("t", "a")),
-                        flow_passthrough(col("s1", "x"), relation("t", "a")),
-                        flow_passthrough(col("s2", "y"), relation("t", "a")),
+                        passthrough(col("s1", "x"), relation("t", "a")),
+                        passthrough(col("s2", "y"), relation("t", "a")),
+                        passthrough(col("s1", "x"), relation("t", "a")),
+                        passthrough(col("s2", "y"), relation("t", "a")),
                     ],
                     diagnostics: vec![],
                 },
@@ -3427,8 +3427,8 @@ mod tests {
                     reads: vec![read("s", "x")],
                     writes: vec![write("t", "total"), write("t", "total")],
                     lineage: vec![
-                        flow_transformation(col("s", "x"), relation("t", "total")),
-                        flow_transformation(col("s", "x"), relation("t", "total")),
+                        transformation(col("s", "x"), relation("t", "total")),
+                        transformation(col("s", "x"), relation("t", "total")),
                     ],
                     diagnostics: vec![],
                 },
@@ -3447,7 +3447,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t", "a")],
                     writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
-                    lineage: vec![flow_passthrough(excluded("b"), relation("t", "b"))],
+                    lineage: vec![passthrough(excluded("b"), relation("t", "b"))],
                     diagnostics: vec![],
                 },
             );
@@ -3685,7 +3685,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t", "id")],
                     writes: vec![write("t", "a"), write("t", "b")],
-                    lineage: vec![flow_passthrough(col("t", "id"), out("id", 0))],
+                    lineage: vec![passthrough(col("t", "id"), out("id", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -3699,7 +3699,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t", "id")],
                     writes: vec![write("t", "a")],
-                    lineage: vec![flow_passthrough(col("t", "id"), out("pk", 0))],
+                    lineage: vec![passthrough(col("t", "id"), out("pk", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -3713,7 +3713,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("t", "id")],
                     writes: vec![write("t", "a")],
-                    lineage: vec![flow_transformation(col("t", "id"), out("bumped", 0))],
+                    lineage: vec![transformation(col("t", "id"), out("bumped", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -3747,9 +3747,9 @@ mod tests {
                     ],
                     writes: vec![write("t", "a")],
                     lineage: vec![
-                        flow_transformation(col("t", "b"), relation("t", "a")),
-                        flow_passthrough(col("t", "id"), out("id", 0)),
-                        flow_passthrough(col("t", "a"), out("a", 1)),
+                        transformation(col("t", "b"), relation("t", "a")),
+                        passthrough(col("t", "id"), out("id", 0)),
+                        passthrough(col("t", "a"), out("a", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3765,8 +3765,8 @@ mod tests {
                     reads: vec![read("t", "id"), read("t", "id"), read("t", "val")],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("t", "id"), out("id", 0)),
-                        flow_passthrough(col("t", "val"), out("val", 1)),
+                        passthrough(col("t", "id"), out("id", 0)),
+                        passthrough(col("t", "val"), out("val", 1)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3787,8 +3787,8 @@ mod tests {
                     reads: vec![read("s", "x"), read("t", "id")],
                     writes: vec![write("t", "a")],
                     lineage: vec![
-                        flow_passthrough(col("s", "x"), relation("t", "a")),
-                        flow_passthrough(col("t", "id"), out("id", 0)),
+                        passthrough(col("s", "x"), relation("t", "a")),
+                        passthrough(col("t", "id"), out("id", 0)),
                     ],
                     diagnostics: vec![],
                 },
@@ -3878,7 +3878,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "a")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t1", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -3899,8 +3899,8 @@ mod tests {
                     reads: vec![read("s", "a"), read("s", "b")],
                     writes: vec![write("t", "x"), write("t", "y")],
                     lineage: vec![
-                        flow_passthrough(col("s", "a"), relation("t", "x")),
-                        flow_passthrough(col("s", "b"), relation("t", "y")),
+                        passthrough(col("s", "a"), relation("t", "x")),
+                        passthrough(col("s", "b"), relation("t", "y")),
                     ],
                     diagnostics: vec![],
                 },
@@ -3920,8 +3920,8 @@ mod tests {
                     reads: vec![read("s", "a"), read("s", "b"), read("s", "c")],
                     writes: vec![write("t", "x"), write("t", "y")],
                     lineage: vec![
-                        flow_passthrough(col("s", "a"), relation("t", "x")),
-                        flow_passthrough(col("s", "b"), relation("t", "y")),
+                        passthrough(col("s", "a"), relation("t", "x")),
+                        passthrough(col("s", "b"), relation("t", "y")),
                     ],
                     diagnostics: vec![],
                 },
@@ -3939,7 +3939,7 @@ mod tests {
                     statement_kind: StatementKind::Insert,
                     reads: vec![read("s", "a")],
                     writes: vec![write("t", "q")],
-                    lineage: vec![flow_passthrough(col("s", "a"), relation("t", "q"))],
+                    lineage: vec![passthrough(col("s", "a"), relation("t", "q"))],
                     diagnostics: vec![],
                 },
             );
@@ -3967,8 +3967,8 @@ mod tests {
                     ],
                     writes: vec![],
                     lineage: vec![
-                        flow_passthrough(col("s", "id"), relation("t", "id")),
-                        flow_passthrough(col("s", "a"), relation("t", "a")),
+                        passthrough(col("s", "id"), relation("t", "id")),
+                        passthrough(col("s", "a"), relation("t", "a")),
                     ],
                     diagnostics: vec![],
                 },
@@ -3990,7 +3990,7 @@ mod tests {
                     statement_kind: StatementKind::Select,
                     reads: vec![read("t1", "id"), read("t2", "id"), read("t2", "a")],
                     writes: vec![],
-                    lineage: vec![flow_passthrough(col("t2", "a"), out("a", 0))],
+                    lineage: vec![passthrough(col("t2", "a"), out("a", 0))],
                     diagnostics: vec![],
                 },
             );
