@@ -161,7 +161,6 @@ mod tests {
     use super::*;
     use crate::catalog::ColumnSchema;
     use crate::reference::TableReference;
-    use sqlparser::ast::Ident;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
     use std::collections::HashMap;
@@ -183,7 +182,7 @@ mod tests {
             self.tables.get(table.name.value.as_str()).map(|cols| {
                 cols.iter()
                     .map(|c| ColumnSchema {
-                        name: Ident::new(*c),
+                        name: c.to_string(),
                     })
                     .collect()
             })

@@ -11,7 +11,7 @@ use super::binding::{
     binding_alias_key, binding_confirms_column, binding_could_contain_column,
     binding_has_known_schema, is_synthetic_binding, normalize_span, span_suffix, BindingKey,
 };
-use super::{Resolver, ScopeId};
+use super::{Binding, Resolver, ScopeId};
 
 /// A column reference captured by the resolver during the AST walk.
 ///
@@ -191,30 +191,43 @@ impl<'a> Resolver<'a> {
         qualifier_parts: &[Ident],
         scope_id: ScopeId,
     ) -> (Option<TableReference>, bool) {
-        let table = table_from_qualifier_parts(qualifier_parts);
-        // Determine synthetic-ness by looking up the qualifier head
-        // in the scope chain. Multi-segment qualifiers (s.t.col) match
-        // only on the head — schema/catalog-qualified bound names are
-        // rare and we don't currently bind their full path anyway.
-        let synthetic = qualifier_parts
+        // Look up the binding for the qualifier head in the scope chain.
+        // Multi-segment qualifiers (s.t.col) match only on the head —
+        // schema/catalog-qualified bound names are rare and we don't
+        // currently bind their full path anyway.
+        let binding = qualifier_parts
             .first()
-            .map(|head| self.qualifier_is_synthetic_at_walk(head, scope_id))
-            .unwrap_or(false);
+            .and_then(|head| self.binding_for_qualifier(head, scope_id));
+        let synthetic = binding.map(is_synthetic_binding).unwrap_or(false);
+        // Canonicalize a single-segment qualifier bound to a real table
+        // to that binding's alias-free underlying `TableReference`, so an
+        // aliased ref (`u.a` over `FROM t1 AS u`) surfaces the real table
+        // `t1` — matching how unqualified refs resolve. Synthetic bindings
+        // (CTE / derived / table function) keep the qualifier verbatim so
+        // lineage composition can re-find the owning binding by name;
+        // multi-segment qualifiers are already real identities and pass
+        // through untouched.
+        let table = match binding {
+            Some(Binding::Table { table, .. }) if qualifier_parts.len() == 1 => {
+                Some((**table).clone())
+            }
+            _ => table_from_qualifier_parts(qualifier_parts),
+        };
         (table, synthetic)
     }
 
-    fn qualifier_is_synthetic_at_walk(&self, qualifier: &Ident, scope_id: ScopeId) -> bool {
-        let key = BindingKey::from_ident(qualifier);
+    fn binding_for_qualifier(&self, head: &Ident, scope_id: ScopeId) -> Option<&Binding> {
+        let key = BindingKey::from_ident(head);
         let mut current = Some(scope_id);
         while let Some(id) = current {
             let scope = self.scopes().scope(id);
             for binding in scope.iter_bindings() {
                 if binding_alias_key(binding) == key {
-                    return is_synthetic_binding(binding);
+                    return Some(binding);
                 }
             }
             current = scope.parent;
         }
-        false
+        None
     }
 }

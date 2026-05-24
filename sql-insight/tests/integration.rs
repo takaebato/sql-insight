@@ -4,7 +4,6 @@
 //! top-level items are equivalent to a `mod tests` in the library —
 //! no extra wrapper module needed.
 
-use sql_insight::sqlparser::ast::Ident;
 use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::test_utils::all_dialects;
 use sql_insight::{
@@ -357,7 +356,7 @@ mod catalog {
             self.tables.get(table.name.value.as_str()).map(|cols| {
                 cols.iter()
                     .map(|c| ColumnSchema {
-                        name: Ident::new(*c),
+                        name: c.to_string(),
                     })
                     .collect()
             })
@@ -497,7 +496,7 @@ mod diagnostics {
                 self.0.get(table.name.value.as_str()).map(|cols| {
                     cols.iter()
                         .map(|c| ColumnSchema {
-                            name: Ident::new(*c),
+                            name: c.to_string(),
                         })
                         .collect()
                 })

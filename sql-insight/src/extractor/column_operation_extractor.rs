@@ -846,6 +846,67 @@ mod tests {
         }
 
         #[test]
+        fn qualified_ref_through_alias_resolves_to_real_table() {
+            // `u` is an alias of `t1`; the qualified ref `u.a` resolves
+            // to the alias-free real table `t1`, matching how an
+            // unqualified ref resolves. Alias is use-site decoration,
+            // not part of the column's identity.
+            assert_column_ops(
+                "SELECT u.a FROM t1 AS u",
+                ColumnOperation {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a")],
+                    writes: vec![],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn qualified_refs_through_aliases_on_both_join_sides_resolve_to_real_tables() {
+            // Implicit aliases (`t1 a`, `t2 b`) on both join sides; every
+            // qualified ref canonicalizes to its real table. JOIN ON is
+            // walked during FROM, so the predicate reads precede the
+            // projection reads.
+            assert_column_ops(
+                "SELECT a.x, b.y FROM t1 a JOIN t2 b ON a.id = b.id",
+                ColumnOperation {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "id"),
+                        read("t2", "id"),
+                        read("t1", "x"),
+                        read("t2", "y"),
+                    ],
+                    writes: vec![],
+                    lineage: vec![
+                        passthrough(col("t1", "x"), out("x", 0)),
+                        passthrough(col("t2", "y"), out("y", 1)),
+                    ],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn aliased_filter_ref_resolves_to_real_table_and_stays_out_of_lineage() {
+            // A WHERE-only column through an alias resolves to the real
+            // table for `reads`, but a filter column is not a value
+            // contributor, so it never appears in `lineage`.
+            assert_column_ops(
+                "SELECT u.a FROM t1 AS u WHERE u.b > 0",
+                ColumnOperation {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "a"), read("t1", "b")],
+                    writes: vec![],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
         fn schema_qualified_ref_resolves_to_schema_dot_table() {
             let table_ref = TableReference {
                 catalog: None,
@@ -2207,6 +2268,24 @@ mod tests {
                     reads: vec![read("t", "x")],
                     writes: vec![],
                     lineage: vec![passthrough(col("t", "x"), out("a", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn cte_column_alias_matched_case_insensitively() {
+            // The CTE projects `x AS Foo`; the outer query references it
+            // as unquoted `foo`. Composition's name-match folds both
+            // sides to the same key, so `foo` composes back to the real
+            // source `t1.x`.
+            assert_column_ops(
+                "WITH cte AS (SELECT x AS Foo FROM t1) SELECT foo FROM cte",
+                ColumnOperation {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "x")],
+                    writes: vec![],
+                    lineage: vec![passthrough(col("t1", "x"), out("foo", 0))],
                     diagnostics: vec![],
                 },
             );
@@ -3804,7 +3883,7 @@ mod tests {
                 self.tables.get(table.name.value.as_str()).map(|cols| {
                     cols.iter()
                         .map(|c| ColumnSchema {
-                            name: Ident::new(*c),
+                            name: c.to_string(),
                         })
                         .collect()
                 })
@@ -3865,6 +3944,52 @@ mod tests {
                     writes: vec![],
                     lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
                     diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn catalog_resolves_unquoted_ref_case_insensitively() {
+            // The catalog declares `id` (lowercase); an unquoted `ID`
+            // folds to the same key, so it resolves to t1. The column
+            // name surfaces as written (`ID`) — folding governs matching,
+            // not the surfaced identity.
+            let catalog = TestCatalog::default().with("t1", vec!["id"]);
+            assert_column_ops_with_catalog(
+                "SELECT ID FROM t1",
+                &catalog,
+                ColumnOperation {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![read("t1", "ID")],
+                    writes: vec![],
+                    lineage: vec![passthrough(col("t1", "ID"), out("ID", 0))],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn catalog_does_not_match_quoted_ref_against_unquoted_column() {
+            // A quoted `"ID"` matches exactly (case-sensitive), so it does
+            // not match the catalog's `id`; it stays unresolved and fires
+            // UnresolvedColumn. Placed in WHERE so it is a read but not a
+            // lineage source.
+            let catalog = TestCatalog::default().with("t1", vec!["a", "id"]);
+            assert_column_ops_with_catalog(
+                r#"SELECT a FROM t1 WHERE "ID" > 0"#,
+                &catalog,
+                ColumnOperation {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![
+                        read("t1", "a"),
+                        ColumnReference {
+                            table: None,
+                            name: Ident::with_quote('"', "ID"),
+                        },
+                    ],
+                    writes: vec![],
+                    lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnresolvedColumn)],
                 },
             );
         }

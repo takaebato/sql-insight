@@ -16,7 +16,6 @@
 //!    not in any in-scope binding; same silence rule applies without
 //!    a catalog.
 
-use sql_insight::sqlparser::ast::Ident;
 use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::{
     extract_column_operations, Catalog, ColumnLevelDiagnosticKind, ColumnSchema, ColumnTarget,
@@ -43,9 +42,7 @@ impl Catalog for InMemoryCatalog {
     fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
         self.tables.get(table.name.value.as_str()).map(|cols| {
             cols.iter()
-                .map(|c| ColumnSchema {
-                    name: Ident::new(c.as_str()),
-                })
+                .map(|c| ColumnSchema { name: c.clone() })
                 .collect()
         })
     }

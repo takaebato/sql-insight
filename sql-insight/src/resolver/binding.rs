@@ -389,9 +389,11 @@ impl<'a> Resolver<'a> {
         };
         let lookup_key = table.clone();
         match catalog.columns(&lookup_key) {
-            Some(cols) => {
-                RelationSchema::Known(cols.into_iter().map(|ColumnSchema { name }| name).collect())
-            }
+            Some(cols) => RelationSchema::Known(
+                cols.into_iter()
+                    .map(|ColumnSchema { name }| Ident::new(name))
+                    .collect(),
+            ),
             None => RelationSchema::Unknown,
         }
     }

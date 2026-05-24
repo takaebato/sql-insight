@@ -12,8 +12,6 @@
 
 use std::fmt;
 
-use sqlparser::ast::Ident;
-
 use crate::reference::TableReference;
 
 /// Provides the column list of a table.
@@ -30,6 +28,12 @@ pub trait Catalog: fmt::Debug {
     /// Resolve a table to its column list. The `table` argument may
     /// carry an alias, but implementations should treat the catalog/schema/
     /// name triplet as the identity — the alias is callsite-only metadata.
+    ///
+    /// Identifier case-folding is the implementation's responsibility: the
+    /// resolver passes the name as written in the SQL and does not
+    /// normalize it. An implementation wanting case-insensitive lookup
+    /// (most dialects) must fold both its stored keys and the incoming
+    /// `table` name.
     fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>>;
 }
 
@@ -37,7 +41,12 @@ pub trait Catalog: fmt::Debug {
 /// with `name` only and grows along the project roadmap (see the resolver
 /// memory note). Type/nullability/comment fields are deliberately deferred
 /// until a downstream consumer needs them.
+///
+/// `name` is a plain `String`: a catalog provides column identities, and
+/// matching against SQL refs is case-insensitive by default (quoting /
+/// case-sensitivity is not modelled per-column — see `BindingKey`), so
+/// there is no need to carry `sqlparser`'s `Ident` (quote style / span).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnSchema {
-    pub name: Ident,
+    pub name: String,
 }
