@@ -3,7 +3,7 @@
 use core::fmt;
 
 use crate::error::Error;
-use sqlparser::ast::{Insert, ObjectName, TableFactor, TableObject};
+use sqlparser::ast::{Ident, Insert, ObjectName, TableFactor, TableObject};
 
 /// Physical table identity — the `catalog.schema.name` triplet.
 ///
@@ -16,9 +16,24 @@ use sqlparser::ast::{Insert, ObjectName, TableFactor, TableObject};
 /// the structures that wrap a `TableReference` (e.g. resolver bindings).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TableReference {
-    pub catalog: Option<sqlparser::ast::Ident>,
-    pub schema: Option<sqlparser::ast::Ident>,
-    pub name: sqlparser::ast::Ident,
+    pub catalog: Option<Ident>,
+    pub schema: Option<Ident>,
+    pub name: Ident,
+}
+
+/// A column-level identity reference: an optional owning table plus the
+/// column name.
+///
+/// `table` is `Option` because some column references cannot be
+/// resolved structurally (ambiguous unqualified columns, references to
+/// derived tables we do not yet expand, etc.) — in that case a
+/// diagnostic accompanies the operation. Identity is name-based: two
+/// `ColumnReference`s with the same `table` and `name` compare equal,
+/// independent of where they appeared in the SQL.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ColumnReference {
+    pub table: Option<TableReference>,
+    pub name: Ident,
 }
 
 impl TableReference {
@@ -91,9 +106,7 @@ impl TryFrom<&ObjectName> for TableReference {
 
 impl TableReference {
     /// Parse an INSERT statement's target into (identity, alias) pair.
-    pub fn from_insert_with_alias(
-        value: &Insert,
-    ) -> Result<(Self, Option<sqlparser::ast::Ident>), Error> {
+    pub fn from_insert_with_alias(value: &Insert) -> Result<(Self, Option<Ident>), Error> {
         let name = match &value.table {
             TableObject::TableName(object_name) => object_name,
             TableObject::TableFunction(function) => &function.name,
@@ -104,7 +117,7 @@ impl TableReference {
     /// Parse a TableFactor (must be `TableFactor::Table`) into (identity, alias) pair.
     pub fn from_table_factor_with_alias(
         table: &TableFactor,
-    ) -> Result<(Self, Option<sqlparser::ast::Ident>), Error> {
+    ) -> Result<(Self, Option<Ident>), Error> {
         match table {
             TableFactor::Table { name, alias, .. } => Ok((
                 Self::try_from_name(name)?,

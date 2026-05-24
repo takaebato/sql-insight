@@ -71,7 +71,7 @@ use crate::catalog::Catalog;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::error::Error;
 use crate::extractor::table_operation_extractor::StatementKind;
-use crate::relation::TableReference;
+use crate::relation::{ColumnReference, TableReference};
 use crate::resolver::{LineageTargetSpec, RawColumnRef, Resolution, Resolver};
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, Ident, OnConflictAction, OnInsert, Statement,
@@ -150,21 +150,6 @@ pub struct ColumnOperation {
     pub writes: Vec<ColumnReference>,
     pub lineage: Vec<ColumnLineageEdge>,
     pub diagnostics: Vec<ColumnLevelDiagnostic>,
-}
-
-/// A column-level identity reference: an optional owning table plus the
-/// column name.
-///
-/// `table` is `Option` because some column references cannot be
-/// resolved structurally (ambiguous unqualified columns, references to
-/// derived tables we do not yet expand, etc.) — in that case a
-/// diagnostic accompanies the operation. Identity is name-based: two
-/// `ColumnReference`s with the same `table` and `name` compare equal,
-/// independent of where they appeared in the SQL.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ColumnReference {
-    pub table: Option<TableReference>,
-    pub name: Ident,
 }
 
 /// A column-level lineage edge: data from `source` contributes to
