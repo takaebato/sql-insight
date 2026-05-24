@@ -7,7 +7,7 @@
 //!   walk-time owner was synthetic, so the public `reads` surface
 //!   only shows real-storage references and unresolved names.
 
-use crate::extractor::column_operation_extractor::ColumnFlowKind;
+use crate::extractor::column_operation_extractor::ColumnLineageKind;
 
 use super::binding::{binding_alias_key, BindingKey};
 use super::{Binding, FlowEdge, RawColumnRef, Resolution};
@@ -62,9 +62,9 @@ impl Resolution {
     fn substitute_source(
         &self,
         raw: &RawColumnRef,
-        outer_kind: ColumnFlowKind,
+        outer_kind: ColumnLineageKind,
         depth: usize,
-    ) -> Vec<(RawColumnRef, ColumnFlowKind)> {
+    ) -> Vec<(RawColumnRef, ColumnLineageKind)> {
         if depth >= MAX_COMPOSITION_DEPTH {
             return vec![(raw.clone(), outer_kind)];
         }
@@ -137,10 +137,10 @@ impl Resolution {
 /// `Passthrough` only when both sides are `Passthrough`; any
 /// `Transformation` step makes the whole composed chain a
 /// `Transformation`.
-fn compose_flow_kinds(outer: ColumnFlowKind, inner: ColumnFlowKind) -> ColumnFlowKind {
-    if outer == ColumnFlowKind::Passthrough && inner == ColumnFlowKind::Passthrough {
-        ColumnFlowKind::Passthrough
+fn compose_flow_kinds(outer: ColumnLineageKind, inner: ColumnLineageKind) -> ColumnLineageKind {
+    if outer == ColumnLineageKind::Passthrough && inner == ColumnLineageKind::Passthrough {
+        ColumnLineageKind::Passthrough
     } else {
-        ColumnFlowKind::Transformation
+        ColumnLineageKind::Transformation
     }
 }

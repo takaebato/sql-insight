@@ -15,14 +15,14 @@ and normalization.
 
 ## Features
 
-- **Table-level Operation Extraction**: `reads` / `writes` / `flows`
+- **Table-level Operation Extraction**: `reads` / `writes` / `lineage`
   surfaces with statement-kind classification per parsed statement.
 - **Column-level Operation Extraction**: the same three surfaces at
   column granularity. `reads` / `writes` are plain occurrence lists
-  of column references; `flows` form a source → target graph with a
+  of column references; `lineage` form a source → target graph with a
   flow-kind (`Passthrough` vs `Transformation`). The value-vs-filter
-  distinction is structural — a value contributor is a `flows`
-  source, a filter-only column is in `reads` but not `flows`.
+  distinction is structural — a value contributor is a `lineage`
+  source, a filter-only column is in `reads` but not `lineage`.
 - **Optional Catalog**: supply a schema provider to make resolution
   strict — catch typos as unresolved references, pair INSERT
   positional values with target columns. Every extractor still
@@ -51,7 +51,7 @@ sql-insight = { version = "0.2.0" }
 
 ### Table-level Operation Extraction
 
-Get the statement kind plus `reads` / `writes` / `flows` in one call:
+Get the statement kind plus `reads` / `writes` / `lineage` in one call:
 
 ```rust
 use sql_insight::sqlparser::dialect::GenericDialect;
@@ -67,14 +67,15 @@ let ops = result[0].as_ref().unwrap();
 assert_eq!(ops.statement_kind, StatementKind::Insert);
 assert_eq!(ops.reads.len(), 1);   // staging
 assert_eq!(ops.writes.len(), 1);  // orders
-assert_eq!(ops.flows.len(), 1);   // staging → orders
+assert_eq!(ops.lineage.len(), 1);   // staging → orders
 ```
 
 ### Column-level Operation Extraction
 
-Same surfaces, at column granularity. Reads carry the clause role
-they appeared in; flows carry the flow kind through which they reach
-the target:
+Same surfaces, at column granularity. `reads` / `writes` are plain
+occurrence lists of column references; `lineage` edges carry a flow
+kind (`Passthrough` vs `Transformation`) describing how each source
+reaches its target:
 
 ```rust
 use sql_insight::sqlparser::dialect::GenericDialect;
@@ -87,8 +88,8 @@ let result = extract_column_operations(
     None,
 ).unwrap();
 let ops = result[0].as_ref().unwrap();
-// One flow per target column: id → id (Passthrough), amount → total (Transformation, via SUM).
-assert_eq!(ops.flows.len(), 2);
+// One lineage edge per target column: id → id (Passthrough), amount → total (Transformation, via SUM).
+assert_eq!(ops.lineage.len(), 2);
 ```
 
 ### Diagnostics
@@ -163,7 +164,7 @@ A few intentional non-supports and behavior nuances that shape what
 you can rely on:
 
 - **Wildcards (`SELECT *`, `t.*`) are not expanded** — they contribute
-  nothing to `reads` / `flows` and surface as a `WildcardSuppressed`
+  nothing to `reads` / `lineage` and surface as a `WildcardSuppressed`
   diagnostic.
 - **TableFunction schemas stay `Unknown`** (`UNNEST`, `JSON_TABLE`,
   etc.) — catalog enrichment doesn't reach them yet.
@@ -191,10 +192,10 @@ Runnable examples under
 [`sql-insight/examples/`](sql-insight/examples):
 
 - [`table_operations.rs`](sql-insight/examples/table_operations.rs) —
-  table-level `reads` / `writes` / `flows` across a multi-statement
+  table-level `reads` / `writes` / `lineage` across a multi-statement
   batch, with `StatementKind`-based dispatch.
 - [`column_operations.rs`](sql-insight/examples/column_operations.rs) —
-  per-column reads and flows classified by `ColumnFlowKind`
+  per-column reads and lineage classified by `ColumnLineageKind`
   (Passthrough vs Transformation) into `Persisted` vs `QueryOutput`
   targets.
 - [`with_catalog.rs`](sql-insight/examples/with_catalog.rs) — supplying

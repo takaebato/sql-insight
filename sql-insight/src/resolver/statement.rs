@@ -294,7 +294,7 @@ impl<'a> Resolver<'a> {
     /// Walk the optional ON-clause attached to an `INSERT`:
     /// `ON CONFLICT ... DO UPDATE SET ...` (Postgres / Sqlite) or
     /// `ON DUPLICATE KEY UPDATE ...` (MySQL). Both update-style
-    /// actions reuse [`Self::emit_assignment_flows`] so each
+    /// actions reuse [`Self::emit_assignment_lineage`] so each
     /// assignment's RHS feeds a Persisted flow into the INSERT
     /// target's column, identical to a standalone `UPDATE`.
     ///
@@ -320,7 +320,7 @@ impl<'a> Resolver<'a> {
                 // function call. Don't bind EXCLUDED here — doing so
                 // would make unqualified column refs inside the SET
                 // expressions ambiguous against the INSERT target.
-                self.emit_assignment_flows(assignments, Some(target_table))?;
+                self.emit_assignment_lineage(assignments, Some(target_table))?;
             }
             OnInsert::OnConflict(on_conflict) => {
                 if let OnConflictAction::DoUpdate(do_update) = &on_conflict.action {
@@ -354,7 +354,7 @@ impl<'a> Resolver<'a> {
                         excluded_schema,
                         body_projections,
                     );
-                    self.emit_assignment_flows(&do_update.assignments, Some(target_table))?;
+                    self.emit_assignment_lineage(&do_update.assignments, Some(target_table))?;
                     if let Some(selection) = &do_update.selection {
                         self.with_filter_clause(|r| r.visit_expr(selection))?;
                     }
@@ -420,7 +420,7 @@ impl<'a> Resolver<'a> {
             }
         }
         let target_table = try_target_table_from_factor(&update.table.relation);
-        self.emit_assignment_flows(&update.assignments, target_table.as_ref())?;
+        self.emit_assignment_lineage(&update.assignments, target_table.as_ref())?;
         if let Some(selection) = &update.selection {
             self.with_filter_clause(|r| r.visit_expr(selection))?;
         }
@@ -435,7 +435,7 @@ impl<'a> Resolver<'a> {
     /// per-assignment semantics. Target column qualifier resolution:
     /// qualified target (`t.col`) wins; bare target falls back to
     /// `default_table` (UPDATE head / MERGE INTO target).
-    fn emit_assignment_flows(
+    fn emit_assignment_lineage(
         &mut self,
         assignments: &[sqlparser::ast::Assignment],
         default_table: Option<&TableReference>,
@@ -514,7 +514,7 @@ impl<'a> Resolver<'a> {
                         self.with_filter_clause(|r| r.visit_expr(pred))?;
                     }
                     if let MergeInsertKind::Values(values) = &insert_expr.kind {
-                        self.emit_merge_insert_flows(
+                        self.emit_merge_insert_lineage(
                             values,
                             &insert_expr.columns,
                             target_table.as_ref(),
@@ -525,7 +525,7 @@ impl<'a> Resolver<'a> {
                     // needs catalog knowledge of the target schema.
                 }
                 MergeAction::Update(update_expr) => {
-                    self.emit_assignment_flows(&update_expr.assignments, target_table.as_ref())?;
+                    self.emit_assignment_lineage(&update_expr.assignments, target_table.as_ref())?;
                 }
                 MergeAction::Delete { .. } => {
                     // DELETE has no column-level value flow.
@@ -540,7 +540,7 @@ impl<'a> Resolver<'a> {
     /// expression's source refs pair with the column at the same
     /// position in `columns`. Walks values with default `Projection`
     /// kind for read classification.
-    fn emit_merge_insert_flows(
+    fn emit_merge_insert_lineage(
         &mut self,
         values: &sqlparser::ast::Values,
         columns: &[sqlparser::ast::ObjectName],

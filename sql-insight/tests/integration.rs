@@ -9,7 +9,7 @@ use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::test_utils::all_dialects;
 use sql_insight::{
     extract_column_operations, extract_crud_tables, extract_table_operations, extract_tables,
-    Catalog, ColumnFlowKind, ColumnSchema, ColumnTarget, CrudTables, Diagnostic, DiagnosticKind,
+    Catalog, ColumnLineageKind, ColumnSchema, ColumnTarget, CrudTables, Diagnostic, DiagnosticKind,
     NormalizerOptions, StatementKind, TableExtraction, TableReference, Tables,
 };
 use std::collections::HashMap;
@@ -216,7 +216,7 @@ mod extract_table_operations {
         assert_eq!(ops.reads.len(), 1);
         assert_eq!(ops.reads[0], table("t1"));
         assert!(ops.writes.is_empty());
-        assert!(ops.flows.is_empty());
+        assert!(ops.lineage.is_empty());
     }
 
     #[test]
@@ -227,9 +227,9 @@ mod extract_table_operations {
         assert_eq!(ops.statement_kind, StatementKind::Insert);
         assert_eq!(ops.reads, vec![table("staging")]);
         assert_eq!(ops.writes, vec![table("orders")]);
-        assert_eq!(ops.flows.len(), 1);
-        assert_eq!(ops.flows[0].source, table("staging"));
-        assert_eq!(ops.flows[0].target, table("orders"));
+        assert_eq!(ops.lineage.len(), 1);
+        assert_eq!(ops.lineage[0].source, table("staging"));
+        assert_eq!(ops.lineage[0].target, table("orders"));
     }
 
     #[test]
@@ -286,7 +286,7 @@ mod extract_column_operations {
         let names: Vec<_> = ops.reads.iter().map(|r| r.name.value.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
         let flow_sources: Vec<_> = ops
-            .flows
+            .lineage
             .iter()
             .map(|f| f.source.name.value.as_str())
             .collect();
@@ -294,14 +294,14 @@ mod extract_column_operations {
     }
 
     #[test]
-    fn insert_select_emits_per_column_flows() {
+    fn insert_select_emits_per_column_lineage() {
         let sql = "INSERT INTO orders (id, total) SELECT id, amount FROM staging";
         let result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
         let ops = result[0].as_ref().unwrap();
-        assert_eq!(ops.flows.len(), 2);
-        // Both flows are Passthrough into Persisted targets.
-        for flow in &ops.flows {
-            assert!(matches!(flow.kind, ColumnFlowKind::Passthrough));
+        assert_eq!(ops.lineage.len(), 2);
+        // Both lineage edges are Passthrough into Persisted targets.
+        for flow in &ops.lineage {
+            assert!(matches!(flow.kind, ColumnLineageKind::Passthrough));
             assert!(matches!(flow.target, ColumnTarget::Persisted(_)));
         }
     }
@@ -311,11 +311,14 @@ mod extract_column_operations {
         let sql = "INSERT INTO summary (total) SELECT SUM(amount) FROM staging";
         let result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
         let ops = result[0].as_ref().unwrap();
-        assert_eq!(ops.flows.len(), 1);
-        assert_eq!(ops.flows[0].source, col("staging", "amount"));
+        assert_eq!(ops.lineage.len(), 1);
+        assert_eq!(ops.lineage[0].source, col("staging", "amount"));
         // SUM changes the value → Transformation (the 2-way kind no
         // longer distinguishes aggregation from other transforms).
-        assert!(matches!(ops.flows[0].kind, ColumnFlowKind::Transformation));
+        assert!(matches!(
+            ops.lineage[0].kind,
+            ColumnLineageKind::Transformation
+        ));
     }
 
     #[test]
@@ -371,9 +374,9 @@ mod catalog {
         let sql = "INSERT INTO orders SELECT id, amount FROM staging";
         let result = extract_column_operations(&GenericDialect {}, sql, Some(&catalog)).unwrap();
         let ops = result[0].as_ref().unwrap();
-        // Two flows into Persisted orders.id / orders.total.
+        // Two lineage edges into Persisted orders.id / orders.total.
         let persisted_targets: Vec<_> = ops
-            .flows
+            .lineage
             .iter()
             .filter_map(|f| match &f.target {
                 ColumnTarget::Persisted(c) => Some(c.name.value.as_str()),
@@ -525,9 +528,7 @@ mod diagnostics {
 /// what changed.
 mod invariants {
     use super::*;
-    use sql_insight::{
-        ColumnFlow, ColumnReference, StatementColumnOperations, StatementTableOperations,
-    };
+    use sql_insight::{ColumnLineageEdge, ColumnOperation, ColumnReference, TableOperation};
     use std::collections::HashSet;
 
     /// Curated corpus chosen to stress the major shapes the resolver
@@ -569,8 +570,8 @@ mod invariants {
     /// extractors run in lockstep so per-statement invariants can be
     /// checked side by side.
     struct StatementPair {
-        col: StatementColumnOperations,
-        tab: StatementTableOperations,
+        col: ColumnOperation,
+        tab: TableOperation,
     }
 
     fn extract_paired(sql: &str) -> Vec<StatementPair> {
@@ -608,7 +609,7 @@ mod invariants {
         w.table.clone()
     }
 
-    fn flow_persisted_table(f: &ColumnFlow) -> Option<TableReference> {
+    fn flow_persisted_table(f: &ColumnLineageEdge) -> Option<TableReference> {
         match &f.target {
             ColumnTarget::Persisted(c) => c.table.clone(),
             ColumnTarget::QueryOutput { .. } => None,
@@ -682,7 +683,7 @@ mod invariants {
         for sql in corpus() {
             for (idx, pair) in extract_paired(sql).into_iter().enumerate() {
                 let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.clone()));
-                for f in &pair.col.flows {
+                for f in &pair.col.lineage {
                     if let Some(target_table) = flow_persisted_table(f) {
                         assert!(
                             table_op_writes.contains(&target_table),

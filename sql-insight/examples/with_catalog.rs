@@ -65,7 +65,7 @@ fn main() {
         let results = extract_column_operations(&dialect, sql, Some(&catalog)).unwrap();
         let ops = results[0].as_ref().unwrap();
         println!("--- 1. INSERT without explicit column list ---");
-        for flow in &ops.flows {
+        for flow in &ops.lineage {
             if let ColumnTarget::Persisted(target) = &flow.target {
                 println!(
                     "  {} -> orders.{} ({:?})",

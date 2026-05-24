@@ -6,12 +6,11 @@
 //! cargo run --example column_operations -p sql-insight
 //! ```
 //!
-//! Demonstrates per-column flows: classification by `ColumnFlowKind`,
-//! `Persisted` vs `QueryOutput` targets, and clause-role tagging on
-//! reads.
+//! Demonstrates per-column lineage: classification by `ColumnLineageKind`,
+//! `Persisted` vs `QueryOutput` targets, and occurrence-based reads.
 
 use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::{extract_column_operations, ColumnFlowKind, ColumnTarget};
+use sql_insight::{extract_column_operations, ColumnLineageKind, ColumnTarget};
 
 fn main() {
     let dialect = GenericDialect {};
@@ -33,8 +32,8 @@ fn main() {
         println!("  {}.{}", table, read.name.value);
     }
 
-    println!("\nflows ({}):", ops.flows.len());
-    for flow in &ops.flows {
+    println!("\nlineage ({}):", ops.lineage.len());
+    for flow in &ops.lineage {
         let source = format!(
             "{}.{}",
             flow.source
@@ -62,21 +61,21 @@ fn main() {
         println!("  {} -> {} ({:?})", source, target, flow.kind);
     }
 
-    // Bucket flows by kind: is the value forwarded unchanged, or
+    // Bucket lineage by kind: is the value forwarded unchanged, or
     // derived? (`direct copy` vs `transformed`).
     let mut passthrough = 0usize;
     let mut transformation = 0usize;
-    for flow in &ops.flows {
+    for flow in &ops.lineage {
         match flow.kind {
-            ColumnFlowKind::Passthrough => passthrough += 1,
-            ColumnFlowKind::Transformation => transformation += 1,
-            // ColumnFlowKind is #[non_exhaustive] — future variants
+            ColumnLineageKind::Passthrough => passthrough += 1,
+            ColumnLineageKind::Transformation => transformation += 1,
+            // ColumnLineageKind is #[non_exhaustive] — future variants
             // fall here. Skipping is fine for the per-kind count.
             _ => {}
         }
     }
     println!(
-        "\nflow kinds — Passthrough={}, Transformation={}",
+        "\nlineage kinds — Passthrough={}, Transformation={}",
         passthrough, transformation
     );
 }

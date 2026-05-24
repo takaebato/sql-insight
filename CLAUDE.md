@@ -42,44 +42,50 @@ by hand.
   - `table_extractor` — flat list of `TableReference`s (legacy API).
   - `crud_table_extractor` — CRUD-bucketed tables (legacy API).
   - `table_operation_extractor` — `extract_table_operations` returns
-    `StatementTableOperations { statement_kind, reads, writes,
-    flows, diagnostics }` per parsed statement.
+    `TableOperation { statement_kind, reads, writes,
+    lineage, diagnostics }` per parsed statement.
   - `column_operation_extractor` — `extract_column_operations`
-    returns `StatementColumnOperations { statement_kind, reads,
-    writes, flows, diagnostics }` at column granularity. Reads
-    carry `kinds: Vec<ReadKind>`; flows carry `kind: ColumnFlowKind`.
+    returns `ColumnOperation { statement_kind, reads,
+    writes, lineage, diagnostics }` at column granularity. `reads` /
+    `writes` are plain occurrence lists; `lineage` edges carry
+    `kind: ColumnLineageKind`.
 - Per-statement output convention: extractors return
   `Vec<Result<X, Error>>` so one bad statement does not kill the
   rest.
 
 ## Vocabulary
 
-- `StatementTableOperations` carries three parallel surfaces:
-  - `reads: Vec<TableRead>` — every table the statement reads from.
-  - `writes: Vec<TableWrite>` — every table the statement writes to.
-  - `flows: Vec<TableFlow>` — directed `source → target` edges, only
-    for statements that physically move data (INSERT / UPDATE /
-    MERGE / CTAS / CREATE VIEW). A table that plays both roles
-    (e.g. `DELETE t1 FROM t1`) appears in both `reads` and `writes`.
-- `StatementColumnOperations` mirrors the same surfaces at column
+- `TableOperation` carries three parallel surfaces:
+  - `reads: Vec<TableReference>` — every table the statement reads
+    from (occurrence-based; a table read more than once appears more
+    than once).
+  - `writes: Vec<TableReference>` — every table the statement writes
+    to.
+  - `lineage: Vec<TableLineageEdge>` — directed `source → target`
+    edges, only for statements that physically move data (INSERT /
+    UPDATE / MERGE / CTAS / CREATE VIEW). A table that plays both
+    roles (e.g. `DELETE t1 FROM t1`) appears in both `reads` and
+    `writes`.
+- `ColumnOperation` mirrors the same surfaces at column
   granularity:
-  - `reads: Vec<ColumnRead>` — every column reference, with
-    `kinds: Vec<ReadKind>` recording syntactic clause role
-    (`Projection` / `Filter` / `GroupBy` / `Sort` / `Window`, plus a
-    `Conditional` modifier for CASE-WHEN condition refs). References
-    whose walk-time owning binding was synthetic (CTE / derived /
-    table function) are dropped — only real-storage references and
+  - `reads: Vec<ColumnReference>` — every column reference, as a
+    plain occurrence list with no clause tag. References whose
+    walk-time owning binding was synthetic (CTE / derived / table
+    function) are dropped — only real-storage references and
     unresolved names surface.
-  - `writes: Vec<ColumnWrite>` — INSERT column lists, UPDATE SET
+  - `writes: Vec<ColumnReference>` — INSERT column lists, UPDATE SET
     targets, CTAS / CREATE VIEW / ALTER VIEW columns, MERGE
     WHEN-clause writes.
-  - `flows: Vec<ColumnFlow>` — `source → target` edges with
-    `kind: ColumnFlowKind` (`Passthrough` / `Aggregation` /
-    `Computed`). Sources flowing through CTE / derived intermediates
-    are composed end-to-end; the composition is `Aggregation`-
-    dominant. Targets: `QueryOutput { name, position }` for
+  - `lineage: Vec<ColumnLineageEdge>` — `source → target` edges with
+    `kind: ColumnLineageKind` (`Passthrough` / `Transformation`).
+    Sources flowing through CTE / derived intermediates are composed
+    end-to-end; composition yields `Transformation` if any step
+    transforms. Targets: `QueryOutput { name, position }` for
     transient SELECT outputs, `Persisted(ColumnReference)` for
     writes into a real relation.
+- The value-vs-filter distinction is structural, not a tag: a value
+  contributor is a `lineage` source; a filter-only column is in
+  `reads` but not `lineage`.
 - `StatementKind` — the verb of the statement; combined with the
   `reads` / `writes` split recovers every granularity distinction.
 - Internal-only `TableRole` (Read / Write) lives inside the resolver
@@ -101,14 +107,11 @@ by hand.
   resolver via flag bags — instead expose helpers like
   `with_filter_clause` / `with_branch_scope` for scoped, lexical
   context.
-- Walking-context state lives in `VisitContext` (`scope_kind` /
-  `read_kind` / `in_case_condition`) — "in effect for the current
-  visit", not "queued". Save / restore goes through `with_context`
-  (and the focused `with_read_kind` / `with_branch_scope` /
-  `with_filter_clause` / `with_case_condition` helpers) so the prior
-  context is restored on scope exit. `resolve_query` resets the
-  fields that don't propagate through a subquery boundary
-  (`read_kind`, `in_case_condition`) but preserves `scope_kind` so
+- Walking-context state lives in `VisitContext` (just `scope_kind`)
+  — "in effect for the current visit", not "queued". Save / restore
+  goes through `with_context` (and the focused `with_branch_scope` /
+  `with_filter_clause` helpers) so the prior context is restored on
+  scope exit. `scope_kind` is preserved across a subquery boundary so
   predicate-ness flows transitively. For owning per-query buffers
   like `current_projections: Vec<…>`, `mem::replace` is used
   instead.
@@ -117,13 +120,8 @@ by hand.
   merge, EXCLUDE / REPLACE / RENAME clauses, CTE column rename,
   multi-segment qualifiers) is too high for a SQL-text-only library
   to handle correctly. Wildcards contribute nothing to `reads` /
-  `flows`; consumers needing per-column source → target flows either
-  supply resolved query plans or do their own expansion.
-- Aggregate function classification combines spec-guaranteed
-  structural markers (`FILTER (WHERE …)`, `WITHIN GROUP (…)`,
-  `DISTINCT` in args — all aggregate-only per SQL standard) with a
-  union name list of common aggregates across major dialects.
-  Window-only functions are excluded.
+  `lineage`; consumers needing per-column source → target lineage
+  either supply resolved query plans or do their own expansion.
 
 ## Code conventions
 
@@ -146,11 +144,8 @@ by hand.
 - Keep `sqlparser-rs` AST `match` arms exhaustive in the resolver
   and extractors — wildcard arms silently hide newly added variants.
 - Public enums that may grow new variants are `#[non_exhaustive]`
-  so adding variants stays SemVer-minor (ReadKind / ColumnFlowKind /
-  ColumnTarget / etc.).
-- Use `Vec<Kind>` on classification fields where multi-role
-  references are plausible (`ColumnRead.kinds`) — leaves room for
-  features like USING / NATURAL JOIN merge without an API break.
+  so adding variants stays SemVer-minor (`ColumnLineageKind` /
+  `ColumnTarget` / `DiagnosticKind` / `StatementKind` / etc.).
 - For unsupported SQL, accumulate diagnostics (`Diagnostic` /
   `OperationDiagnostic`) instead of `?`-bailing mid-walk. Reserve
   hard errors for genuinely unrecoverable conditions.

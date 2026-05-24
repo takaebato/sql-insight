@@ -20,15 +20,15 @@
 //! - **CRUD Table Extraction** — CRUD-bucketed table sets per
 //!   statement. See [`extract_crud_tables`].
 //! - **Table-level Operation Extraction** — `reads` / `writes` /
-//!   `flows` surfaces with [`StatementKind`] classification. See
+//!   `lineage` surfaces with [`StatementKind`] classification. See
 //!   [`extract_table_operations`].
 //! - **Column-level Operation Extraction** — the same three
 //!   surfaces at column granularity. `reads` / `writes` are plain
-//!   occurrence lists of [`ColumnReference`]s; `flows` form a
-//!   source → target graph carrying [`ColumnFlowKind`]
+//!   occurrence lists of [`ColumnReference`]s; `lineage` form a
+//!   source → target graph carrying [`ColumnLineageKind`]
 //!   (`Passthrough` vs `Transformation`). The value-vs-filter
-//!   distinction is structural: a value contributor is a `flows`
-//!   source, a filter-only column is in `reads` but not `flows`.
+//!   distinction is structural: a value contributor is a `lineage`
+//!   source, a filter-only column is in `reads` but not `lineage`.
 //!   See [`extract_column_operations`].
 //! - **Optional [`Catalog`]** — supply a schema provider to make
 //!   resolution strict (catch typos as
@@ -43,7 +43,7 @@
 //! ## Quick Start
 //!
 //! Table-level operation extraction — get `reads` / `writes` /
-//! `flows` and the statement kind from a single call:
+//! `lineage` and the statement kind from a single call:
 //!
 //! ```rust
 //! use sql_insight::sqlparser::dialect::GenericDialect;
@@ -59,7 +59,7 @@
 //! assert_eq!(ops.statement_kind, StatementKind::Insert);
 //! assert_eq!(ops.reads.len(), 1);   // staging
 //! assert_eq!(ops.writes.len(), 1);  // orders
-//! assert_eq!(ops.flows.len(), 1);   // staging → orders
+//! assert_eq!(ops.lineage.len(), 1);   // staging → orders
 //! ```
 //!
 //! SQL formatting:
@@ -83,11 +83,11 @@
 //! - `writes` — every table (or column) the statement writes to. A
 //!   table that plays both roles (e.g. `DELETE t1 FROM t1`) appears
 //!   in both.
-//! - `flows` — directed `source → target` edges, emitted only for
+//! - `lineage` — directed `source → target` edges, emitted only for
 //!   statements that physically move data (`INSERT` / `UPDATE` /
 //!   `MERGE` / `CREATE TABLE AS` / `CREATE VIEW`).
 //!
-//! For column-level flows, [`ColumnFlowKind`] makes one clean
+//! For column-level lineage, [`ColumnLineageKind`] makes one clean
 //! distinction: `Passthrough` (the value is forwarded unchanged; a
 //! rename still counts) vs `Transformation` (any expression that
 //! changes the value — arithmetic, function calls, aggregates,
@@ -95,7 +95,7 @@
 //! occurrence lists of column references with no clause tag; whether
 //! a column contributes a value or merely influences the result
 //! (e.g. a `WHERE` predicate) is recovered structurally — value
-//! contributors appear as `flows` sources, filter-only columns do
+//! contributors appear as `lineage` sources, filter-only columns do
 //! not.
 //!
 //! ## Limitations
@@ -104,7 +104,7 @@
 //! relying on a given output:
 //!
 //! - **Wildcards not expanded**: `SELECT *` / `t.*` contribute
-//!   nothing to `reads` / `flows`. Expanding them safely would
+//!   nothing to `reads` / `lineage`. Expanding them safely would
 //!   require modelling USING / NATURAL JOIN merge, EXCLUDE / REPLACE
 //!   clauses, and multi-level aliases — too much rigor for a
 //!   SQL-text-only library. Surfaced as
@@ -115,7 +115,7 @@
 //!   doesn't reach them yet.
 //! - **Recursive CTE bodies** are pre-bound under a stub for
 //!   self-reference; their projection composition is deferred, so
-//!   `flows` won't trace through them end-to-end.
+//!   `lineage` won't trace through them end-to-end.
 //! - **Flow kind is coarse** (`Passthrough` vs `Transformation`).
 //!   Aggregates, window functions, arithmetic, casts, etc. are all
 //!   `Transformation` — the model deliberately does not sub-classify
@@ -154,7 +154,7 @@
 //! - **Public enums are `#[non_exhaustive]`** so future variants
 //!   stay SemVer-minor — consumers must include a wildcard arm when
 //!   matching on [`DiagnosticKind`] / [`StatementKind`] /
-//!   [`ColumnFlowKind`] / [`ColumnTarget`].
+//!   [`ColumnLineageKind`] / [`ColumnTarget`].
 
 pub mod catalog;
 pub mod diagnostic;

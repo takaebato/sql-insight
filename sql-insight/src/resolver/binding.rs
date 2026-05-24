@@ -28,11 +28,11 @@ pub(crate) struct ScopeId(pub(super) usize);
 ///
 /// - `Body`: data flows through — query bodies, CTE bodies, derived
 ///   tables, INSERT/MERGE sources, scalar subqueries in projection or
-///   SET. Tables bound here participate in `TableFlow` edges when the
+///   SET. Tables bound here participate in `TableLineageEdge` edges when the
 ///   statement has a write target.
 /// - `Predicate`: scope is referenced only in a constraint — WHERE,
 ///   HAVING, JOIN ON, EXISTS, IN, QUALIFY. Tables bound under any
-///   Predicate ancestor are filtered out of `TableFlow` regardless of
+///   Predicate ancestor are filtered out of `TableLineageEdge` regardless of
 ///   their own kind, so `INSERT INTO t SELECT FROM s WHERE id IN
 ///   (SELECT id FROM x)` emits `s → t` but not `x → t`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -486,7 +486,7 @@ impl<'a> Resolver<'a> {
         self.record_diagnostic(Diagnostic {
             kind: DiagnosticKind::WildcardSuppressed,
             message: format!(
-                "{}{} left unexpanded — column flows will be incomplete for this projection",
+                "{}{} left unexpanded — column lineage will be incomplete for this projection",
                 description,
                 span_suffix(span),
             ),
@@ -545,7 +545,7 @@ impl Resolution {
 
     /// Read-role tables in a data-feeding position — Read role plus no
     /// `Predicate` ancestor in their scope chain. The basis for
-    /// `TableFlow` edge sources.
+    /// `TableLineageEdge` edge sources.
     pub(crate) fn feeding_read_tables(&self) -> Vec<TableReference> {
         self.scopes
             .iter()

@@ -5,14 +5,14 @@
 //! answers it in CRUD buckets, this module answers "what operations does
 //! this SQL perform, on which tables, and how do those tables relate?".
 //!
-//! The output is per-statement: one [`StatementTableOperations`] per parsed
+//! The output is per-statement: one [`TableOperation`] per parsed
 //! statement, since a single application call (e.g. an ORM `execute()`)
 //! typically corresponds to a single statement.
 //!
 //! Three parallel surfaces describe the statement:
 //! - `reads` — every table the statement reads from.
 //! - `writes` — every table the statement writes to.
-//! - `flows` — directed `source → target` edges for statements that
+//! - `lineage` — directed `source → target` edges for statements that
 //!   physically move data.
 //!
 //! A single table can appear in both `reads` and `writes` when it plays
@@ -53,17 +53,17 @@ pub fn extract_table_operations(
     dialect: &dyn Dialect,
     sql: &str,
     catalog: Option<&dyn Catalog>,
-) -> Result<Vec<Result<StatementTableOperations, Error>>, Error> {
+) -> Result<Vec<Result<TableOperation, Error>>, Error> {
     TableOperationExtractor::extract(dialect, sql, catalog)
 }
 
 /// Operations performed by a single SQL statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatementTableOperations {
+pub struct TableOperation {
     pub statement_kind: StatementKind,
     pub reads: Vec<TableReference>,
     pub writes: Vec<TableReference>,
-    pub flows: Vec<TableFlow>,
+    pub lineage: Vec<TableLineageEdge>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -75,36 +75,36 @@ pub struct StatementTableOperations {
 #[non_exhaustive]
 pub enum StatementKind {
     /// `SELECT ...` (and other read-only queries: `TABLE foo`, `VALUES`,
-    /// `WITH ... SELECT ...`). Reads only — no writes, no flows.
+    /// `WITH ... SELECT ...`). Reads only — no writes, no lineage.
     Select,
     /// `INSERT INTO ...`. Writes to one target table; reads from the
-    /// `VALUES` / `SELECT` source. Emits source → target flows.
+    /// `VALUES` / `SELECT` source. Emits source → target lineage.
     Insert,
     /// `UPDATE ... SET ...`. Reads and writes the same target table;
-    /// reads from any joined / sub-query sources. Emits flows from
+    /// reads from any joined / sub-query sources. Emits lineage from
     /// SET right-hand-side sources into the target columns.
     Update,
     /// `DELETE FROM ...`. The target table appears in both `reads`
-    /// (row source) and `writes` (deletion target). No flows.
+    /// (row source) and `writes` (deletion target). No lineage.
     Delete,
     /// `MERGE INTO ... USING ...`. The target appears in both `reads`
-    /// and `writes`; each `WHEN` clause may emit flows from the
+    /// and `writes`; each `WHEN` clause may emit lineage from the
     /// source into the target's update / insert columns.
     Merge,
     /// `CREATE TABLE ...`. The new table is a write target. CREATE
     /// TABLE AS (CTAS) also reads from its SELECT and emits per-column
-    /// flows into the new table's columns.
+    /// lineage into the new table's columns.
     CreateTable,
     /// `CREATE VIEW ... AS SELECT ...`. The new view is a write
-    /// target; reads come from the SELECT body. Per-column flows
-    /// pair the SELECT projections with the view's columns.
+    /// target; reads come from the SELECT body. Per-column lineage
+    /// pairs the SELECT projections with the view's columns.
     CreateView,
     /// `ALTER TABLE ...`. The altered table is a write target.
     /// Column-level changes are not modelled in detail.
     AlterTable,
     /// `ALTER VIEW ... AS SELECT ...`. Treated like CREATE VIEW for
     /// extraction purposes — the view is a write target, the new
-    /// SELECT body supplies reads and per-column flows.
+    /// SELECT body supplies reads and per-column lineage.
     AlterView,
     /// `DROP TABLE` / `DROP VIEW` / `DROP MATERIALIZED VIEW`. The
     /// dropped relation is a write target. Other DROP variants
@@ -118,17 +118,18 @@ pub enum StatementKind {
     Unsupported,
 }
 
-/// A source-to-target table flow inferred from the statement structure.
+/// A source-to-target table lineage edge inferred from the statement
+/// structure.
 ///
 /// Emitted only for statements that physically move data into a target
 /// (`INSERT`, `UPDATE`, `MERGE`, `CREATE TABLE AS SELECT`, `CREATE VIEW`).
 /// `DELETE`, `DROP`, `TRUNCATE`, `ALTER`, and bare `SELECT` produce no
-/// flows even when they reference other tables — the touched tables are
-/// still visible through [`StatementTableOperations::reads`] and
-/// [`StatementTableOperations::writes`].
+/// lineage even when they reference other tables — the touched tables are
+/// still visible through [`TableOperation::reads`] and
+/// [`TableOperation::writes`].
 ///
-/// Each `TableFlow` is a single directed edge — a statement that derives
-/// `t` from `a JOIN b` emits two flows (`a → t`, `b → t`), not one entry
+/// Each `TableLineageEdge` is a single directed edge — a statement that derives
+/// `t` from `a JOIN b` emits two edges (`a → t`, `b → t`), not one entry
 /// with both sources. This keeps equality and aggregation across
 /// statements simple (set-union over edges).
 ///
@@ -142,7 +143,7 @@ pub enum StatementKind {
 /// Deeper transitivity (recursive CTEs, multi-hop indirection) is
 /// intentionally out of scope for the MVP.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TableFlow {
+pub struct TableLineageEdge {
     pub source: TableReference,
     pub target: TableReference,
 }
@@ -156,7 +157,7 @@ impl TableOperationExtractor {
         dialect: &dyn Dialect,
         sql: &str,
         catalog: Option<&dyn Catalog>,
-    ) -> Result<Vec<Result<StatementTableOperations, Error>>, Error> {
+    ) -> Result<Vec<Result<TableOperation, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         Ok(statements
             .iter()
@@ -167,7 +168,7 @@ impl TableOperationExtractor {
     pub fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&dyn Catalog>,
-    ) -> Result<StatementTableOperations, Error> {
+    ) -> Result<TableOperation, Error> {
         let kind = classify_statement(statement);
         let resolution = Resolver::resolve_statement(catalog, statement)?;
 
@@ -201,31 +202,31 @@ impl TableOperationExtractor {
             writes = resolution.write_tables();
         }
 
-        let flows = extract_table_flows(&resolution, &kind);
+        let lineage = extract_table_lineage(&resolution, &kind);
 
-        Ok(StatementTableOperations {
+        Ok(TableOperation {
             statement_kind: kind,
             reads,
             writes,
-            flows,
+            lineage,
             diagnostics,
         })
     }
 }
 
-/// Emit one `TableFlow` edge per (feeding source × write target) pair
+/// Emit one `TableLineageEdge` per (feeding source × write target) pair
 /// for statements that physically move data. Statements without a write
-/// target or without any data-feeding source produce no flows.
-fn extract_table_flows(
+/// target or without any data-feeding source produce no lineage.
+fn extract_table_lineage(
     resolution: &crate::resolver::Resolution,
     kind: &StatementKind,
-) -> Vec<TableFlow> {
+) -> Vec<TableLineageEdge> {
     if !is_data_moving(kind) {
         return Vec::new();
     }
     // Data-moving statements all carry exactly one write target. If
     // somehow zero or many appear (parser oddity, unsupported variant)
-    // we conservatively emit no flows rather than guessing.
+    // we conservatively emit no lineage rather than guessing.
     let mut targets = resolution.write_tables().into_iter();
     let Some(target) = targets.next() else {
         return Vec::new();
@@ -233,7 +234,7 @@ fn extract_table_flows(
     resolution
         .feeding_read_tables()
         .into_iter()
-        .map(|source| TableFlow {
+        .map(|source| TableLineageEdge {
             source,
             target: target.clone(),
         })
@@ -303,15 +304,15 @@ mod tests {
         }
     }
 
-    fn flow(source: &str, target: &str) -> TableFlow {
-        TableFlow {
+    fn flow(source: &str, target: &str) -> TableLineageEdge {
+        TableLineageEdge {
             source: table(source),
             target: table(target),
         }
     }
 
     /// Whole-value-ish assertion: pin down the full
-    /// `StatementTableOperations` for `sql`, but compare diagnostics
+    /// `TableOperation` for `sql`, but compare diagnostics
     /// by **kind sequence only** — message text and span coordinates
     /// are ignored. This lets tests focus on "what was extracted"
     /// without coupling to diagnostic wording or column offsets that
@@ -319,18 +320,18 @@ mod tests {
     ///
     /// Tests that genuinely care about the message / span shape
     /// should fall back to per-field `assert_eq!`.
-    fn assert_ops(sql: &str, expected: StatementTableOperations) {
+    fn assert_ops(sql: &str, expected: TableOperation) {
         assert_nth_ops_with(sql, 0, &GenericDialect {}, expected);
     }
 
-    fn assert_ops_with(sql: &str, dialect: &dyn Dialect, expected: StatementTableOperations) {
+    fn assert_ops_with(sql: &str, dialect: &dyn Dialect, expected: TableOperation) {
         assert_nth_ops_with(sql, 0, dialect, expected);
     }
 
     /// Like `assert_ops`, but for multi-statement SQL — pins down the
     /// statement at `index` in the parsed batch. Compose calls to pin
     /// down every statement in a batch separately.
-    fn assert_nth_ops(sql: &str, index: usize, expected: StatementTableOperations) {
+    fn assert_nth_ops(sql: &str, index: usize, expected: TableOperation) {
         assert_nth_ops_with(sql, index, &GenericDialect {}, expected);
     }
 
@@ -338,7 +339,7 @@ mod tests {
         sql: &str,
         index: usize,
         dialect: &dyn Dialect,
-        expected: StatementTableOperations,
+        expected: TableOperation,
     ) {
         let result = extract_table_operations(dialect, sql, None).unwrap();
         let actual = result
@@ -346,11 +347,11 @@ mod tests {
             .nth(index)
             .unwrap_or_else(|| panic!("statement {index} missing in result for SQL: {sql}"))
             .unwrap();
-        let StatementTableOperations {
+        let TableOperation {
             statement_kind,
             reads,
             writes,
-            flows,
+            lineage,
             diagnostics,
         } = expected;
         assert_eq!(
@@ -366,8 +367,8 @@ mod tests {
             "writes for SQL: {sql} (statement {index})"
         );
         assert_eq!(
-            actual.flows, flows,
-            "flows for SQL: {sql} (statement {index})"
+            actual.lineage, lineage,
+            "lineage for SQL: {sql} (statement {index})"
         );
         let actual_kinds: Vec<_> = actual.diagnostics.iter().map(|d| d.kind.clone()).collect();
         let expected_kinds: Vec<_> = diagnostics.iter().map(|d| d.kind.clone()).collect();
@@ -395,11 +396,11 @@ mod tests {
         fn select_emits_reads_only() {
             assert_ops(
                 "SELECT id FROM users",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Select,
                     reads: vec![table("users")],
                     writes: vec![],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -413,11 +414,11 @@ mod tests {
             // expected value.
             assert_ops(
                 "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Select,
                     reads: vec![table("t1"), table("t2")],
                     writes: vec![],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -427,11 +428,11 @@ mod tests {
         fn select_with_subquery_emits_read_for_every_table() {
             assert_ops(
                 "SELECT t1.a FROM t1 WHERE id IN (SELECT id FROM t2)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Select,
                     reads: vec![table("t1"), table("t2")],
                     writes: vec![],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -442,11 +443,11 @@ mod tests {
             // Only t1 is a table reference; t2 is the CTE binding and stays out.
             assert_ops(
                 "WITH t2 AS (SELECT id FROM t1) SELECT t2.id FROM t2",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Select,
                     reads: vec![table("t1")],
                     writes: vec![],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -459,15 +460,15 @@ mod tests {
         #[test]
         fn union_emits_read_for_each_branch_table() {
             // Each UNION branch walks its own FROM, so both tables
-            // surface in reads. No flows: bare SELECT statements
+            // surface in reads. No lineage: bare SELECT statements
             // never produce table-level data movement.
             assert_ops(
                 "SELECT a FROM t1 UNION SELECT b FROM t2",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Select,
                     reads: vec![table("t1"), table("t2")],
                     writes: vec![],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -481,11 +482,11 @@ mod tests {
                 let sql = format!("SELECT a FROM t1 {op} SELECT b FROM t2");
                 assert_ops(
                     &sql,
-                    StatementTableOperations {
+                    TableOperation {
                         statement_kind: StatementKind::Select,
                         reads: vec![table("t1"), table("t2")],
                         writes: vec![],
-                        flows: vec![],
+                        lineage: vec![],
                         diagnostics: vec![],
                     },
                 );
@@ -498,11 +499,11 @@ mod tests {
             // target, so both source tables surface as flow sources.
             assert_ops(
                 "INSERT INTO dst SELECT a FROM t1 UNION SELECT b FROM t2",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t1"), table("t2")],
                     writes: vec![table("dst")],
-                    flows: vec![flow("t1", "dst"), flow("t2", "dst")],
+                    lineage: vec![flow("t1", "dst"), flow("t2", "dst")],
                     diagnostics: vec![],
                 },
             );
@@ -512,11 +513,11 @@ mod tests {
         fn ctas_with_union_body_emits_flow_per_branch() {
             assert_ops(
                 "CREATE TABLE dst AS SELECT a FROM t1 UNION SELECT b FROM t2",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::CreateTable,
                     reads: vec![table("t1"), table("t2")],
                     writes: vec![table("dst")],
-                    flows: vec![flow("t1", "dst"), flow("t2", "dst")],
+                    lineage: vec![flow("t1", "dst"), flow("t2", "dst")],
                     diagnostics: vec![],
                 },
             );
@@ -530,11 +531,11 @@ mod tests {
         fn unsupported_statement_reports_diagnostic() {
             assert_ops(
                 "CREATE INDEX idx ON t1 (a)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Unsupported,
                     reads: vec![],
                     writes: vec![],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![diag(DiagnosticKind::UnsupportedStatement)],
                 },
             );
@@ -546,22 +547,22 @@ mod tests {
             assert_nth_ops(
                 sql,
                 0,
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Select,
                     reads: vec![table("t1")],
                     writes: vec![],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
             assert_nth_ops(
                 sql,
                 1,
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Select,
                     reads: vec![table("t2")],
                     writes: vec![],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -575,11 +576,11 @@ mod tests {
         fn insert_values_emits_write_only() {
             assert_ops(
                 "INSERT INTO t1 (a, b) VALUES (1, 2)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Insert,
                     reads: vec![],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -589,11 +590,11 @@ mod tests {
         fn insert_select_emits_write_and_read() {
             assert_ops(
                 "INSERT INTO t1 SELECT * FROM t2",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("t2", "t1")],
+                    lineage: vec![flow("t2", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -607,11 +608,11 @@ mod tests {
         fn update_basic_emits_write_only() {
             assert_ops(
                 "UPDATE t1 SET a = 1",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Update,
                     reads: vec![],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -621,11 +622,11 @@ mod tests {
         fn update_with_subquery_predicate_emits_write_plus_read() {
             assert_ops(
                 "UPDATE t1 SET a = 1 WHERE id IN (SELECT id FROM t2)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Update,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -640,11 +641,11 @@ mod tests {
             assert_ops_with(
                 "UPDATE t1 SET a = (SELECT b FROM t3) FROM t2 WHERE t1.id IN (SELECT id FROM t4)",
                 &PostgreSqlDialect {},
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Update,
                     reads: vec![table("t2"), table("t3"), table("t4")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("t2", "t1"), flow("t3", "t1")],
+                    lineage: vec![flow("t2", "t1"), flow("t3", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -658,11 +659,11 @@ mod tests {
         fn delete_from_emits_write_only() {
             assert_ops(
                 "DELETE FROM t1",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Delete,
                     reads: vec![],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -672,11 +673,11 @@ mod tests {
         fn delete_from_with_subquery_predicate_emits_write_plus_read() {
             assert_ops(
                 "DELETE FROM t1 WHERE id IN (SELECT id FROM t2)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Delete,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -689,11 +690,11 @@ mod tests {
             assert_ops_with(
                 "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3",
                 &MySqlDialect {},
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Delete,
                     reads: vec![table("t1"), table("t2"), table("t3")],
                     writes: vec![table("t1"), table("t2")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -703,11 +704,11 @@ mod tests {
         fn delete_with_using_lists_target_in_writes_and_source_in_reads() {
             assert_ops(
                 "DELETE FROM t1, t2 USING t1 INNER JOIN t2 INNER JOIN t3",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Delete,
                     reads: vec![table("t1"), table("t2"), table("t3")],
                     writes: vec![table("t1"), table("t2")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -718,11 +719,11 @@ mod tests {
             assert_ops_with(
                 "DELETE t1_alias FROM t1 AS t1_alias JOIN t2 ON t1_alias.a = t2.a",
                 &MySqlDialect {},
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Delete,
                     reads: vec![table("t1"), table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -737,11 +738,11 @@ mod tests {
             assert_ops(
                 "MERGE INTO t1 USING t2 ON t1.id = t2.id \
                  WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Merge,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("t2", "t1")],
+                    lineage: vec![flow("t2", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -755,11 +756,11 @@ mod tests {
         fn create_table_emits_write_only() {
             assert_ops(
                 "CREATE TABLE t1 (a INT)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::CreateTable,
                     reads: vec![],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -769,11 +770,11 @@ mod tests {
         fn create_table_as_select_emits_write_and_read() {
             assert_ops(
                 "CREATE TABLE t1 AS SELECT * FROM t2",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::CreateTable,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("t2", "t1")],
+                    lineage: vec![flow("t2", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -783,11 +784,11 @@ mod tests {
         fn create_view_emits_write_and_read() {
             assert_ops(
                 "CREATE VIEW v1 AS SELECT * FROM t1",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::CreateView,
                     reads: vec![table("t1")],
                     writes: vec![table("v1")],
-                    flows: vec![flow("t1", "v1")],
+                    lineage: vec![flow("t1", "v1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -797,11 +798,11 @@ mod tests {
         fn alter_table_emits_write_only() {
             assert_ops(
                 "ALTER TABLE t1 ADD COLUMN a INT",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::AlterTable,
                     reads: vec![],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -811,11 +812,11 @@ mod tests {
         fn drop_table_emits_one_write_per_name() {
             assert_ops(
                 "DROP TABLE t1, t2",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Drop,
                     reads: vec![],
                     writes: vec![table("t1"), table("t2")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -825,11 +826,11 @@ mod tests {
         fn truncate_emits_one_write_per_name() {
             assert_ops(
                 "TRUNCATE TABLE t1, t2",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Truncate,
                     reads: vec![],
                     writes: vec![table("t1"), table("t2")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -841,29 +842,29 @@ mod tests {
             // meaningful table-level operation.
             assert_ops(
                 "DROP FUNCTION my_fn",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Unsupported,
                     reads: vec![],
                     writes: vec![],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![diag(DiagnosticKind::UnsupportedStatement)],
                 },
             );
         }
     }
 
-    mod flows {
+    mod lineage {
         use super::*;
 
         #[test]
         fn insert_select_emits_flow_from_source_to_target() {
             assert_ops(
                 "INSERT INTO t1 SELECT * FROM t2",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("t2", "t1")],
+                    lineage: vec![flow("t2", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -873,11 +874,11 @@ mod tests {
         fn insert_select_join_emits_one_flow_per_source() {
             assert_ops(
                 "INSERT INTO t1 SELECT * FROM t2 JOIN t3 ON t2.id = t3.id",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t2"), table("t3")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("t2", "t1"), flow("t3", "t1")],
+                    lineage: vec![flow("t2", "t1"), flow("t3", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -890,11 +891,11 @@ mod tests {
             // appear in `reads`.
             assert_ops(
                 "INSERT INTO t1 SELECT * FROM t2 WHERE id IN (SELECT id FROM t3)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t2"), table("t3")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("t2", "t1")],
+                    lineage: vec![flow("t2", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -908,11 +909,11 @@ mod tests {
             assert_ops(
                 "INSERT INTO t1 SELECT * FROM t2 JOIN t3 ON t2.id = t3.id \
                  AND t2.id IN (SELECT id FROM t4)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("t2"), table("t3"), table("t4")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("t2", "t1"), flow("t3", "t1")],
+                    lineage: vec![flow("t2", "t1"), flow("t3", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -922,11 +923,11 @@ mod tests {
         fn update_scalar_subquery_in_set_feeds_flow() {
             assert_ops(
                 "UPDATE t1 SET col = (SELECT v FROM t2)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Update,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("t2", "t1")],
+                    lineage: vec![flow("t2", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -936,11 +937,11 @@ mod tests {
         fn update_predicate_subquery_does_not_feed_flow() {
             assert_ops(
                 "UPDATE t1 SET col = 1 WHERE id IN (SELECT id FROM t2)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Update,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -950,11 +951,11 @@ mod tests {
         fn create_table_as_select_emits_flow() {
             assert_ops(
                 "CREATE TABLE t1 AS SELECT * FROM t2",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::CreateTable,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("t2", "t1")],
+                    lineage: vec![flow("t2", "t1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -964,11 +965,11 @@ mod tests {
         fn create_view_emits_flow() {
             assert_ops(
                 "CREATE VIEW v1 AS SELECT * FROM t1",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::CreateView,
                     reads: vec![table("t1")],
                     writes: vec![table("v1")],
-                    flows: vec![flow("t1", "v1")],
+                    lineage: vec![flow("t1", "v1")],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -979,11 +980,11 @@ mod tests {
             assert_ops(
                 "MERGE INTO t1 USING t2 ON t1.id = t2.id \
                  WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Merge,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("t2", "t1")],
+                    lineage: vec![flow("t2", "t1")],
                     diagnostics: vec![],
                 },
             );
@@ -993,11 +994,11 @@ mod tests {
         fn cte_data_flows_through_to_write_target() {
             assert_ops(
                 "INSERT INTO t1 WITH cte AS (SELECT * FROM s) SELECT * FROM cte",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("s")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("s", "t1")],
+                    lineage: vec![flow("s", "t1")],
                     diagnostics: vec![
                         diag(DiagnosticKind::WildcardSuppressed),
                         diag(DiagnosticKind::WildcardSuppressed),
@@ -1014,11 +1015,11 @@ mod tests {
                 "INSERT INTO t1 WITH cte AS (\
                  SELECT * FROM s WHERE id IN (SELECT id FROM x)\
              ) SELECT * FROM cte",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("s"), table("x")],
                     writes: vec![table("t1")],
-                    flows: vec![flow("s", "t1")],
+                    lineage: vec![flow("s", "t1")],
                     diagnostics: vec![
                         diag(DiagnosticKind::WildcardSuppressed),
                         diag(DiagnosticKind::WildcardSuppressed),
@@ -1028,14 +1029,14 @@ mod tests {
         }
 
         #[test]
-        fn select_only_statement_emits_no_flows() {
+        fn select_only_statement_emits_no_lineage() {
             assert_ops(
                 "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Select,
                     reads: vec![table("t1"), table("t2")],
                     writes: vec![],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
                 },
             );
@@ -1045,11 +1046,11 @@ mod tests {
         fn insert_values_emits_no_flow() {
             assert_ops(
                 "INSERT INTO t1 VALUES (1, 2)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Insert,
                     reads: vec![],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -1061,11 +1062,11 @@ mod tests {
             // references another table.
             assert_ops(
                 "DELETE FROM t1 WHERE id IN (SELECT id FROM t2)",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Delete,
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
@@ -1075,11 +1076,11 @@ mod tests {
         fn truncate_emits_no_flow() {
             assert_ops(
                 "TRUNCATE TABLE t1",
-                StatementTableOperations {
+                TableOperation {
                     statement_kind: StatementKind::Truncate,
                     reads: vec![],
                     writes: vec![table("t1")],
-                    flows: vec![],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );

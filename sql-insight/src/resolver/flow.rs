@@ -6,14 +6,14 @@
 use sqlparser::ast::{Ident, Query};
 
 use crate::error::Error;
-use crate::extractor::column_operation_extractor::ColumnFlowKind;
+use crate::extractor::column_operation_extractor::ColumnLineageKind;
 use crate::relation::TableReference;
 
 use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolver};
 
 /// A pre-resolution column flow record. `source` still needs
 /// scope-chain resolution (for unqualified parts); `target` is fully
-/// spec'd by the resolver; `kind` is the public `ColumnFlowKind` to
+/// spec'd by the resolver; `kind` is the public `ColumnLineageKind` to
 /// surface (composed further by `composed_flow_edges` when the source
 /// goes through a synthetic intermediate).
 ///
@@ -25,7 +25,7 @@ use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolv
 pub(crate) struct FlowEdge {
     pub(crate) source: RawColumnRef,
     pub(crate) target: FlowTargetSpec,
-    pub(crate) kind: ColumnFlowKind,
+    pub(crate) kind: ColumnLineageKind,
 }
 
 /// Target spec for a [`FlowEdge`]. `QueryOutput` is for transient
@@ -59,7 +59,7 @@ impl<'a> Resolver<'a> {
         &mut self,
         since: usize,
         target: FlowTargetSpec,
-        kind: ColumnFlowKind,
+        kind: ColumnLineageKind,
     ) {
         for offset in 0..(self.column_refs_len() - since) {
             let source = self.column_refs_slice(since)[offset].clone();
@@ -75,7 +75,7 @@ impl<'a> Resolver<'a> {
     /// `target_for(position, item)` to produce a `FlowTargetSpec`;
     /// when it returns `Some(target)`, fan out one `FlowEdge` per
     /// `item.source_refs` to that target, carrying the item's
-    /// `ColumnFlowKind`. The closure shape lets the same loop drive
+    /// `ColumnLineageKind`. The closure shape lets the same loop drive
     /// `QueryOutput` emission, INSERT positional pairing, and CTAS /
     /// view's explicit-or-inferred column pairing.
     pub(super) fn emit_per_projection<F>(

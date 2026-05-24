@@ -7,7 +7,7 @@
 //! ```
 //!
 //! Shows how a single call yields the statement kind plus the
-//! `reads` / `writes` / `flows` surfaces for each parsed statement.
+//! `reads` / `writes` / `lineage` surfaces for each parsed statement.
 
 use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::{extract_table_operations, StatementKind};
@@ -28,8 +28,8 @@ fn main() {
         let writes: Vec<&str> = ops.writes.iter().map(|w| w.name.value.as_str()).collect();
         println!("reads:  {:?}", reads);
         println!("writes: {:?}", writes);
-        println!("flows:  {} edge(s)", ops.flows.len());
-        for flow in &ops.flows {
+        println!("lineage:  {} edge(s)", ops.lineage.len());
+        for flow in &ops.lineage {
             println!("  {} -> {}", flow.source.name.value, flow.target.name.value);
         }
         if !ops.diagnostics.is_empty() {

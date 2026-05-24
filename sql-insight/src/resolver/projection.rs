@@ -4,7 +4,7 @@
 
 use sqlparser::ast::{Expr, Ident, SelectItem};
 
-use crate::extractor::column_operation_extractor::ColumnFlowKind;
+use crate::extractor::column_operation_extractor::ColumnLineageKind;
 
 use super::{RawColumnRef, Resolver};
 
@@ -30,7 +30,7 @@ pub(crate) struct ProjectionGroup {
 pub(crate) struct ProjectionItem {
     pub(crate) name: Option<Ident>,
     pub(crate) source_refs: Vec<RawColumnRef>,
-    pub(crate) kind: ColumnFlowKind,
+    pub(crate) kind: ColumnLineageKind,
 }
 
 impl<'a> Resolver<'a> {
@@ -61,15 +61,15 @@ pub(super) fn projection_item_output_name(item: &SelectItem) -> Option<Ident> {
     }
 }
 
-/// Classify a projection item for `ColumnFlowKind`. Wildcards don't
+/// Classify a projection item for `ColumnLineageKind`. Wildcards don't
 /// emit flow edges currently, so the fallback `Transformation` here is
 /// safe; if/when wildcard expansion lands, items will be classified
 /// individually instead.
-pub(super) fn projection_item_kind(item: &SelectItem) -> ColumnFlowKind {
+pub(super) fn projection_item_kind(item: &SelectItem) -> ColumnLineageKind {
     match item {
         SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => expr_kind(expr),
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-            ColumnFlowKind::Transformation
+            ColumnLineageKind::Transformation
         }
     }
 }
@@ -86,16 +86,16 @@ pub(super) fn expr_is_bare(expr: &Expr) -> bool {
     matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
 }
 
-/// Classify an expression for `ColumnFlowKind` — the one clean
+/// Classify an expression for `ColumnLineageKind` — the one clean
 /// distinction:
 /// - bare `Identifier` / `CompoundIdentifier` → `Passthrough` (value
 ///   forwarded unchanged; a rename is still `Passthrough`)
 /// - anything else (arithmetic, function calls incl. aggregates and
 ///   window functions, CASE, casts, …) → `Transformation`
-pub(super) fn expr_kind(expr: &Expr) -> ColumnFlowKind {
+pub(super) fn expr_kind(expr: &Expr) -> ColumnLineageKind {
     if expr_is_bare(expr) {
-        ColumnFlowKind::Passthrough
+        ColumnLineageKind::Passthrough
     } else {
-        ColumnFlowKind::Transformation
+        ColumnLineageKind::Transformation
     }
 }
