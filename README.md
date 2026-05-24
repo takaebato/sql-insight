@@ -30,7 +30,9 @@ and normalization.
 - **Diagnostics**: non-fatal issues (unsupported statements,
   suppressed wildcards, ambiguous / unresolved columns) surface
   alongside the result with optional source-location spans, rather
-  than failing the whole call.
+  than failing the whole call. Split by granularity
+  (`TableLevelDiagnostic` / `ColumnLevelDiagnostic`) so a table-level
+  result never carries a column-only condition.
 - **Table Extraction / CRUD Table Extraction**: flat or
   CRUD-bucketed table sets — lightweight extraction when the
   operation graph isn't needed.
@@ -100,7 +102,7 @@ a `kind`, a human-readable `message`, and an optional source-location
 
 ```rust
 use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::{extract_column_operations, DiagnosticKind};
+use sql_insight::{extract_column_operations, ColumnLevelDiagnosticKind};
 
 let dialect = GenericDialect {};
 let result = extract_column_operations(&dialect, "SELECT * FROM users", None).unwrap();
@@ -108,7 +110,7 @@ let ops = result[0].as_ref().unwrap();
 assert!(ops
     .diagnostics
     .iter()
-    .any(|d| matches!(d.kind, DiagnosticKind::WildcardSuppressed)));
+    .any(|d| matches!(d.kind, ColumnLevelDiagnosticKind::WildcardSuppressed)));
 ```
 
 ### SQL Formatting

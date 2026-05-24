@@ -4,7 +4,7 @@
 
 use sqlparser::ast::Ident;
 
-use crate::diagnostic::{Diagnostic, DiagnosticKind};
+use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::relation::TableReference;
 
 use super::binding::{
@@ -158,8 +158,8 @@ impl<'a> Resolver<'a> {
             if confirmed_count >= 2 {
                 let span = normalize_span(name.span);
                 let names: Vec<String> = candidates.iter().map(|t| t.name.value.clone()).collect();
-                self.record_diagnostic(Diagnostic {
-                    kind: DiagnosticKind::AmbiguousColumn,
+                self.record_diagnostic(ColumnLevelDiagnostic {
+                    kind: ColumnLevelDiagnosticKind::AmbiguousColumn,
                     message: format!(
                         "ambiguous column `{}`{} — matches in: [{}]",
                         name.value,
@@ -173,8 +173,8 @@ impl<'a> Resolver<'a> {
         }
         if had_known_schemas_anywhere {
             let span = normalize_span(name.span);
-            self.record_diagnostic(Diagnostic {
-                kind: DiagnosticKind::UnresolvedColumn,
+            self.record_diagnostic(ColumnLevelDiagnostic {
+                kind: ColumnLevelDiagnosticKind::UnresolvedColumn,
                 message: format!(
                     "unresolved column `{}`{} — no in-scope relation with a known schema contains it",
                     name.value,

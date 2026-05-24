@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::relation::TableReference;
 use crate::{StatementKind, TableOperationExtractor};
@@ -38,6 +39,10 @@ pub struct CrudTables {
     pub read_tables: Vec<TableReference>,
     pub update_tables: Vec<TableReference>,
     pub delete_tables: Vec<TableReference>,
+    /// Non-fatal diagnostics, forwarded from the underlying table-level
+    /// extraction (only [`UnsupportedStatement`](crate::TableLevelDiagnosticKind::UnsupportedStatement)
+    /// arises at this granularity).
+    pub diagnostics: Vec<TableLevelDiagnostic>,
 }
 
 impl fmt::Display for CrudTables {
@@ -88,8 +93,12 @@ impl CrudTableExtractor {
         let ops = TableOperationExtractor::extract_from_statement(statement, None)?;
         let reads = ops.reads;
         let writes = ops.writes;
+        let diagnostics = ops.diagnostics;
 
-        let mut crud = CrudTables::default();
+        let mut crud = CrudTables {
+            diagnostics,
+            ..Default::default()
+        };
         match ops.statement_kind {
             StatementKind::Insert => {
                 crud.create_tables = writes;
@@ -188,6 +197,7 @@ mod tests {
                 read_tables: vec![table("t1")],
                 update_tables: vec![],
                 delete_tables: vec![],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -201,12 +211,14 @@ mod tests {
                     read_tables: vec![table("t1")],
                     update_tables: vec![],
                     delete_tables: vec![],
+                    diagnostics: vec![],
                 }),
                 Ok(CrudTables {
                     create_tables: vec![],
                     read_tables: vec![table("t2")],
                     update_tables: vec![],
                     delete_tables: vec![],
+                    diagnostics: vec![],
                 }),
             ];
             assert_crud_table_extraction(sql, expected, all_dialects());
@@ -220,6 +232,7 @@ mod tests {
                 read_tables: vec![table("t1")],
                 update_tables: vec![],
                 delete_tables: vec![],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -232,6 +245,7 @@ mod tests {
                 read_tables: vec![catalog_schema_table("catalog", "schema", "table")],
                 update_tables: vec![],
                 delete_tables: vec![],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -244,6 +258,7 @@ mod tests {
                 read_tables: vec![catalog_schema_table("catalog", "schema", "table")],
                 update_tables: vec![],
                 delete_tables: vec![],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -256,6 +271,7 @@ mod tests {
                 read_tables: vec![table("t1")],
                 update_tables: vec![],
                 delete_tables: vec![],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -283,6 +299,7 @@ mod tests {
                 read_tables: vec![],
                 update_tables: vec![],
                 delete_tables: vec![table("t1")],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -295,6 +312,7 @@ mod tests {
                 read_tables: vec![],
                 update_tables: vec![],
                 delete_tables: vec![catalog_schema_table("catalog", "schema", "t1")],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -307,6 +325,7 @@ mod tests {
                 read_tables: vec![],
                 update_tables: vec![],
                 delete_tables: vec![table("t1")],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -319,6 +338,7 @@ mod tests {
                 read_tables: vec![table("t1"), table("t2"), table("t3")],
                 update_tables: vec![],
                 delete_tables: vec![table("t1"), table("t2")],
+                diagnostics: vec![],
             })];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_crud_table_extraction(
@@ -337,6 +357,7 @@ mod tests {
                 read_tables: vec![table("t1"), table("t2"), table("t3")],
                 update_tables: vec![],
                 delete_tables: vec![table("t1"), table("t2")],
+                diagnostics: vec![],
             })];
             // BigQuery and Generic do not support DELETE ... FROM
             assert_crud_table_extraction(
@@ -354,6 +375,7 @@ mod tests {
                 read_tables: vec![table("t1"), table("t2"), table("t3")],
                 update_tables: vec![],
                 delete_tables: vec![table("t1"), table("t2")],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -366,6 +388,7 @@ mod tests {
                 read_tables: vec![table("t1"), table("t2"), table("t3")],
                 update_tables: vec![],
                 delete_tables: vec![table("t1"), table("t2")],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -382,6 +405,7 @@ mod tests {
                 read_tables: vec![],
                 update_tables: vec![],
                 delete_tables: vec![],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -394,6 +418,7 @@ mod tests {
                 read_tables: vec![table("t2"), table("t3")],
                 update_tables: vec![],
                 delete_tables: vec![],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -413,6 +438,7 @@ mod tests {
                     read_tables: vec![],
                     update_tables: vec![table("t1")],
                     delete_tables: vec![],
+                    diagnostics: vec![],
                 }),]
             )
         }
@@ -429,6 +455,7 @@ mod tests {
                 read_tables: vec![table("t2"), table("t3")],
                 update_tables: vec![table("t1")],
                 delete_tables: vec![],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -448,6 +475,7 @@ mod tests {
                 read_tables: vec![table("t2")],
                 update_tables: vec![table("t1")],
                 delete_tables: vec![table("t1")],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -464,6 +492,7 @@ mod tests {
                 read_tables: vec![table("t1")],
                 update_tables: vec![],
                 delete_tables: vec![],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
@@ -476,6 +505,7 @@ mod tests {
                 read_tables: vec![table("t1")],
                 update_tables: vec![],
                 delete_tables: vec![],
+                diagnostics: vec![],
             })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }

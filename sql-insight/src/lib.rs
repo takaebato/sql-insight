@@ -32,13 +32,14 @@
 //!   See [`extract_column_operations`].
 //! - **Optional [`Catalog`]** — supply a schema provider to make
 //!   resolution strict (catch typos as
-//!   [`UnresolvedColumn`](DiagnosticKind::UnresolvedColumn),
+//!   [`UnresolvedColumn`](ColumnLevelDiagnosticKind::UnresolvedColumn),
 //!   pair INSERT positional values with target columns, etc.).
 //!   Every extractor works catalog-free in best-effort mode.
-//! - **[`Diagnostic`]** — non-fatal issues surface alongside the
-//!   extraction result rather than failing the whole call:
-//!   unsupported statements, suppressed wildcards, ambiguous /
-//!   unresolved columns.
+//! - **Diagnostics** ([`TableLevelDiagnostic`] / [`ColumnLevelDiagnostic`])
+//!   — non-fatal issues surface alongside the extraction result rather
+//!   than failing the whole call: unsupported statements, suppressed
+//!   wildcards, ambiguous / unresolved columns. Split by granularity so a
+//!   table-level result can't carry a column-only condition.
 //!
 //! ## Quick Start
 //!
@@ -108,7 +109,7 @@
 //!   require modelling USING / NATURAL JOIN merge, EXCLUDE / REPLACE
 //!   clauses, and multi-level aliases — too much rigor for a
 //!   SQL-text-only library. Surfaced as
-//!   [`WildcardSuppressed`](DiagnosticKind::WildcardSuppressed) so
+//!   [`WildcardSuppressed`](ColumnLevelDiagnosticKind::WildcardSuppressed) so
 //!   consumers can detect incomplete projections.
 //! - **TableFunction schemas stay `Unknown`** (`UNNEST`,
 //!   `generate_series`, `JSON_TABLE`, etc.) — catalog enrichment
@@ -144,17 +145,20 @@
 //! - **Fatal vs non-fatal split**: parser failures and structural
 //!   problems short-circuit as `Err`; semantic issues (unsupported
 //!   statement, ambiguity, suppressed wildcards) surface in the
-//!   per-statement `diagnostics: Vec<Diagnostic>` instead.
+//!   per-statement `diagnostics` list instead.
 //! - **[`TableReference`] / [`ColumnReference`] are identity-only**.
 //!   No `alias` field — alias is use-site decoration. `HashSet`
 //!   dedup behaves intuitively across statements.
 //! - **Set operations follow the left side**: the result schema of
 //!   `UNION` / `INTERSECT` / `EXCEPT` takes its column names from
 //!   the left branch, mirroring SQL's conventional behaviour.
-//! - **Public enums are `#[non_exhaustive]`** so future variants
-//!   stay SemVer-minor — consumers must include a wildcard arm when
-//!   matching on [`DiagnosticKind`] / [`StatementKind`] /
-//!   [`ColumnLineageKind`] / [`ColumnTarget`].
+//! - **Public enums are exhaustive while the crate is pre-1.0.** Adding
+//!   a variant to [`StatementKind`] / [`ColumnLineageKind`] /
+//!   [`ColumnTarget`] / the diagnostic-kind enums is therefore a visible
+//!   breaking change — deliberate, so consumers re-acknowledge each new
+//!   case rather than silently routing it to a wildcard arm. They will
+//!   likely gain `#[non_exhaustive]` at the 1.0 freeze, once the variant
+//!   sets stabilize.
 
 pub mod catalog;
 pub mod diagnostic;

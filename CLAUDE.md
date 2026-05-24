@@ -143,12 +143,25 @@ by hand.
   unscannable.
 - Keep `sqlparser-rs` AST `match` arms exhaustive in the resolver
   and extractors — wildcard arms silently hide newly added variants.
-- Public enums that may grow new variants are `#[non_exhaustive]`
-  so adding variants stays SemVer-minor (`ColumnLineageKind` /
-  `ColumnTarget` / `DiagnosticKind` / `StatementKind` / etc.).
-- For unsupported SQL, accumulate diagnostics (`Diagnostic` /
-  `OperationDiagnostic`) instead of `?`-bailing mid-walk. Reserve
-  hard errors for genuinely unrecoverable conditions.
+- Public enums are **exhaustive (no `#[non_exhaustive]`) while pre-1.0**
+  (`StatementKind` / `ColumnLineageKind` / `ColumnTarget` /
+  `TableLevelDiagnosticKind` / `ColumnLevelDiagnosticKind`). Adding a
+  variant is therefore a breaking change on purpose — pre-1.0 that
+  rides a `0.x` bump and forces consumers to re-acknowledge the new
+  case rather than silently hitting a wildcard arm. Add
+  `#[non_exhaustive]` at the 1.0 freeze (removing it later is
+  non-breaking; adding it is breaking, so the 1.0 boundary is the
+  place). Keep internal `match`es exhaustive regardless.
+- Diagnostics are split by extraction granularity:
+  `TableLevelDiagnostic` (only `UnsupportedStatement`) vs
+  `ColumnLevelDiagnostic` (adds `WildcardSuppressed` /
+  `AmbiguousColumn` / `UnresolvedColumn`). The resolver produces the
+  column-level superset; table-level surfaces project it down via
+  `ColumnLevelDiagnostic::to_table_level` (exhaustive match, so a new
+  column kind forces a table-level decision).
+- For unsupported SQL, accumulate diagnostics instead of `?`-bailing
+  mid-walk. Reserve hard errors for genuinely unrecoverable
+  conditions.
 - Tests: compare whole values (`assert_eq!(ops.reads, vec![...])`)
   over field-by-field assertions. Use a layered helper convention
   — `extract` → `extract_with(dialect)` → `extract_with_catalog(

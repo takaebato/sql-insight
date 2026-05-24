@@ -19,7 +19,8 @@
 use sql_insight::sqlparser::ast::Ident;
 use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::{
-    extract_column_operations, Catalog, ColumnSchema, ColumnTarget, DiagnosticKind, TableReference,
+    extract_column_operations, Catalog, ColumnLevelDiagnosticKind, ColumnSchema, ColumnTarget,
+    TableReference,
 };
 use std::collections::HashMap;
 
@@ -84,18 +85,18 @@ fn main() {
         let without = extract_column_operations(&dialect, sql, None).unwrap();
         let with_count = count_kind(
             &with[0].as_ref().unwrap().diagnostics,
-            DiagnosticKind::AmbiguousColumn,
+            ColumnLevelDiagnosticKind::AmbiguousColumn,
         );
         let without_count = count_kind(
             &without[0].as_ref().unwrap().diagnostics,
-            DiagnosticKind::AmbiguousColumn,
+            ColumnLevelDiagnosticKind::AmbiguousColumn,
         );
         println!(
             "\n--- 2. ambiguous column: with catalog={}, without={} ---",
             with_count, without_count
         );
         for diag in &with[0].as_ref().unwrap().diagnostics {
-            if matches!(diag.kind, DiagnosticKind::AmbiguousColumn) {
+            if matches!(diag.kind, ColumnLevelDiagnosticKind::AmbiguousColumn) {
                 println!("  {}", diag.message);
             }
         }
@@ -109,24 +110,27 @@ fn main() {
         let without = extract_column_operations(&dialect, sql, None).unwrap();
         let with_count = count_kind(
             &with[0].as_ref().unwrap().diagnostics,
-            DiagnosticKind::UnresolvedColumn,
+            ColumnLevelDiagnosticKind::UnresolvedColumn,
         );
         let without_count = count_kind(
             &without[0].as_ref().unwrap().diagnostics,
-            DiagnosticKind::UnresolvedColumn,
+            ColumnLevelDiagnosticKind::UnresolvedColumn,
         );
         println!(
             "\n--- 3. unresolved column: with catalog={}, without={} ---",
             with_count, without_count
         );
         for diag in &with[0].as_ref().unwrap().diagnostics {
-            if matches!(diag.kind, DiagnosticKind::UnresolvedColumn) {
+            if matches!(diag.kind, ColumnLevelDiagnosticKind::UnresolvedColumn) {
                 println!("  {}", diag.message);
             }
         }
     }
 }
 
-fn count_kind(diagnostics: &[sql_insight::Diagnostic], kind: DiagnosticKind) -> usize {
+fn count_kind(
+    diagnostics: &[sql_insight::ColumnLevelDiagnostic],
+    kind: ColumnLevelDiagnosticKind,
+) -> usize {
     diagnostics.iter().filter(|d| d.kind == kind).count()
 }

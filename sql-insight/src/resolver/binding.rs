@@ -6,7 +6,7 @@ use sqlparser::ast::{Ident, ObjectName, Statement};
 use sqlparser::tokenizer::Span;
 
 use crate::catalog::ColumnSchema;
-use crate::diagnostic::{Diagnostic, DiagnosticKind};
+use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::relation::TableReference;
 
 use super::{ProjectionGroup, Resolution, Resolver};
@@ -310,7 +310,7 @@ pub(super) fn synthetic_table_ref(name: &Ident) -> TableReference {
 }
 
 /// Convert a raw sqlparser `Span` to the `Option<Span>` shape stored on
-/// `Diagnostic`: an empty span (sqlparser convention: `line == 0`) is
+/// `ColumnLevelDiagnostic`: an empty span (sqlparser convention: `line == 0`) is
 /// flattened to `None` so consumers can distinguish "no source location"
 /// from "location at (0, 0)".
 pub(super) fn normalize_span(span: Span) -> Option<Span> {
@@ -469,13 +469,13 @@ impl<'a> Resolver<'a> {
         );
     }
 
-    pub(super) fn record_diagnostic(&mut self, diagnostic: Diagnostic) {
+    pub(super) fn record_diagnostic(&mut self, diagnostic: ColumnLevelDiagnostic) {
         self.diagnostics.push(diagnostic);
     }
 
     pub(super) fn record_unsupported_statement(&mut self, statement: &Statement) {
-        self.record_diagnostic(Diagnostic {
-            kind: DiagnosticKind::UnsupportedStatement,
+        self.record_diagnostic(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::UnsupportedStatement,
             message: format!("Unsupported statement while inspecting SQL: {}", statement),
             span: None,
         });
@@ -483,8 +483,8 @@ impl<'a> Resolver<'a> {
 
     pub(super) fn record_wildcard_suppressed(&mut self, description: &str, span: Span) {
         let span = normalize_span(span);
-        self.record_diagnostic(Diagnostic {
-            kind: DiagnosticKind::WildcardSuppressed,
+        self.record_diagnostic(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::WildcardSuppressed,
             message: format!(
                 "{}{} left unexpanded — column lineage will be incomplete for this projection",
                 description,

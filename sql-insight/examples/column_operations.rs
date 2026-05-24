@@ -69,9 +69,6 @@ fn main() {
         match flow.kind {
             ColumnLineageKind::Passthrough => passthrough += 1,
             ColumnLineageKind::Transformation => transformation += 1,
-            // ColumnLineageKind is #[non_exhaustive] — future variants
-            // fall here. Skipping is fine for the per-kind count.
-            _ => {}
         }
     }
     println!(

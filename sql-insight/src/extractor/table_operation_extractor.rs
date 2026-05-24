@@ -20,7 +20,7 @@
 //! a row source).
 
 use crate::catalog::Catalog;
-use crate::diagnostic::{Diagnostic, DiagnosticKind};
+use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
 use crate::relation::TableReference;
 use crate::resolver::Resolver;
@@ -64,7 +64,7 @@ pub struct TableOperation {
     pub reads: Vec<TableReference>,
     pub writes: Vec<TableReference>,
     pub lineage: Vec<TableLineageEdge>,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<TableLevelDiagnostic>,
 }
 
 /// What a statement does, at a coarse level. The *verb* of the statement
@@ -72,7 +72,6 @@ pub struct TableOperation {
 /// `reads` / `writes` split recovers every distinction the project needs
 /// to make at table granularity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum StatementKind {
     /// `SELECT ...` (and other read-only queries: `TABLE foo`, `VALUES`,
     /// `WITH ... SELECT ...`). Reads only — no writes, no lineage.
@@ -174,20 +173,26 @@ impl TableOperationExtractor {
 
         let mut reads = Vec::new();
         let mut writes = Vec::new();
-        // Start from resolver-level diagnostics (e.g. statements the
-        // resolver explicitly flagged unsupported). Extractor adds its
-        // own only when classify_statement detects an unsupported case
-        // the resolver did not already report — avoids duplicating the
-        // common case where both layers agree.
-        let mut diagnostics = resolution.diagnostics.clone();
+        // Start from resolver-level diagnostics, projected down to the
+        // table granularity — column-resolution gaps and suppressed
+        // wildcards don't affect table-level completeness, so they drop
+        // out here (only `UnsupportedStatement` carries over). Extractor
+        // adds its own only when classify_statement detects an unsupported
+        // case the resolver did not already report — avoids duplicating
+        // the common case where both layers agree.
+        let mut diagnostics: Vec<TableLevelDiagnostic> = resolution
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.to_table_level())
+            .collect();
 
         if matches!(kind, StatementKind::Unsupported) {
             if !diagnostics
                 .iter()
-                .any(|d| matches!(d.kind, DiagnosticKind::UnsupportedStatement))
+                .any(|d| matches!(d.kind, TableLevelDiagnosticKind::UnsupportedStatement))
             {
-                diagnostics.push(Diagnostic {
-                    kind: DiagnosticKind::UnsupportedStatement,
+                diagnostics.push(TableLevelDiagnostic {
+                    kind: TableLevelDiagnosticKind::UnsupportedStatement,
                     message: format!(
                         "Unsupported statement for operation extraction: {}",
                         statement
@@ -378,11 +383,11 @@ mod tests {
         );
     }
 
-    /// Construct a placeholder `Diagnostic` for the `expected.diagnostics`
-    /// list in `assert_ops`. Only the kind is compared; the message and
-    /// span are placeholders.
-    fn diag(kind: DiagnosticKind) -> Diagnostic {
-        Diagnostic {
+    /// Construct a placeholder `TableLevelDiagnostic` for the
+    /// `expected.diagnostics` list in `assert_ops`. Only the kind is
+    /// compared; the message and span are placeholders.
+    fn diag(kind: TableLevelDiagnosticKind) -> TableLevelDiagnostic {
+        TableLevelDiagnostic {
             kind,
             message: String::new(),
             span: None,
@@ -408,10 +413,10 @@ mod tests {
 
         #[test]
         fn select_with_join_emits_one_read_per_table() {
-            // Wildcard in the projection fires a WildcardSuppressed
-            // diagnostic; assert_ops compares it by kind only so the
-            // message text / span coordinates aren't baked into the
-            // expected value.
+            // The `*` does not surface a diagnostic at table granularity —
+            // WildcardSuppressed is a column-level concern and is filtered
+            // out of table-level output (the table set is complete
+            // regardless of wildcard expansion).
             assert_ops(
                 "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",
                 TableOperation {
@@ -419,7 +424,7 @@ mod tests {
                     reads: vec![table("t1"), table("t2")],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -536,7 +541,7 @@ mod tests {
                     reads: vec![],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::UnsupportedStatement)],
+                    diagnostics: vec![diag(TableLevelDiagnosticKind::UnsupportedStatement)],
                 },
             );
         }
@@ -552,7 +557,7 @@ mod tests {
                     reads: vec![table("t1")],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
             assert_nth_ops(
@@ -563,7 +568,7 @@ mod tests {
                     reads: vec![table("t2")],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -595,7 +600,7 @@ mod tests {
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![flow("t2", "t1")],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -775,7 +780,7 @@ mod tests {
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![flow("t2", "t1")],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -789,7 +794,7 @@ mod tests {
                     reads: vec![table("t1")],
                     writes: vec![table("v1")],
                     lineage: vec![flow("t1", "v1")],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -847,7 +852,7 @@ mod tests {
                     reads: vec![],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::UnsupportedStatement)],
+                    diagnostics: vec![diag(TableLevelDiagnosticKind::UnsupportedStatement)],
                 },
             );
         }
@@ -865,7 +870,7 @@ mod tests {
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![flow("t2", "t1")],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -879,7 +884,7 @@ mod tests {
                     reads: vec![table("t2"), table("t3")],
                     writes: vec![table("t1")],
                     lineage: vec![flow("t2", "t1"), flow("t3", "t1")],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -896,7 +901,7 @@ mod tests {
                     reads: vec![table("t2"), table("t3")],
                     writes: vec![table("t1")],
                     lineage: vec![flow("t2", "t1")],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -914,7 +919,7 @@ mod tests {
                     reads: vec![table("t2"), table("t3"), table("t4")],
                     writes: vec![table("t1")],
                     lineage: vec![flow("t2", "t1"), flow("t3", "t1")],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -956,7 +961,7 @@ mod tests {
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![flow("t2", "t1")],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -970,7 +975,7 @@ mod tests {
                     reads: vec![table("t1")],
                     writes: vec![table("v1")],
                     lineage: vec![flow("t1", "v1")],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -999,10 +1004,7 @@ mod tests {
                     reads: vec![table("s")],
                     writes: vec![table("t1")],
                     lineage: vec![flow("s", "t1")],
-                    diagnostics: vec![
-                        diag(DiagnosticKind::WildcardSuppressed),
-                        diag(DiagnosticKind::WildcardSuppressed),
-                    ],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -1020,10 +1022,7 @@ mod tests {
                     reads: vec![table("s"), table("x")],
                     writes: vec![table("t1")],
                     lineage: vec![flow("s", "t1")],
-                    diagnostics: vec![
-                        diag(DiagnosticKind::WildcardSuppressed),
-                        diag(DiagnosticKind::WildcardSuppressed),
-                    ],
+                    diagnostics: vec![],
                 },
             );
         }
@@ -1037,7 +1036,7 @@ mod tests {
                     reads: vec![table("t1"), table("t2")],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![],
                 },
             );
         }

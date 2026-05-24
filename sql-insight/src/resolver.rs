@@ -53,7 +53,7 @@ pub(super) use rename::{rename_projection_groups, rename_relation_schema};
 use sqlparser::ast::Statement;
 
 use crate::catalog::Catalog;
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::ColumnLevelDiagnostic;
 use crate::error::Error;
 
 /// The end-of-walk result the resolver produces. Holds the scope
@@ -65,7 +65,7 @@ use crate::error::Error;
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct Resolution {
-    pub(crate) diagnostics: Vec<Diagnostic>,
+    pub(crate) diagnostics: Vec<ColumnLevelDiagnostic>,
     pub(crate) scopes: Vec<Scope>,
     /// Column refs that survive the synthetic-binding filter (see
     /// [`Resolution::real_column_refs`]).
@@ -102,7 +102,7 @@ pub(crate) struct Resolver<'a> {
     /// enrichment; table schemas stay `RelationSchema::Unknown` in
     /// that case.
     catalog: Option<&'a dyn Catalog>,
-    diagnostics: Vec<Diagnostic>,
+    diagnostics: Vec<ColumnLevelDiagnostic>,
     scopes: ScopeStack,
     column_refs: Vec<RawColumnRef>,
     flow_edges: Vec<FlowEdge>,

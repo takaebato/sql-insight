@@ -4,7 +4,7 @@
 
 use core::fmt;
 
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 pub use crate::relation::TableReference;
 use crate::resolver::Resolver;
@@ -54,7 +54,7 @@ impl fmt::Display for Tables {
 #[derive(Debug, PartialEq)]
 pub struct TableExtraction {
     pub tables: Vec<TableReference>,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<TableLevelDiagnostic>,
 }
 
 impl TableExtraction {
@@ -101,7 +101,13 @@ impl TableExtractor {
         let resolution = Resolver::resolve_statement(None, statement)?;
         Ok(TableExtraction {
             tables: resolution.tables(),
-            diagnostics: resolution.diagnostics,
+            // Project resolver diagnostics to table granularity; column
+            // resolution / wildcard gaps don't affect the table list.
+            diagnostics: resolution
+                .diagnostics
+                .iter()
+                .filter_map(|d| d.to_table_level())
+                .collect(),
         })
     }
 }
@@ -206,7 +212,7 @@ mod tests {
             assert_eq!(extraction.diagnostics.len(), 1);
             assert_eq!(
                 extraction.diagnostics[0].kind,
-                crate::DiagnosticKind::UnsupportedStatement
+                crate::TableLevelDiagnosticKind::UnsupportedStatement
             );
             assert!(extraction.diagnostics[0]
                 .message

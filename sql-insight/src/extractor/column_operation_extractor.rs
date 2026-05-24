@@ -67,7 +67,7 @@
 //! typos that would otherwise silently resolve become unresolved.
 
 use crate::catalog::Catalog;
-use crate::diagnostic::{Diagnostic, DiagnosticKind};
+use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::error::Error;
 use crate::extractor::table_operation_extractor::StatementKind;
 use crate::relation::TableReference;
@@ -148,7 +148,7 @@ pub struct ColumnOperation {
     /// like `reads`.
     pub writes: Vec<ColumnReference>,
     pub lineage: Vec<ColumnLineageEdge>,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<ColumnLevelDiagnostic>,
 }
 
 /// A column-level identity reference: an optional owning table plus the
@@ -230,10 +230,9 @@ pub enum ColumnTarget {
 /// cardinality, etc.) is deliberately not modelled here — it is lossy
 /// for edge cases (window aggregates, value-preserving `STRING_AGG`)
 /// and not load-bearing for the core dependency / impact-analysis use
-/// case. The enum is `#[non_exhaustive]`, so a finer variant can be
-/// added (SemVer-minor) if a concrete consumer needs it.
+/// case. A finer variant can be added later if a concrete consumer
+/// needs it (a breaking change while the crate is pre-1.0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum ColumnLineageKind {
     /// Source value is forwarded unchanged. Composition stays
     /// `Passthrough` only when every step in the chain is also
@@ -277,10 +276,10 @@ impl ColumnOperationExtractor {
         if matches!(kind, StatementKind::Unsupported) {
             if !diagnostics
                 .iter()
-                .any(|d| matches!(d.kind, DiagnosticKind::UnsupportedStatement))
+                .any(|d| matches!(d.kind, ColumnLevelDiagnosticKind::UnsupportedStatement))
             {
-                diagnostics.push(Diagnostic {
-                    kind: DiagnosticKind::UnsupportedStatement,
+                diagnostics.push(ColumnLevelDiagnostic {
+                    kind: ColumnLevelDiagnosticKind::UnsupportedStatement,
                     message: format!(
                         "Unsupported statement for column operation extraction: {}",
                         statement
@@ -804,10 +803,10 @@ mod tests {
         );
     }
 
-    /// Placeholder `Diagnostic` for `assert_column_ops.expected.diagnostics`.
+    /// Placeholder `ColumnLevelDiagnostic` for `assert_column_ops.expected.diagnostics`.
     /// Only the kind is compared; message and span are placeholders.
-    fn diag(kind: DiagnosticKind) -> Diagnostic {
-        Diagnostic {
+    fn diag(kind: ColumnLevelDiagnosticKind) -> ColumnLevelDiagnostic {
+        ColumnLevelDiagnostic {
             kind,
             message: String::new(),
             span: None,
@@ -1085,7 +1084,7 @@ mod tests {
                             kind: ColumnLineageKind::Passthrough,
                         },
                     ],
-                    diagnostics: vec![diag(DiagnosticKind::UnresolvedColumn)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnresolvedColumn)],
                 },
             );
         }
@@ -1121,7 +1120,7 @@ mod tests {
                     reads: vec![read("t1", "id"), read("t2", "id"), read("t2", "y")],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
                 },
             );
         }
@@ -1141,7 +1140,7 @@ mod tests {
                     reads: vec![read("t1", "id"), read("t1", "zz"), read("t1", "outer_col")],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
                 },
             );
         }
@@ -1775,7 +1774,7 @@ mod tests {
                     reads: vec![],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::UnsupportedStatement)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
                 },
             );
         }
@@ -1794,7 +1793,7 @@ mod tests {
                     reads: vec![],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
                 },
             );
             // Span info ("at L1:C8") is duplicated in message and surfaced
@@ -1820,7 +1819,7 @@ mod tests {
                     reads: vec![],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
                 },
             );
         }
@@ -1861,7 +1860,7 @@ mod tests {
                     reads: vec![],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
                 },
             );
         }
@@ -2080,7 +2079,7 @@ mod tests {
                     reads: vec![],
                     writes: vec![],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
                 },
             );
         }
@@ -3727,7 +3726,7 @@ mod tests {
                     reads: vec![],
                     writes: vec![write("t", "a")],
                     lineage: vec![],
-                    diagnostics: vec![diag(DiagnosticKind::WildcardSuppressed)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
                 },
             );
         }
@@ -3862,7 +3861,7 @@ mod tests {
                         target: out("a", 0),
                         kind: ColumnLineageKind::Passthrough,
                     }],
-                    diagnostics: vec![diag(DiagnosticKind::UnresolvedColumn)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnresolvedColumn)],
                 },
             );
         }
@@ -3997,7 +3996,7 @@ mod tests {
 
         #[test]
         fn catalog_confirmed_ambiguity_reports_diagnostic() {
-            // Both tables Known and both declare `a`. Diagnostic must
+            // Both tables Known and both declare `a`. ColumnLevelDiagnostic must
             // fire — without catalog the same query is silently
             // ambiguous (no diagnostic) since Unknown schemas could
             // contain anything. assert_column_ops compares diagnostics
@@ -4021,7 +4020,7 @@ mod tests {
                         target: out("a", 0),
                         kind: ColumnLineageKind::Passthrough,
                     }],
-                    diagnostics: vec![diag(DiagnosticKind::AmbiguousColumn)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::AmbiguousColumn)],
                 },
             );
             // Specific message-content checks for this test's purpose.
@@ -4035,7 +4034,7 @@ mod tests {
             let amb = ops
                 .diagnostics
                 .iter()
-                .find(|d| matches!(d.kind, DiagnosticKind::AmbiguousColumn))
+                .find(|d| matches!(d.kind, ColumnLevelDiagnosticKind::AmbiguousColumn))
                 .expect("AmbiguousColumn must fire");
             assert!(amb.message.contains("ambiguous column `a`"));
             assert!(amb.message.contains("t1"));
@@ -4062,7 +4061,7 @@ mod tests {
                         target: out("z", 0),
                         kind: ColumnLineageKind::Passthrough,
                     }],
-                    diagnostics: vec![diag(DiagnosticKind::UnresolvedColumn)],
+                    diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnresolvedColumn)],
                 },
             );
             // Message-content check for this test's purpose.
@@ -4073,7 +4072,7 @@ mod tests {
             let unr = ops
                 .diagnostics
                 .iter()
-                .find(|d| matches!(d.kind, DiagnosticKind::UnresolvedColumn))
+                .find(|d| matches!(d.kind, ColumnLevelDiagnosticKind::UnresolvedColumn))
                 .expect("UnresolvedColumn must fire");
             assert!(unr.message.contains("unresolved column `z`"));
         }

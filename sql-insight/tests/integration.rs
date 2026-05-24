@@ -9,8 +9,9 @@ use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::test_utils::all_dialects;
 use sql_insight::{
     extract_column_operations, extract_crud_tables, extract_table_operations, extract_tables,
-    Catalog, ColumnLineageKind, ColumnSchema, ColumnTarget, CrudTables, Diagnostic, DiagnosticKind,
-    NormalizerOptions, StatementKind, TableExtraction, TableReference, Tables,
+    Catalog, ColumnLevelDiagnostic, ColumnLevelDiagnosticKind, ColumnLineageKind, ColumnSchema,
+    ColumnTarget, CrudTables, NormalizerOptions, StatementKind, TableExtraction,
+    TableLevelDiagnosticKind, TableReference, Tables,
 };
 use std::collections::HashMap;
 
@@ -91,6 +92,7 @@ mod extract_crud_tables {
                         }],
                         update_tables: vec![],
                         delete_tables: vec![],
+                        diagnostics: vec![],
                     }),
                     Ok(CrudTables {
                         create_tables: vec![],
@@ -101,6 +103,7 @@ mod extract_crud_tables {
                         }],
                         update_tables: vec![],
                         delete_tables: vec![],
+                        diagnostics: vec![],
                     }),
                 ],
                 "Failed for dialect: {dialect:?}"
@@ -124,6 +127,7 @@ mod extract_crud_tables {
                     }],
                     update_tables: vec![],
                     delete_tables: vec![],
+                    diagnostics: vec![],
                 })],
                 "Failed for dialect: {dialect:?}"
             )
@@ -191,7 +195,7 @@ mod extract_tables {
         assert_eq!(extraction.diagnostics.len(), 1);
         assert_eq!(
             extraction.diagnostics[0].kind,
-            DiagnosticKind::UnsupportedStatement
+            TableLevelDiagnosticKind::UnsupportedStatement
         );
     }
 }
@@ -257,7 +261,7 @@ mod extract_table_operations {
         assert!(ops
             .diagnostics
             .iter()
-            .any(|d| matches!(d.kind, DiagnosticKind::UnsupportedStatement)));
+            .any(|d| matches!(d.kind, TableLevelDiagnosticKind::UnsupportedStatement)));
     }
 }
 
@@ -329,7 +333,7 @@ mod extract_column_operations {
         assert!(ops
             .diagnostics
             .iter()
-            .any(|d| matches!(d.kind, DiagnosticKind::WildcardSuppressed)));
+            .any(|d| matches!(d.kind, ColumnLevelDiagnosticKind::WildcardSuppressed)));
     }
 }
 
@@ -360,7 +364,7 @@ mod catalog {
         }
     }
 
-    fn count_kind(diagnostics: &[Diagnostic], kind: DiagnosticKind) -> usize {
+    fn count_kind(diagnostics: &[ColumnLevelDiagnostic], kind: ColumnLevelDiagnosticKind) -> usize {
         diagnostics.iter().filter(|d| d.kind == kind).count()
     }
 
@@ -399,11 +403,11 @@ mod catalog {
 
         let with_count = count_kind(
             &with[0].as_ref().unwrap().diagnostics,
-            DiagnosticKind::AmbiguousColumn,
+            ColumnLevelDiagnosticKind::AmbiguousColumn,
         );
         let without_count = count_kind(
             &without[0].as_ref().unwrap().diagnostics,
-            DiagnosticKind::AmbiguousColumn,
+            ColumnLevelDiagnosticKind::AmbiguousColumn,
         );
         assert_eq!(with_count, 1, "with catalog should report AmbiguousColumn");
         assert_eq!(
@@ -422,11 +426,11 @@ mod catalog {
 
         let with_count = count_kind(
             &with[0].as_ref().unwrap().diagnostics,
-            DiagnosticKind::UnresolvedColumn,
+            ColumnLevelDiagnosticKind::UnresolvedColumn,
         );
         let without_count = count_kind(
             &without[0].as_ref().unwrap().diagnostics,
-            DiagnosticKind::UnresolvedColumn,
+            ColumnLevelDiagnosticKind::UnresolvedColumn,
         );
         assert_eq!(with_count, 1);
         assert_eq!(without_count, 0);
@@ -445,7 +449,7 @@ mod diagnostics {
         assert!(ops
             .diagnostics
             .iter()
-            .any(|d| matches!(d.kind, DiagnosticKind::UnsupportedStatement)));
+            .any(|d| matches!(d.kind, TableLevelDiagnosticKind::UnsupportedStatement)));
     }
 
     #[test]
@@ -462,7 +466,7 @@ mod diagnostics {
         let wildcard = ops
             .diagnostics
             .iter()
-            .find(|d| matches!(d.kind, DiagnosticKind::WildcardSuppressed))
+            .find(|d| matches!(d.kind, ColumnLevelDiagnosticKind::WildcardSuppressed))
             .expect("WildcardSuppressed not found");
         assert!(
             wildcard.message.contains("at L1:"),
@@ -509,7 +513,7 @@ mod diagnostics {
         let unresolved = ops
             .diagnostics
             .iter()
-            .find(|d| matches!(d.kind, DiagnosticKind::UnresolvedColumn))
+            .find(|d| matches!(d.kind, ColumnLevelDiagnosticKind::UnresolvedColumn))
             .expect("UnresolvedColumn not found");
         let span = unresolved.span.expect("ident token carries a span");
         assert_eq!(span.start.line, 1);
