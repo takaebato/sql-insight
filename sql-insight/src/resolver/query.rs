@@ -11,7 +11,9 @@ use sqlparser::ast::{
 
 impl<'a> Resolver<'a> {
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
-        let scope_id = self.scopes.push_query_scope(self.ctx.scope_kind);
+        // Push a fresh scope for the query body (the returned id isn't
+        // needed — bindings resolve via the stack walk).
+        self.scopes.push_query_scope(self.ctx.scope_kind);
         // Swap in a fresh projection buffer for this query — restored on
         // return — so each ResolvedQuery owns exactly its own groups
         // without leaking into siblings or ancestors.
@@ -72,7 +74,6 @@ impl<'a> Resolver<'a> {
         self.scopes.pop_scope();
         let projections = std::mem::replace(&mut self.current_projections, prev_projections);
         Ok(ResolvedQuery {
-            scope_id,
             output_schema: body_schema,
             projections,
         })

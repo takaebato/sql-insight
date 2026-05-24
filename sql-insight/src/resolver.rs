@@ -63,7 +63,6 @@ use crate::error::Error;
 /// `column_refs` and `lineage_edges` before the resolution leaves the
 /// resolver.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct Resolution {
     pub(crate) diagnostics: Vec<ColumnLevelDiagnostic>,
     pub(crate) scopes: Vec<Scope>,
@@ -76,16 +75,13 @@ pub(crate) struct Resolution {
     pub(crate) lineage_edges: Vec<LineageEdge>,
 }
 
-/// What `resolve_query` returns: the scope id pushed for this query
-/// (mostly informational), the body's `output_schema`, and the body
-/// projections per top-level SELECT (one entry, or one per UNION
+/// What `resolve_query` returns: the body's `output_schema` and the
+/// body projections per top-level SELECT (one entry, or one per UNION
 /// branch). Callers decide whether to emit `QueryOutput` edges
 /// (default), pair positionally with relation target columns
 /// (INSERT / CTAS), or bubble them through `SetExpr::Query`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct ResolvedQuery {
-    pub(crate) scope_id: ScopeId,
     pub(crate) output_schema: RelationSchema,
     pub(crate) projections: Vec<ProjectionGroup>,
 }

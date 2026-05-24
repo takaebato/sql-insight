@@ -36,7 +36,6 @@ pub(crate) struct ScopeId(pub(super) usize);
 ///   their own kind, so `INSERT INTO t SELECT FROM s WHERE id IN
 ///   (SELECT id FROM x)` emits `s → t` but not `x → t`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub(crate) enum ScopeKind {
     Body,
     Predicate,
@@ -59,14 +58,12 @@ impl BindingKey {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum RelationSchema {
     Known(Vec<Column>),
     Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct Column {
     pub(crate) name: Ident,
 }
@@ -75,7 +72,6 @@ pub(crate) struct Column {
 /// one of the synthetic intermediates (CTE / derived subquery / table
 /// function) that SQL exposes as a named row set.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum Binding {
     // `table` is boxed because the variant otherwise dwarfs the others
     // (TableReference is ~300B) and inflates the entire enum's size.
@@ -113,7 +109,6 @@ pub(crate) enum Binding {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct Scope {
     pub(crate) id: ScopeId,
     pub(crate) parent: Option<ScopeId>,
