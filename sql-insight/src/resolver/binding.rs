@@ -41,19 +41,25 @@ pub(crate) enum ScopeKind {
     Predicate,
 }
 
+/// A normalized identifier key for binding lookup.
+///
+/// Quoting controls whether the name is *case-folded*, not which
+/// namespace it lives in: an unquoted identifier folds to lowercase
+/// (matching PostgreSQL / MySQL convention) while a quoted one is kept
+/// exact. Two identifiers match iff their normalized forms are equal —
+/// so `"id"` and unquoted `id` are the same column, while `"ID"` and
+/// `id` are not. (Which way unquoted names fold is dialect-specific;
+/// lowercase is an approximation the resolver doesn't vary by dialect.)
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum BindingKey {
-    Unquoted(String),
-    Quoted(String),
-}
+pub(super) struct BindingKey(String);
 
 impl BindingKey {
     pub(super) fn from_ident(ident: &Ident) -> Self {
-        if ident.quote_style.is_some() {
-            Self::Quoted(ident.value.clone())
+        Self(if ident.quote_style.is_some() {
+            ident.value.clone()
         } else {
-            Self::Unquoted(ident.value.to_ascii_lowercase())
-        }
+            ident.value.to_ascii_lowercase()
+        })
     }
 }
 
