@@ -133,12 +133,19 @@
 //!
 //! ## Behavior notes
 //!
-//! - **Catalog is optional, and shapes resolver strictness**.
-//!   Without a catalog the resolver runs best-effort: table schemas
-//!   stay `Unknown`, ambiguous and unresolved column diagnostics are
-//!   suppressed (every `Unknown` schema could contain anything).
-//!   With a catalog, those diagnostics fire and INSERT positional
-//!   pairing pairs source projections with target columns.
+//! - **Catalog is optional, but load-bearing for column lineage**.
+//!   Table-level extraction is robust catalog-free — a table's
+//!   identity comes straight from the FROM clause. Column-level
+//!   extraction degrades without one: an unqualified column across
+//!   multiple in-scope tables (`SELECT x FROM a JOIN b`) is not
+//!   determinable from the SQL text alone, so it resolves to
+//!   `table: None`. Qualified (`t.col`) and single-table refs resolve
+//!   fine catalog-free. The ambiguous / unresolved-column diagnostics
+//!   that explain those `None`s fire only *with* a catalog; without
+//!   one they are suppressed (every `Unknown` schema could contain
+//!   anything, so flagging would flood the output with noise). With a
+//!   catalog, those diagnostics fire and INSERT positional pairing
+//!   pairs source projections with target columns.
 //! - **Per-statement isolation**: every extractor returns
 //!   `Vec<Result<X, Error>>` so a bad statement in a multi-statement
 //!   batch doesn't take the rest down.

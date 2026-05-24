@@ -172,13 +172,17 @@ you can rely on:
   etc.) — catalog enrichment doesn't reach them yet.
 - **Recursive CTE bodies** are pre-bound under a stub; flow
   composition through them is deferred.
-- **Aggregate detection** uses a built-in name list across major
-  dialects plus structural markers — dialect-specific UDAFs may be
-  misclassified.
-- **Catalog is optional**, and its presence shapes resolver
-  strictness: with a catalog, ambiguous / unresolved column
-  diagnostics fire; without, they are suppressed (every `Unknown`
-  schema could contain anything).
+- **Catalog is optional, but load-bearing for column lineage.**
+  Table-level extraction is robust catalog-free (a table's identity
+  comes straight from the FROM clause). Column-level extraction
+  degrades without one: an unqualified column across multiple
+  in-scope tables (`SELECT x FROM a JOIN b`) can't be attributed from
+  the SQL text alone, so it resolves to `table: None`. Qualified
+  (`t.col`) and single-table queries resolve fine catalog-free. The
+  ambiguous / unresolved-column diagnostics that would explain those
+  `None`s only fire *with* a catalog — without one they are
+  suppressed (every `Unknown` schema could contain anything, so
+  flagging would be noise).
 - **No type checking** — the catalog is an enrichment input, not a
   validator.
 
