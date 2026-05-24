@@ -303,10 +303,10 @@ mod extract_column_operations {
         let result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.lineage.len(), 2);
-        // Both lineage edges are Passthrough into Persisted targets.
+        // Both lineage edges are Passthrough into Relation targets.
         for flow in &ops.lineage {
             assert!(matches!(flow.kind, ColumnLineageKind::Passthrough));
-            assert!(matches!(flow.target, ColumnTarget::Persisted(_)));
+            assert!(matches!(flow.target, ColumnTarget::Relation(_)));
         }
     }
 
@@ -378,17 +378,17 @@ mod catalog {
         let sql = "INSERT INTO orders SELECT id, amount FROM staging";
         let result = extract_column_operations(&GenericDialect {}, sql, Some(&catalog)).unwrap();
         let ops = result[0].as_ref().unwrap();
-        // Two lineage edges into Persisted orders.id / orders.total.
-        let persisted_targets: Vec<_> = ops
+        // Two lineage edges into Relation targets orders.id / orders.total.
+        let relation_targets: Vec<_> = ops
             .lineage
             .iter()
             .filter_map(|f| match &f.target {
-                ColumnTarget::Persisted(c) => Some(c.name.value.as_str()),
+                ColumnTarget::Relation(c) => Some(c.name.value.as_str()),
                 _ => None,
             })
             .collect();
-        assert!(persisted_targets.contains(&"id"));
-        assert!(persisted_targets.contains(&"total"));
+        assert!(relation_targets.contains(&"id"));
+        assert!(relation_targets.contains(&"total"));
     }
 
     #[test]
@@ -613,9 +613,9 @@ mod invariants {
         w.table.clone()
     }
 
-    fn flow_persisted_table(f: &ColumnLineageEdge) -> Option<TableReference> {
+    fn flow_relation_table(f: &ColumnLineageEdge) -> Option<TableReference> {
         match &f.target {
-            ColumnTarget::Persisted(c) => c.table.clone(),
+            ColumnTarget::Relation(c) => c.table.clone(),
             ColumnTarget::QueryOutput { .. } => None,
         }
     }
@@ -683,15 +683,15 @@ mod invariants {
     }
 
     #[test]
-    fn persisted_flow_targets_resolve_to_known_write_tables() {
+    fn relation_flow_targets_resolve_to_known_write_tables() {
         for sql in corpus() {
             for (idx, pair) in extract_paired(sql).into_iter().enumerate() {
                 let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.clone()));
                 for f in &pair.col.lineage {
-                    if let Some(target_table) = flow_persisted_table(f) {
+                    if let Some(target_table) = flow_relation_table(f) {
                         assert!(
                             table_op_writes.contains(&target_table),
-                            "Persisted flow target {target_table:?} not in table_op writes \
+                            "Relation flow target {target_table:?} not in table_op writes \
                              for statement {idx} of SQL: {sql}\n\
                              table_op writes: {table_op_writes:?}"
                         );

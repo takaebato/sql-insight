@@ -7,7 +7,7 @@
 //! ```
 //!
 //! Demonstrates per-column lineage: classification by `ColumnLineageKind`,
-//! `Persisted` vs `QueryOutput` targets, and occurrence-based reads.
+//! `Relation` vs `QueryOutput` targets, and occurrence-based reads.
 
 use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::{extract_column_operations, ColumnLineageKind, ColumnTarget};
@@ -44,7 +44,7 @@ fn main() {
             flow.source.name.value
         );
         let target = match &flow.target {
-            ColumnTarget::Persisted(c) => format!(
+            ColumnTarget::Relation(c) => format!(
                 "{}.{}",
                 c.table
                     .as_ref()

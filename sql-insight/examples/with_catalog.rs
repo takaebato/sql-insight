@@ -67,7 +67,7 @@ fn main() {
         let ops = results[0].as_ref().unwrap();
         println!("--- 1. INSERT without explicit column list ---");
         for flow in &ops.lineage {
-            if let ColumnTarget::Persisted(target) = &flow.target {
+            if let ColumnTarget::Relation(target) = &flow.target {
                 println!(
                     "  {} -> orders.{} ({:?})",
                     flow.source.name.value, target.name.value, flow.kind

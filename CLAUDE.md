@@ -81,8 +81,8 @@ by hand.
     Sources flowing through CTE / derived intermediates are composed
     end-to-end; composition yields `Transformation` if any step
     transforms. Targets: `QueryOutput { name, position }` for
-    transient SELECT outputs, `Persisted(ColumnReference)` for
-    writes into a real relation.
+    transient SELECT outputs, `Relation(ColumnReference)` for
+    writes into a named relation (table or view).
 - The value-vs-filter distinction is structural, not a tag: a value
   contributor is a `lineage` source; a filter-only column is in
   `reads` but not `lineage`.

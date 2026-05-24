@@ -202,7 +202,7 @@ Runnable examples under
   batch, with `StatementKind`-based dispatch.
 - [`column_operations.rs`](sql-insight/examples/column_operations.rs) —
   per-column reads and lineage classified by `ColumnLineageKind`
-  (Passthrough vs Transformation) into `Persisted` vs `QueryOutput`
+  (Passthrough vs Transformation) into `Relation` vs `QueryOutput`
   targets.
 - [`with_catalog.rs`](sql-insight/examples/with_catalog.rs) — supplying
   a `Catalog` enables INSERT positional column pairing and surfaces
