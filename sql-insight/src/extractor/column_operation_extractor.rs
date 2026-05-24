@@ -450,14 +450,13 @@ fn collect_writes(
                 }
             }
         }
-        Statement::CreateTable(ct) => {
-            // Plain `CREATE TABLE t (a INT, ...)` (no AS) is pure DDL —
-            // no data write. Only CTAS (with a query) emits writes.
-            if ct.query.is_some() {
-                let target = TableReference::try_from(&ct.name)?;
-                let explicit: Vec<Ident> = ct.columns.iter().map(|c| c.name.clone()).collect();
-                writes.extend(created_writes(&target, &explicit, resolution));
-            }
+        // Only CTAS (`CREATE TABLE ... AS query`) writes data; plain
+        // `CREATE TABLE t (a INT, ...)` is pure DDL and falls through to
+        // the no-op arm below.
+        Statement::CreateTable(ct) if ct.query.is_some() => {
+            let target = TableReference::try_from(&ct.name)?;
+            let explicit: Vec<Ident> = ct.columns.iter().map(|c| c.name.clone()).collect();
+            writes.extend(created_writes(&target, &explicit, resolution));
         }
         Statement::CreateView(cv) => {
             let target = TableReference::try_from(&cv.name)?;
