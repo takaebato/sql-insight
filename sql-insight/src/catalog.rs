@@ -14,7 +14,7 @@ use std::fmt;
 
 use sqlparser::ast::Ident;
 
-use crate::relation::TableReference;
+use crate::reference::TableReference;
 
 /// Provides the column list of a table.
 ///

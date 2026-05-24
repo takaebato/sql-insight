@@ -1,7 +1,7 @@
 use super::projection::{projection_item_kind, projection_item_output_name};
 use super::{ProjectionGroup, ProjectionItem, RelationSchema, ResolvedQuery, Resolver, TableRole};
 use crate::error::Error;
-use crate::relation::TableReference;
+use crate::reference::TableReference;
 use sqlparser::ast::{
     ConnectByKind, Distinct, Expr, GroupByExpr, GroupByWithModifier, Ident, NamedWindowExpr, Query,
     Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Table, TopQuantity, Values,

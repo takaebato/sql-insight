@@ -22,7 +22,7 @@
 use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
-use crate::relation::TableReference;
+use crate::reference::TableReference;
 use crate::resolver::Resolver;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;

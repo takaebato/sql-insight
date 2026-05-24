@@ -1,4 +1,9 @@
-//! Relation model types shared by SQL inspection features.
+//! Reference (identity) types shared by SQL inspection features.
+//!
+//! [`TableReference`] / [`ColumnReference`] are *qualified names* that
+//! denote a table / column in a catalog or schema — pure identity, not
+//! a relation (no tuples) nor a schema (no attribute types). They carry
+//! only enough to name the thing and compare two names for equality.
 
 use core::fmt;
 

@@ -173,7 +173,7 @@ pub mod error;
 pub mod extractor;
 pub mod formatter;
 pub mod normalizer;
-pub mod relation;
+pub mod reference;
 pub(crate) mod resolver;
 
 pub use catalog::{Catalog, ColumnSchema};
@@ -181,7 +181,7 @@ pub use diagnostic::*;
 pub use extractor::*;
 pub use formatter::*;
 pub use normalizer::*;
-pub use relation::*;
+pub use reference::*;
 pub use sqlparser;
 
 #[doc(hidden)]

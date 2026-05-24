@@ -7,7 +7,7 @@ use sqlparser::ast::{Ident, Query};
 
 use crate::error::Error;
 use crate::extractor::column_operation_extractor::ColumnLineageKind;
-use crate::relation::TableReference;
+use crate::reference::TableReference;
 
 use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolver};
 

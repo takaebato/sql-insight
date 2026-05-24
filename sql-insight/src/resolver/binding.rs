@@ -7,7 +7,7 @@ use sqlparser::tokenizer::Span;
 
 use crate::catalog::ColumnSchema;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
-use crate::relation::TableReference;
+use crate::reference::TableReference;
 
 use super::{ProjectionGroup, Resolution, Resolver};
 

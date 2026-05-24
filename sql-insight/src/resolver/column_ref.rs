@@ -5,7 +5,7 @@
 use sqlparser::ast::Ident;
 
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
-use crate::relation::TableReference;
+use crate::reference::TableReference;
 
 use super::binding::{
     binding_alias_key, binding_confirms_column, binding_could_contain_column,

@@ -1,6 +1,6 @@
 use super::{LineageTargetSpec, ProjectionGroup, RelationSchema, Resolver, TableRole};
 use crate::error::Error;
-use crate::relation::TableReference;
+use crate::reference::TableReference;
 use sqlparser::ast::{
     Delete, FromTable, Ident, Merge, ObjectType, OnConflictAction, OnInsert, SelectItem, Statement,
     TableWithJoins, Update, UpdateTableFromKind,

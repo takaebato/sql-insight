@@ -71,7 +71,7 @@ use crate::catalog::Catalog;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::error::Error;
 use crate::extractor::table_operation_extractor::StatementKind;
-use crate::relation::{ColumnReference, TableReference};
+use crate::reference::{ColumnReference, TableReference};
 use crate::resolver::{LineageTargetSpec, RawColumnRef, Resolution, Resolver};
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, Ident, OnConflictAction, OnInsert, Statement,

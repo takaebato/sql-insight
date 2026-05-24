@@ -160,7 +160,7 @@ impl<'a> Resolver<'a> {
 mod tests {
     use super::*;
     use crate::catalog::ColumnSchema;
-    use crate::relation::TableReference;
+    use crate::reference::TableReference;
     use sqlparser::ast::Ident;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;

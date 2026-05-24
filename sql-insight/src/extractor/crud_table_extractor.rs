@@ -6,7 +6,7 @@ use std::fmt;
 
 use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
-use crate::relation::TableReference;
+use crate::reference::TableReference;
 use crate::{StatementKind, TableOperationExtractor};
 use sqlparser::ast::{MergeAction, Statement};
 use sqlparser::dialect::Dialect;
