@@ -43,13 +43,31 @@ pub(crate) enum ScopeKind {
 
 /// A normalized identifier key for binding lookup.
 ///
-/// Quoting controls whether the name is *case-folded*, not which
-/// namespace it lives in: an unquoted identifier folds to lowercase
-/// (matching PostgreSQL / MySQL convention) while a quoted one is kept
-/// exact. Two identifiers match iff their normalized forms are equal —
-/// so `"id"` and unquoted `id` are the same column, while `"ID"` and
-/// `id` are not. (Which way unquoted names fold is dialect-specific;
-/// lowercase is an approximation the resolver doesn't vary by dialect.)
+/// Two identifiers match iff their normalized forms are equal. The
+/// rule: fold an unquoted name to lowercase, keep a quoted name exact.
+/// So `"id"` and unquoted `id` are the same column, while `"ID"` and
+/// `id` are not.
+///
+/// This is one fixed rule, applied uniformly — it is *not* varied by
+/// dialect, nor by table-vs-column. Real dialects do diverge there
+/// (e.g. MySQL / BigQuery / SQLite treat quoting as mere escaping and
+/// keep quoted names case-insensitive; BigQuery columns are
+/// case-insensitive but its tables are case-sensitive; ClickHouse is
+/// fully case-sensitive). Modelling each faithfully would need a
+/// per-dialect identifier-resolution strategy, which is deferred — the
+/// fixed rule here is a deliberate common-denominator approximation:
+///
+/// - **Unquoted → lowercase** makes unquoted matching case-insensitive,
+///   which every supported dialect except ClickHouse does. (ClickHouse
+///   is over-matched — sound, just imprecise.) The fold *direction*
+///   only affects the quoted/unquoted edge; lowercase follows the
+///   popular majority (PG / MySQL / SQLite / BigQuery / Redshift / Spark)
+///   over the uppercase minority (ANSI / Oracle / Snowflake).
+/// - **Quoted → exact** follows the ANSI / PostgreSQL family, where
+///   quoting makes an identifier case-sensitive. The MySQL / BigQuery /
+///   SQLite family instead treat quoting as escaping, so this is
+///   stricter than they are for quoted names — accepted, since quoted
+///   identifiers are rare in practice.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct BindingKey(String);
 
