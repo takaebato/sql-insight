@@ -110,7 +110,7 @@ impl<'a> Resolver<'a> {
                     // table-lineage collapse reaches the same place
                     // from either definition or use site.
                     self.bind_cte(bind_name, schema, body, body_scope.unwrap());
-                    self.record_intermediate_table_ref(body_scope.unwrap());
+                    self.record_synthetic_table_ref(body_scope.unwrap());
                     return Ok(());
                 }
                 let (table, alias_ident) =
@@ -166,7 +166,7 @@ impl<'a> Resolver<'a> {
                         renamed_projections,
                         Some(resolved.body_scope),
                     );
-                    self.record_intermediate_table_ref(resolved.body_scope);
+                    self.record_synthetic_table_ref(resolved.body_scope);
                 }
                 if let Some(sample) = sample {
                     self.visit_table_sample_kind(sample)?;

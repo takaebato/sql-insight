@@ -18,8 +18,7 @@
 //! - [`lineage`]: `LineageEdge` / `LineageTargetSpec` and the emit
 //!   helpers that drive INSERT / CTAS / QueryOutput edge construction.
 //! - [`collapse`]: post-walk passes that collapse synthetic
-//!   intermediates out of the lineage chain and filter synthetic
-//!   reads.
+//!   relations out of the lineage chain and filter synthetic reads.
 //! - [`rename`]: CTE / derived column-alias renaming.
 //! - Walker modules ([`expr`], [`query`], [`statement`], [`table`]):
 //!   `visit_*` methods on `Resolver`, one per major AST
@@ -79,8 +78,7 @@ pub(crate) struct Resolution {
     /// [`Resolution::real_column_refs`]).
     pub(crate) column_refs: Vec<RawColumnRef>,
     /// Lineage edges after end-to-end collapse through CTE / derived
-    /// intermediates (see
-    /// [`Resolution::collapsed_lineage_edges`]).
+    /// synthetics (see [`Resolution::collapsed_lineage_edges`]).
     pub(crate) lineage_edges: Vec<LineageEdge>,
     /// Every `FROM`-position use of a table-like source captured
     /// during the walk. Drives table-lineage collapse (see
@@ -131,7 +129,7 @@ pub(crate) struct Resolver<'a> {
     /// [`Resolution::column_refs`].
     column_refs: Vec<RawColumnRef>,
     /// Lineage edges emitted directly during the walk. Post-pass
-    /// collapses through CTE / derived intermediates into
+    /// collapses through CTE / derived synthetics into
     /// [`Resolution::lineage_edges`].
     lineage_edges: Vec<LineageEdge>,
     /// In-progress `RawTableRef` buffer; moved into

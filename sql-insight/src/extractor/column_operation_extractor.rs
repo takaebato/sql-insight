@@ -15,7 +15,7 @@
 //!   the scope chain at walk time. A unique candidate binding wins;
 //!   0 or 2+ candidates leave `table: None` (the column name still
 //!   surfaces). References whose walk-time owning binding was a CTE,
-//!   derived table, or table function (synthetic intermediates, not
+//!   derived table, or table function (synthetic relations, not
 //!   real storage) are dropped from reads — only references to real
 //!   tables or unresolved names surface. `reads` is a plain
 //!   occurrence list of `ColumnReference`s in walk order: a column
@@ -42,8 +42,8 @@
 //!   per-assignment edges for
 //!   UPDATE SET. Sources that reference CTEs or derived tables are
 //!   collapsed end-to-end — references recurse through the
-//!   intermediate's body projections, so a SELECT through a chain of
-//!   CTEs surfaces lineage whose sources are the underlying base
+//!   synthetic's body projections, so a SELECT through a chain of
+//!   CTEs surfaces lineage whose sources are the underlying real
 //!   tables. Each edge is tagged with a `ColumnLineageKind`:
 //!   `Passthrough` (the value is forwarded unchanged — a bare column
 //!   ref, rename included) or `Transformation` (any expression that

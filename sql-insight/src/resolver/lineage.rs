@@ -14,8 +14,8 @@ use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolv
 /// A pre-resolution column lineage record. `source` still needs
 /// scope-chain resolution (for unqualified parts); `target` is fully
 /// spec'd by the resolver; `kind` is the public `ColumnLineageKind` to
-/// surface (collapsed further by `collapsed_lineage_edges` when the source
-/// goes through a synthetic intermediate).
+/// surface (collapsed further by `collapsed_lineage_edges` when the
+/// source goes through a synthetic relation).
 ///
 /// Created by callers from [`ProjectionGroup`]s (for SELECT-style
 /// lineage edges — INSERT pairs with target columns, top-level / nested
@@ -25,14 +25,14 @@ use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolv
 pub(crate) struct LineageEdge {
     /// Source column ref as recorded at the walk site. Still carries
     /// `scope_id` so collapse can re-resolve through synthetic
-    /// intermediates.
+    /// relations.
     pub(crate) source: RawColumnRef,
     /// Where the value flows to — a transient SELECT output column
     /// or a real-relation column.
     pub(crate) target: LineageTargetSpec,
     /// `Passthrough` (bare forwarded column) or `Transformation`
     /// (anything value-changing). Composed with the inner edge's
-    /// kind when the source goes through a CTE / derived intermediate.
+    /// kind when the source goes through a CTE / derived synthetic.
     pub(crate) kind: ColumnLineageKind,
 }
 

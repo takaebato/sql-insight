@@ -8,7 +8,7 @@
 //!   only shows real-storage references and unresolved names.
 //! - [`Resolution::collapsed_feeding_table_sources`] walks the
 //!   captured `RawTableRef` events and recursively expands
-//!   intermediate uses (CTE / derived) into the real tables
+//!   synthetic uses (CTE / derived) into the real tables
 //!   underneath, producing the lineage-source list at table
 //!   granularity.
 
@@ -30,9 +30,9 @@ impl Resolution {
     /// Filter [`column_refs`](Resolution::column_refs) down
     /// to "real reads": references whose walk-time owning binding was
     /// a `Table` (or unresolved). Refs that pointed at a synthetic
-    /// intermediate (`Cte` / `DerivedTable` / `TableFunction`) are
-    /// dropped — those intermediates aren't storage, so they don't
-    /// belong in the public reads surface.
+    /// relation (`Cte` / `DerivedTable` / `TableFunction`) are dropped
+    /// — synthetics aren't storage, so they don't belong in the public
+    /// reads surface.
     pub(crate) fn real_column_refs(&self) -> Vec<RawColumnRef> {
         self.column_refs
             .iter()
@@ -115,12 +115,12 @@ impl Resolution {
         }
     }
 
-    /// Compose [`RawTableRef`]s into the real-table lineage source list:
-    /// for each top-level use, emit the real table directly, or recurse
-    /// into the intermediate's `body_scope` subtree to gather the real
-    /// tables underneath. Uses whose scope has a `Predicate` ancestor
-    /// (WHERE / JOIN ON / etc.) are filtered out — they're filter
-    /// position, not data-feeding.
+    /// Collapse [`RawTableRef`]s into the real-table lineage source
+    /// list: for each top-level use, emit the real table directly, or
+    /// recurse into the synthetic's `body_scope` subtree to gather the
+    /// real tables underneath. Uses whose scope has a `Predicate`
+    /// ancestor (WHERE / JOIN ON / etc.) are filtered out — they're
+    /// filter position, not data-feeding.
     ///
     /// Occurrence-based: a statement using the same source more than
     /// once (`FROM s AS x JOIN s AS y`, repeated `FROM cte` across
@@ -129,17 +129,16 @@ impl Resolution {
     /// [`Resolution::collapsed_lineage_edges`] (column-level) on
     /// multiplicity.
     ///
-    /// Cycle-safe: each visited intermediate `body_scope` is recorded
-    /// so recursive CTE self-references terminate after one pass.
+    /// Cycle-safe: each visited synthetic `body_scope` is recorded so
+    /// recursive CTE self-references terminate after one pass.
     pub(crate) fn collapsed_feeding_table_sources(&self) -> Vec<TableReference> {
-        // Body scopes of every intermediate (CTE / true derived). The
-        // top loop skips uses inside these subtrees — those uses are
-        // only reachable via the intermediate's own `Intermediate` use,
-        // never standalone. Without this, a `FROM s` inside `WITH cte
-        // AS (... FROM s) SELECT ... FROM cte` would be picked up
-        // twice: once as a top-level Real use and once via the CTE
-        // recursion.
-        let intermediate_body_scopes: HashSet<ScopeId> = self
+        // Body scopes of every synthetic (CTE / true derived). The top
+        // loop skips uses inside these subtrees — those uses are only
+        // reachable via the synthetic's own `Synthetic` use, never
+        // standalone. Without this, a `FROM s` inside `WITH cte AS
+        // (... FROM s) SELECT ... FROM cte` would be picked up twice:
+        // once as a top-level Real use and once via the CTE recursion.
+        let synthetic_body_scopes: HashSet<ScopeId> = self
             .scopes
             .iter()
             .flat_map(|scope| scope.bindings.values())
@@ -158,7 +157,7 @@ impl Resolution {
             if self.has_predicate_ancestor(raw.scope_id) {
                 continue;
             }
-            if intermediate_body_scopes
+            if synthetic_body_scopes
                 .iter()
                 .any(|body| self.is_in_scope_subtree(raw.scope_id, *body))
             {
@@ -177,7 +176,7 @@ impl Resolution {
     ) {
         match &raw.target {
             TableRefTarget::Real(table) => out.push(table.clone()),
-            TableRefTarget::Intermediate { body_scope } => {
+            TableRefTarget::Synthetic { body_scope } => {
                 if !visited.insert(*body_scope) {
                     // Recursive CTE self-reference — terminate the
                     // chain. The first pass through the body has

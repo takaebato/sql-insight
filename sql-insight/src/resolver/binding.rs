@@ -38,35 +38,49 @@ pub(crate) struct RawTableRef {
     /// filtering at collapse time.
     pub(crate) scope_id: ScopeId,
     /// What's being used: a real table (emits as a lineage source) or
-    /// an intermediate relation (recurses into its body to find real
+    /// a synthetic relation (recurses into its body to find real
     /// tables underneath).
     pub(crate) target: TableRefTarget,
 }
 
-/// Resolution of a [`RawTableRef`] target — split by the role the
-/// target plays in table-lineage collapse, not by what it is
-/// structurally:
+/// Resolution of a [`RawTableRef`] target.
 ///
-/// - `Real`: terminal in the lineage chain — emit directly as a
-///   source.
-/// - `Intermediate`: a hop on the way down — recurse into the
-///   carried `body_scope` to find the real tables beneath.
+/// **Terminology note**: "Synthetic" is this codebase's chosen
+/// umbrella term for `{Binding::Cte, Binding::DerivedTable,
+/// Binding::TableFunction}` — relations defined inside the SQL
+/// statement (CTE bodies, derived subqueries, table functions)
+/// rather than stored in a catalog. **This is our own
+/// classification, not borrowed from SQL spec or vendor docs**:
 ///
-/// The split is intentionally **lineage-role-shaped**, not
-/// **storage-shaped** (which is `Binding`'s job: see
-/// [`is_synthetic_binding`]). `Binding::Cte` and
-/// `Binding::DerivedTable` map to `Intermediate` here;
-/// `Binding::TableFunction` doesn't appear at all (it has no
-/// inspectable body, so no `RawTableRef` is emitted for it).
+/// - ANSI SQL has no umbrella term covering all three; the spec
+///   treats "derived table" (narrower, our `DerivedTable` only),
+///   CTE, and table function as separate constructs.
+/// - Oracle's "inline view" is similarly narrower — FROM-clause
+///   subqueries only.
+/// - The compiler-flavored sense of "synthetic" ("produced by the
+///   processor, not in source") doesn't fit either: the SQL author
+///   wrote these definitions explicitly.
+///
+/// Despite the inexact fit, "synthetic" is chosen for being short,
+/// distinct, free of dialect collision, and consistent with the
+/// existing [`RawColumnRef::synthetic`](crate::resolver::RawColumnRef)
+/// field and [`is_synthetic_binding`] helper.
+///
+/// Variants represent **what to do during table-lineage collapse**,
+/// not raw storage classification. `Binding::TableFunction` is
+/// synthetic at the binding level but is omitted here (and from
+/// `RawTableRef` emission entirely), since it has no inspectable
+/// body to recurse into.
 #[derive(Clone, Debug)]
 pub(crate) enum TableRefTarget {
     /// A real table — `collapsed_feeding_table_sources` emits this
     /// `TableReference` directly. Terminal.
     Real(TableReference),
-    /// A CTE / derived subquery whose body lives at `body_scope`.
-    /// Composition recurses into that scope's subtree, collecting the
-    /// real tables underneath.
-    Intermediate { body_scope: ScopeId },
+    /// A CTE or derived subquery whose body lives at `body_scope`.
+    /// Collapse recurses into that scope's subtree, collecting the
+    /// real tables underneath. Covers `Binding::Cte` and
+    /// `Binding::DerivedTable` (with non-`None` body_scope).
+    Synthetic { body_scope: ScopeId },
 }
 
 /// Whether a scope contributes data to its enclosing write target.
@@ -139,9 +153,9 @@ pub(crate) enum RelationSchema {
     Unknown,
 }
 
-/// What's bound to a name in a [`Scope`] — a real Table or
-/// one of the synthetic intermediates (CTE / derived subquery / table
-/// function) that SQL exposes as a named row set.
+/// What's bound to a name in a [`Scope`] — a real Table or one of
+/// the synthetic relations (CTE / derived subquery / table function)
+/// that SQL exposes as a named row set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Binding {
     // `table` is boxed because the variant otherwise dwarfs the others
@@ -507,14 +521,14 @@ impl<'a> Resolver<'a> {
         });
     }
 
-    /// Record a use of an intermediate relation (CTE / true derived)
-    /// at the current scope. `body_scope` is the arena id of the
-    /// intermediate's body — collapse recurses into its subtree.
-    pub(super) fn record_intermediate_table_ref(&mut self, body_scope: ScopeId) {
+    /// Record a use of a synthetic relation (CTE / true derived) at
+    /// the current scope. `body_scope` is the arena id of the
+    /// synthetic's body — collapse recurses into its subtree.
+    pub(super) fn record_synthetic_table_ref(&mut self, body_scope: ScopeId) {
         let scope_id = self.scopes.current_scope_id();
         self.table_refs.push(RawTableRef {
             scope_id,
-            target: TableRefTarget::Intermediate { body_scope },
+            target: TableRefTarget::Synthetic { body_scope },
         });
     }
 
