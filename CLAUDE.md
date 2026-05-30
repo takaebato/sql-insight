@@ -167,3 +167,12 @@ by hand.
   — `extract` → `extract_with(dialect)` → `extract_with_catalog(
   dialect, catalog)` — so callsites stay terse and new parameters
   fall through cleanly.
+- Tests double as behavior documentation: a reader should be able to
+  learn what a given SQL construct produces by reading its test, so
+  prefer concrete, minimal SQL with the full expected value spelled
+  out over clever parameterization that hides the input/output pair.
+  Per-construct "arm coverage" modules (one terse case per AST
+  variant / statement kind) are encouraged — they both pin behavior
+  and force a new test when an exhaustive `match` gains a variant.
+  Adding tests is cheap and welcome; err on the side of more
+  coverage rather than less.

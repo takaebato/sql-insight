@@ -307,6 +307,43 @@ mod integration {
         }
 
         #[tokio::test]
+        async fn test_normalize_interactive() -> Result<(), Box<dyn std::error::Error>> {
+            // `normalize` reaches `ProcessType::Interactive` through a
+            // different match arm in `ProcessType::from` (via
+            // `common_options`), so the `format` interactive test alone
+            // does not cover this path.
+            let mut child = Command::new(BIN_PATH)
+                .arg("normalize")
+                .stdin(process::Stdio::piped())
+                .stdout(process::Stdio::piped())
+                .stderr(process::Stdio::piped())
+                .spawn()
+                .expect("Failed to spawn child process");
+
+            let stdin = child.stdin.as_mut().expect("Failed to open stdin");
+            let stdout = child.stdout.take().expect("Failed to open stdout");
+            let mut stdout_reader = BufReader::new(stdout).lines();
+
+            let initial_prompt = read_from_stdout(&mut stdout_reader).await?;
+            assert!(
+                initial_prompt.contains("Entering interactive mode."),
+                "Initial prompt not as expected: {initial_prompt:?}"
+            );
+
+            write_to_stdin(stdin, "SELECT * FROM t1 WHERE a = 1;\n").await?;
+            let query_result = read_from_stdout(&mut stdout_reader).await?;
+            assert!(
+                query_result.contains("SELECT * FROM t1 WHERE a = ?"),
+                "Query result not as expected: {query_result:?}"
+            );
+
+            write_to_stdin(stdin, "quit\n").await?;
+            child.wait().await?;
+
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn test_interactive() -> Result<(), Box<dyn std::error::Error>> {
             let mut child = Command::new(BIN_PATH)
                 .arg("format")
@@ -403,6 +440,21 @@ mod integration {
         fn test_fail_to_analyze_sql() {
             sql_insight_cmd()
                 .arg("extract-tables")
+                .arg("select * from catalog.schema.table.extra")
+                .assert()
+                .success()
+                .stdout("Error: Too many identifiers provided\n")
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_crud_per_statement_error_surfaces() {
+            // Mirror of `test_fail_to_analyze_sql` for the CRUD path —
+            // exercises the per-statement `Err(e) => "Error: ..."` arm
+            // in `CrudTableExtractExecutor::execute`. Parse succeeds, but
+            // the over-qualified table name fails analysis.
+            sql_insight_cmd()
+                .arg("extract-crud")
                 .arg("select * from catalog.schema.table.extra")
                 .assert()
                 .success()
