@@ -24,8 +24,8 @@ pub(crate) struct ProjectionGroup {
 /// name (explicit alias > bare ident name > `None`). `kind`
 /// classifies how the source refs turn into the output value
 /// (`Passthrough` for a bare forwarded column, `Transformation` for
-/// anything value-changing); composed with the outer edge's kind when
-/// this item participates in a CTE / derived table substitution.
+/// anything value-changing); collapsed with the outer edge's kind when
+/// this item participates in a CTE / derived table collapse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectionItem {
     pub(crate) name: Option<Ident>,

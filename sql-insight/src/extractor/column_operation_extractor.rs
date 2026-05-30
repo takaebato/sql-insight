@@ -41,10 +41,10 @@
 //!   branch, each paired against the same target columns), and
 //!   per-assignment edges for
 //!   UPDATE SET. Sources that reference CTEs or derived tables are
-//!   composed end-to-end — references substitute through the
-//!   intermediate's body projections recursively, so a SELECT through
-//!   a chain of CTEs surfaces lineage whose sources are the underlying
-//!   base tables. Each edge is tagged with a `ColumnLineageKind`:
+//!   collapsed end-to-end — references recurse through the
+//!   intermediate's body projections, so a SELECT through a chain of
+//!   CTEs surfaces lineage whose sources are the underlying base
+//!   tables. Each edge is tagged with a `ColumnLineageKind`:
 //!   `Passthrough` (the value is forwarded unchanged — a bare column
 //!   ref, rename included) or `Transformation` (any expression that
 //!   changes the value: arithmetic, function calls, aggregates,
@@ -161,7 +161,7 @@ pub struct ColumnOperation {
 /// edges, from `t1.a` and `t1.b` to the same query-output target, each
 /// tagged `Transformation`.
 ///
-/// Statements that physically move data emit composed end-to-end lineage
+/// Statements that physically move data emit collapsed end-to-end lineage
 /// — `INSERT INTO t1 (col) SELECT b FROM t2` emits `t2.b → t1.col`
 /// directly, with no intermediate query-output entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

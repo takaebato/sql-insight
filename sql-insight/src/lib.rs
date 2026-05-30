@@ -115,7 +115,7 @@
 //!   `generate_series`, `JSON_TABLE`, etc.) — catalog enrichment
 //!   doesn't reach them yet.
 //! - **Recursive CTE bodies** are pre-bound under a stub for
-//!   self-reference; their projection composition is deferred, so
+//!   self-reference; their projection collapse is deferred, so
 //!   `lineage` won't trace through them end-to-end.
 //! - **Lineage kind is coarse** (`Passthrough` vs `Transformation`).
 //!   Aggregates, window functions, arithmetic, casts, etc. are all

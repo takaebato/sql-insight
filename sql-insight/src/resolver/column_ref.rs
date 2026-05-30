@@ -18,7 +18,7 @@ use super::{Binding, Resolver, ScopeId};
 /// `parts` mirrors `sqlparser`'s split — 1 part for bare `a`, 2 for
 /// `t1.a`, 3 for `schema.t1.a`, 4 for `catalog.schema.t1.a`.
 /// `scope_id` is the scope in which the reference appeared (kept for
-/// diagnostics and for binding lookups at composition time).
+/// diagnostics and for binding lookups at collapse time).
 ///
 /// `resolved` and `synthetic` are computed at record time, when scope
 /// state still reflects what was visible to the SQL author at that
@@ -33,7 +33,7 @@ pub(crate) struct RawColumnRef {
     pub(crate) resolved: Option<TableReference>,
     /// True iff the walk-time owning binding was synthetic
     /// (`Cte` / `DerivedTable` / `TableFunction`). Drives reads
-    /// filtering and lineage composition. `false` when `resolved` is
+    /// filtering and lineage collapse. `false` when `resolved` is
     /// `None`.
     pub(crate) synthetic: bool,
 }
@@ -204,7 +204,7 @@ impl<'a> Resolver<'a> {
         // aliased ref (`u.a` over `FROM t1 AS u`) surfaces the real table
         // `t1` — matching how unqualified refs resolve. Synthetic bindings
         // (CTE / derived / table function) keep the qualifier verbatim so
-        // lineage composition can re-find the owning binding by name;
+        // lineage collapse can re-find the owning binding by name;
         // multi-segment qualifiers are already real identities and pass
         // through untouched.
         let table = match binding {

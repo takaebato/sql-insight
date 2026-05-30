@@ -14,7 +14,7 @@ use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolv
 /// A pre-resolution column lineage record. `source` still needs
 /// scope-chain resolution (for unqualified parts); `target` is fully
 /// spec'd by the resolver; `kind` is the public `ColumnLineageKind` to
-/// surface (composed further by `composed_lineage_edges` when the source
+/// surface (collapsed further by `collapsed_lineage_edges` when the source
 /// goes through a synthetic intermediate).
 ///
 /// Created by callers from [`ProjectionGroup`]s (for SELECT-style
@@ -23,8 +23,16 @@ use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolv
 /// walkers that already know their write target.
 #[derive(Debug, Clone)]
 pub(crate) struct LineageEdge {
+    /// Source column ref as recorded at the walk site. Still carries
+    /// `scope_id` so collapse can re-resolve through synthetic
+    /// intermediates.
     pub(crate) source: RawColumnRef,
+    /// Where the value flows to — a transient SELECT output column
+    /// or a real-relation column.
     pub(crate) target: LineageTargetSpec,
+    /// `Passthrough` (bare forwarded column) or `Transformation`
+    /// (anything value-changing). Composed with the inner edge's
+    /// kind when the source goes through a CTE / derived intermediate.
     pub(crate) kind: ColumnLineageKind,
 }
 
@@ -34,11 +42,18 @@ pub(crate) struct LineageEdge {
 #[derive(Debug, Clone)]
 pub(crate) enum LineageTargetSpec {
     QueryOutput {
+        /// Output column's inferred name: explicit alias > bare
+        /// identifier > `None` for computed expressions / wildcards.
         name: Option<Ident>,
+        /// Zero-based position in the SELECT's projection list. The
+        /// position is the stable handle when `name` is `None`.
         position: usize,
     },
     Relation {
+        /// The relation being written to (INSERT / UPDATE target,
+        /// CTAS / CREATE VIEW output, MERGE target).
         table: TableReference,
+        /// The specific column within `table` receiving the value.
         column: Ident,
     },
 }

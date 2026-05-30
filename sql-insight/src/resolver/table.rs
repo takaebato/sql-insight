@@ -80,9 +80,9 @@ impl<'a> Resolver<'a> {
                 if self.is_cte_reference(name) {
                     // Carry the original CTE's schema + body_projections
                     // to the local binding so:
-                    //  1. lineage composition works through the use site
+                    //  1. lineage collapse works through the use site
                     //     (`FROM cte AS c` → `c.col` and `FROM cte` →
-                    //     `cte.col` both compose to the body's source);
+                    //     `cte.col` both collapse to the body's source);
                     //  2. catalog-aware strictness still applies — refs
                     //     against a Known schema that doesn't list the
                     //     column still surface as unresolved instead of
@@ -95,6 +95,7 @@ impl<'a> Resolver<'a> {
                     //     INSERT target.
                     let body = self.cte_body_projections(name);
                     let schema = self.cte_schema(name);
+                    let body_scope = self.cte_body_scope(name);
                     let bind_name = match alias {
                         Some(a) => a.name.clone(),
                         // `is_cte_reference` already returned true,
@@ -102,12 +103,19 @@ impl<'a> Resolver<'a> {
                         // whose head is an Ident.
                         None => name.0[0].as_ident().cloned().unwrap(),
                     };
-                    self.bind_cte(bind_name, schema, body);
+                    // `body_scope.unwrap()` is safe — `is_cte_reference`
+                    // just confirmed the name resolves to a `Cte`, and a
+                    // `Cte` binding always carries `body_scope`. The
+                    // local re-bind shares the original CTE's body so
+                    // table-lineage collapse reaches the same place
+                    // from either definition or use site.
+                    self.bind_cte(bind_name, schema, body, body_scope.unwrap());
+                    self.record_intermediate_table_ref(body_scope.unwrap());
                     return Ok(());
                 }
                 let (table, alias_ident) =
                     TableReference::from_table_factor_with_alias(table_factor)?;
-                self.bind_base_table(table, alias_ident, role);
+                self.bind_real_table(table, alias_ident, role);
                 if let Some(args) = args {
                     self.visit_table_function_args(&args.args)?;
                     if let Some(settings) = &args.settings {
@@ -130,8 +138,21 @@ impl<'a> Resolver<'a> {
                 // Raw resolve_query — same rationale as CTE bodies:
                 // the derived subquery's projection isn't a query
                 // result on its own, and storing its projections on
-                // the binding lets lineage composition substitute
+                // the binding lets lineage collapse collapse
                 // through the derived alias.
+                //
+                // TODO: the `lateral: bool` field is intentionally
+                // ignored — the parent-chain walk-up always lets the
+                // subquery see preceding FROM siblings, so non-LATERAL
+                // refs that SQL would reject are silently resolved.
+                // Safe for table-level lineage (the outer sibling is
+                // already in `reads`), but at column granularity it
+                // can mis-resolve a name that should surface as
+                // `UnresolvedColumn`. Fix would mean hiding same-FROM
+                // siblings under a non-LATERAL derived's scope while
+                // keeping the enclosing SELECT visible — a forward
+                // walk-up with sibling masking, not a flat parent
+                // chain.
                 let resolved = self.resolve_query(subquery)?;
                 if let Some(alias) = alias {
                     let renames = &alias.columns;
@@ -143,7 +164,9 @@ impl<'a> Resolver<'a> {
                         alias.name.clone(),
                         renamed_schema,
                         renamed_projections,
+                        Some(resolved.body_scope),
                     );
+                    self.record_intermediate_table_ref(resolved.body_scope);
                 }
                 if let Some(sample) = sample {
                     self.visit_table_sample_kind(sample)?;
@@ -155,10 +178,15 @@ impl<'a> Resolver<'a> {
             } => {
                 self.visit_table_with_joins(table_with_joins, TableRole::Read)?;
                 if let Some(alias) = alias {
+                    // Wrapper alias — the inner tables are bound directly
+                    // in the current scope (via visit_table_with_joins
+                    // above), so they emit their own Real RawTableRefs.
+                    // The alias itself doesn't drive collapse.
                     self.bind_derived_table(
                         alias.name.clone(),
                         RelationSchema::Unknown,
                         Vec::new(),
+                        None,
                     );
                 }
             }
@@ -185,6 +213,7 @@ impl<'a> Resolver<'a> {
                         alias.name.clone(),
                         RelationSchema::Unknown,
                         Vec::new(),
+                        None,
                     );
                 }
             }
@@ -205,6 +234,7 @@ impl<'a> Resolver<'a> {
                         alias.name.clone(),
                         RelationSchema::Unknown,
                         Vec::new(),
+                        None,
                     );
                 }
             }
@@ -233,6 +263,7 @@ impl<'a> Resolver<'a> {
                         alias.name.clone(),
                         RelationSchema::Unknown,
                         Vec::new(),
+                        None,
                     );
                 }
             }

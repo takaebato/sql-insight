@@ -606,7 +606,7 @@ mod tests {
         }
 
         #[test]
-        fn test_statement_with_cte_shadows_base_table_after_definition() {
+        fn test_statement_with_cte_shadows_real_table_after_definition() {
             let sql = "WITH t2 AS (SELECT id FROM t3), t3 AS (SELECT id FROM t1) SELECT * FROM t3";
             let expected = vec![ok_tables(vec![table("t3"), table("t1")])];
             assert_table_extraction(sql, expected, all_dialects());
@@ -646,7 +646,7 @@ mod tests {
         }
 
         #[test]
-        fn test_statement_with_cte_shadowing_base_table() {
+        fn test_statement_with_cte_shadowing_real_table() {
             let sql =
                 "WITH t1 AS (SELECT id FROM t2) SELECT * FROM t1 JOIN s1.t1 AS t3 ON t1.id = t3.id";
             // Outer scope's s1.t1 AS t3 (from JOIN) is recorded before the CTE
@@ -665,7 +665,7 @@ mod tests {
         #[test]
         fn test_nested_cte_does_not_leak_to_outer_query() {
             let sql = "SELECT * FROM (WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2) AS t3 JOIN t2 ON t3.id = t2.id";
-            // Outer scope's t2 (from JOIN, base table) comes before the nested
+            // Outer scope's t2 (from JOIN, real table) comes before the nested
             // CTE body's t1.
             let expected = vec![ok_tables(vec![table("t2"), table("t1")])];
             assert_table_extraction(sql, expected, all_dialects());

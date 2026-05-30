@@ -129,8 +129,14 @@ pub enum StatementKind {
 ///
 /// Each `TableLineageEdge` is a single directed edge — a statement that derives
 /// `t` from `a JOIN b` emits two edges (`a → t`, `b → t`), not one entry
-/// with both sources. This keeps equality and aggregation across
-/// statements simple (set-union over edges).
+/// with both sources.
+///
+/// **Occurrence-based**: a statement using the same source more than
+/// once (`FROM s AS x JOIN s AS y`, repeated `FROM cte` across UNION
+/// branches) emits one entry per use, not one deduped entry. Matches
+/// [`ColumnLineageEdge`](crate::extractor::column_operation_extractor::ColumnLineageEdge)
+/// on multiplicity. Consumers wanting set-union semantics dedup
+/// explicitly via `HashSet::from_iter`.
 ///
 /// Tables referenced only inside a predicate subquery are excluded:
 /// `INSERT INTO t SELECT FROM s WHERE id IN (SELECT id FROM x)` emits
@@ -139,8 +145,11 @@ pub enum StatementKind {
 /// CTE transitivity: `WITH cte AS (SELECT ... FROM s) INSERT INTO t
 /// SELECT ... FROM cte` emits `s → t` because `s` sits in a
 /// data-feeding chain from the CTE body up through the INSERT target.
-/// Deeper transitivity (recursive CTEs, multi-hop indirection) is
-/// intentionally out of scope for the MVP.
+/// An unreferenced CTE contributes nothing — `WITH cte AS (SELECT a
+/// FROM s) INSERT INTO t SELECT 1` emits no edge (the `cte` is bound
+/// but never `FROM`-used, so `s` doesn't feed `t`). Deeper transitivity
+/// (recursive CTEs are walked best-effort, with self-references
+/// terminated after one pass via cycle detection.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableLineageEdge {
     pub source: TableReference,
@@ -237,7 +246,7 @@ fn extract_table_lineage(
         return Vec::new();
     };
     resolution
-        .feeding_read_tables()
+        .collapsed_feeding_table_sources()
         .into_iter()
         .map(|source| TableLineageEdge {
             source,
@@ -720,7 +729,7 @@ mod tests {
         }
 
         #[test]
-        fn delete_resolves_target_alias_to_base_table() {
+        fn delete_resolves_target_alias_to_real_table() {
             assert_ops_with(
                 "DELETE t1_alias FROM t1 AS t1_alias JOIN t2 ON t1_alias.a = t2.a",
                 &MySqlDialect {},
@@ -1022,6 +1031,36 @@ mod tests {
                     reads: vec![table("s"), table("x")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("s", "t1")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn unreferenced_cte_body_tables_do_not_leak_into_lineage() {
+            // `cte` is defined but never referenced — the INSERT pulls
+            // its value from a constant projection. No data actually
+            // flows from `s` to `t1` (an optimizer would prune the CTE
+            // entirely). `s` should still appear in `reads` since the
+            // SQL text touches it, but it must not produce a lineage
+            // edge into `t1`.
+            //
+            // This pins down the boundary between "table is referenced
+            // in the SQL" (reads) and "data actually moves from this
+            // table to the target" (lineage). The current scope-arena
+            // walk in `feeding_read_tables` over-includes any Body-
+            // position Table binding regardless of whether its owning
+            // synthetic (CTE / derived) was ever used downstream — a
+            // ref+collapse rewrite of the lineage path would fix
+            // it. See the discussion in the resolver scope-kind
+            // analysis.
+            assert_ops(
+                "WITH cte AS (SELECT a FROM s) INSERT INTO t1 SELECT 1",
+                TableOperation {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![table("s")],
+                    writes: vec![table("t1")],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );

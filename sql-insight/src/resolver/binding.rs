@@ -21,8 +21,53 @@ pub(crate) enum TableRole {
     Write,
 }
 
+/// Arena index for a [`Scope`]. Stable across later pushes since the
+/// arena only grows during a resolver run, so a `ScopeId` captured
+/// during the walk still resolves correctly in post-passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ScopeId(pub(super) usize);
+
+/// A single `FROM`-position use of a table-like source captured at walk
+/// time. Table-lineage collapse iterates these (instead of walking
+/// scope bindings), so an unreferenced CTE — whose declaration binds
+/// names but whose body is never `FROM`-used — contributes no lineage
+/// sources.
+#[derive(Clone, Debug)]
+pub(crate) struct RawTableRef {
+    /// Scope where the use occurs — used for predicate-ancestor
+    /// filtering at collapse time.
+    pub(crate) scope_id: ScopeId,
+    /// What's being used: a real table (emits as a lineage source) or
+    /// an intermediate relation (recurses into its body to find real
+    /// tables underneath).
+    pub(crate) target: TableRefTarget,
+}
+
+/// Resolution of a [`RawTableRef`] target — split by the role the
+/// target plays in table-lineage collapse, not by what it is
+/// structurally:
+///
+/// - `Real`: terminal in the lineage chain — emit directly as a
+///   source.
+/// - `Intermediate`: a hop on the way down — recurse into the
+///   carried `body_scope` to find the real tables beneath.
+///
+/// The split is intentionally **lineage-role-shaped**, not
+/// **storage-shaped** (which is `Binding`'s job: see
+/// [`is_synthetic_binding`]). `Binding::Cte` and
+/// `Binding::DerivedTable` map to `Intermediate` here;
+/// `Binding::TableFunction` doesn't appear at all (it has no
+/// inspectable body, so no `RawTableRef` is emitted for it).
+#[derive(Clone, Debug)]
+pub(crate) enum TableRefTarget {
+    /// A real table — `collapsed_feeding_table_sources` emits this
+    /// `TableReference` directly. Terminal.
+    Real(TableReference),
+    /// A CTE / derived subquery whose body lives at `body_scope`.
+    /// Composition recurses into that scope's subtree, collecting the
+    /// real tables underneath.
+    Intermediate { body_scope: ScopeId },
+}
 
 /// Whether a scope contributes data to its enclosing write target.
 ///
@@ -81,12 +126,16 @@ impl BindingKey {
     }
 }
 
+/// Column-name schema of a relation as seen by the resolver. Just
+/// the names — the resolver needs identity, not types.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RelationSchema {
-    /// Column names of a relation with a known schema (from the
-    /// catalog). Just the names — the resolver needs identity, not
-    /// types.
+    /// Populated either from the catalog (for real tables) or derived
+    /// from the body (for CTEs / derived tables).
     Known(Vec<Ident>),
+    /// Fallback when no catalog is available, the catalog misses, or
+    /// the body's columns can't be inferred (wildcards, computed
+    /// expressions).
     Unknown,
 }
 
@@ -98,50 +147,94 @@ pub(crate) enum Binding {
     // `table` is boxed because the variant otherwise dwarfs the others
     // (TableReference is ~300B) and inflates the entire enum's size.
     Table {
+        /// The real underlying table. Alias-free so catalog lookup
+        /// and cross-statement comparison behave intuitively (alias
+        /// lives next door in `alias`).
         table: Box<TableReference>,
         /// Alias given at this use-site, if any. Kept separately so
         /// `TableReference` stays alias-free for catalog lookup and
         /// cross-statement comparison.
         alias: Option<Ident>,
+        /// Column schema for the underlying table. `Known` when the
+        /// catalog has the table, `Unknown` otherwise (no catalog or
+        /// catalog miss).
         schema: RelationSchema,
+        /// How this binding is used in the statement — Read, Write,
+        /// or both (e.g. `DELETE t1 FROM t1`). Re-binding the same
+        /// name merges roles rather than overwriting (see `Scope::bind`).
         roles: Vec<TableRole>,
     },
     Cte {
+        /// The CTE's declared name (the `<name>` in `WITH <name> AS …`).
+        /// Lookup keys derive from this via `BindingKey`.
         name: Ident,
+        /// Output column schema derived from the CTE body, then
+        /// renamed via the CTE's column-alias list when one is given.
         schema: RelationSchema,
         /// The CTE body's projection groups, captured so that lineage
-        /// composition can substitute references to `cte.col` with the
+        /// collapse can collapse references to `cte.col` with the
         /// body's source refs (transitive source → target lineage).
         /// Empty for recursive CTEs where the body is walked under a
         /// pre-bound stub and fixpoint-aware projection capture is
         /// deferred.
         body_projections: Vec<ProjectionGroup>,
+        /// Arena id of the scope that holds the CTE body's bindings.
+        /// Table-lineage collapse walks descendant scopes of this
+        /// id to collect the real tables underneath the CTE — so a
+        /// `FROM cte` use can resolve back to the body's `FROM s`.
+        body_scope: ScopeId,
     },
     DerivedTable {
+        /// Mandatory alias from `(SELECT …) AS d`. Unlike `Table::alias`,
+        /// this is the only handle the outer query has on the derived
+        /// relation.
         alias: Ident,
+        /// Output column schema derived from the subquery body, then
+        /// renamed via the alias's column list when one is given.
         schema: RelationSchema,
         /// Same role as `Cte::body_projections` — captured at the
-        /// derived subquery walk and consumed by lineage composition.
+        /// derived subquery walk and consumed by lineage collapse.
         body_projections: Vec<ProjectionGroup>,
+        /// Arena id of the scope holding the derived subquery body's
+        /// bindings (`Some`) — or `None` for wrapper aliases
+        /// (`NestedJoin`, `Pivot`, `Unpivot`, `MatchRecognize`) whose
+        /// inner tables are bound directly in the current scope and
+        /// don't need collapse through this synthetic.
+        body_scope: Option<ScopeId>,
     },
     TableFunction {
+        /// Mandatory alias from `f(...) AS t`. Refs against the alias
+        /// surface as synthetic-owned (filtered out of public reads).
         alias: Ident,
+        /// Always `Unknown` today — placeholder for future
+        /// per-dialect table-function schema inference.
         schema: RelationSchema,
     },
 }
 
+/// One lexical scope: a `name → Binding` map plus the links
+/// (`parent`, `kind`) used to walk up the scope chain at
+/// name-resolution and lineage-emission time. Self-id is implicit —
+/// the scope's id equals its index in [`ScopeStack::scopes`].
 #[derive(Debug)]
 pub(crate) struct Scope {
-    pub(crate) id: ScopeId,
+    /// Lexically enclosing scope, or `None` for the root. Drives the
+    /// walk-up for unqualified name resolution.
     pub(crate) parent: Option<ScopeId>,
+    /// `Body` vs `Predicate`. A `Predicate` anywhere along the
+    /// ancestor chain excludes nested scopes from `TableLineageEdge`
+    /// even if they themselves are `Body`.
     pub(crate) kind: ScopeKind,
+    /// Bindings introduced *in this scope* (FROM tables, CTE
+    /// definitions, derived tables, table functions). Keyed by
+    /// `BindingKey` (case-folded); `IndexMap` preserves definition
+    /// order for deterministic iteration.
     pub(super) bindings: IndexMap<BindingKey, Binding>,
 }
 
 impl Scope {
-    fn new(id: ScopeId, parent: Option<ScopeId>, kind: ScopeKind) -> Self {
+    fn new(parent: Option<ScopeId>, kind: ScopeKind) -> Self {
         Self {
-            id,
             parent,
             kind,
             bindings: IndexMap::new(),
@@ -179,9 +272,20 @@ impl Scope {
     }
 }
 
+/// Arena + active-stack model of the scope tree. `scopes` retains
+/// every scope by id so post-passes can still look them up after they
+/// have been popped from the active stack; `stack` tracks what is
+/// currently "open" as the walker descends.
 #[derive(Default, Debug)]
 pub(super) struct ScopeStack {
+    /// All scopes ever opened during the walk. Kept after `pop_scope`
+    /// so later passes (lineage collapse, column-ref resolution)
+    /// can address scopes by `ScopeId`. Index in this Vec equals
+    /// `ScopeId.0`.
     pub(super) scopes: Vec<Scope>,
+    /// Currently-open scope ids, innermost at the top. Drives parent
+    /// derivation in `push_scope` and the walk-up in
+    /// `resolve_unqualified_relation`.
     stack: Vec<ScopeId>,
 }
 
@@ -194,9 +298,12 @@ impl ScopeStack {
         self.scopes
     }
 
-    pub(super) fn push_query_scope(&mut self, kind: ScopeKind) -> ScopeId {
+    /// Push a fresh scope as a child of the current stack top, with
+    /// the given `kind`. Parent is derived from the stack — this is
+    /// the normal "open a nested scope" operation.
+    pub(super) fn push_scope(&mut self, kind: ScopeKind) -> ScopeId {
         let parent = self.stack.last().copied();
-        self.push_scope(parent, kind)
+        self.insert_scope(parent, kind)
     }
 
     pub(super) fn pop_scope(&mut self) {
@@ -218,9 +325,13 @@ impl ScopeStack {
             .find_map(|scope_id| self.scopes[scope_id.0].resolve(name))
     }
 
-    fn push_scope(&mut self, parent: Option<ScopeId>, kind: ScopeKind) -> ScopeId {
+    /// Low-level: allocate a `ScopeId`, append to the `scopes` arena, and
+    /// push onto the active `stack`, with an arbitrary `parent` (including
+    /// `None` for a root scope). Maintains the invariant that a newly
+    /// inserted scope's `ScopeId.0` equals its index in `scopes`.
+    fn insert_scope(&mut self, parent: Option<ScopeId>, kind: ScopeKind) -> ScopeId {
         let id = ScopeId(self.scopes.len());
-        self.scopes.push(Scope::new(id, parent, kind));
+        self.scopes.push(Scope::new(parent, kind));
         self.stack.push(id);
         id
     }
@@ -229,7 +340,7 @@ impl ScopeStack {
         if let Some(id) = self.stack.last() {
             *id
         } else {
-            self.push_scope(None, ScopeKind::Body)
+            self.insert_scope(None, ScopeKind::Body)
         }
     }
 
@@ -361,7 +472,7 @@ impl<'a> Resolver<'a> {
         )
     }
 
-    pub(super) fn bind_base_table(
+    pub(super) fn bind_real_table(
         &mut self,
         table: TableReference,
         alias: Option<Ident>,
@@ -369,6 +480,12 @@ impl<'a> Resolver<'a> {
     ) {
         let binding_name = alias.clone().unwrap_or_else(|| table.name.clone());
         let schema = self.lookup_table_schema(&table);
+        if role == TableRole::Read {
+            // Read-position FROM/JOIN — emit a RawTableRef so table-lineage
+            // collapse sees this as a real source. Write targets feed
+            // `write_tables` separately and don't drive collapse.
+            self.record_real_table_ref(table.clone());
+        }
         self.bind_relation(
             binding_name,
             Binding::Table {
@@ -378,6 +495,27 @@ impl<'a> Resolver<'a> {
                 roles: vec![role],
             },
         );
+    }
+
+    /// Record a use of a real table at the current scope. Called by
+    /// [`Self::bind_real_table`] on Read-position binds.
+    pub(super) fn record_real_table_ref(&mut self, table: TableReference) {
+        let scope_id = self.scopes.current_scope_id();
+        self.table_refs.push(RawTableRef {
+            scope_id,
+            target: TableRefTarget::Real(table),
+        });
+    }
+
+    /// Record a use of an intermediate relation (CTE / true derived)
+    /// at the current scope. `body_scope` is the arena id of the
+    /// intermediate's body — collapse recurses into its subtree.
+    pub(super) fn record_intermediate_table_ref(&mut self, body_scope: ScopeId) {
+        let scope_id = self.scopes.current_scope_id();
+        self.table_refs.push(RawTableRef {
+            scope_id,
+            target: TableRefTarget::Intermediate { body_scope },
+        });
     }
 
     /// Query the optional catalog for a table's columns.
@@ -422,7 +560,7 @@ impl<'a> Resolver<'a> {
     /// under an alias (`FROM cte AS c`). Returns an empty `Vec` when
     /// the reference is multi-segment, not bound, or not a Cte
     /// binding — the caller (alias-bound Cte construction) treats
-    /// that as "no composition through this alias", matching
+    /// that as "no collapse through this alias", matching
     /// recursive-CTE behavior.
     pub(super) fn cte_body_projections(&self, cte_name: &ObjectName) -> Vec<ProjectionGroup> {
         match self.scopes.resolve_unqualified_relation(cte_name) {
@@ -449,6 +587,7 @@ impl<'a> Resolver<'a> {
         name: Ident,
         schema: RelationSchema,
         body_projections: Vec<ProjectionGroup>,
+        body_scope: ScopeId,
     ) {
         self.bind_relation(
             name.clone(),
@@ -456,6 +595,7 @@ impl<'a> Resolver<'a> {
                 name,
                 schema,
                 body_projections,
+                body_scope,
             },
         );
     }
@@ -465,6 +605,7 @@ impl<'a> Resolver<'a> {
         alias: Ident,
         schema: RelationSchema,
         body_projections: Vec<ProjectionGroup>,
+        body_scope: Option<ScopeId>,
     ) {
         self.bind_relation(
             alias.clone(),
@@ -472,8 +613,19 @@ impl<'a> Resolver<'a> {
                 alias,
                 schema,
                 body_projections,
+                body_scope,
             },
         );
+    }
+
+    /// Look up the body scope for a CTE name. Returns `None` if the name
+    /// does not resolve to a `Cte` binding — same fall-through semantics
+    /// as [`Self::cte_body_projections`] / [`Self::cte_schema`].
+    pub(super) fn cte_body_scope(&self, cte_name: &ObjectName) -> Option<ScopeId> {
+        match self.scopes.resolve_unqualified_relation(cte_name) {
+            Some(Binding::Cte { body_scope, .. }) => Some(*body_scope),
+            _ => None,
+        }
     }
 
     pub(super) fn bind_table_function(&mut self, alias: Ident) {
@@ -536,8 +688,8 @@ impl Resolution {
     /// Every table referenced as a Read source, in scope-arena order.
     /// Includes tables inside predicate subqueries (e.g. `x` in
     /// `WHERE id IN (SELECT id FROM x)`). Use
-    /// [`Self::feeding_read_tables`] for the stricter "feeds the
-    /// enclosing write target" filter.
+    /// [`Self::collapsed_feeding_table_sources`] for the stricter
+    /// "feeds the enclosing write target" filter.
     pub(crate) fn read_tables(&self) -> Vec<TableReference> {
         self.collect_tables_by_role(TableRole::Read)
     }
@@ -560,24 +712,11 @@ impl Resolution {
             .collect()
     }
 
-    /// Read-role tables in a data-feeding position — Read role plus no
-    /// `Predicate` ancestor in their scope chain. The basis for
-    /// `TableLineageEdge` edge sources.
-    pub(crate) fn feeding_read_tables(&self) -> Vec<TableReference> {
-        self.scopes
-            .iter()
-            .filter(|scope| !self.has_predicate_ancestor(scope.id))
-            .flat_map(|scope| scope.iter_bindings())
-            .filter_map(|binding| match binding {
-                Binding::Table { table, roles, .. } if roles.contains(&TableRole::Read) => {
-                    Some((**table).clone())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn has_predicate_ancestor(&self, scope_id: ScopeId) -> bool {
+    /// Walk parent chain from `scope_id`; return true iff any scope along
+    /// the way carries `ScopeKind::Predicate`. Drives the
+    /// filter-position exclusion in
+    /// [`Self::collapsed_feeding_table_sources`].
+    pub(super) fn has_predicate_ancestor(&self, scope_id: ScopeId) -> bool {
         let mut current = Some(scope_id);
         while let Some(id) = current {
             let scope = &self.scopes[id.0];

@@ -1,5 +1,7 @@
 use super::projection::{projection_item_kind, projection_item_output_name};
-use super::{ProjectionGroup, ProjectionItem, RelationSchema, ResolvedQuery, Resolver, TableRole};
+use super::{
+    ProjectionGroup, ProjectionItem, RelationSchema, ResolvedQuery, Resolver, ScopeId, TableRole,
+};
 use crate::error::Error;
 use crate::reference::TableReference;
 use sqlparser::ast::{
@@ -9,70 +11,87 @@ use sqlparser::ast::{
 
 impl<'a> Resolver<'a> {
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
-        // Push a fresh scope for the query body (the returned id isn't
-        // needed — bindings resolve via the stack walk).
-        self.scopes.push_query_scope(self.scope_kind);
         // Swap in a fresh projection buffer for this query — restored on
         // return — so each ResolvedQuery owns exactly its own groups
-        // without leaking into siblings or ancestors.
+        // without leaking into siblings or ancestors. This is independent
+        // of the scope-arena push below: projections accumulate into the
+        // resolver's own buffer, not into the scope.
         let prev_projections = std::mem::take(&mut self.current_projections);
-        // `scope_kind` intentionally propagates through the subquery
-        // boundary (a subquery in a predicate is itself predicate-position
-        // for table-lineage exclusion), so nothing to reset/restore here.
-        if let Some(with) = &query.with {
-            if with.recursive {
-                for cte in &with.cte_tables {
-                    // Recursive CTEs pre-bind with empty body_projections;
-                    // fixpoint-aware projection capture is deferred.
-                    self.bind_cte(cte.alias.name.clone(), RelationSchema::Unknown, Vec::new());
+        let (body_schema, body_scope) =
+            self.with_scope(|r| -> Result<(RelationSchema, ScopeId), Error> {
+                let body_scope = r.scopes_mut().current_scope_id();
+                if let Some(with) = &query.with {
+                    if with.recursive {
+                        for cte in &with.cte_tables {
+                            // Recursive CTEs pre-bind with empty
+                            // body_projections; fixpoint-aware projection
+                            // capture is deferred. `body_scope` here is the
+                            // enclosing WITH scope (no real body has been
+                            // walked yet) — collapse treats an empty body
+                            // as a terminal stub.
+                            r.bind_cte(
+                                cte.alias.name.clone(),
+                                RelationSchema::Unknown,
+                                Vec::new(),
+                                body_scope,
+                            );
+                        }
+                        for cte in &with.cte_tables {
+                            // Body output is discarded for recursive CTEs
+                            // (no collapse either). Raw resolve_query so
+                            // the intermediate QueryOutput edges aren't
+                            // emitted.
+                            r.resolve_query(&cte.query)?;
+                        }
+                    } else {
+                        for cte in &with.cte_tables {
+                            // Raw resolve_query: the body's projections and
+                            // body_scope are stored in the binding for
+                            // lineage collapse, and no intermediate
+                            // QueryOutput edges are emitted since the CTE
+                            // output isn't a query result on its own —
+                            // references through the CTE collapse end to end
+                            // at lineage-emission time.
+                            let resolved = r.resolve_query(&cte.query)?;
+                            let renames = &cte.alias.columns;
+                            let renamed_schema =
+                                super::rename_relation_schema(resolved.output_schema, renames);
+                            let renamed_projections =
+                                super::rename_projection_groups(resolved.projections, renames);
+                            r.bind_cte(
+                                cte.alias.name.clone(),
+                                renamed_schema,
+                                renamed_projections,
+                                resolved.body_scope,
+                            );
+                        }
+                    }
                 }
-                for cte in &with.cte_tables {
-                    // Body output is discarded for recursive CTEs (no
-                    // composition either). Raw resolve_query so the
-                    // intermediate QueryOutput edges aren't emitted.
-                    self.resolve_query(&cte.query)?;
+                let body_schema = r.visit_set_expr(&query.body)?;
+                if let Some(order_by) = &query.order_by {
+                    r.visit_order_by(order_by)?;
                 }
-            } else {
-                for cte in &with.cte_tables {
-                    // Raw resolve_query: the body's projections are
-                    // stored in the binding for lineage composition, and
-                    // no intermediate QueryOutput edges are emitted
-                    // since the CTE output isn't a query result on its
-                    // own — references through the CTE compose end to
-                    // end at lineage-emission time.
-                    let resolved = self.resolve_query(&cte.query)?;
-                    let renames = &cte.alias.columns;
-                    let renamed_schema =
-                        super::rename_relation_schema(resolved.output_schema, renames);
-                    let renamed_projections =
-                        super::rename_projection_groups(resolved.projections, renames);
-                    self.bind_cte(cte.alias.name.clone(), renamed_schema, renamed_projections);
+                if let Some(limit_clause) = &query.limit_clause {
+                    r.visit_limit_clause(limit_clause)?;
                 }
-            }
-        }
-        let body_schema = self.visit_set_expr(&query.body)?;
-        if let Some(order_by) = &query.order_by {
-            self.visit_order_by(order_by)?;
-        }
-        if let Some(limit_clause) = &query.limit_clause {
-            self.visit_limit_clause(limit_clause)?;
-        }
-        if let Some(fetch) = &query.fetch {
-            self.visit_fetch(fetch)?;
-        }
-        if let Some(settings) = &query.settings {
-            for setting in settings {
-                self.visit_expr(&setting.value)?;
-            }
-        }
-        for pipe_operator in &query.pipe_operators {
-            self.visit_pipe_operator(pipe_operator)?;
-        }
-        self.scopes.pop_scope();
+                if let Some(fetch) = &query.fetch {
+                    r.visit_fetch(fetch)?;
+                }
+                if let Some(settings) = &query.settings {
+                    for setting in settings {
+                        r.visit_expr(&setting.value)?;
+                    }
+                }
+                for pipe_operator in &query.pipe_operators {
+                    r.visit_pipe_operator(pipe_operator)?;
+                }
+                Ok((body_schema, body_scope))
+            })?;
         let projections = std::mem::replace(&mut self.current_projections, prev_projections);
         Ok(ResolvedQuery {
             output_schema: body_schema,
             projections,
+            body_scope,
         })
     }
 
@@ -96,8 +115,8 @@ impl<'a> Resolver<'a> {
                 // so UNION INSERT naturally pairs every branch with the
                 // same target columns. Result schema conventionally
                 // follows the left side's column names.
-                let left_schema = self.with_branch_scope(|r| r.visit_set_expr(left))?;
-                self.with_branch_scope(|r| r.visit_set_expr(right))?;
+                let left_schema = self.with_scope(|r| r.visit_set_expr(left))?;
+                self.with_scope(|r| r.visit_set_expr(right))?;
                 Ok(left_schema)
             }
             SetExpr::Insert(statement)
@@ -112,7 +131,7 @@ impl<'a> Resolver<'a> {
                 // would see both `t` and `cte` in one scope and resolve
                 // ambiguously to None. CTEs stay reachable via the
                 // parent-scope walk-up.
-                self.with_branch_scope(|r| r.visit_statement(statement))?;
+                self.with_scope(|r| r.visit_statement(statement))?;
                 Ok(RelationSchema::Unknown)
             }
             SetExpr::Table(table) => {
@@ -147,12 +166,18 @@ impl<'a> Resolver<'a> {
         });
         if let Some(into) = &select.into {
             // SELECT ... INTO new_table acts like CTAS — INTO is the write target.
-            self.bind_base_table(
+            self.bind_real_table(
                 TableReference::try_from(&into.name)?,
                 None,
                 TableRole::Write,
             );
         }
+        // TODO: Hive/Spark `LATERAL VIEW explode(arr) t AS col` — the
+        // generator expression is walked as a plain read here, but
+        // the alias `t` and its output columns (`col`) are not bound,
+        // so column refs against them currently surface as
+        // `UnresolvedColumn`. Binding would need `lateral_view.lateral_view_name`
+        // + `lateral_col_alias` as a DerivedTable-like with synthetic columns.
         for lateral_view in &select.lateral_views {
             self.visit_expr(&lateral_view.lateral_view)?;
         }
@@ -243,7 +268,7 @@ impl<'a> Resolver<'a> {
             return;
         };
         // `TABLE foo` is sugar for `SELECT * FROM foo` — foo is read.
-        self.bind_base_table(
+        self.bind_real_table(
             TableReference {
                 catalog: None,
                 schema: table

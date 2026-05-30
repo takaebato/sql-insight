@@ -18,7 +18,7 @@ impl<'a> Resolver<'a> {
             Statement::Merge(merge) => self.visit_merge(merge),
             Statement::CreateTable(create_table) => {
                 let target = TableReference::try_from(&create_table.name)?;
-                self.bind_base_table(target.clone(), None, TableRole::Write);
+                self.bind_real_table(target.clone(), None, TableRole::Write);
                 if let Some(query) = &create_table.query {
                     // CTAS: source projections pair with the new
                     // table's columns. Explicit column defs (if any)
@@ -35,13 +35,13 @@ impl<'a> Resolver<'a> {
             }
             Statement::CreateView(create_view) => {
                 let target = TableReference::try_from(&create_view.name)?;
-                self.bind_base_table(target.clone(), None, TableRole::Write);
+                self.bind_real_table(target.clone(), None, TableRole::Write);
                 let explicit: Vec<sqlparser::ast::Ident> =
                     create_view.columns.iter().map(|c| c.name.clone()).collect();
                 let resolved = self.resolve_query(&create_view.query)?;
                 self.emit_relation_to_created(&target, &explicit, &resolved);
                 if let Some(to) = &create_view.to {
-                    self.bind_base_table(TableReference::try_from(to)?, None, TableRole::Write);
+                    self.bind_real_table(TableReference::try_from(to)?, None, TableRole::Write);
                 }
                 Ok(())
             }
@@ -52,17 +52,17 @@ impl<'a> Resolver<'a> {
                 ..
             } => {
                 let target = TableReference::try_from(name)?;
-                self.bind_base_table(target.clone(), None, TableRole::Write);
+                self.bind_real_table(target.clone(), None, TableRole::Write);
                 let resolved = self.resolve_query(query)?;
                 self.emit_relation_to_created(&target, columns, &resolved);
                 Ok(())
             }
             Statement::CreateVirtualTable { name, .. } => {
-                self.bind_base_table(TableReference::try_from(name)?, None, TableRole::Write);
+                self.bind_real_table(TableReference::try_from(name)?, None, TableRole::Write);
                 Ok(())
             }
             Statement::AlterTable(alter_table) => {
-                self.bind_base_table(
+                self.bind_real_table(
                     TableReference::try_from(&alter_table.name)?,
                     None,
                     TableRole::Write,
@@ -80,7 +80,7 @@ impl<'a> Resolver<'a> {
                     ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
                 ) {
                     for name in names {
-                        self.bind_base_table(
+                        self.bind_real_table(
                             TableReference::try_from(name)?,
                             None,
                             TableRole::Write,
@@ -88,13 +88,13 @@ impl<'a> Resolver<'a> {
                     }
                 }
                 if let Some(table) = table {
-                    self.bind_base_table(TableReference::try_from(table)?, None, TableRole::Write);
+                    self.bind_real_table(TableReference::try_from(table)?, None, TableRole::Write);
                 }
                 Ok(())
             }
             Statement::Truncate(truncate) => {
                 for table in &truncate.table_names {
-                    self.bind_base_table(
+                    self.bind_real_table(
                         TableReference::try_from(&table.name)?,
                         None,
                         TableRole::Write,
@@ -226,7 +226,7 @@ impl<'a> Resolver<'a> {
     fn visit_insert(&mut self, insert: &sqlparser::ast::Insert) -> Result<(), Error> {
         let (table, alias) = TableReference::from_insert_with_alias(insert)?;
         let target_table = table.clone();
-        self.bind_base_table(table, alias, TableRole::Write);
+        self.bind_real_table(table, alias, TableRole::Write);
         // Explicit column list wins; otherwise fall back to the
         // catalog-provided schema (when present) for positional
         // pairing. Without either, no lineage edges are emitted —
@@ -332,7 +332,7 @@ impl<'a> Resolver<'a> {
                     //   `reads` surface (like CTE / derived);
                     // - body_projections: the INSERT source's
                     //   projections renamed positionally to the target
-                    //   column names, so `substitute_source` composes
+                    //   column names, so `collapse_source` collapses
                     //   `EXCLUDED.<col>` back to the actual source ref
                     //   (e.g. `EXCLUDED.b` → source's `y` when the
                     //   INSERT pairs (a, b) ← (x, y)).
@@ -343,10 +343,17 @@ impl<'a> Resolver<'a> {
                     };
                     let body_projections =
                         excluded_body_projections(effective_columns, source_projections);
+                    // `body_scope: None` — EXCLUDED's body_projections are
+                    // synthesized from the INSERT source's projections, not
+                    // walked into a fresh scope. The INSERT source's real
+                    // tables are already covered by their own RawTableRefs,
+                    // so EXCLUDED needs no collapse path for table
+                    // lineage.
                     self.bind_derived_table(
                         Ident::new("EXCLUDED"),
                         excluded_schema,
                         body_projections,
+                        None,
                     );
                     self.emit_assignment_lineage(&do_update.assignments, Some(target_table))?;
                     if let Some(selection) = &do_update.selection {
@@ -483,7 +490,7 @@ impl<'a> Resolver<'a> {
             self.visit_table_with_joins(table, from_role)?;
         }
         for name in &delete.tables {
-            self.bind_base_table(TableReference::try_from_name(name)?, None, TableRole::Write);
+            self.bind_real_table(TableReference::try_from_name(name)?, None, TableRole::Write);
         }
         if let Some(selection) = &delete.selection {
             self.with_filter_clause(|r| r.visit_expr(selection))?;
@@ -577,10 +584,10 @@ impl<'a> Resolver<'a> {
 /// Rename each source projection group's items positionally to the
 /// INSERT target's column names — the EXCLUDED pseudo-table exposes
 /// the would-be-inserted row, so `EXCLUDED.<target_col>` should
-/// compose back to whatever expression feeds that position of the
+/// collapse back to whatever expression feeds that position of the
 /// source. Returns an empty `Vec` when there are no source
 /// projections (e.g. `INSERT ... VALUES (...) ON CONFLICT ...`),
-/// in which case `substitute_source` falls back to leaving
+/// in which case `collapse_source` falls back to leaving
 /// `EXCLUDED.<col>` as the lineage source.
 fn excluded_body_projections(
     effective_columns: &[Ident],

@@ -964,7 +964,7 @@ mod reads_by_clause {
     }
 
     #[test]
-    fn scalar_subquery_in_case_condition_composes_to_outer_only() {
+    fn scalar_subquery_in_case_condition_collapses_to_outer_only() {
         // A scalar subquery in a CASE condition emits no lineage of its
         // own (Option B: raw resolve). The outer CASE projection
         // item captures the subquery's refs (`s.x` from its
@@ -1587,9 +1587,9 @@ mod lineage {
     }
 
     #[test]
-    fn cte_aggregate_composes_to_outer_as_transformation() {
+    fn cte_aggregate_collapses_to_outer_as_transformation() {
         // CTE body's `s` is Transformation (SUM(a)); outer's bare `s`
-        // would be Passthrough, but composition keeps the chain a
+        // would be Passthrough, but collapse keeps the chain a
         // Transformation (any transforming step dominates).
         assert_column_ops(
             "WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s FROM cte",
@@ -1608,7 +1608,7 @@ mod cte_derived_rename {
     use super::*;
 
     #[test]
-    fn cte_column_rename_composes_through_renamed_name() {
+    fn cte_column_rename_collapses_through_renamed_name() {
         // Outer `a` refers to cte's renamed column at position 0,
         // which body-positionally is `x` from t. Composition follows
         // the renamed name back to the body item, then to t.x.
@@ -1630,7 +1630,7 @@ mod cte_derived_rename {
     fn cte_column_alias_matched_case_insensitively() {
         // The CTE projects `x AS Foo`; the outer query references it
         // as unquoted `foo`. Composition's name-match folds both
-        // sides to the same key, so `foo` composes back to the real
+        // sides to the same key, so `foo` collapses back to the real
         // source `t1.x`.
         assert_column_ops(
             "WITH cte AS (SELECT x AS Foo FROM t1) SELECT foo FROM cte",
@@ -1664,7 +1664,7 @@ mod cte_derived_rename {
     }
 
     #[test]
-    fn derived_table_column_rename_composes() {
+    fn derived_table_column_rename_collapses() {
         // `(SELECT x FROM t) AS d(a)` — outer `a` resolves via d's
         // renamed column at position 0 → body item x → t.x.
         assert_column_ops(
@@ -1682,7 +1682,7 @@ mod cte_derived_rename {
     #[test]
     fn cte_column_rename_into_insert() {
         // `INSERT INTO t2 (col) WITH cte(a) AS (SELECT x FROM t1)
-        //  SELECT a FROM cte` composes through both the CTE rename
+        //  SELECT a FROM cte` collapses through both the CTE rename
         //  and the INSERT pairing: t1.x → t2.col.
         assert_column_ops(
             "INSERT INTO t2 (col) WITH cte (a) AS (SELECT x FROM t1) \
@@ -1708,7 +1708,7 @@ mod with_in_dml {
     use super::*;
 
     #[test]
-    fn with_in_insert_select_composes_cte_to_target() {
+    fn with_in_insert_select_collapses_cte_to_target() {
         assert_column_ops(
             "WITH cte AS (SELECT x FROM s) INSERT INTO t (a) SELECT x FROM cte",
             ColumnOperation {
@@ -1722,10 +1722,10 @@ mod with_in_dml {
     }
 
     #[test]
-    fn with_in_update_via_scalar_subquery_composes() {
+    fn with_in_update_via_scalar_subquery_collapses() {
         // CTE referenced from the SET RHS scalar subquery. The
         // subquery emits no QueryOutput edge of its own (Option B);
-        // the UPDATE SET assignment captures its source (composed
+        // the UPDATE SET assignment captures its source (collapsed
         // through cte to s.x) and emits the single Relation edge.
         // Transformation (the value is derived through max + the
         // subquery wrapping).
@@ -1767,7 +1767,7 @@ mod with_in_dml {
     fn with_multiple_ctes_chained_into_insert() {
         // Two CTEs where `b` references `a`. INSERT then pulls
         // from `b`. Composition walks back through both layers
-        // to the base table.
+        // to the real table.
         assert_column_ops(
             "WITH a AS (SELECT id FROM t1), \
                   b AS (SELECT id + 1 AS x FROM a) \
@@ -2039,7 +2039,7 @@ mod ctas_view {
     #[test]
     fn cte_aggregate_then_outer_expression_still_transformation() {
         // Outer wraps the CTE column in an expression (s + 1) —
-        // composition: outer Transformation × inner Transformation =
+        // collapse: outer Transformation × inner Transformation =
         // Transformation.
         assert_column_ops(
             "WITH cte AS (SELECT SUM(a) AS s FROM t1) SELECT s + 1 FROM cte",
@@ -2054,12 +2054,12 @@ mod ctas_view {
     }
 }
 
-mod composition {
+mod collapse {
     use super::*;
 
     #[test]
-    fn cte_passthrough_composes_to_base_table() {
-        // The outer edge's source `id` resolves to cte, then composes
+    fn cte_passthrough_collapses_to_real_table() {
+        // The outer edge's source `id` resolves to cte, then collapses
         // through the CTE body's projection back to t1.id. No
         // intermediate cte.id → out edge survives.
         assert_column_ops(
@@ -2075,9 +2075,9 @@ mod composition {
     }
 
     #[test]
-    fn cte_transformation_propagates_kind_after_composition() {
+    fn cte_transformation_propagates_kind_after_collapse() {
         // CTE body's `sum` is a transformation of a, b. Outer's bare
-        // `sum` composes back into two edges, each Transformation
+        // `sum` collapses back into two edges, each Transformation
         // because the body item is (outer.bare && item.bare = false).
         assert_column_ops(
             "WITH cte AS (SELECT a + b AS sum FROM t1) SELECT sum FROM cte",
@@ -2095,7 +2095,7 @@ mod composition {
     }
 
     #[test]
-    fn cte_to_insert_composes_end_to_end() {
+    fn cte_to_insert_collapses_end_to_end() {
         // Composition reaches past the CTE boundary into the INSERT
         // target — t1.id → t2.x directly, no cte.id step.
         assert_column_ops(
@@ -2111,8 +2111,8 @@ mod composition {
     }
 
     #[test]
-    fn cte_chain_composes_through_all_levels() {
-        // a → b → outer: outer's `b.id` composes via b's body back to
+    fn cte_chain_collapses_through_all_levels() {
+        // a → b → outer: outer's `b.id` collapses via b's body back to
         // a, then via a's body back to t1. Outer is qualified because
         // having both `a` and `b` in scope with the same column name
         // makes the unqualified form ambiguous under our scope model
@@ -2130,8 +2130,8 @@ mod composition {
     }
 
     #[test]
-    fn derived_table_composes_to_base_table() {
-        // The outer projection's `col` composes through derived `d`'s
+    fn derived_table_collapses_to_real_table() {
+        // The outer projection's `col` collapses through derived `d`'s
         // body (a + b AS col) into two Transformation edges on t1.
         assert_column_ops(
             "SELECT col FROM (SELECT a + b AS col FROM t1) d",
@@ -2149,8 +2149,8 @@ mod composition {
     }
 
     #[test]
-    fn cte_referenced_twice_composes_each_use() {
-        // Each cte reference in the projection composes independently
+    fn cte_referenced_twice_collapses_each_use() {
+        // Each cte reference in the projection collapses independently
         // back to t1.id.
         assert_column_ops(
             "WITH cte AS (SELECT id FROM t1) SELECT cte.id AS a, cte.id AS b FROM cte",
@@ -2168,11 +2168,11 @@ mod composition {
     }
 
     #[test]
-    fn recursive_cte_does_not_panic_and_skips_composition() {
+    fn recursive_cte_does_not_panic_and_skips_collapse() {
         // Recursive CTEs don't carry body_projections (fixpoint is
-        // deferred), so composition falls back to leaving the lineage edge
+        // deferred), so collapse falls back to leaving the lineage edge
         // source pointing at the CTE binding (`r.id`) rather than
-        // tracing into a base table. Reads still get the synthetic
+        // tracing into a real table. Reads still get the synthetic
         // filter, so only `t1.id` from the non-recursive branch
         // surfaces in reads. No infinite recursion either.
         assert_column_ops(
@@ -2359,9 +2359,9 @@ mod set_operations {
     }
 
     #[test]
-    fn union_in_subquery_composes_both_branches_to_outer() {
+    fn union_in_subquery_collapses_both_branches_to_outer() {
         // The inner UNION lives in a derived subquery; the outer
-        // SELECT projects from it and composes back to the base
+        // SELECT projects from it and collapses back to the base
         // tables of both branches — no intermediate QueryOutput
         // edge for the subquery survives.
         assert_column_ops(
@@ -2380,7 +2380,7 @@ mod set_operations {
     }
 
     #[test]
-    fn union_in_cte_composes_to_outer_use() {
+    fn union_in_cte_collapses_to_outer_use() {
         // CTE body is a UNION. Outer SELECT pulls `x` from the cte.
         // Composition should walk back through both branches to t1/t2.
         assert_column_ops(
@@ -2447,7 +2447,7 @@ mod set_operations {
         // ORDER BY on the whole UNION is visited in the outer query
         // scope, AFTER both branch scopes have been popped. The
         // ORDER BY column refers to a UNION output column, not a
-        // base table — so `a` resolves to None (no in-scope
+        // real table — so `a` resolves to None (no in-scope
         // binding).
         assert_column_ops(
             "SELECT a FROM t1 UNION SELECT b FROM t2 ORDER BY a",
@@ -2757,12 +2757,12 @@ mod on_conflict {
     }
 
     #[test]
-    fn pg_insert_select_with_on_conflict_composes_excluded_to_source() {
+    fn pg_insert_select_with_on_conflict_collapses_excluded_to_source() {
         // EXCLUDED's body_projections come from the INSERT source
         // renamed to the target columns positionally. So
-        // `EXCLUDED.b` composes through to the source's position-1
+        // `EXCLUDED.b` collapses through to the source's position-1
         // projection (`y` from s) — the conflict-action lineage edge
-        // bottoms out at the same base table as the
+        // bottoms out at the same real table as the
         // source-projection lineage edge.
         assert_column_ops_with_dialect(
             "INSERT INTO t (a, b) SELECT x, y FROM s \
@@ -2808,7 +2808,7 @@ mod on_conflict {
         // The source has TWO ProjectionGroups (one per UNION
         // branch), so EXCLUDED's body_projections also have two
         // groups — each with a position-0 item named after the
-        // INSERT target column. `EXCLUDED.a` then composes to
+        // INSERT target column. `EXCLUDED.a` then collapses to
         // BOTH branches' position-0 source refs.
         assert_column_ops_with_dialect(
             "INSERT INTO t (a) SELECT x FROM s1 UNION SELECT y FROM s2 \
@@ -2832,7 +2832,7 @@ mod on_conflict {
     #[test]
     fn pg_insert_aggregate_with_on_conflict_excluded_keeps_transformation_kind() {
         // SUM(x) makes the source projection a Transformation. When
-        // EXCLUDED.total composes back, compose_lineage_kinds keeps the
+        // EXCLUDED.total collapses back, collapse_lineage_kinds keeps the
         // transforming step → lineage kind stays Transformation even on
         // the conflict-action path.
         assert_column_ops_with_dialect(
@@ -2880,7 +2880,7 @@ mod values_as_relation {
     //! VALUES doesn't carry projection items the resolver can
     //! capture (literals have no source refs), so lineage from these
     //! variants bottom out at the synthetic binding — no
-    //! composition to a base table is possible.
+    //! collapse to a real table is possible.
     use super::*;
 
     #[test]
@@ -2890,7 +2890,7 @@ mod values_as_relation {
         // contributes no ProjectionItems). So `t.x` is recorded as
         // a synthetic ref pointing at the derived binding; reads
         // filter it out, and lineage keeps `t.x` as the source
-        // (composition can't substitute further).
+        // (collapse can't collapse further).
         assert_column_ops(
             "SELECT x, y FROM (VALUES (1, 'a'), (2, 'b')) AS t(x, y)",
             ColumnOperation {
@@ -4597,7 +4597,7 @@ mod relation_arm_coverage {
     fn create_view_with_to_target() {
         // ClickHouse-style materialized view `CREATE VIEW v TO dst`:
         // both `v` (the view) and `dst` (the storage target) bind as
-        // write targets via `bind_base_table`. Only `v.a` surfaces as a
+        // write targets via `bind_real_table`. Only `v.a` surfaces as a
         // column-level write — projections pair against the view's
         // column list, not the `TO` target.
         let result = op("CREATE VIEW v TO dst AS SELECT t.a FROM t");

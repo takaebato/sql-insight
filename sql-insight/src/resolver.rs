@@ -1,7 +1,7 @@
 //! Walks a `sqlparser` `Statement` once and produces a
 //! [`Resolution`] carrying scope bindings, captured column
 //! references, and lineage edges. Two post-passes
-//! ([`Resolution::composed_lineage_edges`] and
+//! ([`Resolution::collapsed_lineage_edges`] and
 //! [`Resolution::real_column_refs`]) refine the raw walk
 //! data into the public extraction surfaces.
 //!
@@ -17,16 +17,17 @@
 //!   passthrough-vs-transformation classification helper.
 //! - [`lineage`]: `LineageEdge` / `LineageTargetSpec` and the emit
 //!   helpers that drive INSERT / CTAS / QueryOutput edge construction.
-//! - [`composition`]: post-walk passes that substitute synthetic
-//!   sources and filter synthetic reads.
+//! - [`collapse`]: post-walk passes that collapse synthetic
+//!   intermediates out of the lineage chain and filter synthetic
+//!   reads.
 //! - [`rename`]: CTE / derived column-alias renaming.
 //! - Walker modules ([`expr`], [`query`], [`statement`], [`table`]):
 //!   `visit_*` methods on `Resolver`, one per major AST
 //!   region.
 
 mod binding;
+mod collapse;
 mod column_ref;
-mod composition;
 mod context;
 mod lineage;
 mod projection;
@@ -37,7 +38,9 @@ mod query;
 mod statement;
 mod table;
 
-pub(crate) use binding::{Binding, RelationSchema, Scope, ScopeId, ScopeKind, TableRole};
+pub(crate) use binding::{
+    Binding, RawTableRef, RelationSchema, Scope, ScopeId, ScopeKind, TableRefTarget, TableRole,
+};
 pub(crate) use column_ref::RawColumnRef;
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
 pub(crate) use projection::{ProjectionGroup, ProjectionItem};
@@ -63,15 +66,28 @@ use crate::error::Error;
 /// resolver.
 #[derive(Debug)]
 pub(crate) struct Resolution {
+    /// Column-level diagnostics accumulated during the walk
+    /// (`WildcardSuppressed`, `AmbiguousColumn`, `UnresolvedColumn`,
+    /// `UnsupportedStatement`). Table-level extractors project this
+    /// down via `ColumnLevelDiagnostic::to_table_level`.
     pub(crate) diagnostics: Vec<ColumnLevelDiagnostic>,
+    /// Finalized scope arena, indexed by [`ScopeId`]. Holds every
+    /// scope created during the walk — post-passes (collapse,
+    /// real-column-ref filtering) re-walk via id lookups.
     pub(crate) scopes: Vec<Scope>,
     /// Column refs that survive the synthetic-binding filter (see
     /// [`Resolution::real_column_refs`]).
     pub(crate) column_refs: Vec<RawColumnRef>,
-    /// Lineage edges after end-to-end composition through CTE / derived
+    /// Lineage edges after end-to-end collapse through CTE / derived
     /// intermediates (see
-    /// [`Resolution::composed_lineage_edges`]).
+    /// [`Resolution::collapsed_lineage_edges`]).
     pub(crate) lineage_edges: Vec<LineageEdge>,
+    /// Every `FROM`-position use of a table-like source captured
+    /// during the walk. Drives table-lineage collapse (see
+    /// [`Resolution::collapsed_feeding_table_sources`]) — an entry per
+    /// physical use, occurrence-based (no dedup), matching
+    /// [`ColumnLineageEdge`] semantics.
+    pub(crate) table_refs: Vec<RawTableRef>,
 }
 
 /// What `resolve_query` returns: the body's `output_schema` and the
@@ -83,6 +99,13 @@ pub(crate) struct Resolution {
 pub(crate) struct ResolvedQuery {
     pub(crate) output_schema: RelationSchema,
     pub(crate) projections: Vec<ProjectionGroup>,
+    /// Arena id of the scope pushed for this query's body — exposed so
+    /// callers binding the query as a synthetic relation (CTE / derived
+    /// table) can record it on the binding for table-lineage
+    /// collapse. Equals the scope that held the body's FROM
+    /// bindings; pop has already happened by the time the caller sees
+    /// this id, but the arena entry remains for post-pass lookups.
+    pub(crate) body_scope: ScopeId,
 }
 
 /// The walker. Owns the scope stack, the in-progress refs / edges,
@@ -97,10 +120,25 @@ pub(crate) struct Resolver<'a> {
     /// enrichment; table schemas stay `RelationSchema::Unknown` in
     /// that case.
     catalog: Option<&'a dyn Catalog>,
+    /// In-progress diagnostics buffer; moved into
+    /// [`Resolution::diagnostics`] at `into_resolution`.
     diagnostics: Vec<ColumnLevelDiagnostic>,
+    /// Active scope arena + stack. Pushes/pops during the walk,
+    /// flattens into [`Resolution::scopes`] at `into_resolution`.
     scopes: ScopeStack,
+    /// Column refs captured by `record_column_ref` in walk order.
+    /// Post-pass filters synthetic-owned ones out into
+    /// [`Resolution::column_refs`].
     column_refs: Vec<RawColumnRef>,
+    /// Lineage edges emitted directly during the walk. Post-pass
+    /// collapses through CTE / derived intermediates into
+    /// [`Resolution::lineage_edges`].
     lineage_edges: Vec<LineageEdge>,
+    /// In-progress `RawTableRef` buffer; moved into
+    /// [`Resolution::table_refs`] at `into_resolution`. Emit happens at
+    /// every `FROM`-position bind site (real tables, CTE references,
+    /// true derived subqueries).
+    table_refs: Vec<RawTableRef>,
     /// Per-query buffer of projection groups collected by
     /// `visit_select`. `resolve_query` swaps a fresh buffer in for
     /// the duration of its walk and packs the collected groups into
@@ -124,6 +162,7 @@ impl<'a> Resolver<'a> {
             scopes: ScopeStack::default(),
             column_refs: Vec::new(),
             lineage_edges: Vec::new(),
+            table_refs: Vec::new(),
             current_projections: Vec::new(),
             scope_kind: ScopeKind::Body,
         }
@@ -144,13 +183,14 @@ impl<'a> Resolver<'a> {
             scopes: self.scopes.into_scopes(),
             column_refs: self.column_refs,
             lineage_edges: self.lineage_edges,
+            table_refs: self.table_refs,
         };
         // Two post-passes, both rely on the scope arena being final:
-        // - compose lineage edges so synthetic-binding (Cte/Derived)
-        //   sources are substituted with their body's source refs;
+        // - collapse lineage edges so synthetic-binding (Cte/Derived)
+        //   sources are collapsed with their body's source refs;
         // - filter column refs so synthetic-owned ones don't surface
         //   in the public reads list.
-        resolution.lineage_edges = resolution.composed_lineage_edges();
+        resolution.lineage_edges = resolution.collapsed_lineage_edges();
         resolution.column_refs = resolution.real_column_refs();
         resolution
     }
