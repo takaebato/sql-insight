@@ -1,55 +1,55 @@
 //! Walks a `sqlparser` `Statement` once and produces a
-//! [`Resolution`] carrying scope bindings, captured column
-//! references, and lineage edges. Two post-passes
-//! ([`Resolution::collapsed_lineage_edges`] and
-//! [`Resolution::real_column_refs`]) refine the raw walk
-//! data into the public extraction surfaces.
+//! [`Resolution`] carrying scope bindings, captured refs, and lineage
+//! edges. Two post-passes ([`Resolution::collapsed_lineage_edges`]
+//! and [`Resolution::real_column_refs`]) refine the raw walk data
+//! into the public extraction surfaces.
 //!
 //! Module layout (all sub-modules are crate-internal):
 //!
-//! - [`binding`]: scope arena, `Binding` enum, scope traversal,
-//!   binder methods on `Resolver`.
-//! - [`context`]: the scoped `with_*` helpers that save / restore
-//!   `scope_kind` around a clause walk.
+//! - [`scope`]: `Scope`, `ScopeStack`, and the `with_*` helpers that
+//!   save / restore scope state around a clause walk.
+//! - [`binding`]: `Binding` enum + `BindingKey` + `bind_*` /
+//!   lookup / diagnostic-record methods on `Resolver`.
 //! - [`column_ref`]: `RawColumnRef` and walk-time resolution of
 //!   identifier parts to owning tables.
-//! - [`projection`]: `ProjectionGroup` / `ProjectionItem` and the
-//!   passthrough-vs-transformation classification helper.
+//! - [`table_ref`]: `RawTableRef` / `TableRefTarget` and the
+//!   `record_*_table_ref` constructors. Parallel to `column_ref`.
+//! - [`body_output`]: `BodyOutput` / `OutputColumn` and the helpers
+//!   that derive each output column's name / kind from a `SelectItem`.
 //! - [`lineage`]: `LineageEdge` / `LineageTargetSpec` and the emit
 //!   helpers that drive INSERT / CTAS / QueryOutput edge construction.
-//! - [`collapse`]: post-walk passes that collapse synthetic
-//!   relations out of the lineage chain and filter synthetic reads.
-//! - [`rename`]: CTE / derived column-alias renaming.
-//! - Walker modules ([`expr`], [`query`], [`statement`], [`table`]):
-//!   `visit_*` methods on `Resolver`, one per major AST
-//!   region.
+//! - [`resolution`]: `Resolution` struct + every `impl Resolution`
+//!   method — public table queries and the post-walk collapse /
+//!   filter passes.
+//! - Walker modules ([`resolve_statement`], [`resolve_query`],
+//!   [`resolve_expr`], [`resolve_table`]): `visit_*` methods on
+//!   `Resolver`, one per major AST region. `resolve_query` also
+//!   defines `ResolvedQuery`.
 
 mod binding;
-mod collapse;
+mod body_output;
 mod column_ref;
-mod context;
 mod lineage;
-mod projection;
-mod rename;
+mod resolution;
+mod scope;
+mod table_ref;
 
-mod expr;
-mod query;
-mod statement;
-mod table;
+mod resolve_expr;
+mod resolve_query;
+mod resolve_statement;
+mod resolve_table;
 
-pub(crate) use binding::{
-    Binding, RawTableRef, Scope, ScopeId, ScopeKind, TableRefTarget, TableRole,
-};
+pub(crate) use binding::{Binding, TableRole};
+pub(crate) use body_output::{BodyOutput, OutputColumn};
 pub(crate) use column_ref::RawColumnRef;
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
-pub(crate) use projection::{BodyOutput, OutputColumn};
+pub(crate) use resolution::Resolution;
+pub(crate) use resolve_query::ResolvedQuery;
+pub(crate) use scope::{Scope, ScopeId, ScopeKind};
+pub(crate) use table_ref::{RawTableRef, TableRefTarget};
 
-// Internal helpers used by walkers via `super::*`. Some are
-// resolver-internal infrastructure (`BindingKey`, `ScopeStack`,
-// binding helpers); rename helpers are surfaced for the CTE /
-// derived-table walkers in walker/query.rs and walker/table.rs.
-use binding::ScopeStack;
-pub(super) use rename::rename_body_output;
+// Internal infrastructure used by walkers via `super::*`.
+use scope::ScopeStack;
 
 use sqlparser::ast::Statement;
 
@@ -57,61 +57,8 @@ use crate::catalog::Catalog;
 use crate::diagnostic::ColumnLevelDiagnostic;
 use crate::error::Error;
 
-/// The end-of-walk result the resolver produces. Holds the scope
-/// arena and the raw column refs / lineage edges collected during the
-/// walk, plus accumulated diagnostics. Two post-passes inside
-/// [`Resolver::into_resolution`] refine
-/// `column_refs` and `lineage_edges` before the resolution leaves the
-/// resolver.
-#[derive(Debug)]
-pub(crate) struct Resolution {
-    /// Column-level diagnostics accumulated during the walk
-    /// (`WildcardSuppressed`, `AmbiguousColumn`, `UnresolvedColumn`,
-    /// `UnsupportedStatement`). Table-level extractors project this
-    /// down via `ColumnLevelDiagnostic::to_table_level`.
-    pub(crate) diagnostics: Vec<ColumnLevelDiagnostic>,
-    /// Finalized scope arena, indexed by [`ScopeId`]. Holds every
-    /// scope created during the walk — post-passes (collapse,
-    /// real-column-ref filtering) re-walk via id lookups.
-    pub(crate) scopes: Vec<Scope>,
-    /// Column refs that survive the synthetic-binding filter (see
-    /// [`Resolution::real_column_refs`]).
-    pub(crate) column_refs: Vec<RawColumnRef>,
-    /// Lineage edges after end-to-end collapse through CTE / derived
-    /// synthetics (see [`Resolution::collapsed_lineage_edges`]).
-    pub(crate) lineage_edges: Vec<LineageEdge>,
-    /// Every `FROM`-position use of a table-like source captured
-    /// during the walk. Drives table-lineage collapse (see
-    /// [`Resolution::collapsed_feeding_table_sources`]) — an entry per
-    /// physical use, occurrence-based (no dedup), matching
-    /// [`ColumnLineageEdge`] semantics.
-    pub(crate) table_refs: Vec<RawTableRef>,
-}
-
-/// What `resolve_query` returns: the body's `output_schema` and the
-/// body projections per top-level SELECT (one entry, or one per UNION
-/// branch). Callers decide whether to emit `QueryOutput` edges
-/// (default), pair positionally with relation target columns
-/// (INSERT / CTAS), or bubble them through `SetExpr::Query`.
-#[derive(Debug, Clone)]
-pub(crate) struct ResolvedQuery {
-    /// Body-walk output of the query — per-branch list of
-    /// [`OutputColumn`]s with full lineage info. `None` when nothing
-    /// was captured (e.g. recursive CTE pre-bind stub, `VALUES`-only
-    /// query). Callers (CTE / derived bind, INSERT pairing, etc.)
-    /// consume this directly.
-    pub(crate) output_columns: Option<BodyOutput>,
-    /// Arena id of the scope pushed for this query's body — exposed so
-    /// callers binding the query as a synthetic relation (CTE / derived
-    /// table) can record it on the binding for table-lineage
-    /// collapse. Equals the scope that held the body's FROM
-    /// bindings; pop has already happened by the time the caller sees
-    /// this id, but the arena entry remains for post-pass lookups.
-    pub(crate) body_scope: ScopeId,
-}
-
 /// The walker. Owns the scope stack, the in-progress refs / edges,
-/// the current projection buffer, and the lexical `scope_kind`. All
+/// the current branch buffer, and the lexical `scope_kind`. All
 /// `visit_*` methods (in the walker sub-modules) and the various
 /// `bind_*` / `record_*` / `with_*` helpers live as `impl` blocks
 /// across the sub-modules — this is just the data shape and the
@@ -119,8 +66,7 @@ pub(crate) struct ResolvedQuery {
 #[derive(Debug)]
 pub(crate) struct Resolver<'a> {
     /// `None` means the resolver runs without external schema
-    /// enrichment; table schemas stay `RelationSchema::Unknown` in
-    /// that case.
+    /// enrichment; tables bound here carry `output_columns: None`.
     catalog: Option<&'a dyn Catalog>,
     /// In-progress diagnostics buffer; moved into
     /// [`Resolution::diagnostics`] at `into_resolution`.

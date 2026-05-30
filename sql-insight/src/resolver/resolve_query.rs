@@ -1,11 +1,41 @@
-use super::projection::{projection_item_kind, projection_item_output_name};
-use super::{BodyOutput, OutputColumn, ResolvedQuery, Resolver, ScopeId, TableRole};
+//! Walker for `Query`: `resolve_query` is the main entry, walking
+//! `WITH` bindings, `SetExpr` branches (Select / SetOperation /
+//! Query / Insert / Update / Delete / Merge / Table / Values), and
+//! per-SELECT projection capture into branch-shaped output columns.
+//! Also defines [`ResolvedQuery`], the data the walker hands back to
+//! its callers.
+
+use super::body_output::{output_column_kind, output_column_name};
+use super::{BodyOutput, OutputColumn, Resolver, ScopeId, TableRole};
 use crate::error::Error;
 use crate::reference::TableReference;
 use sqlparser::ast::{
     ConnectByKind, Distinct, GroupByExpr, GroupByWithModifier, NamedWindowExpr, Query, Select,
     SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Table, TopQuantity, Values,
 };
+
+/// What `resolve_query` returns: the body's per-branch output
+/// columns and the body's scope id. Callers decide whether to emit
+/// `QueryOutput` edges (default), pair positionally with relation
+/// target columns (INSERT / CTAS), or bubble them through
+/// `SetExpr::Query`.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedQuery {
+    /// Body-walk output of the query — per-branch list of
+    /// [`OutputColumn`]s with full lineage info. `None` when nothing
+    /// was captured (e.g. recursive CTE pre-bind stub, `VALUES`-only
+    /// query). Callers (CTE / derived bind, INSERT pairing, etc.)
+    /// consume this directly.
+    pub(crate) output_columns: Option<BodyOutput>,
+    /// Arena id of the scope pushed for this query's body — exposed
+    /// so callers binding the query as a synthetic relation (CTE /
+    /// derived table) can record it on the binding for table-lineage
+    /// collapse. Equals the scope that held the body's FROM
+    /// bindings; pop has already happened by the time the caller
+    /// sees this id, but the arena entry remains for post-pass
+    /// lookups.
+    pub(crate) body_scope: ScopeId,
+}
 
 impl<'a> Resolver<'a> {
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
@@ -46,9 +76,7 @@ impl<'a> Resolver<'a> {
                         // end at lineage-emission time.
                         let resolved = r.resolve_query(&cte.query)?;
                         let renames = &cte.alias.columns;
-                        let renamed = resolved
-                            .output_columns
-                            .map(|o| super::rename_body_output(o, renames));
+                        let renamed = resolved.output_columns.map(|o| o.renamed(renames));
                         r.bind_cte(cte.alias.name.clone(), renamed, resolved.body_scope);
                     }
                 }
@@ -211,9 +239,9 @@ impl<'a> Resolver<'a> {
         self.visit_select_item(item)?;
         let source_refs = self.column_refs_slice(refs_before).to_vec();
         Ok(OutputColumn {
-            name: projection_item_output_name(item),
+            name: output_column_name(item),
             source_refs,
-            kind: projection_item_kind(item),
+            kind: output_column_kind(item),
         })
     }
 

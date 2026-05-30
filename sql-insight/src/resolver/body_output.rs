@@ -3,7 +3,7 @@
 //! and `Passthrough` / `Transformation` kind. Plus the helpers
 //! that derive each output column's name / kind from a `SelectItem`.
 
-use sqlparser::ast::{Expr, Ident, SelectItem};
+use sqlparser::ast::{Expr, Ident, SelectItem, TableAliasColumnDef};
 
 use crate::extractor::column_operation_extractor::ColumnLineageKind;
 
@@ -45,6 +45,39 @@ impl BodyOutput {
         let first = self.per_branch.first()?;
         first.iter().map(|c| c.name.clone()).collect()
     }
+
+    /// Apply a CTE / derived column-alias rename list (`WITH cte(a, b)
+    /// AS (...)` or `(SELECT ...) d(a, b)`). Position N in the rename
+    /// list overrides position N's column name; positions beyond the
+    /// body's columns are appended as name-only entries (no source
+    /// refs). Each branch is renamed independently. An empty rename
+    /// list returns the body unchanged.
+    pub(crate) fn renamed(mut self, renames: &[TableAliasColumnDef]) -> Self {
+        if renames.is_empty() {
+            return self;
+        }
+        for branch in &mut self.per_branch {
+            apply_renames(branch, renames);
+        }
+        self
+    }
+}
+
+fn apply_renames(branch: &mut Vec<OutputColumn>, renames: &[TableAliasColumnDef]) {
+    for (position, rename) in renames.iter().enumerate() {
+        match branch.get_mut(position) {
+            Some(col) => col.name = Some(rename.name.clone()),
+            None => branch.push(rename_only_column(rename.name.clone())),
+        }
+    }
+}
+
+fn rename_only_column(name: Ident) -> OutputColumn {
+    OutputColumn {
+        name: Some(name),
+        source_refs: Vec::new(),
+        kind: ColumnLineageKind::Transformation,
+    }
 }
 
 impl<'a> Resolver<'a> {
@@ -64,10 +97,10 @@ impl<'a> Resolver<'a> {
     }
 }
 
-/// Inferred output name for a projection item:
+/// Inferred output name for a SELECT-list item:
 /// - explicit alias > bare identifier's name > `None` for computed
 ///   expressions and wildcards.
-pub(super) fn projection_item_output_name(item: &SelectItem) -> Option<Ident> {
+pub(super) fn output_column_name(item: &SelectItem) -> Option<Ident> {
     match item {
         SelectItem::ExprWithAlias { alias, .. } => Some(alias.clone()),
         SelectItem::UnnamedExpr(expr) => expr_inferred_name(expr),
@@ -75,11 +108,11 @@ pub(super) fn projection_item_output_name(item: &SelectItem) -> Option<Ident> {
     }
 }
 
-/// Classify a projection item for `ColumnLineageKind`. Wildcards don't
-/// emit lineage edges currently, so the fallback `Transformation` here is
-/// safe; if/when wildcard expansion lands, items will be classified
-/// individually instead.
-pub(super) fn projection_item_kind(item: &SelectItem) -> ColumnLineageKind {
+/// Classify a SELECT-list item for `ColumnLineageKind`. Wildcards
+/// don't emit lineage edges currently, so the fallback
+/// `Transformation` here is safe; if/when wildcard expansion lands,
+/// items will be classified individually instead.
+pub(super) fn output_column_kind(item: &SelectItem) -> ColumnLineageKind {
     match item {
         SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => expr_kind(expr),
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {

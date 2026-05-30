@@ -1,28 +1,67 @@
-//! Post-walk passes on `Resolution`:
+//! `impl Resolution` — methods on the end-of-walk result:
 //!
-//! - [`Resolution::collapsed_lineage_edges`] rewrites each lineage
-//!   edge so its source resolves to a real (non-synthetic) reference
-//!   by walking back through CTE / derived body projections.
-//! - [`Resolution::real_column_refs`] filters out refs whose
-//!   walk-time owner was synthetic, so the public `reads` surface
-//!   only shows real-storage references and unresolved names.
-//! - [`Resolution::collapsed_feeding_table_sources`] walks the
-//!   captured `RawTableRef` events and recursively expands
-//!   synthetic uses (CTE / derived) into the real tables
-//!   underneath, producing the lineage-source list at table
-//!   granularity.
+//! - Public table queries: [`Resolution::tables`],
+//!   [`Resolution::read_tables`], [`Resolution::write_tables`].
+//! - Column-ref post-pass: [`Resolution::real_column_refs`] filters
+//!   out refs whose walk-time owner was synthetic, so the public
+//!   `reads` surface only shows real-storage references and
+//!   unresolved names.
+//! - Column-lineage post-pass: [`Resolution::collapsed_lineage_edges`]
+//!   rewrites each lineage edge so its source resolves to a real
+//!   (non-synthetic) reference by walking back through the CTE /
+//!   derived body's output columns.
+//! - Table-lineage post-pass:
+//!   [`Resolution::collapsed_feeding_table_sources`] walks the
+//!   captured `RawTableRef` events and recursively expands synthetic
+//!   uses (CTE / derived) into the real tables underneath,
+//!   producing the lineage-source list at table granularity.
 
 use std::collections::HashSet;
 
+use crate::diagnostic::ColumnLevelDiagnostic;
 use crate::extractor::column_operation_extractor::ColumnLineageKind;
 use crate::reference::TableReference;
 
-use super::binding::{binding_alias_key, BindingKey};
-use super::{Binding, LineageEdge, RawColumnRef, RawTableRef, Resolution, ScopeId, TableRefTarget};
+use super::binding::binding_alias_key;
+use super::binding::BindingKey;
+use super::{
+    Binding, LineageEdge, RawColumnRef, RawTableRef, Scope, ScopeId, ScopeKind, TableRefTarget,
+    TableRole,
+};
+
+/// The end-of-walk result the resolver produces. Holds the scope
+/// arena and the raw column refs / lineage edges collected during the
+/// walk, plus accumulated diagnostics. Two post-passes inside
+/// `Resolver::into_resolution` refine `column_refs` and
+/// `lineage_edges` before the resolution leaves the resolver.
+#[derive(Debug)]
+pub(crate) struct Resolution {
+    /// Column-level diagnostics accumulated during the walk
+    /// (`WildcardSuppressed`, `AmbiguousColumn`, `UnresolvedColumn`,
+    /// `UnsupportedStatement`). Table-level extractors project this
+    /// down via `ColumnLevelDiagnostic::to_table_level`.
+    pub(crate) diagnostics: Vec<ColumnLevelDiagnostic>,
+    /// Finalized scope arena, indexed by [`ScopeId`]. Holds every
+    /// scope created during the walk — post-passes (collapse,
+    /// real-column-ref filtering) re-walk via id lookups.
+    pub(crate) scopes: Vec<Scope>,
+    /// Column refs that survive the synthetic-binding filter (see
+    /// [`Resolution::real_column_refs`]).
+    pub(crate) column_refs: Vec<RawColumnRef>,
+    /// Lineage edges after end-to-end collapse through CTE / derived
+    /// synthetics (see [`Resolution::collapsed_lineage_edges`]).
+    pub(crate) lineage_edges: Vec<LineageEdge>,
+    /// Every `FROM`-position use of a table-like source captured
+    /// during the walk. Drives table-lineage collapse (see
+    /// [`Resolution::collapsed_feeding_table_sources`]) — an entry per
+    /// physical use, occurrence-based (no dedup), matching
+    /// `ColumnLineageEdge` semantics.
+    pub(crate) table_refs: Vec<RawTableRef>,
+}
 
 /// Recursion ceiling for `collapse_source` — guards against
-/// accidental cycles (recursive CTEs are pre-bound with empty
-/// body_projections, so the typical case stops there; this is a
+/// accidental cycles (recursive CTEs are pre-bound with `None`
+/// `output_columns`, so the typical case stops there; this is a
 /// defence for unexpected loops).
 const MAX_COLLAPSE_DEPTH: usize = 64;
 
@@ -43,11 +82,11 @@ impl Resolution {
 
     /// Collapse every lineage edge so its source resolves to a real
     /// (non-synthetic) reference. References whose walk-time owner is
-    /// a Cte / DerivedTable with non-empty `body_projections` are
-    /// replaced by walking that body's matching `ProjectionItem` and
-    /// emitting one edge per inner source ref — recursively, until the
-    /// chain bottoms out at a real table or an unresolvable ref. The
-    /// outer edge's `kind` is combined with each body item's kind via
+    /// a Cte / DerivedTable with `Some` `output_columns` are replaced
+    /// by walking that body's matching `OutputColumn` and emitting one
+    /// edge per inner source ref — recursively, until the chain
+    /// bottoms out at a real table or an unresolvable ref. The outer
+    /// edge's `kind` is combined with each body column's kind via
     /// [`collapse_lineage_kinds`] (Passthrough is preserved only when
     /// both sides are Passthrough; any transforming step yields
     /// Transformation). Bounded by [`MAX_COLLAPSE_DEPTH`] as a cycle
@@ -243,5 +282,64 @@ fn collapse_lineage_kinds(outer: ColumnLineageKind, inner: ColumnLineageKind) ->
         ColumnLineageKind::Passthrough
     } else {
         ColumnLineageKind::Transformation
+    }
+}
+
+impl Resolution {
+    /// All tables touched by the statement, in scope-arena order. The
+    /// union of [`Self::read_tables`] and [`Self::write_tables`] (with
+    /// duplicates when a single table carries both roles).
+    pub(crate) fn tables(&self) -> Vec<TableReference> {
+        self.scopes
+            .iter()
+            .flat_map(|scope| scope.iter_bindings())
+            .filter_map(|binding| match binding {
+                Binding::Table { table, .. } => Some((**table).clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every table referenced as a Read source, in scope-arena order.
+    /// Includes tables inside predicate subqueries (e.g. `x` in
+    /// `WHERE id IN (SELECT id FROM x)`). Use
+    /// [`Self::collapsed_feeding_table_sources`] for the stricter
+    /// "feeds the enclosing write target" filter.
+    pub(crate) fn read_tables(&self) -> Vec<TableReference> {
+        self.collect_tables_by_role(TableRole::Read)
+    }
+
+    /// Every table referenced as a Write target, in scope-arena order.
+    pub(crate) fn write_tables(&self) -> Vec<TableReference> {
+        self.collect_tables_by_role(TableRole::Write)
+    }
+
+    fn collect_tables_by_role(&self, role: TableRole) -> Vec<TableReference> {
+        self.scopes
+            .iter()
+            .flat_map(|scope| scope.iter_bindings())
+            .filter_map(|binding| match binding {
+                Binding::Table { table, roles, .. } if roles.contains(&role) => {
+                    Some((**table).clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Walk parent chain from `scope_id`; return true iff any scope
+    /// along the way carries `ScopeKind::Predicate`. Drives the
+    /// filter-position exclusion in
+    /// [`Self::collapsed_feeding_table_sources`].
+    pub(super) fn has_predicate_ancestor(&self, scope_id: ScopeId) -> bool {
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let scope = &self.scopes[id.0];
+            if scope.kind == ScopeKind::Predicate {
+                return true;
+            }
+            current = scope.parent;
+        }
+        false
     }
 }

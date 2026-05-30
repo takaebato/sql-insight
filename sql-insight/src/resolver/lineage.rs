@@ -1,7 +1,8 @@
-//! `LineageEdge` / `LineageTargetSpec` and the resolver helpers that emit
-//! them — directly into the `lineage_edges` buffer, or fanned out from
-//! a snapshot of recorded column refs, or driven by a projection
-//! group via a closure-supplied target.
+//! `LineageEdge` / `LineageTargetSpec` and the resolver helpers that
+//! emit them — directly into the `lineage_edges` buffer, fanned out
+//! from a snapshot of recorded column refs, or driven by a
+//! [`BodyOutput`](super::BodyOutput)'s branches via a closure-supplied
+//! target.
 
 use sqlparser::ast::{Ident, Query};
 

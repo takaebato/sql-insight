@@ -4,7 +4,7 @@
 //! resolution (CTE / derived table schemas, FROM alias bindings) works
 //! catalog-free, and a catalog only fills in the columns of tables
 //! that the resolver could not derive from the SQL alone. When no catalog is
-//! provided, those holes stay `RelationSchema::Unknown` and surface as diagnostics
+//! provided, those holes stay column-list-unknown and surface as diagnostics
 //! once consumers (e.g. column-level operations) start reading them.
 //!
 //! The catalog is treated as **open-world**: a table it returns no columns

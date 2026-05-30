@@ -1,7 +1,8 @@
-//! Scope arena, `Binding` enum, and the resolver-side helpers that
-//! create and inspect them.
+//! `Binding` enum + the resolver-side `bind_*` constructors / lookup
+//! helpers / diagnostic recording. The scope arena that holds these
+//! bindings lives in [`super::scope`]; the FROM-position table-use
+//! captures live in [`super::table_ref`].
 
-use indexmap::IndexMap;
 use sqlparser::ast::{Ident, ObjectName, Statement};
 use sqlparser::tokenizer::Span;
 
@@ -9,96 +10,7 @@ use crate::catalog::ColumnSchema;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::reference::TableReference;
 
-use super::{BodyOutput, Resolution, Resolver};
-
-/// Internal role a table binding carries within a statement. Surfaced
-/// to the operation extractor via [`Resolution::read_tables`]
-/// and [`Resolution::write_tables`]; the public API exposes
-/// two separate lists instead of this enum.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum TableRole {
-    Read,
-    Write,
-}
-
-/// Arena index for a [`Scope`]. Stable across later pushes since the
-/// arena only grows during a resolver run, so a `ScopeId` captured
-/// during the walk still resolves correctly in post-passes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ScopeId(pub(super) usize);
-
-/// A single `FROM`-position use of a table-like source captured at walk
-/// time. Table-lineage collapse iterates these (instead of walking
-/// scope bindings), so an unreferenced CTE — whose declaration binds
-/// names but whose body is never `FROM`-used — contributes no lineage
-/// sources.
-#[derive(Clone, Debug)]
-pub(crate) struct RawTableRef {
-    /// Scope where the use occurs — used for predicate-ancestor
-    /// filtering at collapse time.
-    pub(crate) scope_id: ScopeId,
-    /// What's being used: a real table (emits as a lineage source) or
-    /// a synthetic relation (recurses into its body to find real
-    /// tables underneath).
-    pub(crate) target: TableRefTarget,
-}
-
-/// Resolution of a [`RawTableRef`] target.
-///
-/// **Terminology note**: "Synthetic" is this codebase's chosen
-/// umbrella term for `{Binding::Cte, Binding::DerivedTable,
-/// Binding::TableFunction}` — relations defined inside the SQL
-/// statement (CTE bodies, derived subqueries, table functions)
-/// rather than stored in a catalog. **This is our own
-/// classification, not borrowed from SQL spec or vendor docs**:
-///
-/// - ANSI SQL has no umbrella term covering all three; the spec
-///   treats "derived table" (narrower, our `DerivedTable` only),
-///   CTE, and table function as separate constructs.
-/// - Oracle's "inline view" is similarly narrower — FROM-clause
-///   subqueries only.
-/// - The compiler-flavored sense of "synthetic" ("produced by the
-///   processor, not in source") doesn't fit either: the SQL author
-///   wrote these definitions explicitly.
-///
-/// Despite the inexact fit, "synthetic" is chosen for being short,
-/// distinct, free of dialect collision, and consistent with the
-/// existing [`RawColumnRef::synthetic`](crate::resolver::RawColumnRef)
-/// field and [`is_synthetic_binding`] helper.
-///
-/// Variants represent **what to do during table-lineage collapse**,
-/// not raw storage classification. `Binding::TableFunction` is
-/// synthetic at the binding level but is omitted here (and from
-/// `RawTableRef` emission entirely), since it has no inspectable
-/// body to recurse into.
-#[derive(Clone, Debug)]
-pub(crate) enum TableRefTarget {
-    /// A real table — `collapsed_feeding_table_sources` emits this
-    /// `TableReference` directly. Terminal.
-    Real(TableReference),
-    /// A CTE or derived subquery whose body lives at `body_scope`.
-    /// Collapse recurses into that scope's subtree, collecting the
-    /// real tables underneath. Covers `Binding::Cte` and
-    /// `Binding::DerivedTable` (with non-`None` body_scope).
-    Synthetic { body_scope: ScopeId },
-}
-
-/// Whether a scope contributes data to its enclosing write target.
-///
-/// - `Body`: data moves through — query bodies, CTE bodies, derived
-///   tables, INSERT/MERGE sources, scalar subqueries in projection or
-///   SET. Tables bound here participate in `TableLineageEdge` edges when the
-///   statement has a write target.
-/// - `Predicate`: scope is referenced only in a constraint — WHERE,
-///   HAVING, JOIN ON, EXISTS, IN, QUALIFY. Tables bound under any
-///   Predicate ancestor are filtered out of `TableLineageEdge` regardless of
-///   their own kind, so `INSERT INTO t SELECT FROM s WHERE id IN
-///   (SELECT id FROM x)` emits `s → t` but not `x → t`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ScopeKind {
-    Body,
-    Predicate,
-}
+use super::{BodyOutput, Resolver, ScopeId};
 
 /// A normalized identifier key for binding lookup.
 ///
@@ -140,18 +52,29 @@ impl BindingKey {
     }
 }
 
-/// What's bound to a name in a [`Scope`] — a real Table or one of
-/// the synthetic relations (CTE / derived subquery / table function)
+/// Internal role a table binding carries within a statement. Surfaced
+/// to the operation extractor via [`super::Resolution::read_tables`]
+/// and [`super::Resolution::write_tables`]; the public API exposes
+/// two separate lists instead of this enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TableRole {
+    Read,
+    Write,
+}
+
+/// What's bound to a name in a [`super::Scope`] — a real Table or one
+/// of the synthetic relations (CTE / derived subquery / table function)
 /// that SQL exposes as a named row set.
 ///
 /// Column-name info lives in the `output_columns` field, shaped per
 /// binding kind:
-/// - `Table::output_columns: Option<Vec<Ident>>` — naked column-name
-///   list from the catalog (`Some`) or unknown (`None`).
+/// - `Table::output_columns: Option<Vec<Ident>>` — naked catalog
+///   column names (`Some` = catalog hit, `None` = miss / no catalog).
 /// - `Cte` / `DerivedTable` `output_columns: Option<BodyOutput>` —
-///   per-branch list of [`OutputColumn`]s with full lineage info, or
-///   `None` for recursive CTE stubs / wrapper aliases / walk-failed
-///   bodies.
+///   per-branch list of [`super::OutputColumn`]s with full lineage
+///   info (name, source_refs, kind). `None` covers recursive CTE
+///   stubs, wrapper aliases (NestedJoin / Pivot / etc.), and
+///   walk-failed bodies.
 /// - `TableFunction` carries no column info — always unknown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Binding {
@@ -171,7 +94,8 @@ pub(crate) enum Binding {
         output_columns: Option<Vec<Ident>>,
         /// How this binding is used in the statement — Read, Write,
         /// or both (e.g. `DELETE t1 FROM t1`). Re-binding the same
-        /// name merges roles rather than overwriting (see `Scope::bind`).
+        /// name merges roles rather than overwriting (see
+        /// `Scope::bind`).
         roles: Vec<TableRole>,
     },
     Cte {
@@ -179,10 +103,10 @@ pub(crate) enum Binding {
         /// Lookup keys derive from this via `BindingKey`.
         name: Ident,
         /// Body-walk output of the CTE: per-branch list of
-        /// [`OutputColumn`]s with full lineage info (name, source
-        /// refs, kind). `None` for recursive CTEs pre-bound under a
-        /// stub (fixpoint-aware capture is deferred). Renamed via the
-        /// CTE's column-alias list when one is given.
+        /// [`super::OutputColumn`]s with full lineage info (name,
+        /// source refs, kind). `None` for recursive CTEs pre-bound
+        /// under a stub (fixpoint-aware capture is deferred). Renamed
+        /// via the CTE's column-alias list when one is given.
         output_columns: Option<BodyOutput>,
         /// Arena id of the scope that holds the CTE body's bindings.
         /// Table-lineage collapse walks descendant scopes of this id
@@ -214,144 +138,6 @@ pub(crate) enum Binding {
         /// not modelled (always unknown).
         alias: Ident,
     },
-}
-
-/// One lexical scope: a `name → Binding` map plus the links
-/// (`parent`, `kind`) used to walk up the scope chain at
-/// name-resolution and lineage-emission time. Self-id is implicit —
-/// the scope's id equals its index in [`ScopeStack::scopes`].
-#[derive(Debug)]
-pub(crate) struct Scope {
-    /// Lexically enclosing scope, or `None` for the root. Drives the
-    /// walk-up for unqualified name resolution.
-    pub(crate) parent: Option<ScopeId>,
-    /// `Body` vs `Predicate`. A `Predicate` anywhere along the
-    /// ancestor chain excludes nested scopes from `TableLineageEdge`
-    /// even if they themselves are `Body`.
-    pub(crate) kind: ScopeKind,
-    /// Bindings introduced *in this scope* (FROM tables, CTE
-    /// definitions, derived tables, table functions). Keyed by
-    /// `BindingKey` (case-folded); `IndexMap` preserves definition
-    /// order for deterministic iteration.
-    pub(super) bindings: IndexMap<BindingKey, Binding>,
-}
-
-impl Scope {
-    fn new(parent: Option<ScopeId>, kind: ScopeKind) -> Self {
-        Self {
-            parent,
-            kind,
-            bindings: IndexMap::new(),
-        }
-    }
-
-    fn bind(&mut self, name: &Ident, binding: Binding) {
-        let key = BindingKey::from_ident(name);
-        // Re-binding the same name as a Table merges roles rather than
-        // replacing — this captures the `DELETE t1 FROM t1` style case
-        // where a single name plays multiple roles in one statement.
-        if let (
-            Some(Binding::Table {
-                roles: existing, ..
-            }),
-            Binding::Table { roles: new, .. },
-        ) = (self.bindings.get_mut(&key), &binding)
-        {
-            for role in new {
-                if !existing.contains(role) {
-                    existing.push(*role);
-                }
-            }
-            return;
-        }
-        self.bindings.insert(key, binding);
-    }
-
-    fn resolve(&self, name: &Ident) -> Option<&Binding> {
-        self.bindings.get(&BindingKey::from_ident(name))
-    }
-
-    pub(super) fn iter_bindings(&self) -> impl Iterator<Item = &Binding> {
-        self.bindings.values()
-    }
-}
-
-/// Arena + active-stack model of the scope tree. `scopes` retains
-/// every scope by id so post-passes can still look them up after they
-/// have been popped from the active stack; `stack` tracks what is
-/// currently "open" as the walker descends.
-#[derive(Default, Debug)]
-pub(super) struct ScopeStack {
-    /// All scopes ever opened during the walk. Kept after `pop_scope`
-    /// so later passes (lineage collapse, column-ref resolution)
-    /// can address scopes by `ScopeId`. Index in this Vec equals
-    /// `ScopeId.0`.
-    pub(super) scopes: Vec<Scope>,
-    /// Currently-open scope ids, innermost at the top. Drives parent
-    /// derivation in `push_scope` and the walk-up in
-    /// `resolve_unqualified_relation`.
-    stack: Vec<ScopeId>,
-}
-
-impl ScopeStack {
-    pub(super) fn scope(&self, id: ScopeId) -> &Scope {
-        &self.scopes[id.0]
-    }
-
-    pub(super) fn into_scopes(self) -> Vec<Scope> {
-        self.scopes
-    }
-
-    /// Push a fresh scope as a child of the current stack top, with
-    /// the given `kind`. Parent is derived from the stack — this is
-    /// the normal "open a nested scope" operation.
-    pub(super) fn push_scope(&mut self, kind: ScopeKind) -> ScopeId {
-        let parent = self.stack.last().copied();
-        self.insert_scope(parent, kind)
-    }
-
-    pub(super) fn pop_scope(&mut self) {
-        self.stack.pop();
-    }
-
-    pub(super) fn bind_current(&mut self, name: Ident, binding: Binding) {
-        self.current_scope_mut().bind(&name, binding);
-    }
-
-    pub(super) fn resolve_unqualified_relation(&self, relation: &ObjectName) -> Option<&Binding> {
-        if relation.0.len() != 1 {
-            return None;
-        }
-        let name = relation.0[0].as_ident()?;
-        self.stack
-            .iter()
-            .rev()
-            .find_map(|scope_id| self.scopes[scope_id.0].resolve(name))
-    }
-
-    /// Low-level: allocate a `ScopeId`, append to the `scopes` arena, and
-    /// push onto the active `stack`, with an arbitrary `parent` (including
-    /// `None` for a root scope). Maintains the invariant that a newly
-    /// inserted scope's `ScopeId.0` equals its index in `scopes`.
-    fn insert_scope(&mut self, parent: Option<ScopeId>, kind: ScopeKind) -> ScopeId {
-        let id = ScopeId(self.scopes.len());
-        self.scopes.push(Scope::new(parent, kind));
-        self.stack.push(id);
-        id
-    }
-
-    pub(super) fn current_scope_id(&mut self) -> ScopeId {
-        if let Some(id) = self.stack.last() {
-            *id
-        } else {
-            self.insert_scope(None, ScopeKind::Body)
-        }
-    }
-
-    fn current_scope_mut(&mut self) -> &mut Scope {
-        let id = self.current_scope_id();
-        &mut self.scopes[id.0]
-    }
 }
 
 pub(super) fn is_synthetic_binding(binding: &Binding) -> bool {
@@ -467,20 +253,10 @@ pub(super) fn span_suffix(span: Option<Span>) -> String {
     }
 }
 
-// ───────── Resolver binding-related methods ─────────
-
 impl<'a> Resolver<'a> {
-    pub(super) fn scopes(&self) -> &ScopeStack {
-        &self.scopes
-    }
-
-    pub(super) fn scopes_mut(&mut self) -> &mut ScopeStack {
-        &mut self.scopes
-    }
-
     pub(super) fn is_cte_reference(&self, relation: &ObjectName) -> bool {
         matches!(
-            self.scopes.resolve_unqualified_relation(relation),
+            self.scopes().resolve_unqualified_relation(relation),
             Some(Binding::Cte { .. })
         )
     }
@@ -508,27 +284,6 @@ impl<'a> Resolver<'a> {
                 roles: vec![role],
             },
         );
-    }
-
-    /// Record a use of a real table at the current scope. Called by
-    /// [`Self::bind_real_table`] on Read-position binds.
-    pub(super) fn record_real_table_ref(&mut self, table: TableReference) {
-        let scope_id = self.scopes.current_scope_id();
-        self.table_refs.push(RawTableRef {
-            scope_id,
-            target: TableRefTarget::Real(table),
-        });
-    }
-
-    /// Record a use of a synthetic relation (CTE / true derived) at
-    /// the current scope. `body_scope` is the arena id of the
-    /// synthetic's body — collapse recurses into its subtree.
-    pub(super) fn record_synthetic_table_ref(&mut self, body_scope: ScopeId) {
-        let scope_id = self.scopes.current_scope_id();
-        self.table_refs.push(RawTableRef {
-            scope_id,
-            target: TableRefTarget::Synthetic { body_scope },
-        });
     }
 
     /// Query the optional catalog for a table's columns.
@@ -568,7 +323,7 @@ impl<'a> Resolver<'a> {
     /// the caller (alias-bound Cte construction) treats that as "no
     /// collapse through this alias", matching recursive-CTE behavior.
     pub(super) fn cte_output_columns(&self, cte_name: &ObjectName) -> Option<BodyOutput> {
-        match self.scopes.resolve_unqualified_relation(cte_name) {
+        match self.scopes().resolve_unqualified_relation(cte_name) {
             Some(Binding::Cte { output_columns, .. }) => output_columns.clone(),
             _ => None,
         }
@@ -610,7 +365,7 @@ impl<'a> Resolver<'a> {
     /// name does not resolve to a `Cte` binding — same fall-through
     /// semantics as [`Self::cte_output_columns`].
     pub(super) fn cte_body_scope(&self, cte_name: &ObjectName) -> Option<ScopeId> {
-        match self.scopes.resolve_unqualified_relation(cte_name) {
+        match self.scopes().resolve_unqualified_relation(cte_name) {
             Some(Binding::Cte { body_scope, .. }) => Some(*body_scope),
             _ => None,
         }
@@ -646,67 +401,6 @@ impl<'a> Resolver<'a> {
     }
 
     fn bind_relation(&mut self, name: Ident, binding: Binding) {
-        self.scopes.bind_current(name, binding);
-    }
-}
-
-// ───────── Resolution binding-related queries ─────────
-
-impl Resolution {
-    /// All tables touched by the statement, in scope-arena order. The
-    /// union of [`Self::read_tables`] and [`Self::write_tables`] (with
-    /// duplicates when a single table carries both roles).
-    pub(crate) fn tables(&self) -> Vec<TableReference> {
-        self.scopes
-            .iter()
-            .flat_map(|scope| scope.iter_bindings())
-            .filter_map(|binding| match binding {
-                Binding::Table { table, .. } => Some((**table).clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Every table referenced as a Read source, in scope-arena order.
-    /// Includes tables inside predicate subqueries (e.g. `x` in
-    /// `WHERE id IN (SELECT id FROM x)`). Use
-    /// [`Self::collapsed_feeding_table_sources`] for the stricter
-    /// "feeds the enclosing write target" filter.
-    pub(crate) fn read_tables(&self) -> Vec<TableReference> {
-        self.collect_tables_by_role(TableRole::Read)
-    }
-
-    /// Every table referenced as a Write target, in scope-arena order.
-    pub(crate) fn write_tables(&self) -> Vec<TableReference> {
-        self.collect_tables_by_role(TableRole::Write)
-    }
-
-    fn collect_tables_by_role(&self, role: TableRole) -> Vec<TableReference> {
-        self.scopes
-            .iter()
-            .flat_map(|scope| scope.iter_bindings())
-            .filter_map(|binding| match binding {
-                Binding::Table { table, roles, .. } if roles.contains(&role) => {
-                    Some((**table).clone())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Walk parent chain from `scope_id`; return true iff any scope along
-    /// the way carries `ScopeKind::Predicate`. Drives the
-    /// filter-position exclusion in
-    /// [`Self::collapsed_feeding_table_sources`].
-    pub(super) fn has_predicate_ancestor(&self, scope_id: ScopeId) -> bool {
-        let mut current = Some(scope_id);
-        while let Some(id) = current {
-            let scope = &self.scopes[id.0];
-            if scope.kind == ScopeKind::Predicate {
-                return true;
-            }
-            current = scope.parent;
-        }
-        false
+        self.scopes_mut().bind_current(name, binding);
     }
 }

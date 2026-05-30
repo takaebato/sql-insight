@@ -33,12 +33,12 @@
 //!   from the source projection), and MERGE WHEN-clause writes
 //!   (UPDATE SET targets and INSERT column lists, with the same
 //!   catalog fallback for column-list-less INSERT).
-//! - `lineage`: per-projection-item edges for SELECT (target =
+//! - `lineage`: per-output-column edges for SELECT (target =
 //!   `QueryOutput { name, position }`), positionally paired
 //!   `source-column → target-column` edges for INSERT (explicit
 //!   column list, or — when the catalog provides the target's
-//!   schema — the catalog columns; one ProjectionGroup per UNION
-//!   branch, each paired against the same target columns), and
+//!   schema — the catalog columns; one branch per UNION arm, each
+//!   paired against the same target columns), and
 //!   per-assignment edges for
 //!   UPDATE SET. Sources that reference CTEs or derived tables are
 //!   collapsed end-to-end — references recurse through the

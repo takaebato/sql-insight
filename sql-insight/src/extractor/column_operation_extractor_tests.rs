@@ -2169,7 +2169,7 @@ mod collapse {
 
     #[test]
     fn recursive_cte_does_not_panic_and_skips_collapse() {
-        // Recursive CTEs don't carry body_projections (fixpoint is
+        // Recursive CTEs have output_columns = None (fixpoint is
         // deferred), so collapse falls back to leaving the lineage edge
         // source pointing at the CTE binding (`r.id`) rather than
         // tracing into a real table. Reads still get the synthetic
@@ -2204,7 +2204,7 @@ mod set_operations {
 
     #[test]
     fn union_two_branches_emit_query_output_per_branch() {
-        // Each branch contributes its own ProjectionGroup, so both
+        // Each branch contributes its own output-column list, so both
         // branches' projections fan out independently into
         // QueryOutput edges. Position is per-group, so both land at
         // position 0; name follows each branch's own projection.
@@ -2403,7 +2403,7 @@ mod set_operations {
     fn ctas_with_union_body_pairs_left_branch_names_for_all_branches() {
         // CTAS schema follows the LEFT branch's projection names
         // (SQL standard). The inferred-name path uses the first
-        // ProjectionGroup's item names for every branch's
+        // the branch's column names for every branch's
         // positional pairing — same as INSERT-SELECT-UNION. So:
         //   - writes: only `dst.a` (left branch's name)
         //   - lineage: BOTH branches feed `Relation(dst.a)`
@@ -2758,7 +2758,7 @@ mod on_conflict {
 
     #[test]
     fn pg_insert_select_with_on_conflict_collapses_excluded_to_source() {
-        // EXCLUDED's body_projections come from the INSERT source
+        // EXCLUDED's output_columns come from the INSERT source
         // renamed to the target columns positionally. So
         // `EXCLUDED.b` collapses through to the source's position-1
         // projection (`y` from s) — the conflict-action lineage edge
@@ -2805,8 +2805,8 @@ mod on_conflict {
 
     #[test]
     fn pg_insert_union_with_on_conflict_excluded_fans_out_to_each_branch() {
-        // The source has TWO ProjectionGroups (one per UNION
-        // branch), so EXCLUDED's body_projections also have two
+        // The source has TWO branches (one per UNION
+        // branch), so EXCLUDED's output_columns also have two
         // groups — each with a position-0 item named after the
         // INSERT target column. `EXCLUDED.a` then collapses to
         // BOTH branches' position-0 source refs.
@@ -2886,8 +2886,8 @@ mod values_as_relation {
     #[test]
     fn values_as_derived_table_with_aliases_emits_synthetic_refs_only() {
         // The derived table `t` carries schema [x, y] from the
-        // alias rename, but its body_projections are empty (VALUES
-        // contributes no ProjectionItems). So `t.x` is recorded as
+        // alias rename, but its output_columns is None (VALUES
+        // contributes no OutputColumns). So `t.x` is recorded as
         // a synthetic ref pointing at the derived binding; reads
         // filter it out, and lineage keeps `t.x` as the source
         // (collapse can't collapse further).

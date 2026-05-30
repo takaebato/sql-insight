@@ -1,3 +1,8 @@
+//! Walker for `Statement`: top-level dispatch + per-DML walkers
+//! (INSERT / UPDATE / DELETE / MERGE) including RETURNING, ON
+//! CONFLICT / EXCLUDED binding, and CTAS / CREATE VIEW / ALTER VIEW
+//! lineage emission.
+
 use super::{BodyOutput, LineageTargetSpec, OutputColumn, Resolver, TableRole};
 use crate::error::Error;
 use crate::reference::TableReference;
@@ -373,9 +378,9 @@ impl<'a> Resolver<'a> {
     ///
     /// For UNION-bodied sources the result schema follows the LEFT
     /// branch's names (SQL standard), so the inferred-name fallback
-    /// reads the first projection group's item names rather than the
-    /// current group's — making every branch pair against the same
-    /// target column at each position. Mirrors INSERT-SELECT-UNION
+    /// reads the first branch's column names rather than the current
+    /// branch's — making every branch pair against the same target
+    /// column at each position. Mirrors INSERT-SELECT-UNION
     /// positional pairing.
     fn emit_relation_to_created(
         &mut self,
@@ -440,7 +445,7 @@ impl<'a> Resolver<'a> {
     ) -> Result<(), Error> {
         for assignment in assignments {
             let target_parts = assignment_target_parts(&assignment.target);
-            let kind = super::projection::expr_kind(&assignment.value);
+            let kind = super::body_output::expr_kind(&assignment.value);
             let refs_before = self.column_refs_len();
             self.visit_expr(&assignment.value)?;
             let Some(target_parts) = target_parts else {
@@ -559,7 +564,7 @@ impl<'a> Resolver<'a> {
         };
         for row in &values.rows {
             for (position, value_expr) in row.iter().enumerate() {
-                let kind = super::projection::expr_kind(value_expr);
+                let kind = super::body_output::expr_kind(value_expr);
                 let refs_before = self.column_refs_len();
                 self.visit_expr(value_expr)?;
                 let (Some(target_table), Some(col_ident)) =

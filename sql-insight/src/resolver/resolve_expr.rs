@@ -1,3 +1,7 @@
+//! Walker for `Expr`: visit every sqlparser `Expr` variant, recording
+//! `RawColumnRef`s at identifier sites and descending into nested
+//! sub-expressions / sub-queries / function arguments.
+
 use super::Resolver;
 use crate::error::Error;
 use sqlparser::ast::{

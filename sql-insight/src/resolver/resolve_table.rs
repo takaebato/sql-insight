@@ -1,3 +1,9 @@
+//! Walker for `TableFactor` / `TableWithJoins`: dispatches per
+//! sqlparser variant (Table / Derived / NestedJoin / Pivot / Unpivot
+//! / MatchRecognize / TableFunction / Function / UNNEST / JsonTable /
+//! OpenJsonTable / XmlTable / SemanticView), binding real tables and
+//! synthetic relations as it goes.
+
 use super::{Resolver, TableRole};
 use crate::error::Error;
 use crate::reference::TableReference;
@@ -155,9 +161,7 @@ impl<'a> Resolver<'a> {
                 let resolved = self.resolve_query(subquery)?;
                 if let Some(alias) = alias {
                     let renames = &alias.columns;
-                    let renamed = resolved
-                        .output_columns
-                        .map(|o| super::rename_body_output(o, renames));
+                    let renamed = resolved.output_columns.map(|o| o.renamed(renames));
                     self.bind_derived_table(alias.name.clone(), renamed, Some(resolved.body_scope));
                     self.record_synthetic_table_ref(resolved.body_scope);
                 }
