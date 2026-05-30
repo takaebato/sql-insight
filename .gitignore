@@ -4,3 +4,5 @@
 .idea
 tmp/
 coverage/
+/codecov.json
+/lcov.info
