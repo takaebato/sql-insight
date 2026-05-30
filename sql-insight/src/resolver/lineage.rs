@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::extractor::column_operation_extractor::ColumnLineageKind;
 use crate::reference::TableReference;
 
-use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolver};
+use super::{OutputColumn, RawColumnRef, ResolvedQuery, Resolver};
 
 /// A pre-resolution column lineage record. `source` still needs
 /// scope-chain resolution (for unqualified parts); `target` is fully
@@ -17,10 +17,10 @@ use super::{ProjectionGroup, ProjectionItem, RawColumnRef, ResolvedQuery, Resolv
 /// surface (collapsed further by `collapsed_lineage_edges` when the
 /// source goes through a synthetic relation).
 ///
-/// Created by callers from [`ProjectionGroup`]s (for SELECT-style
-/// lineage edges — INSERT pairs with target columns, top-level / nested
-/// SELECTs emit `QueryOutput`) or directly by UPDATE / similar
-/// walkers that already know their write target.
+/// Created by callers from a [`super::BodyOutput`]'s branches (for
+/// SELECT-style lineage edges — INSERT pairs with target columns,
+/// top-level / nested SELECTs emit `QueryOutput`) or directly by
+/// UPDATE / similar walkers that already know their write target.
 #[derive(Debug, Clone)]
 pub(crate) struct LineageEdge {
     /// Source column ref as recorded at the walk site. Still carries
@@ -86,53 +86,56 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// For each `(group, position, item)` in `projections`, ask
-    /// `target_for(position, item)` to produce a `LineageTargetSpec`;
+    /// For each `(branch, position, column)` across `branches`, ask
+    /// `target_for(position, column)` to produce a `LineageTargetSpec`;
     /// when it returns `Some(target)`, fan out one `LineageEdge` per
-    /// `item.source_refs` to that target, carrying the item's
+    /// `column.source_refs` to that target, carrying the column's
     /// `ColumnLineageKind`. The closure shape lets the same loop drive
     /// `QueryOutput` emission, INSERT positional pairing, and CTAS /
     /// view's explicit-or-inferred column pairing.
-    pub(super) fn emit_per_projection<F>(
+    pub(super) fn emit_per_output_column<F>(
         &mut self,
-        projections: &[ProjectionGroup],
+        branches: &[Vec<OutputColumn>],
         mut target_for: F,
     ) where
-        F: FnMut(usize, &ProjectionItem) -> Option<LineageTargetSpec>,
+        F: FnMut(usize, &OutputColumn) -> Option<LineageTargetSpec>,
     {
-        for group in projections {
-            for (position, item) in group.items.iter().enumerate() {
-                let Some(target) = target_for(position, item) else {
+        for branch in branches {
+            for (position, column) in branch.iter().enumerate() {
+                let Some(target) = target_for(position, column) else {
                     continue;
                 };
-                for source in &item.source_refs {
+                for source in &column.source_refs {
                     self.push_lineage_edge(LineageEdge {
                         source: source.clone(),
                         target: target.clone(),
-                        kind: item.kind,
+                        kind: column.kind,
                     });
                 }
             }
         }
     }
 
-    /// Emit `QueryOutput` lineage edges for every projection item in
+    /// Emit `QueryOutput` lineage edges for every output column in
     /// `resolved`. The default disposition for queries whose output
     /// is not bound to a relation target (top-level SELECT, scalar
     /// subqueries, derived tables, CTE bodies, predicate subqueries).
     pub(super) fn emit_query_output_edges(&mut self, resolved: &ResolvedQuery) {
-        self.emit_per_projection(&resolved.projections, |position, item| {
+        let Some(output) = resolved.output_columns.as_ref() else {
+            return;
+        };
+        self.emit_per_output_column(&output.per_branch, |position, column| {
             Some(LineageTargetSpec::QueryOutput {
-                name: item.name.clone(),
+                name: column.name.clone(),
                 position,
             })
         });
     }
 
     /// Convenience wrapper: resolve `query` and emit `QueryOutput`
-    /// edges for its projections in one shot. Use this from any
+    /// edges for its output columns in one shot. Use this from any
     /// caller that doesn't have a special target — INSERT calls the
-    /// raw `resolve_query` instead so it can pair projections with
+    /// raw `resolve_query` instead so it can pair output columns with
     /// its target columns.
     pub(super) fn resolve_query_emitting_query_output(
         &mut self,

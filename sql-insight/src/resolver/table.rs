@@ -1,4 +1,4 @@
-use super::{RelationSchema, Resolver, TableRole};
+use super::{Resolver, TableRole};
 use crate::error::Error;
 use crate::reference::TableReference;
 use sqlparser::ast::{
@@ -78,14 +78,14 @@ impl<'a> Resolver<'a> {
                 ..
             } => {
                 if self.is_cte_reference(name) {
-                    // Carry the original CTE's schema + body_projections
-                    // to the local binding so:
+                    // Carry the original CTE's `output_columns` and
+                    // `body_scope` to the local binding so:
                     //  1. lineage collapse works through the use site
                     //     (`FROM cte AS c` → `c.col` and `FROM cte` →
                     //     `cte.col` both collapse to the body's source);
                     //  2. catalog-aware strictness still applies — refs
-                    //     against a Known schema that doesn't list the
-                    //     column still surface as unresolved instead of
+                    //     against known columns that don't list the
+                    //     name still surface as unresolved instead of
                     //     getting absorbed by the synthetic binding;
                     //  3. unqualified refs in the current scope have a
                     //     single in-scope candidate — without this
@@ -93,8 +93,7 @@ impl<'a> Resolver<'a> {
                     //     INSERT INTO t ... SELECT x FROM cte` would
                     //     walk up and ambify against the outer-bound
                     //     INSERT target.
-                    let body = self.cte_body_projections(name);
-                    let schema = self.cte_schema(name);
+                    let output = self.cte_output_columns(name);
                     let body_scope = self.cte_body_scope(name);
                     let bind_name = match alias {
                         Some(a) => a.name.clone(),
@@ -109,7 +108,7 @@ impl<'a> Resolver<'a> {
                     // local re-bind shares the original CTE's body so
                     // table-lineage collapse reaches the same place
                     // from either definition or use site.
-                    self.bind_cte(bind_name, schema, body, body_scope.unwrap());
+                    self.bind_cte(bind_name, output, body_scope.unwrap());
                     self.record_synthetic_table_ref(body_scope.unwrap());
                     return Ok(());
                 }
@@ -156,16 +155,10 @@ impl<'a> Resolver<'a> {
                 let resolved = self.resolve_query(subquery)?;
                 if let Some(alias) = alias {
                     let renames = &alias.columns;
-                    let renamed_schema =
-                        super::rename_relation_schema(resolved.output_schema, renames);
-                    let renamed_projections =
-                        super::rename_projection_groups(resolved.projections, renames);
-                    self.bind_derived_table(
-                        alias.name.clone(),
-                        renamed_schema,
-                        renamed_projections,
-                        Some(resolved.body_scope),
-                    );
+                    let renamed = resolved
+                        .output_columns
+                        .map(|o| super::rename_body_output(o, renames));
+                    self.bind_derived_table(alias.name.clone(), renamed, Some(resolved.body_scope));
                     self.record_synthetic_table_ref(resolved.body_scope);
                 }
                 if let Some(sample) = sample {
@@ -182,12 +175,7 @@ impl<'a> Resolver<'a> {
                     // in the current scope (via visit_table_with_joins
                     // above), so they emit their own Real RawTableRefs.
                     // The alias itself doesn't drive collapse.
-                    self.bind_derived_table(
-                        alias.name.clone(),
-                        RelationSchema::Unknown,
-                        Vec::new(),
-                        None,
-                    );
+                    self.bind_derived_table(alias.name.clone(), None, None);
                 }
             }
             TableFactor::Pivot {
@@ -209,12 +197,7 @@ impl<'a> Resolver<'a> {
                     self.visit_expr(expr)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(
-                        alias.name.clone(),
-                        RelationSchema::Unknown,
-                        Vec::new(),
-                        None,
-                    );
+                    self.bind_derived_table(alias.name.clone(), None, None);
                 }
             }
             TableFactor::Unpivot {
@@ -230,12 +213,7 @@ impl<'a> Resolver<'a> {
                     self.visit_expr(&expr.expr)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(
-                        alias.name.clone(),
-                        RelationSchema::Unknown,
-                        Vec::new(),
-                        None,
-                    );
+                    self.bind_derived_table(alias.name.clone(), None, None);
                 }
             }
             TableFactor::MatchRecognize {
@@ -259,12 +237,7 @@ impl<'a> Resolver<'a> {
                     self.visit_expr(&symbol.definition)?;
                 }
                 if let Some(alias) = alias {
-                    self.bind_derived_table(
-                        alias.name.clone(),
-                        RelationSchema::Unknown,
-                        Vec::new(),
-                        None,
-                    );
+                    self.bind_derived_table(alias.name.clone(), None, None);
                 }
             }
             TableFactor::TableFunction { expr, alias } => {

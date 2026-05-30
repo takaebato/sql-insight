@@ -1,59 +1,46 @@
 //! Column-list rename for `WITH cte(a, b) AS (...)` and
-//! `(SELECT ...) d(a, b)` aliases. Applied to both the body's
-//! `output_schema` and its `projection_groups` so lineage collapse's
-//! name-match lookup finds the renamed columns.
+//! `(SELECT ...) d(a, b)` aliases. Applied to the body's
+//! [`BodyOutput`] so lineage collapse's name-match lookup finds the
+//! renamed columns.
 
-use super::{ProjectionGroup, RelationSchema};
+use sqlparser::ast::{Ident, TableAliasColumnDef};
 
-/// Apply a column alias rename list to a body's `output_schema`. The
-/// alias at position N overrides the body's inferred column at
-/// position N; body columns past the alias list keep their inferred
-/// names. An empty rename list returns `schema` unchanged; an
-/// `Unknown` body schema is promoted to `Known` containing exactly
-/// the declared rename columns (the only columns we can name with
-/// certainty after a rename clause).
-pub(crate) fn rename_relation_schema(
-    schema: RelationSchema,
-    renames: &[sqlparser::ast::TableAliasColumnDef],
-) -> RelationSchema {
+use crate::extractor::column_operation_extractor::ColumnLineageKind;
+
+use super::{BodyOutput, OutputColumn};
+
+/// Apply a column alias rename list to a body's output columns.
+/// Position N in the rename list overrides position N's column name;
+/// positions beyond the body's columns are appended as name-only
+/// entries (no source refs). Each branch (UNION branch / set-op
+/// branch) is renamed independently. An empty rename list returns
+/// the body unchanged.
+pub(crate) fn rename_body_output(
+    mut output: BodyOutput,
+    renames: &[TableAliasColumnDef],
+) -> BodyOutput {
     if renames.is_empty() {
-        return schema;
+        return output;
     }
-    match schema {
-        RelationSchema::Unknown => {
-            RelationSchema::Known(renames.iter().map(|r| r.name.clone()).collect())
-        }
-        RelationSchema::Known(mut cols) => {
-            for (position, rename) in renames.iter().enumerate() {
-                if let Some(col) = cols.get_mut(position) {
-                    *col = rename.name.clone();
-                } else {
-                    cols.push(rename.name.clone());
-                }
-            }
-            RelationSchema::Known(cols)
+    for branch in &mut output.per_branch {
+        apply_renames(branch, renames);
+    }
+    output
+}
+
+fn apply_renames(branch: &mut Vec<OutputColumn>, renames: &[TableAliasColumnDef]) {
+    for (position, rename) in renames.iter().enumerate() {
+        match branch.get_mut(position) {
+            Some(col) => col.name = Some(rename.name.clone()),
+            None => branch.push(rename_only_column(rename.name.clone())),
         }
     }
 }
 
-/// Apply the same rename to the projection items' inferred names so
-/// lineage collapse's name-match lookup finds the renamed columns.
-/// Position N in the rename list overrides position N's item name;
-/// positions beyond the list keep their body-inferred names. Each
-/// `ProjectionGroup` (set-op branch) is renamed independently.
-pub(crate) fn rename_projection_groups(
-    mut groups: Vec<ProjectionGroup>,
-    renames: &[sqlparser::ast::TableAliasColumnDef],
-) -> Vec<ProjectionGroup> {
-    if renames.is_empty() {
-        return groups;
+fn rename_only_column(name: Ident) -> OutputColumn {
+    OutputColumn {
+        name: Some(name),
+        source_refs: Vec::new(),
+        kind: ColumnLineageKind::Transformation,
     }
-    for group in &mut groups {
-        for (position, item) in group.items.iter_mut().enumerate() {
-            if let Some(rename) = renames.get(position) {
-                item.name = Some(rename.name.clone());
-            }
-        }
-    }
-    groups
 }

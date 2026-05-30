@@ -76,34 +76,33 @@ impl Resolution {
         if depth >= MAX_COLLAPSE_DEPTH {
             return vec![(raw.clone(), outer_kind)];
         }
-        let body_projections = match self.synthetic_owning_binding(raw) {
+        let output = match self.synthetic_owning_binding(raw) {
             Some(Binding::Cte {
-                body_projections, ..
-            }) => body_projections,
+                output_columns: Some(o),
+                ..
+            }) => o,
             Some(Binding::DerivedTable {
-                body_projections, ..
-            }) => body_projections,
+                output_columns: Some(o),
+                ..
+            }) => o,
             _ => return vec![(raw.clone(), outer_kind)],
         };
-        if body_projections.is_empty() {
-            return vec![(raw.clone(), outer_kind)];
-        }
         let Some(col_name) = raw.parts.last() else {
             return vec![(raw.clone(), outer_kind)];
         };
         let key = BindingKey::from_ident(col_name);
         let mut result = Vec::new();
-        for group in body_projections {
-            for item in &group.items {
-                let matches = item
+        for branch in &output.per_branch {
+            for column in branch {
+                let matches = column
                     .name
                     .as_ref()
                     .is_some_and(|n| BindingKey::from_ident(n) == key);
                 if !matches {
                     continue;
                 }
-                let collapsed = collapse_lineage_kinds(outer_kind, item.kind);
-                for source in &item.source_refs {
+                let collapsed = collapse_lineage_kinds(outer_kind, column.kind);
+                for source in &column.source_refs {
                     result.extend(self.collapse_source(source, collapsed, depth + 1));
                 }
             }

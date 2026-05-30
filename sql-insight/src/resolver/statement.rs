@@ -1,4 +1,4 @@
-use super::{LineageTargetSpec, ProjectionGroup, RelationSchema, Resolver, TableRole};
+use super::{BodyOutput, LineageTargetSpec, OutputColumn, Resolver, TableRole};
 use crate::error::Error;
 use crate::reference::TableReference;
 use sqlparser::ast::{
@@ -232,24 +232,26 @@ impl<'a> Resolver<'a> {
         // pairing. Without either, no lineage edges are emitted —
         // we have no target column names to pair against.
         let effective_columns = self.effective_target_columns(&insert.columns, &target_table);
-        let source_projections = if let Some(source) = &insert.source {
+        let source_output = if let Some(source) = &insert.source {
             // Raw resolve_query (not the QueryOutput-emitting wrapper):
-            // INSERT pairs each projection item positionally with its
+            // INSERT pairs each output column positionally with its
             // target column instead, emitting Relation edges. UNION
-            // sources surface as multiple projection groups, so each
-            // branch pairs against the same target columns naturally.
+            // sources surface as multiple branches, so each branch
+            // pairs against the same target columns naturally.
             let resolved = self.resolve_query(source)?;
-            self.emit_per_projection(&resolved.projections, |position, _item| {
-                effective_columns
-                    .get(position)
-                    .map(|col| LineageTargetSpec::Relation {
-                        table: target_table.clone(),
-                        column: col.clone(),
-                    })
-            });
-            resolved.projections
+            if let Some(output) = resolved.output_columns.as_ref() {
+                self.emit_per_output_column(&output.per_branch, |position, _col| {
+                    effective_columns
+                        .get(position)
+                        .map(|col| LineageTargetSpec::Relation {
+                            table: target_table.clone(),
+                            column: col.clone(),
+                        })
+                });
+            }
+            resolved.output_columns
         } else {
-            Vec::new()
+            None
         };
         for assignment in &insert.assignments {
             self.visit_expr(&assignment.value)?;
@@ -260,7 +262,12 @@ impl<'a> Resolver<'a> {
         // would ambify unqualified refs that collide with INSERT cols.
         self.visit_returning(insert.returning.as_deref())?;
         if let Some(on) = &insert.on {
-            self.visit_insert_on(on, &target_table, &effective_columns, &source_projections)?;
+            self.visit_insert_on(
+                on,
+                &target_table,
+                &effective_columns,
+                source_output.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -275,16 +282,14 @@ impl<'a> Resolver<'a> {
         let Some(items) = returning else {
             return Ok(());
         };
-        let mut projection_items = Vec::with_capacity(items.len());
+        let mut columns = Vec::with_capacity(items.len());
         for item in items {
-            projection_items.push(self.build_projection_item(item)?);
+            columns.push(self.build_output_column(item)?);
         }
-        let projections = vec![ProjectionGroup {
-            items: projection_items,
-        }];
-        self.emit_per_projection(&projections, |position, item| {
+        let branches = vec![columns];
+        self.emit_per_output_column(&branches, |position, col| {
             Some(LineageTargetSpec::QueryOutput {
-                name: item.name.clone(),
+                name: col.name.clone(),
                 position,
             })
         });
@@ -310,7 +315,7 @@ impl<'a> Resolver<'a> {
         on: &OnInsert,
         target_table: &TableReference,
         effective_columns: &[Ident],
-        source_projections: &[super::ProjectionGroup],
+        source_output: Option<&BodyOutput>,
     ) -> Result<(), Error> {
         match on {
             OnInsert::DuplicateKeyUpdate(assignments) => {
@@ -326,35 +331,24 @@ impl<'a> Resolver<'a> {
                 if let OnConflictAction::DoUpdate(do_update) = &on_conflict.action {
                     // EXCLUDED in Postgres / Sqlite exposes the
                     // would-be-inserted row as a row source. Bind it
-                    // as a synthetic derived-table with:
-                    // - schema: the INSERT target's column list, so
-                    //   `EXCLUDED.<col>` refs filter out of the public
-                    //   `reads` surface (like CTE / derived);
-                    // - body_projections: the INSERT source's
-                    //   projections renamed positionally to the target
-                    //   column names, so `collapse_source` collapses
-                    //   `EXCLUDED.<col>` back to the actual source ref
-                    //   (e.g. `EXCLUDED.b` → source's `y` when the
-                    //   INSERT pairs (a, b) ← (x, y)).
-                    let excluded_schema = if effective_columns.is_empty() {
-                        RelationSchema::Unknown
-                    } else {
-                        RelationSchema::Known(effective_columns.to_vec())
-                    };
-                    let body_projections =
-                        excluded_body_projections(effective_columns, source_projections);
-                    // `body_scope: None` — EXCLUDED's body_projections are
-                    // synthesized from the INSERT source's projections, not
-                    // walked into a fresh scope. The INSERT source's real
-                    // tables are already covered by their own RawTableRefs,
-                    // so EXCLUDED needs no collapse path for table
-                    // lineage.
-                    self.bind_derived_table(
-                        Ident::new("EXCLUDED"),
-                        excluded_schema,
-                        body_projections,
-                        None,
-                    );
+                    // as a synthetic derived-table whose `output_columns`
+                    // is the INSERT source's per-branch columns renamed
+                    // positionally to the target column names. That way
+                    // `EXCLUDED.<col>` collapses back to whatever
+                    // expression feeds that position of the source
+                    // (e.g. `EXCLUDED.b` → source's `y` when the INSERT
+                    // pairs (a, b) ← (x, y)). Refs against `EXCLUDED`
+                    // also filter out of the public `reads` surface
+                    // (like CTE / derived).
+                    //
+                    // `body_scope: None` — EXCLUDED's output is
+                    // synthesized from the INSERT source's per-branch
+                    // columns, not walked into a fresh scope. The
+                    // INSERT source's real tables are already covered
+                    // by their own RawTableRefs, so EXCLUDED needs no
+                    // collapse path for table lineage.
+                    let excluded_output = excluded_body_output(effective_columns, source_output);
+                    self.bind_derived_table(Ident::new("EXCLUDED"), excluded_output, None);
                     self.emit_assignment_lineage(&do_update.assignments, Some(target_table))?;
                     if let Some(selection) = &do_update.selection {
                         self.with_filter_clause(|r| r.visit_expr(selection))?;
@@ -389,12 +383,15 @@ impl<'a> Resolver<'a> {
         explicit_columns: &[sqlparser::ast::Ident],
         resolved: &super::ResolvedQuery,
     ) {
-        let inferred_left_names: Vec<Option<Ident>> = resolved
-            .projections
+        let Some(output) = resolved.output_columns.as_ref() else {
+            return;
+        };
+        let inferred_left_names: Vec<Option<Ident>> = output
+            .per_branch
             .first()
-            .map(|g| g.items.iter().map(|i| i.name.clone()).collect())
+            .map(|branch| branch.iter().map(|c| c.name.clone()).collect())
             .unwrap_or_default();
-        self.emit_per_projection(&resolved.projections, |position, _item| {
+        self.emit_per_output_column(&output.per_branch, |position, _col| {
             explicit_columns
                 .get(position)
                 .cloned()
@@ -581,33 +578,40 @@ impl<'a> Resolver<'a> {
     }
 }
 
-/// Rename each source projection group's items positionally to the
-/// INSERT target's column names — the EXCLUDED pseudo-table exposes
-/// the would-be-inserted row, so `EXCLUDED.<target_col>` should
-/// collapse back to whatever expression feeds that position of the
-/// source. Returns an empty `Vec` when there are no source
-/// projections (e.g. `INSERT ... VALUES (...) ON CONFLICT ...`),
-/// in which case `collapse_source` falls back to leaving
+/// Rename each source branch's columns positionally to the INSERT
+/// target's column names — the EXCLUDED pseudo-table exposes the
+/// would-be-inserted row, so `EXCLUDED.<target_col>` should collapse
+/// back to whatever expression feeds that position of the source.
+/// Returns `None` when there are no source output columns (e.g.
+/// `INSERT ... VALUES (...) ON CONFLICT ...`) or no effective target
+/// columns, in which case `collapse_source` falls back to leaving
 /// `EXCLUDED.<col>` as the lineage source.
-fn excluded_body_projections(
+fn excluded_body_output(
     effective_columns: &[Ident],
-    source_projections: &[super::ProjectionGroup],
-) -> Vec<super::ProjectionGroup> {
-    if source_projections.is_empty() || effective_columns.is_empty() {
-        return Vec::new();
+    source_output: Option<&BodyOutput>,
+) -> Option<BodyOutput> {
+    if effective_columns.is_empty() {
+        return None;
     }
-    source_projections
+    let source = source_output?;
+    let per_branch: Vec<Vec<OutputColumn>> = source
+        .per_branch
         .iter()
-        .map(|group| {
-            let mut g = group.clone();
-            for (position, item) in g.items.iter_mut().enumerate() {
-                if let Some(name) = effective_columns.get(position) {
-                    item.name = Some(name.clone());
-                }
-            }
-            g
+        .map(|branch| {
+            branch
+                .iter()
+                .enumerate()
+                .map(|(position, col)| {
+                    let mut renamed = col.clone();
+                    if let Some(name) = effective_columns.get(position) {
+                        renamed.name = Some(name.clone());
+                    }
+                    renamed
+                })
+                .collect()
         })
-        .collect()
+        .collect();
+    Some(BodyOutput { per_branch })
 }
 
 fn from_table_items(from: &FromTable) -> &[TableWithJoins] {

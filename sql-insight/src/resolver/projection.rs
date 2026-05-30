@@ -1,6 +1,7 @@
-//! Per-SELECT projection facts captured by the resolver during the
-//! walk, plus the classification helpers that derive each projection
-//! item's name / kind (`Passthrough` / `Transformation`).
+//! Per-SELECT body output captured during the walk: per-branch
+//! lists of output columns with their inferred names, source refs,
+//! and `Passthrough` / `Transformation` kind. Plus the helpers
+//! that derive each output column's name / kind from a `SelectItem`.
 
 use sqlparser::ast::{Expr, Ident, SelectItem};
 
@@ -8,45 +9,58 @@ use crate::extractor::column_operation_extractor::ColumnLineageKind;
 
 use super::{RawColumnRef, Resolver};
 
-/// One SELECT's projection captured during the walk — one
-/// [`ProjectionItem`] per output column, in projection order. Set
-/// operations contribute one group per branch (so UNION INSERT pairs
-/// each branch's items with the same target columns).
+/// Body-walk output of a SELECT-derived relation (CTE / true
+/// derived), with full per-column lineage.
+///
+/// `per_branch[i][j]` is the `j`-th output column of the `i`-th UNION
+/// branch (plain SELECT contributes a single branch). Branches are
+/// kept separate so INSERT pairing can match each branch's columns
+/// against the same target columns. Real tables don't carry an
+/// instance of this — their column info comes from the catalog and
+/// is just a name list.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectionGroup {
-    pub(crate) items: Vec<ProjectionItem>,
+pub(crate) struct BodyOutput {
+    pub(crate) per_branch: Vec<Vec<OutputColumn>>,
 }
 
-/// A single projection slot's resolver-collected facts.
+/// One output column slot — name, the input refs that produced its
+/// value (`source_refs`), and a `Passthrough` / `Transformation`
+/// classification (`kind`).
 ///
-/// `source_refs` are the raw column refs the projection item's
-/// expression read, in walk order. `name` is the inferable output
-/// name (explicit alias > bare ident name > `None`). `kind`
-/// classifies how the source refs turn into the output value
-/// (`Passthrough` for a bare forwarded column, `Transformation` for
-/// anything value-changing); collapsed with the outer edge's kind when
-/// this item participates in a CTE / derived table collapse.
+/// `kind` is collapsed with the outer edge's kind when this column
+/// participates in a CTE / derived collapse chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectionItem {
+pub(crate) struct OutputColumn {
     pub(crate) name: Option<Ident>,
     pub(crate) source_refs: Vec<RawColumnRef>,
     pub(crate) kind: ColumnLineageKind,
 }
 
+impl BodyOutput {
+    /// First branch's column names if all of them have an inferable
+    /// name. `None` if any column has no name (wildcards, computed
+    /// without alias) — equivalent to "column names unknown" for the
+    /// relation as a whole.
+    pub(super) fn column_names(&self) -> Option<Vec<Ident>> {
+        let first = self.per_branch.first()?;
+        first.iter().map(|c| c.name.clone()).collect()
+    }
+}
+
 impl<'a> Resolver<'a> {
-    /// Push a fully-built `ProjectionGroup` into the active query's
-    /// projection buffer. Called by `visit_select` once per SELECT
-    /// body.
-    pub(super) fn push_projection_group(&mut self, group: ProjectionGroup) {
-        self.current_projections.push(group);
+    /// Push a fully-built branch of output columns into the active
+    /// query's per-branch buffer. Called by `visit_select` once per
+    /// SELECT body.
+    pub(super) fn push_output_branch(&mut self, branch: Vec<OutputColumn>) {
+        self.current_branches.push(branch);
     }
 
-    /// Extend the active query's projection buffer with externally
-    /// produced groups — used by `SetExpr::Query` to bubble the inner
-    /// query's projections up into the enclosing query (so INSERT
+    /// Extend the active query's per-branch buffer with externally
+    /// produced branches — used by `SetExpr::Query` to bubble the
+    /// inner query's branches up into the enclosing query (so INSERT
     /// pairing reaches through a parenthesized source).
-    pub(super) fn extend_projections(&mut self, groups: Vec<ProjectionGroup>) {
-        self.current_projections.extend(groups);
+    pub(super) fn extend_branches(&mut self, branches: Vec<Vec<OutputColumn>>) {
+        self.current_branches.extend(branches);
     }
 }
 

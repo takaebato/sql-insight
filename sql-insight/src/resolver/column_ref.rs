@@ -9,7 +9,7 @@ use crate::reference::TableReference;
 
 use super::binding::{
     binding_alias_key, binding_confirms_column, binding_could_contain_column,
-    binding_has_known_schema, is_synthetic_binding, normalize_span, span_suffix, BindingKey,
+    binding_has_known_columns, is_synthetic_binding, normalize_span, span_suffix, BindingKey,
 };
 use super::{Binding, Resolver, ScopeId};
 
@@ -122,7 +122,7 @@ impl<'a> Resolver<'a> {
 
         while let Some(id) = current {
             let scope = self.scopes().scope(id);
-            if scope.iter_bindings().any(binding_has_known_schema) {
+            if scope.iter_bindings().any(binding_has_known_columns) {
                 had_known_schemas_anywhere = true;
             }
             let matches: Vec<(TableReference, bool, bool)> = scope

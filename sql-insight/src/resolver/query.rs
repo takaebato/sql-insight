@@ -1,123 +1,115 @@
 use super::projection::{projection_item_kind, projection_item_output_name};
-use super::{
-    ProjectionGroup, ProjectionItem, RelationSchema, ResolvedQuery, Resolver, ScopeId, TableRole,
-};
+use super::{BodyOutput, OutputColumn, ResolvedQuery, Resolver, ScopeId, TableRole};
 use crate::error::Error;
 use crate::reference::TableReference;
 use sqlparser::ast::{
-    ConnectByKind, Distinct, Expr, GroupByExpr, GroupByWithModifier, Ident, NamedWindowExpr, Query,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Table, TopQuantity, Values,
+    ConnectByKind, Distinct, GroupByExpr, GroupByWithModifier, NamedWindowExpr, Query, Select,
+    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Table, TopQuantity, Values,
 };
 
 impl<'a> Resolver<'a> {
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
-        // Swap in a fresh projection buffer for this query — restored on
-        // return — so each ResolvedQuery owns exactly its own groups
-        // without leaking into siblings or ancestors. This is independent
-        // of the scope-arena push below: projections accumulate into the
-        // resolver's own buffer, not into the scope.
-        let prev_projections = std::mem::take(&mut self.current_projections);
-        let (body_schema, body_scope) =
-            self.with_scope(|r| -> Result<(RelationSchema, ScopeId), Error> {
-                let body_scope = r.scopes_mut().current_scope_id();
-                if let Some(with) = &query.with {
-                    if with.recursive {
-                        for cte in &with.cte_tables {
-                            // Recursive CTEs pre-bind with empty
-                            // body_projections; fixpoint-aware projection
-                            // capture is deferred. `body_scope` here is the
-                            // enclosing WITH scope (no real body has been
-                            // walked yet) — collapse treats an empty body
-                            // as a terminal stub.
-                            r.bind_cte(
-                                cte.alias.name.clone(),
-                                RelationSchema::Unknown,
-                                Vec::new(),
-                                body_scope,
-                            );
-                        }
-                        for cte in &with.cte_tables {
-                            // Body output is discarded for recursive CTEs
-                            // (no collapse either). Raw resolve_query so
-                            // the intermediate QueryOutput edges aren't
-                            // emitted.
-                            r.resolve_query(&cte.query)?;
-                        }
-                    } else {
-                        for cte in &with.cte_tables {
-                            // Raw resolve_query: the body's projections and
-                            // body_scope are stored in the binding for
-                            // lineage collapse, and no intermediate
-                            // QueryOutput edges are emitted since the CTE
-                            // output isn't a query result on its own —
-                            // references through the CTE collapse end to end
-                            // at lineage-emission time.
-                            let resolved = r.resolve_query(&cte.query)?;
-                            let renames = &cte.alias.columns;
-                            let renamed_schema =
-                                super::rename_relation_schema(resolved.output_schema, renames);
-                            let renamed_projections =
-                                super::rename_projection_groups(resolved.projections, renames);
-                            r.bind_cte(
-                                cte.alias.name.clone(),
-                                renamed_schema,
-                                renamed_projections,
-                                resolved.body_scope,
-                            );
-                        }
+        // Swap in a fresh per-branch buffer for this query — restored
+        // on return — so each ResolvedQuery owns exactly its own
+        // branches without leaking into siblings or ancestors. This is
+        // independent of the scope-arena push below: branches
+        // accumulate into the resolver's own buffer, not into the scope.
+        let prev_branches = std::mem::take(&mut self.current_branches);
+        let body_scope = self.with_scope(|r| -> Result<ScopeId, Error> {
+            let body_scope = r.scopes_mut().current_scope_id();
+            if let Some(with) = &query.with {
+                if with.recursive {
+                    for cte in &with.cte_tables {
+                        // Recursive CTEs pre-bind with `None`
+                        // output_columns; fixpoint-aware capture is
+                        // deferred. `body_scope` here is the enclosing
+                        // WITH scope (no real body has been walked
+                        // yet) — collapse treats `None` as a terminal
+                        // stub.
+                        r.bind_cte(cte.alias.name.clone(), None, body_scope);
+                    }
+                    for cte in &with.cte_tables {
+                        // Body output is discarded for recursive CTEs
+                        // (no collapse either). Raw resolve_query so
+                        // the intermediate QueryOutput edges aren't
+                        // emitted.
+                        r.resolve_query(&cte.query)?;
+                    }
+                } else {
+                    for cte in &with.cte_tables {
+                        // Raw resolve_query: the body's output_columns
+                        // and body_scope are stored in the binding for
+                        // lineage collapse, and no intermediate
+                        // QueryOutput edges are emitted since the CTE
+                        // output isn't a query result on its own —
+                        // references through the CTE collapse end to
+                        // end at lineage-emission time.
+                        let resolved = r.resolve_query(&cte.query)?;
+                        let renames = &cte.alias.columns;
+                        let renamed = resolved
+                            .output_columns
+                            .map(|o| super::rename_body_output(o, renames));
+                        r.bind_cte(cte.alias.name.clone(), renamed, resolved.body_scope);
                     }
                 }
-                let body_schema = r.visit_set_expr(&query.body)?;
-                if let Some(order_by) = &query.order_by {
-                    r.visit_order_by(order_by)?;
+            }
+            r.visit_set_expr(&query.body)?;
+            if let Some(order_by) = &query.order_by {
+                r.visit_order_by(order_by)?;
+            }
+            if let Some(limit_clause) = &query.limit_clause {
+                r.visit_limit_clause(limit_clause)?;
+            }
+            if let Some(fetch) = &query.fetch {
+                r.visit_fetch(fetch)?;
+            }
+            if let Some(settings) = &query.settings {
+                for setting in settings {
+                    r.visit_expr(&setting.value)?;
                 }
-                if let Some(limit_clause) = &query.limit_clause {
-                    r.visit_limit_clause(limit_clause)?;
-                }
-                if let Some(fetch) = &query.fetch {
-                    r.visit_fetch(fetch)?;
-                }
-                if let Some(settings) = &query.settings {
-                    for setting in settings {
-                        r.visit_expr(&setting.value)?;
-                    }
-                }
-                for pipe_operator in &query.pipe_operators {
-                    r.visit_pipe_operator(pipe_operator)?;
-                }
-                Ok((body_schema, body_scope))
-            })?;
-        let projections = std::mem::replace(&mut self.current_projections, prev_projections);
+            }
+            for pipe_operator in &query.pipe_operators {
+                r.visit_pipe_operator(pipe_operator)?;
+            }
+            Ok(body_scope)
+        })?;
+        let branches = std::mem::replace(&mut self.current_branches, prev_branches);
+        let output_columns = if branches.is_empty() {
+            None
+        } else {
+            Some(BodyOutput {
+                per_branch: branches,
+            })
+        };
         Ok(ResolvedQuery {
-            output_schema: body_schema,
-            projections,
+            output_columns,
             body_scope,
         })
     }
 
-    fn visit_set_expr(&mut self, set_expr: &SetExpr) -> Result<RelationSchema, Error> {
+    fn visit_set_expr(&mut self, set_expr: &SetExpr) -> Result<(), Error> {
         match set_expr {
             SetExpr::Select(select) => self.visit_select(select),
             SetExpr::Query(query) => {
                 // Parenthesized continuation of the enclosing query —
-                // bubble the inner projections up so an outer INSERT (or
+                // bubble the inner branches up so an outer INSERT (or
                 // any other caller) sees them as if they were inline.
                 let resolved = self.resolve_query(query)?;
-                let output_schema = resolved.output_schema.clone();
-                self.extend_projections(resolved.projections);
-                Ok(output_schema)
+                if let Some(output) = resolved.output_columns {
+                    self.extend_branches(output.per_branch);
+                }
+                Ok(())
             }
             SetExpr::SetOperation { left, right, .. } => {
                 // Each branch lives in its own scope so name resolution
                 // doesn't see sibling branches' FROM bindings — matching
                 // SQL's per-SELECT name resolution. The branches' own
-                // visit_select calls each contribute a ProjectionGroup,
-                // so UNION INSERT naturally pairs every branch with the
-                // same target columns. Result schema conventionally
-                // follows the left side's column names.
-                let left_schema = self.with_scope(|r| r.visit_set_expr(left))?;
+                // visit_select calls each contribute one branch entry
+                // of output columns, so UNION INSERT naturally pairs
+                // every branch with the same target columns.
+                self.with_scope(|r| r.visit_set_expr(left))?;
                 self.with_scope(|r| r.visit_set_expr(right))?;
-                Ok(left_schema)
+                Ok(())
             }
             SetExpr::Insert(statement)
             | SetExpr::Update(statement)
@@ -131,21 +123,17 @@ impl<'a> Resolver<'a> {
                 // would see both `t` and `cte` in one scope and resolve
                 // ambiguously to None. CTEs stay reachable via the
                 // parent-scope walk-up.
-                self.with_scope(|r| r.visit_statement(statement))?;
-                Ok(RelationSchema::Unknown)
+                self.with_scope(|r| r.visit_statement(statement))
             }
             SetExpr::Table(table) => {
                 self.visit_table_command(table);
-                Ok(RelationSchema::Unknown)
+                Ok(())
             }
-            SetExpr::Values(values) => {
-                self.visit_values(values)?;
-                Ok(RelationSchema::Unknown)
-            }
+            SetExpr::Values(values) => self.visit_values(values),
         }
     }
 
-    fn visit_select(&mut self, select: &Select) -> Result<RelationSchema, Error> {
+    fn visit_select(&mut self, select: &Select) -> Result<(), Error> {
         if let Some(Distinct::On(exprs)) = &select.distinct {
             self.visit_exprs(exprs)?;
         }
@@ -157,13 +145,11 @@ impl<'a> Resolver<'a> {
         for table in &select.from {
             self.visit_table_with_joins(table, TableRole::Read)?;
         }
-        let mut projection_items = Vec::with_capacity(select.projection.len());
+        let mut branch_columns = Vec::with_capacity(select.projection.len());
         for item in &select.projection {
-            projection_items.push(self.build_projection_item(item)?);
+            branch_columns.push(self.build_output_column(item)?);
         }
-        self.push_projection_group(ProjectionGroup {
-            items: projection_items,
-        });
+        self.push_output_branch(branch_columns);
         if let Some(into) = &select.into {
             // SELECT ... INTO new_table acts like CTAS — INTO is the write target.
             self.bind_real_table(
@@ -214,20 +200,17 @@ impl<'a> Resolver<'a> {
                 self.visit_window_spec(spec)?;
             }
         }
-        Ok(projection_schema(&select.projection))
+        Ok(())
     }
 
     /// Walk a single projection item's expression and snapshot the
-    /// refs it records, packaging name / source_refs / kind into a
-    /// `ProjectionItem`.
-    pub(super) fn build_projection_item(
-        &mut self,
-        item: &SelectItem,
-    ) -> Result<ProjectionItem, Error> {
+    /// refs it records, packaging name / source_refs / kind into an
+    /// [`OutputColumn`].
+    pub(super) fn build_output_column(&mut self, item: &SelectItem) -> Result<OutputColumn, Error> {
         let refs_before = self.column_refs_len();
         self.visit_select_item(item)?;
         let source_refs = self.column_refs_slice(refs_before).to_vec();
-        Ok(ProjectionItem {
+        Ok(OutputColumn {
             name: projection_item_output_name(item),
             source_refs,
             kind: projection_item_kind(item),
@@ -306,36 +289,5 @@ impl<'a> Resolver<'a> {
             }
         }
         Ok(())
-    }
-}
-
-/// Derive an output `RelationSchema` from a `SELECT` projection, structurally only.
-/// Wildcards and computed expressions fall back to `RelationSchema::Unknown`; that
-/// gap is filled in later phases once catalog and in-scope relation schemas
-/// can drive expansion.
-fn projection_schema(projection: &[SelectItem]) -> RelationSchema {
-    let mut columns = Vec::with_capacity(projection.len());
-    for item in projection {
-        match column_from_select_item(item) {
-            Some(column) => columns.push(column),
-            None => return RelationSchema::Unknown,
-        }
-    }
-    RelationSchema::Known(columns)
-}
-
-fn column_from_select_item(item: &SelectItem) -> Option<Ident> {
-    match item {
-        SelectItem::ExprWithAlias { alias, .. } => Some(alias.clone()),
-        SelectItem::UnnamedExpr(expr) => column_from_expr(expr),
-        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
-    }
-}
-
-fn column_from_expr(expr: &Expr) -> Option<Ident> {
-    match expr {
-        Expr::Identifier(ident) => Some(ident.clone()),
-        Expr::CompoundIdentifier(parts) => parts.last().cloned(),
-        _ => None,
     }
 }

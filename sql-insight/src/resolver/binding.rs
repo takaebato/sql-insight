@@ -9,7 +9,7 @@ use crate::catalog::ColumnSchema;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::reference::TableReference;
 
-use super::{ProjectionGroup, Resolution, Resolver};
+use super::{BodyOutput, Resolution, Resolver};
 
 /// Internal role a table binding carries within a statement. Surfaced
 /// to the operation extractor via [`Resolution::read_tables`]
@@ -140,22 +140,19 @@ impl BindingKey {
     }
 }
 
-/// Column-name schema of a relation as seen by the resolver. Just
-/// the names — the resolver needs identity, not types.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RelationSchema {
-    /// Populated either from the catalog (for real tables) or derived
-    /// from the body (for CTEs / derived tables).
-    Known(Vec<Ident>),
-    /// Fallback when no catalog is available, the catalog misses, or
-    /// the body's columns can't be inferred (wildcards, computed
-    /// expressions).
-    Unknown,
-}
-
 /// What's bound to a name in a [`Scope`] — a real Table or one of
 /// the synthetic relations (CTE / derived subquery / table function)
 /// that SQL exposes as a named row set.
+///
+/// Column-name info lives in the `output_columns` field, shaped per
+/// binding kind:
+/// - `Table::output_columns: Option<Vec<Ident>>` — naked column-name
+///   list from the catalog (`Some`) or unknown (`None`).
+/// - `Cte` / `DerivedTable` `output_columns: Option<BodyOutput>` —
+///   per-branch list of [`OutputColumn`]s with full lineage info, or
+///   `None` for recursive CTE stubs / wrapper aliases / walk-failed
+///   bodies.
+/// - `TableFunction` carries no column info — always unknown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Binding {
     // `table` is boxed because the variant otherwise dwarfs the others
@@ -169,10 +166,9 @@ pub(crate) enum Binding {
         /// `TableReference` stays alias-free for catalog lookup and
         /// cross-statement comparison.
         alias: Option<Ident>,
-        /// Column schema for the underlying table. `Known` when the
-        /// catalog has the table, `Unknown` otherwise (no catalog or
-        /// catalog miss).
-        schema: RelationSchema,
+        /// Catalog-derived column names. `Some` when the catalog has
+        /// the table, `None` otherwise (no catalog or catalog miss).
+        output_columns: Option<Vec<Ident>>,
         /// How this binding is used in the statement — Read, Write,
         /// or both (e.g. `DELETE t1 FROM t1`). Re-binding the same
         /// name merges roles rather than overwriting (see `Scope::bind`).
@@ -182,19 +178,15 @@ pub(crate) enum Binding {
         /// The CTE's declared name (the `<name>` in `WITH <name> AS …`).
         /// Lookup keys derive from this via `BindingKey`.
         name: Ident,
-        /// Output column schema derived from the CTE body, then
-        /// renamed via the CTE's column-alias list when one is given.
-        schema: RelationSchema,
-        /// The CTE body's projection groups, captured so that lineage
-        /// collapse can collapse references to `cte.col` with the
-        /// body's source refs (transitive source → target lineage).
-        /// Empty for recursive CTEs where the body is walked under a
-        /// pre-bound stub and fixpoint-aware projection capture is
-        /// deferred.
-        body_projections: Vec<ProjectionGroup>,
+        /// Body-walk output of the CTE: per-branch list of
+        /// [`OutputColumn`]s with full lineage info (name, source
+        /// refs, kind). `None` for recursive CTEs pre-bound under a
+        /// stub (fixpoint-aware capture is deferred). Renamed via the
+        /// CTE's column-alias list when one is given.
+        output_columns: Option<BodyOutput>,
         /// Arena id of the scope that holds the CTE body's bindings.
-        /// Table-lineage collapse walks descendant scopes of this
-        /// id to collect the real tables underneath the CTE — so a
+        /// Table-lineage collapse walks descendant scopes of this id
+        /// to collect the real tables underneath the CTE — so a
         /// `FROM cte` use can resolve back to the body's `FROM s`.
         body_scope: ScopeId,
     },
@@ -203,15 +195,14 @@ pub(crate) enum Binding {
         /// this is the only handle the outer query has on the derived
         /// relation.
         alias: Ident,
-        /// Output column schema derived from the subquery body, then
+        /// Body-walk output. Same shape as `Cte::output_columns`,
         /// renamed via the alias's column list when one is given.
-        schema: RelationSchema,
-        /// Same role as `Cte::body_projections` — captured at the
-        /// derived subquery walk and consumed by lineage collapse.
-        body_projections: Vec<ProjectionGroup>,
+        /// `None` for wrapper aliases (`NestedJoin`, `Pivot`,
+        /// `Unpivot`, `MatchRecognize`) whose body isn't a real
+        /// subquery with its own projection.
+        output_columns: Option<BodyOutput>,
         /// Arena id of the scope holding the derived subquery body's
-        /// bindings (`Some`) — or `None` for wrapper aliases
-        /// (`NestedJoin`, `Pivot`, `Unpivot`, `MatchRecognize`) whose
+        /// bindings (`Some`) — or `None` for wrapper aliases whose
         /// inner tables are bound directly in the current scope and
         /// don't need collapse through this synthetic.
         body_scope: Option<ScopeId>,
@@ -219,10 +210,9 @@ pub(crate) enum Binding {
     TableFunction {
         /// Mandatory alias from `f(...) AS t`. Refs against the alias
         /// surface as synthetic-owned (filtered out of public reads).
+        /// No column-info field — TableFunction column inference is
+        /// not modelled (always unknown).
         alias: Ident,
-        /// Always `Unknown` today — placeholder for future
-        /// per-dialect table-function schema inference.
-        schema: RelationSchema,
     },
 }
 
@@ -388,56 +378,65 @@ pub(super) fn binding_could_contain_column(
     name: &Ident,
 ) -> Option<TableReference> {
     match binding {
-        Binding::Table { table, schema, .. } => {
-            schema_could_contain(schema, name).then(|| (**table).clone())
+        Binding::Table { table, .. } => {
+            names_could_contain(binding_column_names(binding).as_deref(), name)
+                .then(|| (**table).clone())
         }
-        Binding::Cte {
-            name: cte_name,
-            schema,
-            ..
-        } => schema_could_contain(schema, name).then(|| synthetic_table_ref(cte_name)),
-        Binding::DerivedTable { alias, schema, .. } => {
-            schema_could_contain(schema, name).then(|| synthetic_table_ref(alias))
+        Binding::Cte { name: cte_name, .. } => {
+            names_could_contain(binding_column_names(binding).as_deref(), name)
+                .then(|| synthetic_table_ref(cte_name))
         }
-        // TableFunction schemas are always Unknown for now, so any
-        // unqualified column could plausibly come from one.
-        Binding::TableFunction { alias, .. } => Some(synthetic_table_ref(alias)),
+        Binding::DerivedTable { alias, .. } => {
+            names_could_contain(binding_column_names(binding).as_deref(), name)
+                .then(|| synthetic_table_ref(alias))
+        }
+        // TableFunction columns are unmodeled, so any unqualified
+        // column could plausibly come from one.
+        Binding::TableFunction { alias } => Some(synthetic_table_ref(alias)),
     }
 }
 
-/// Schema-confirmed membership: `true` iff the binding has a `Known`
-/// schema that declares the column. Distinguished from
+/// Known-membership: `true` iff the binding has a known column list
+/// that declares the column. Distinguished from
 /// `binding_could_contain_column`, which also returns `Some` for
-/// `Unknown` schemas. Used by diagnostic emit to separate "definitely
-/// ambiguous" from "uncertain over Unknown schemas".
+/// bindings with unknown column lists. Used by diagnostic emit to
+/// separate "definitely ambiguous" from "uncertain over unknown
+/// columns".
 pub(super) fn binding_confirms_column(binding: &Binding, name: &Ident) -> bool {
-    matches!(
-        binding_schema(binding),
-        RelationSchema::Known(cols)
-            if cols.iter().any(|c| BindingKey::from_ident(c) == BindingKey::from_ident(name))
-    )
-}
-
-/// `true` iff the binding's schema is `Known` (not `Unknown`). Used to
-/// gate `UnresolvedColumn` diagnostics — without at least one Known
-/// schema in scope, the resolver can't claim a column is missing.
-pub(super) fn binding_has_known_schema(binding: &Binding) -> bool {
-    matches!(binding_schema(binding), RelationSchema::Known(_))
-}
-
-fn binding_schema(binding: &Binding) -> &RelationSchema {
-    match binding {
-        Binding::Table { schema, .. }
-        | Binding::Cte { schema, .. }
-        | Binding::DerivedTable { schema, .. }
-        | Binding::TableFunction { schema, .. } => schema,
+    match binding_column_names(binding) {
+        Some(cols) => cols
+            .iter()
+            .any(|c| BindingKey::from_ident(c) == BindingKey::from_ident(name)),
+        None => false,
     }
 }
 
-fn schema_could_contain(schema: &RelationSchema, name: &Ident) -> bool {
-    match schema {
-        RelationSchema::Unknown => true,
-        RelationSchema::Known(cols) => cols
+/// `true` iff the binding has a known column list. Used to gate
+/// `UnresolvedColumn` diagnostics — without at least one binding
+/// with known columns in scope, the resolver can't claim a column is
+/// missing.
+pub(super) fn binding_has_known_columns(binding: &Binding) -> bool {
+    binding_column_names(binding).is_some()
+}
+
+/// Cross-binding column-name lookup: the single entry point that
+/// abstracts over `Binding::Table`'s catalog list and
+/// `Cte`/`DerivedTable`'s body-derived column names. `TableFunction`
+/// always returns `None`.
+pub(super) fn binding_column_names(binding: &Binding) -> Option<Vec<Ident>> {
+    match binding {
+        Binding::Table { output_columns, .. } => output_columns.clone(),
+        Binding::Cte { output_columns, .. } | Binding::DerivedTable { output_columns, .. } => {
+            output_columns.as_ref()?.column_names()
+        }
+        Binding::TableFunction { .. } => None,
+    }
+}
+
+fn names_could_contain(names: Option<&[Ident]>, name: &Ident) -> bool {
+    match names {
+        None => true, // unknown columns — anything could match
+        Some(cols) => cols
             .iter()
             .any(|c| BindingKey::from_ident(c) == BindingKey::from_ident(name)),
     }
@@ -493,7 +492,7 @@ impl<'a> Resolver<'a> {
         role: TableRole,
     ) {
         let binding_name = alias.clone().unwrap_or_else(|| table.name.clone());
-        let schema = self.lookup_table_schema(&table);
+        let output_columns = self.lookup_catalog_columns(&table);
         if role == TableRole::Read {
             // Read-position FROM/JOIN — emit a RawTableRef so table-lineage
             // collapse sees this as a real source. Write targets feed
@@ -505,7 +504,7 @@ impl<'a> Resolver<'a> {
             Binding::Table {
                 table: Box::new(table),
                 alias,
-                schema,
+                output_columns,
                 roles: vec![role],
             },
         );
@@ -534,20 +533,16 @@ impl<'a> Resolver<'a> {
 
     /// Query the optional catalog for a table's columns.
     /// `TableReference` is already alias-free, so it is a valid
-    /// catalog key as-is.
-    fn lookup_table_schema(&self, table: &TableReference) -> RelationSchema {
-        let Some(catalog) = self.catalog else {
-            return RelationSchema::Unknown;
-        };
-        let lookup_key = table.clone();
-        match catalog.columns(&lookup_key) {
-            Some(cols) => RelationSchema::Known(
-                cols.into_iter()
-                    .map(|ColumnSchema { name }| Ident::new(name))
-                    .collect(),
-            ),
-            None => RelationSchema::Unknown,
-        }
+    /// catalog key as-is. Returns `None` when no catalog is supplied
+    /// or the catalog has no entry for the table.
+    fn lookup_catalog_columns(&self, table: &TableReference) -> Option<Vec<Ident>> {
+        let catalog = self.catalog?;
+        let cols = catalog.columns(table)?;
+        Some(
+            cols.into_iter()
+                .map(|ColumnSchema { name }| Ident::new(name))
+                .collect(),
+        )
     }
 
     /// Resolve the effective target column list for INSERT-style
@@ -564,51 +559,32 @@ impl<'a> Resolver<'a> {
         if !explicit.is_empty() {
             return explicit.to_vec();
         }
-        match self.lookup_table_schema(target) {
-            RelationSchema::Known(cols) => cols,
-            RelationSchema::Unknown => Vec::new(),
-        }
+        self.lookup_catalog_columns(target).unwrap_or_default()
     }
 
-    /// Look up an in-scope CTE's body projections, for re-binding
-    /// under an alias (`FROM cte AS c`). Returns an empty `Vec` when
-    /// the reference is multi-segment, not bound, or not a Cte
-    /// binding — the caller (alias-bound Cte construction) treats
-    /// that as "no collapse through this alias", matching
-    /// recursive-CTE behavior.
-    pub(super) fn cte_body_projections(&self, cte_name: &ObjectName) -> Vec<ProjectionGroup> {
+    /// Look up an in-scope CTE's `output_columns`, for re-binding
+    /// under an alias (`FROM cte AS c`). Returns `None` when the
+    /// reference is multi-segment, not bound, or not a Cte binding —
+    /// the caller (alias-bound Cte construction) treats that as "no
+    /// collapse through this alias", matching recursive-CTE behavior.
+    pub(super) fn cte_output_columns(&self, cte_name: &ObjectName) -> Option<BodyOutput> {
         match self.scopes.resolve_unqualified_relation(cte_name) {
-            Some(Binding::Cte {
-                body_projections, ..
-            }) => body_projections.clone(),
-            _ => Vec::new(),
-        }
-    }
-
-    /// Look up an in-scope CTE's schema (companion to
-    /// [`Self::cte_body_projections`]). Returns `RelationSchema::Unknown`
-    /// when the lookup misses — same fallthrough semantics as the
-    /// body-projections accessor.
-    pub(super) fn cte_schema(&self, cte_name: &ObjectName) -> RelationSchema {
-        match self.scopes.resolve_unqualified_relation(cte_name) {
-            Some(Binding::Cte { schema, .. }) => schema.clone(),
-            _ => RelationSchema::Unknown,
+            Some(Binding::Cte { output_columns, .. }) => output_columns.clone(),
+            _ => None,
         }
     }
 
     pub(super) fn bind_cte(
         &mut self,
         name: Ident,
-        schema: RelationSchema,
-        body_projections: Vec<ProjectionGroup>,
+        output_columns: Option<BodyOutput>,
         body_scope: ScopeId,
     ) {
         self.bind_relation(
             name.clone(),
             Binding::Cte {
                 name,
-                schema,
-                body_projections,
+                output_columns,
                 body_scope,
             },
         );
@@ -617,24 +593,22 @@ impl<'a> Resolver<'a> {
     pub(super) fn bind_derived_table(
         &mut self,
         alias: Ident,
-        schema: RelationSchema,
-        body_projections: Vec<ProjectionGroup>,
+        output_columns: Option<BodyOutput>,
         body_scope: Option<ScopeId>,
     ) {
         self.bind_relation(
             alias.clone(),
             Binding::DerivedTable {
                 alias,
-                schema,
-                body_projections,
+                output_columns,
                 body_scope,
             },
         );
     }
 
-    /// Look up the body scope for a CTE name. Returns `None` if the name
-    /// does not resolve to a `Cte` binding — same fall-through semantics
-    /// as [`Self::cte_body_projections`] / [`Self::cte_schema`].
+    /// Look up the body scope for a CTE name. Returns `None` if the
+    /// name does not resolve to a `Cte` binding — same fall-through
+    /// semantics as [`Self::cte_output_columns`].
     pub(super) fn cte_body_scope(&self, cte_name: &ObjectName) -> Option<ScopeId> {
         match self.scopes.resolve_unqualified_relation(cte_name) {
             Some(Binding::Cte { body_scope, .. }) => Some(*body_scope),
@@ -643,13 +617,7 @@ impl<'a> Resolver<'a> {
     }
 
     pub(super) fn bind_table_function(&mut self, alias: Ident) {
-        self.bind_relation(
-            alias.clone(),
-            Binding::TableFunction {
-                alias,
-                schema: RelationSchema::Unknown,
-            },
-        );
+        self.bind_relation(alias.clone(), Binding::TableFunction { alias });
     }
 
     pub(super) fn record_diagnostic(&mut self, diagnostic: ColumnLevelDiagnostic) {

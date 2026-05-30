@@ -38,18 +38,18 @@ mod statement;
 mod table;
 
 pub(crate) use binding::{
-    Binding, RawTableRef, RelationSchema, Scope, ScopeId, ScopeKind, TableRefTarget, TableRole,
+    Binding, RawTableRef, Scope, ScopeId, ScopeKind, TableRefTarget, TableRole,
 };
 pub(crate) use column_ref::RawColumnRef;
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
-pub(crate) use projection::{ProjectionGroup, ProjectionItem};
+pub(crate) use projection::{BodyOutput, OutputColumn};
 
 // Internal helpers used by walkers via `super::*`. Some are
 // resolver-internal infrastructure (`BindingKey`, `ScopeStack`,
 // binding helpers); rename helpers are surfaced for the CTE /
 // derived-table walkers in walker/query.rs and walker/table.rs.
 use binding::ScopeStack;
-pub(super) use rename::{rename_projection_groups, rename_relation_schema};
+pub(super) use rename::rename_body_output;
 
 use sqlparser::ast::Statement;
 
@@ -95,8 +95,12 @@ pub(crate) struct Resolution {
 /// (INSERT / CTAS), or bubble them through `SetExpr::Query`.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedQuery {
-    pub(crate) output_schema: RelationSchema,
-    pub(crate) projections: Vec<ProjectionGroup>,
+    /// Body-walk output of the query — per-branch list of
+    /// [`OutputColumn`]s with full lineage info. `None` when nothing
+    /// was captured (e.g. recursive CTE pre-bind stub, `VALUES`-only
+    /// query). Callers (CTE / derived bind, INSERT pairing, etc.)
+    /// consume this directly.
+    pub(crate) output_columns: Option<BodyOutput>,
     /// Arena id of the scope pushed for this query's body — exposed so
     /// callers binding the query as a synthetic relation (CTE / derived
     /// table) can record it on the binding for table-lineage
@@ -137,12 +141,12 @@ pub(crate) struct Resolver<'a> {
     /// every `FROM`-position bind site (real tables, CTE references,
     /// true derived subqueries).
     table_refs: Vec<RawTableRef>,
-    /// Per-query buffer of projection groups collected by
-    /// `visit_select`. `resolve_query` swaps a fresh buffer in for
-    /// the duration of its walk and packs the collected groups into
-    /// the returned `ResolvedQuery`, so each query gets exactly its
-    /// own projections.
-    current_projections: Vec<ProjectionGroup>,
+    /// Per-query buffer of branch-shaped output columns collected by
+    /// `visit_select` (one inner `Vec` per branch). `resolve_query`
+    /// swaps a fresh buffer in for the duration of its walk and packs
+    /// the collected branches into the returned `ResolvedQuery`'s
+    /// `output_columns`, so each query gets exactly its own branches.
+    current_branches: Vec<Vec<OutputColumn>>,
     /// Lexical context stamped onto every scope pushed while it is in
     /// effect: `Body` by default, flipped to `Predicate` by
     /// [`Resolver::with_filter_clause`] so subqueries nested in WHERE /
@@ -161,7 +165,7 @@ impl<'a> Resolver<'a> {
             column_refs: Vec::new(),
             lineage_edges: Vec::new(),
             table_refs: Vec::new(),
-            current_projections: Vec::new(),
+            current_branches: Vec::new(),
             scope_kind: ScopeKind::Body,
         }
     }
@@ -233,57 +237,48 @@ mod tests {
         Resolver::resolve_statement(catalog, &statements[0]).unwrap()
     }
 
-    fn first_table_schema(resolution: &Resolution) -> Option<&RelationSchema> {
+    fn first_table_columns(resolution: &Resolution) -> Option<&Option<Vec<sqlparser::ast::Ident>>> {
         resolution
             .scopes
             .iter()
             .flat_map(|scope| scope.bindings.values())
             .find_map(|binding| match binding {
-                Binding::Table { schema, .. } => Some(schema),
+                Binding::Table { output_columns, .. } => Some(output_columns),
                 _ => None,
             })
     }
 
     #[test]
-    fn catalog_hit_populates_table_schema() {
+    fn catalog_hit_populates_table_columns() {
         let catalog = TestCatalog::default().with("users", vec!["id", "email"]);
         let resolution = resolve("SELECT * FROM users", Some(&catalog));
-        match first_table_schema(&resolution) {
-            Some(RelationSchema::Known(cols)) => {
+        match first_table_columns(&resolution) {
+            Some(Some(cols)) => {
                 assert_eq!(cols.len(), 2);
                 assert_eq!(cols[0].value, "id");
                 assert_eq!(cols[1].value, "email");
             }
-            other => panic!("expected RelationSchema::Known(...), got {:?}", other),
+            other => panic!("expected Some(Some(...)), got {:?}", other),
         }
     }
 
     #[test]
-    fn catalog_miss_keeps_schema_unknown() {
+    fn catalog_miss_leaves_columns_unknown() {
         let catalog = TestCatalog::default();
         let resolution = resolve("SELECT * FROM users", Some(&catalog));
-        assert!(matches!(
-            first_table_schema(&resolution),
-            Some(RelationSchema::Unknown)
-        ));
+        assert!(matches!(first_table_columns(&resolution), Some(None)));
     }
 
     #[test]
-    fn no_catalog_keeps_schema_unknown() {
+    fn no_catalog_leaves_columns_unknown() {
         let resolution = resolve("SELECT * FROM users", None);
-        assert!(matches!(
-            first_table_schema(&resolution),
-            Some(RelationSchema::Unknown)
-        ));
+        assert!(matches!(first_table_columns(&resolution), Some(None)));
     }
 
     #[test]
     fn catalog_lookup_ignores_alias() {
         let catalog = TestCatalog::default().with("users", vec!["id"]);
         let resolution = resolve("SELECT * FROM users AS u", Some(&catalog));
-        assert!(matches!(
-            first_table_schema(&resolution),
-            Some(RelationSchema::Known(_))
-        ));
+        assert!(matches!(first_table_columns(&resolution), Some(Some(_))));
     }
 }
