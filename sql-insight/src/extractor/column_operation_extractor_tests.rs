@@ -3932,6 +3932,120 @@ mod expr_arm_coverage {
             vec![c("c"), c("a"), c("b")]
         );
     }
+
+    #[test]
+    fn all_op() {
+        // Expr::AllOp — sibling of AnyOp in the chained-pattern arm.
+        assert_eq!(
+            reads("SELECT t.c FROM t WHERE t.a = ALL (SELECT t.b FROM t)"),
+            vec![c("c"), c("a"), c("b")]
+        );
+    }
+
+    #[test]
+    fn is_not_distinct_from() {
+        // Expr::IsNotDistinctFrom — `IS DISTINCT FROM` already covered;
+        // the negated form is a distinct AST variant.
+        assert_eq!(
+            reads("SELECT t.c FROM t WHERE t.a IS NOT DISTINCT FROM t.b"),
+            vec![c("c"), c("a"), c("b")]
+        );
+    }
+
+    #[test]
+    fn is_false() {
+        // Expr::IsFalse — `t.a IS FALSE`
+        assert_eq!(
+            reads("SELECT t.c FROM t WHERE t.a IS FALSE"),
+            vec![c("c"), c("a")]
+        );
+    }
+
+    #[test]
+    fn is_not_false() {
+        // Expr::IsNotFalse — `t.a IS NOT FALSE`
+        assert_eq!(
+            reads("SELECT t.c FROM t WHERE t.a IS NOT FALSE"),
+            vec![c("c"), c("a")]
+        );
+    }
+
+    #[test]
+    fn is_not_true() {
+        // Expr::IsNotTrue — sibling of IsTrue in the chained-pattern arm.
+        assert_eq!(
+            reads("SELECT t.c FROM t WHERE t.a IS NOT TRUE"),
+            vec![c("c"), c("a")]
+        );
+    }
+
+    #[test]
+    fn is_unknown() {
+        // Expr::IsUnknown — SQL three-valued-logic predicate.
+        assert_eq!(
+            reads("SELECT t.c FROM t WHERE t.a IS UNKNOWN"),
+            vec![c("c"), c("a")]
+        );
+    }
+
+    #[test]
+    fn is_not_unknown() {
+        // Expr::IsNotUnknown — negated three-valued-logic predicate.
+        assert_eq!(
+            reads("SELECT t.c FROM t WHERE t.a IS NOT UNKNOWN"),
+            vec![c("c"), c("a")]
+        );
+    }
+
+    #[test]
+    fn is_normalized() {
+        // Expr::IsNormalized — Unicode normalization predicate
+        // (`t.a IS [form] NORMALIZED`); arm visits `expr` only.
+        assert_eq!(
+            reads("SELECT t.c FROM t WHERE t.a IS NORMALIZED"),
+            vec![c("c"), c("a")]
+        );
+    }
+
+    #[test]
+    fn ceil_to_field() {
+        // Expr::Ceil — the `CEIL(<expr> TO <field>)` form. Plain
+        // `CEIL(<expr>)` parses as a function call (Expr::Function),
+        // not the Ceil variant; the `TO <field>` is what triggers it.
+        assert_eq!(reads("SELECT CEIL(t.a TO YEAR) FROM t"), vec![c("a")]);
+    }
+
+    #[test]
+    fn floor_to_field() {
+        // Expr::Floor — sibling of Ceil; same `TO <field>` form.
+        assert_eq!(reads("SELECT FLOOR(t.a TO YEAR) FROM t"), vec![c("a")]);
+    }
+
+    #[test]
+    fn rlike() {
+        // Expr::RLike — MySQL regex match operator; sibling of
+        // Like / ILike / SimilarTo in the chained-pattern arm.
+        assert_eq!(
+            reads("SELECT t.c FROM t WHERE t.a RLIKE 'pat'"),
+            vec![c("c"), c("a")]
+        );
+    }
+
+    #[test]
+    fn convert_using() {
+        // Expr::Convert — `CONVERT(<expr> USING <charset>)` form
+        // (MySQL / PostgreSQL); arm walks expr + each style.
+        assert_eq!(reads("SELECT CONVERT(t.a USING utf8) FROM t"), vec![c("a")]);
+    }
+
+    #[test]
+    fn trim_characters() {
+        // Expr::Trim — the `TRIM(<expr>, <chars>...)` comma form sets
+        // `trim_characters: Some(Vec<Expr>)` (vs the `FROM` form which
+        // sets `trim_what` instead). Existing `trim` test covers the
+        // FROM path; this covers the chars-list path.
+        assert_eq!(reads("SELECT TRIM(t.y, t.a) FROM t"), vec![c("y"), c("a")]);
+    }
 }
 
 /// Per-construct coverage for `visit_table_factor` / `visit_join`
