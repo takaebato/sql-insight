@@ -5,7 +5,7 @@
 
 use sqlparser::ast::{Expr, Ident, SelectItem, TableAliasColumnDef};
 
-use crate::extractor::column_operation_extractor::ColumnLineageKind;
+use crate::extractor::ColumnLineageKind;
 
 use super::{RawColumnRef, Resolver};
 

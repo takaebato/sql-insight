@@ -1,7 +1,7 @@
-pub mod column_operation_extractor;
-pub mod crud_table_extractor;
-pub mod table_extractor;
-pub mod table_operation_extractor;
+mod column_operation_extractor;
+mod crud_table_extractor;
+mod table_extractor;
+mod table_operation_extractor;
 
 pub use column_operation_extractor::*;
 pub use crud_table_extractor::*;

@@ -6,7 +6,7 @@ use core::fmt;
 
 use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
-pub use crate::reference::TableReference;
+use crate::reference::TableReference;
 use crate::resolver::Resolver;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;

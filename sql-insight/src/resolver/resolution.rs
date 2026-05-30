@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 
 use crate::diagnostic::ColumnLevelDiagnostic;
-use crate::extractor::column_operation_extractor::ColumnLineageKind;
+use crate::extractor::ColumnLineageKind;
 use crate::reference::TableReference;
 
 use super::binding::binding_alias_key;
