@@ -278,7 +278,12 @@ mod integration {
         use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
         use tokio::time;
 
-        const BIN_PATH: &str = "../target/debug/sql-insight";
+        // Resolved by Cargo at compile time, so it tracks any
+        // `--target-dir` override the runner applies — notably
+        // `cargo-llvm-cov`, which builds into `target/llvm-cov-target/`.
+        // The hardcoded `../target/debug/sql-insight` form worked under
+        // tarpaulin only because tarpaulin reuses the default target dir.
+        const BIN_PATH: &str = env!("CARGO_BIN_EXE_sql-insight");
         const TIMEOUT_DURATION: Duration = Duration::from_secs(1);
 
         async fn write_to_stdin(
