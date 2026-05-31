@@ -17,7 +17,7 @@
 //!   identifier parts to owning tables.
 //! - [`table_ref`]: `RawTableRef` / `TableRefTarget` and the
 //!   `record_*_table_ref` constructors. Parallel to `column_ref`.
-//! - [`body_output`]: `QueryBodyOutput` / `OutputColumn` and the helpers
+//! - [`query_body_output`]: `QueryBodyOutput` / `OutputColumn` and the helpers
 //!   that derive each output column's name / kind from a `SelectItem`.
 //! - [`lineage`]: `LineageEdge` / `LineageTargetSpec` and the emit
 //!   helpers that drive INSERT / CTAS / QueryOutput edge construction.
@@ -30,7 +30,7 @@
 //! table walkers all live here as one consolidated `impl` block).
 
 mod binding;
-mod body_output;
+mod query_body_output;
 mod column_ref;
 mod lineage;
 mod resolution;
@@ -38,14 +38,14 @@ mod scope;
 mod table_ref;
 
 pub(crate) use binding::{Binding, TableRole};
-pub(crate) use body_output::{OutputColumn, QueryBodyOutput, SetOperand};
+pub(crate) use query_body_output::{OutputColumn, QueryBodyOutput, SetOperand};
 pub(crate) use column_ref::RawColumnRef;
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
 pub(crate) use resolution::Resolution;
 pub(crate) use scope::{Scope, ScopeId, ScopeKind};
 pub(crate) use table_ref::{RawTableRef, TableRefTarget};
 
-use body_output::{output_column_kind, output_column_name};
+use query_body_output::{output_column_kind, output_column_name};
 
 use sqlparser::ast::{
     AccessExpr, Array, ConnectByKind, Delete, DictionaryField, Distinct, Expr, Fetch, FromTable,
@@ -921,7 +921,7 @@ impl<'a> Resolver<'a> {
     ) -> Result<(), Error> {
         for assignment in assignments {
             let target_parts = assignment_target_parts(&assignment.target);
-            let kind = body_output::expr_kind(&assignment.value);
+            let kind = query_body_output::expr_kind(&assignment.value);
             let refs_before = self.resolution.column_refs.len();
             self.visit_expr(&assignment.value)?;
             let Some(target_parts) = target_parts else {
@@ -1049,7 +1049,7 @@ impl<'a> Resolver<'a> {
         };
         for row in &values.rows {
             for (position, value_expr) in row.iter().enumerate() {
-                let kind = body_output::expr_kind(value_expr);
+                let kind = query_body_output::expr_kind(value_expr);
                 let refs_before = self.resolution.column_refs.len();
                 self.visit_expr(value_expr)?;
                 let (Some(target_table), Some(col_ident)) =
