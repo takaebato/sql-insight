@@ -72,18 +72,9 @@ columns). Every extractor works catalog-free in best-effort mode.
 
 ## Limitations
 
-Full list in the
-[crate docs](https://docs.rs/sql-insight/latest/sql_insight/#limitations).
-Highlights:
-
-- **Wildcards (`SELECT *`, `t.*`) are not expanded** — they surface
-  as `WildcardSuppressed` and contribute nothing to `reads` /
-  `lineage`.
-- **Recursive CTE column lineage is deferred.** Table-level lineage
-  traces the anchor branch's real tables; a column edge from a
-  recursive CTE surfaces with the CTE binding as the source.
-- **No type checking.** The catalog is an enrichment input, not a
-  validator.
+See the
+[Limitations](https://docs.rs/sql-insight/latest/sql_insight/#limitations)
+section of the crate docs.
 
 ## Examples & docs
 
