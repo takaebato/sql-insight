@@ -11,7 +11,7 @@
 //! directly to the SQL standard's `<query expression body>` (the
 //! part of a query stripped of WITH / ORDER BY / LIMIT / FETCH /
 //! settings / pipes). So [`QueryBodyOutput`] is "the projection columns
-//! produced by walking that body", `current_query_body` is the in-progress
+//! produced by walking that body", `current_query_body_output` is the in-progress
 //! such buffer, and `body_scope` on a synthetic binding is the
 //! arena scope of that body's FROM bindings.
 
@@ -107,7 +107,10 @@ impl<'a> Resolver<'a> {
     /// Push a fully-built set operand into the active query's body
     /// output. Called by `visit_select` once per SELECT body.
     pub(super) fn push_set_operand(&mut self, operand: SetOperand) {
-        self.context.current_query_body.set_operands.push(operand);
+        self.context
+            .current_query_body_output
+            .set_operands
+            .push(operand);
     }
 
     /// Extend the active query's body output with externally produced
@@ -116,7 +119,7 @@ impl<'a> Resolver<'a> {
     /// pairing reaches through a parenthesized source).
     pub(super) fn extend_set_operands(&mut self, operands: Vec<SetOperand>) {
         self.context
-            .current_query_body
+            .current_query_body_output
             .set_operands
             .extend(operands);
     }
