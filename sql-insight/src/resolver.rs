@@ -1098,16 +1098,32 @@ impl<'a> Resolver<'a> {
             // Subqueries in expression position (scalar / EXISTS / IN)
             // resolve with raw `resolve_query`, NOT the
             // QueryOutput-emitting wrapper — their transient projection
-            // is an intermediate, not a statement output. A scalar
-            // subquery in a projection has its source refs absorbed by
-            // the enclosing projection item (which emits the meaningful
-            // edge); a predicate subquery produces reads but no lineage.
-            // Same disposition as CTE / derived bodies.
+            // is an intermediate, not a statement output. Same
+            // disposition as CTE / derived bodies.
+            //
+            // `Expr::Subquery` is a scalar — its inner column flows
+            // out as the subquery's value, so it stays in the
+            // surrounding context (Body when used in projection,
+            // Predicate when used inside WHERE etc.).
+            //
+            // `Expr::Exists` and `Expr::InSubquery`'s RHS are
+            // predicate-shape regardless of where they're written:
+            // EXISTS returns a boolean (column values never flow),
+            // and IN's RHS columns are match-test targets (only the
+            // boolean result flows). Force `with_filter_clause` so
+            // refs captured inside are tagged `in_predicate` even
+            // when the surrounding context is Body (e.g. a CASE
+            // WHEN inside a projection).
             Expr::Subquery(query) => self.resolve_query(query).map(|_| ()),
-            Expr::Exists { subquery, .. } => self.resolve_query(subquery).map(|_| ()),
+            Expr::Exists { subquery, .. } => {
+                self.with_filter_clause(|r| r.resolve_query(subquery).map(|_| ()))
+            }
             Expr::InSubquery { expr, subquery, .. } => {
+                // LHS stays in the surrounding context — its value
+                // participates in the comparison and (transitively)
+                // in the boolean result.
                 self.visit_expr(expr)?;
-                self.resolve_query(subquery).map(|_| ())
+                self.with_filter_clause(|r| r.resolve_query(subquery).map(|_| ()))
             }
             Expr::BinaryOp { left, right, .. }
             | Expr::IsDistinctFrom(left, right)

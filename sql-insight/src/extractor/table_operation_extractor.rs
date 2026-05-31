@@ -936,6 +936,81 @@ mod tests {
         }
 
         #[test]
+        fn exists_subquery_in_projection_is_filter() {
+            // EXISTS returns a boolean — its inner refs never carry
+            // value into the projection. Even though the CASE
+            // expression is lexically a projection (value position),
+            // EXISTS itself is shape-based predicate and `x` must
+            // not become a lineage source.
+            assert_ops(
+                "INSERT INTO t1 SELECT \
+                 CASE WHEN EXISTS (SELECT 1 FROM x) THEN 1 ELSE 0 END \
+             FROM s",
+                TableOperation {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![table("s"), table("x")],
+                    writes: vec![table("t1")],
+                    lineage: vec![edge("s", "t1")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn in_subquery_rhs_in_projection_is_filter() {
+            // IN's RHS subquery columns are match-test targets, not
+            // value contributors — only the boolean result flows.
+            // `x` stays out of lineage even when the IN sits inside
+            // a projection-position CASE.
+            assert_ops(
+                "INSERT INTO t1 SELECT \
+                 CASE WHEN s.id IN (SELECT id FROM x) THEN 1 ELSE 0 END \
+             FROM s",
+                TableOperation {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![table("s"), table("x")],
+                    writes: vec![table("t1")],
+                    lineage: vec![edge("s", "t1")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn exists_subquery_in_update_set_is_filter() {
+            // Same shape-based rule applies inside UPDATE SET. The
+            // SET RHS is value-position by default, but EXISTS still
+            // acts as a predicate — `x` must not feed `t1`.
+            assert_ops(
+                "UPDATE t1 SET col = CASE WHEN EXISTS (SELECT 1 FROM x) THEN 1 ELSE 0 END",
+                TableOperation {
+                    statement_kind: StatementKind::Update,
+                    reads: vec![table("x")],
+                    writes: vec![table("t1")],
+                    lineage: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn scalar_subquery_in_projection_still_feeds_lineage() {
+            // Counterpoint to the EXISTS / IN cases above: a scalar
+            // subquery returns a value, so its inner column does
+            // flow into the projection and onto the target.
+            assert_ops(
+                "INSERT INTO t1 SELECT (SELECT v FROM x LIMIT 1) FROM s",
+                TableOperation {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![table("s"), table("x")],
+                    writes: vec![table("t1")],
+                    lineage: vec![edge("s", "t1"), edge("x", "t1")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
         fn update_scalar_subquery_in_set_feeds_lineage() {
             assert_ops(
                 "UPDATE t1 SET col = (SELECT v FROM t2)",
