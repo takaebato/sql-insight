@@ -27,8 +27,9 @@ pub(crate) struct ScopeId(pub(crate) usize);
 ///   Predicate ancestor are filtered out of `TableLineageEdge` regardless of
 ///   their own kind, so `INSERT INTO t SELECT FROM s WHERE id IN
 ///   (SELECT id FROM x)` emits `s → t` but not `x → t`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum ScopeKind {
+    #[default]
     Body,
     Predicate,
 }
@@ -102,22 +103,23 @@ impl Scope {
 }
 
 impl<'a> Resolver<'a> {
-    /// Push a fresh scope as a child of `self.current_scope`, with
-    /// the given `kind`. Returns the new scope's id and makes it
-    /// current.
+    /// Push a fresh scope as a child of `self.context.current_scope`,
+    /// with the given `kind`. Returns the new scope's id and makes
+    /// it current.
     pub(super) fn push_scope(&mut self, kind: ScopeKind) -> ScopeId {
         let id = ScopeId(self.resolution.scopes.len());
         self.resolution
             .scopes
-            .push(Scope::new(self.current_scope, kind));
-        self.current_scope = Some(id);
+            .push(Scope::new(self.context.current_scope, kind));
+        self.context.current_scope = Some(id);
         id
     }
 
     /// Close the current scope by walking back to its parent. The
     /// popped scope stays in the arena for post-pass lookups.
     pub(super) fn pop_scope(&mut self) {
-        self.current_scope = self
+        self.context.current_scope = self
+            .context
             .current_scope
             .and_then(|id| self.resolution.scopes[id.0].parent);
     }
@@ -125,7 +127,7 @@ impl<'a> Resolver<'a> {
     /// Id of the currently-open scope. Lazily inserts a root scope
     /// on first call so the very first bind has somewhere to land.
     pub(super) fn current_scope_id(&mut self) -> ScopeId {
-        match self.current_scope {
+        match self.context.current_scope {
             Some(id) => id,
             None => self.push_scope(ScopeKind::Body),
         }
@@ -139,15 +141,16 @@ impl<'a> Resolver<'a> {
     }
 
     /// Resolve an unqualified single-segment relation name by walking
-    /// up the parent chain from `current_scope`, returning the first
-    /// matching binding. Multi-segment qualified names return `None`
-    /// — those route through schema/catalog resolution elsewhere.
+    /// up the parent chain from `context.current_scope`, returning
+    /// the first matching binding. Multi-segment qualified names
+    /// return `None` — those route through schema/catalog resolution
+    /// elsewhere.
     pub(super) fn resolve_unqualified_relation(&self, relation: &ObjectName) -> Option<&Binding> {
         if relation.0.len() != 1 {
             return None;
         }
         let name = relation.0[0].as_ident()?;
-        let from = self.current_scope?;
+        let from = self.context.current_scope?;
         parent_chain(&self.resolution.scopes, from)
             .find_map(|id| self.resolution.scopes[id.0].resolve(name))
     }
@@ -171,7 +174,7 @@ impl<'a> Resolver<'a> {
     /// path of a `Result`-returning closure, so this is the safe way
     /// to nest a `?`-bailing walk under a scope push.
     pub(crate) fn with_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let kind = self.scope_kind;
+        let kind = self.context.scope_kind;
         self.push_scope(kind);
         let r = f(self);
         self.pop_scope();
@@ -184,10 +187,10 @@ impl<'a> Resolver<'a> {
     /// QUALIFY, JOIN ON, AsOf match, MERGE ON, CONNECT BY, pipe
     /// `|> WHERE`, etc. The previous `scope_kind` is restored on return.
     pub(crate) fn with_filter_clause<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let prev = self.scope_kind;
-        self.scope_kind = ScopeKind::Predicate;
+        let prev = self.context.scope_kind;
+        self.context.scope_kind = ScopeKind::Predicate;
         let r = f(self);
-        self.scope_kind = prev;
+        self.context.scope_kind = prev;
         r
     }
 }

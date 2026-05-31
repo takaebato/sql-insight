@@ -87,11 +87,13 @@ pub(crate) struct ResolvedQuery {
     pub(crate) body_scope: ScopeId,
 }
 
-/// The walker. Owns the [`Resolution`] being built (scope arena +
-/// in-progress refs / edges / diagnostics) plus the active walk
-/// state (current body buffer, current scope cursor, lexical scope
-/// kind). On `into_resolution` the embedded `Resolution` is finalized
-/// via the post-passes and handed back.
+/// The walker. Three fields, three roles:
+///
+/// - [`catalog`](Self::catalog) — input, optional schema provider.
+/// - [`resolution`](Self::resolution) — output, the [`Resolution`]
+///   under construction; finalized by `into_resolution`.
+/// - [`context`](Self::context) — walk-time scratch state ([`Context`]):
+///   per-query body buffer, scope cursor, lexical scope kind.
 ///
 /// All `visit_*` methods and the various `bind_*` / `record_*` /
 /// `with_*` helpers live as `impl` blocks in this file or in the
@@ -106,28 +108,37 @@ pub(crate) struct Resolver<'a> {
     /// directly into its `diagnostics` / `column_refs` /
     /// `lineage_edges` / `table_refs` buffers and the `scopes` arena;
     /// `into_resolution` runs the two post-passes on it and hands it
-    /// back to the caller. Sub-modules access these via
-    /// `self.resolution.<field>`.
+    /// back to the caller.
     resolution: Resolution,
+    /// In-flight walk state — body buffer, scope cursor, scope-kind
+    /// flag — see [`Context`].
+    context: Context,
+}
+
+/// Per-walk scratch state for the [`Resolver`]: the things that change
+/// as the walk progresses but don't survive into the final
+/// [`Resolution`]. Reset implicitly when the walker is dropped.
+#[derive(Debug, Default)]
+pub(crate) struct Context {
     /// Per-query in-progress [`BodyOutput`], filled by `visit_select`
     /// (one [`SetOperand`] per SELECT body, accumulated across the
     /// operands of a set operation chain). `resolve_query` swaps a
     /// fresh buffer in for the duration of its walk and hands the
     /// collected body back via the returned `ResolvedQuery`'s
     /// `output_columns`, so each query gets exactly its own operands.
-    current_body: BodyOutput,
+    pub(crate) current_body: BodyOutput,
     /// Cursor into [`Resolution::scopes`]: the currently-open scope.
     /// `None` before any push (then `current_scope_id` lazily inserts
     /// a root); set on each `push_scope` and walked back to the
     /// parent on each `pop_scope`.
-    current_scope: Option<ScopeId>,
+    pub(crate) current_scope: Option<ScopeId>,
     /// Lexical context stamped onto every scope pushed while it is in
     /// effect: `Body` by default, flipped to `Predicate` by
     /// [`Resolver::with_filter_clause`] so subqueries nested in WHERE /
     /// HAVING / JOIN ON etc. are excluded from table-lineage. Propagates
     /// *through* subquery boundaries (a subquery in a predicate is itself
     /// predicate-position).
-    scope_kind: ScopeKind,
+    pub(crate) scope_kind: ScopeKind,
 }
 
 impl<'a> Resolver<'a> {
@@ -137,9 +148,7 @@ impl<'a> Resolver<'a> {
         Self {
             catalog,
             resolution: Resolution::default(),
-            current_body: BodyOutput::default(),
-            current_scope: None,
-            scope_kind: ScopeKind::Body,
+            context: Context::default(),
         }
     }
 
@@ -181,7 +190,7 @@ impl<'a> Resolver<'a> {
         // operands without leaking into siblings or ancestors. This is
         // independent of the scope-arena push below: operands
         // accumulate into the resolver's own buffer, not into the scope.
-        let prev_body = std::mem::take(&mut self.current_body);
+        let prev_body = std::mem::take(&mut self.context.current_body);
         let body_scope = self.with_scope(|r| -> Result<ScopeId, Error> {
             let body_scope = r.current_scope_id();
             if let Some(with) = &query.with {
@@ -238,7 +247,7 @@ impl<'a> Resolver<'a> {
             }
             Ok(body_scope)
         })?;
-        let body = std::mem::replace(&mut self.current_body, prev_body);
+        let body = std::mem::replace(&mut self.context.current_body, prev_body);
         let output_columns = if body.set_operands.is_empty() {
             None
         } else {

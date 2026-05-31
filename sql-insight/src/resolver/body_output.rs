@@ -96,7 +96,7 @@ impl<'a> Resolver<'a> {
     /// Push a fully-built set operand into the active query's body
     /// output. Called by `visit_select` once per SELECT body.
     pub(super) fn push_set_operand(&mut self, operand: SetOperand) {
-        self.current_body.set_operands.push(operand);
+        self.context.current_body.set_operands.push(operand);
     }
 
     /// Extend the active query's body output with externally produced
@@ -104,7 +104,7 @@ impl<'a> Resolver<'a> {
     /// query's operands up into the enclosing query (so INSERT
     /// pairing reaches through a parenthesized source).
     pub(super) fn extend_set_operands(&mut self, operands: Vec<SetOperand>) {
-        self.current_body.set_operands.extend(operands);
+        self.context.current_body.set_operands.extend(operands);
     }
 }
 
