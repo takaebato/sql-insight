@@ -40,30 +40,26 @@ assert_eq!(ops.lineage.len(), 1); // staging → orders
 
 ## API
 
-Four extractors at increasing granularity (all in
-[`sql_insight::extractor`](https://docs.rs/sql-insight/latest/sql_insight/extractor/)):
+Six entry points, organized by module:
 
-| Function | Output |
-|---|---|
-| `extract_tables` | flat list of `TableReference`s |
-| `extract_crud_tables` | tables bucketed by CRUD verb |
-| `extract_table_operations` | per-statement `reads` / `writes` / `lineage` at table granularity |
-| `extract_column_operations` | same surfaces at column granularity, with `Passthrough` / `Transformation` kinds |
-
-Plus two SQL utilities:
-
+- [`extractor::extract_tables`](https://docs.rs/sql-insight/latest/sql_insight/extractor/fn.extract_tables.html) —
+  flat list of `TableReference`s per statement.
+- [`extractor::extract_crud_tables`](https://docs.rs/sql-insight/latest/sql_insight/extractor/fn.extract_crud_tables.html) —
+  tables bucketed by CRUD verb.
+- [`extractor::extract_table_operations`](https://docs.rs/sql-insight/latest/sql_insight/extractor/fn.extract_table_operations.html) —
+  per-statement `reads` / `writes` / `lineage` at table granularity.
+- [`extractor::extract_column_operations`](https://docs.rs/sql-insight/latest/sql_insight/extractor/fn.extract_column_operations.html) —
+  same surfaces at column granularity, with `Passthrough` / `Transformation` kinds.
 - [`formatter::format`](https://docs.rs/sql-insight/latest/sql_insight/formatter/fn.format.html) /
   `format_with_options` — re-emit SQL via sqlparser's `Display`
   (multi-line pretty-print via `FormatterOptions::pretty`).
 - [`normalizer::normalize`](https://docs.rs/sql-insight/latest/sql_insight/normalizer/fn.normalize.html) /
-  `normalize_with_options` — placeholder-substitute literals
-  (`1` → `?`) plus three opt-in collapses (`IN (1,2,3)` → `IN (...)`, etc.).
-
-Every extractor returns `Vec<Result<X, Error>>` — one entry per
-parsed statement, so a bad statement in a batch doesn't kill the
-rest. Non-fatal issues surface in each result's `diagnostics` field
-(unsupported statements, suppressed wildcards, ambiguous /
-unresolved columns).
+  `normalize_with_options` — substitute literals with placeholders
+  (`1` → `?`) so structurally identical queries hash to the same shape.
+  Three opt-in collapses tighten the equivalence further:
+  `IN (1, 2, 3)` → `IN (...)`,
+  `VALUES (1, 2, 3), (4, 5, 6)` → `VALUES (...)`, and
+  `INSERT INTO t (c, b, a) VALUES (1, 2, 3)` → `INSERT INTO t (a, b, c) VALUES (...)`.
 
 An optional [`Catalog`](https://docs.rs/sql-insight/latest/sql_insight/catalog/)
 makes column resolution strict (typos surface as
