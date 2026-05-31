@@ -161,7 +161,7 @@ impl<'a> Resolver<'a> {
     /// Popping happens on the closure's return, including the `Err`
     /// path of a `Result`-returning closure, so this is the safe way
     /// to nest a `?`-bailing walk under a scope push.
-    pub(crate) fn with_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+    pub(super) fn with_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.push_scope();
         let r = f(self);
         self.pop_scope();
