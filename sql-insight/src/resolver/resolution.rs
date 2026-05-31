@@ -26,8 +26,8 @@ use super::binding::binding_alias_key;
 use super::binding::BindingKey;
 use super::scope::parent_chain;
 use super::{
-    Binding, CapturedColumnRef, CapturedTableRef, LineageEdge, Scope, ScopeId, ScopeKind,
-    TableRefTarget, TableRole,
+    Binding, CapturedColumnRef, CapturedTableRef, LineageEdge, Scope, ScopeId, TableRefTarget,
+    TableRole,
 };
 
 /// The end-of-walk result the resolver produces. Holds the scope
@@ -159,9 +159,10 @@ impl Resolution {
     /// Collapse [`CapturedTableRef`]s into the real-table lineage source
     /// list: for each top-level use, emit the real table directly, or
     /// recurse into the synthetic's `body_scope` subtree to gather the
-    /// real tables underneath. Uses whose scope has a `Predicate`
-    /// ancestor (WHERE / JOIN ON / etc.) are filtered out — they're
-    /// filter position, not data-feeding.
+    /// real tables underneath. Uses captured in predicate position
+    /// (WHERE / JOIN ON / EXISTS / etc.) are filtered out via the
+    /// captured-ref's own `in_predicate` flag — they're filter
+    /// position, not data-feeding.
     ///
     /// Occurrence-based: a statement using the same source more than
     /// once (`FROM s AS x JOIN s AS y`, repeated `FROM cte` across
@@ -195,16 +196,14 @@ impl Resolution {
         let mut out = Vec::new();
         let mut visited = HashSet::new();
         for captured in &self.table_refs {
-            // Both filters reduce to "does any ancestor of
-            // captured.scope_id satisfy a predicate?" — fold them
-            // into a single parent walk with O(1) HashSet lookup per
-            // step, instead of one walk for the predicate check and
-            // one walk per synthetic body scope.
-            let skip = parent_chain(&self.scopes, captured.scope_id).any(|id| {
-                self.scopes[id.0].kind == ScopeKind::Predicate
-                    || synthetic_body_scopes.contains(&id)
-            });
-            if skip {
+            if captured.in_predicate {
+                continue;
+            }
+            // Uses inside a synthetic's body subtree are reachable via
+            // the synthetic's own use — skip them at the top loop.
+            let in_synthetic_body = parent_chain(&self.scopes, captured.scope_id)
+                .any(|id| synthetic_body_scopes.contains(&id));
+            if in_synthetic_body {
                 continue;
             }
             self.collect_use(captured, &mut out, &mut visited);
@@ -228,10 +227,10 @@ impl Resolution {
                     return;
                 }
                 for nested in &self.table_refs {
-                    if !self.is_in_scope_subtree(nested.scope_id, *body_scope) {
+                    if nested.in_predicate {
                         continue;
                     }
-                    if self.has_predicate_ancestor(nested.scope_id) {
+                    if !self.is_in_scope_subtree(nested.scope_id, *body_scope) {
                         continue;
                     }
                     self.collect_use(nested, out, visited);
@@ -304,15 +303,6 @@ impl Resolution {
                 _ => None,
             })
             .collect()
-    }
-
-    /// Walk parent chain from `scope_id`; return true iff any scope
-    /// along the way carries `ScopeKind::Predicate`. Drives the
-    /// filter-position exclusion in
-    /// [`Self::collapsed_feeding_table_sources`].
-    pub(super) fn has_predicate_ancestor(&self, scope_id: ScopeId) -> bool {
-        parent_chain(&self.scopes, scope_id)
-            .any(|id| self.scopes[id.0].kind == ScopeKind::Predicate)
     }
 }
 

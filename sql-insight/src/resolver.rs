@@ -6,8 +6,8 @@
 //!
 //! Module layout (all sub-modules are crate-internal):
 //!
-//! - [`scope`]: `Scope`, `ScopeId`, `ScopeKind`, plus the arena-
-//!   management methods on `Resolver` (`push_scope` / `pop_scope` /
+//! - [`scope`]: `Scope` / `ScopeId`, plus the arena-management
+//!   methods on `Resolver` (`push_scope` / `pop_scope` /
 //!   `bind_current` / `resolve_unqualified_relation` / etc.) and the
 //!   lexical `with_*` helpers that save / restore scope state around
 //!   a clause walk.
@@ -42,7 +42,7 @@ pub(crate) use column_ref::CapturedColumnRef;
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
 pub(crate) use query_body_output::{OutputColumn, QueryBodyOutput, SetOperand};
 pub(crate) use resolution::Resolution;
-pub(crate) use scope::{Scope, ScopeId, ScopeKind};
+pub(crate) use scope::{Scope, ScopeId};
 pub(crate) use table_ref::{CapturedTableRef, TableRefTarget};
 
 use query_body_output::{output_column_kind, output_column_name};
@@ -93,7 +93,7 @@ pub(crate) struct ResolvedQuery {
 /// - [`resolution`](Self::resolution) — output, the [`Resolution`]
 ///   under construction; finalized by `into_resolution`.
 /// - [`context`](Self::context) — walk-time scratch state ([`Context`]):
-///   per-query body buffer, scope cursor, lexical scope kind.
+///   per-query body buffer, scope cursor, predicate-position flag.
 ///
 /// All `visit_*` methods and the various `bind_*` / `record_*` /
 /// `with_*` helpers live as `impl` blocks in this file or in the
@@ -110,8 +110,8 @@ pub(crate) struct Resolver<'a> {
     /// `into_resolution` runs the two post-passes on it and hands it
     /// back to the caller.
     resolution: Resolution,
-    /// In-flight walk state — body buffer, scope cursor, scope-kind
-    /// flag — see [`Context`].
+    /// In-flight walk state — body buffer, scope cursor,
+    /// predicate-position flag — see [`Context`].
     context: Context,
 }
 
@@ -135,13 +135,15 @@ pub(crate) struct Context {
     /// a root); set on each `push_scope` and walked back to the
     /// parent on each `pop_scope`.
     pub(crate) current_scope: Option<ScopeId>,
-    /// Lexical context stamped onto every scope pushed while it is in
-    /// effect: `Body` by default, flipped to `Predicate` by
-    /// [`Resolver::with_filter_clause`] so subqueries nested in WHERE /
-    /// HAVING / JOIN ON etc. are excluded from table-lineage. Propagates
-    /// *through* subquery boundaries (a subquery in a predicate is itself
-    /// predicate-position).
-    pub(crate) current_scope_kind: ScopeKind,
+    /// True while walking a predicate clause (WHERE / HAVING / JOIN ON
+    /// / etc.) or a predicate-shape expression. Stamped onto every
+    /// captured column / table ref's `in_predicate` field at capture
+    /// time, so predicate-position refs are excluded from lineage
+    /// regardless of which scope they happen to land in. Stays set
+    /// across subquery boundaries — a subquery inside a predicate is
+    /// itself predicate-position. Toggled by
+    /// [`Resolver::with_filter_clause`].
+    pub(crate) in_predicate: bool,
 }
 
 impl<'a> Resolver<'a> {
@@ -168,7 +170,7 @@ impl<'a> Resolver<'a> {
 
     /// Finalize the embedded [`Resolution`] via the two post-passes
     /// (lineage collapse + real-column filter) and hand it back. The
-    /// walk state (current_query_body_output / current_scope / current_scope_kind) is
+    /// walk state (body_output_stack / current_scope / in_predicate) is
     /// dropped at this point — only `resolution` survives.
     fn into_resolution(self) -> Resolution {
         let mut resolution = self.resolution;
@@ -222,7 +224,7 @@ impl<'a> Resolver<'a> {
                     // `output_columns` is left `None` for now —
                     // fixpoint-aware column capture is deferred.
                     for cte in &with.cte_tables {
-                        let stub = r.push_scope(ScopeKind::Body);
+                        let stub = r.push_scope();
                         r.pop_scope();
                         r.bind_cte(cte.alias.name.clone(), None, stub);
                     }

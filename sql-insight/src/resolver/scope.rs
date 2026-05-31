@@ -1,8 +1,8 @@
-//! Scope arena types — `ScopeId`, `ScopeKind`, `Scope` — plus the
-//! arena-management methods on [`Resolver`] (`push_scope` / `pop_scope`
-//! / `bind_current` / `resolve_unqualified_relation` / etc.) and the
-//! lexical `with_*` helpers. Owns the "container" side of name
-//! resolution; the `Binding` "contents" live in [`super::binding`].
+//! Scope arena types — `ScopeId`, `Scope` — plus the arena-management
+//! methods on [`Resolver`] (`push_scope` / `pop_scope` / `bind_current`
+//! / `resolve_unqualified_relation` / etc.) and the lexical `with_*`
+//! helpers. Owns the "container" side of name resolution; the
+//! `Binding` "contents" live in [`super::binding`].
 
 use indexmap::IndexMap;
 use sqlparser::ast::{Ident, ObjectName};
@@ -16,37 +16,21 @@ use super::{Binding, Resolver};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ScopeId(pub(crate) usize);
 
-/// Whether a scope contributes data to its enclosing write target.
+/// One lexical scope: a `name → Binding` map plus the parent link
+/// used to walk up the scope chain at name-resolution time. Self-id
+/// is implicit — the scope's id equals its index in
+/// [`super::Resolution::scopes`].
 ///
-/// - `Body`: data moves through — query bodies, CTE bodies, derived
-///   tables, INSERT/MERGE sources, scalar subqueries in projection or
-///   SET. Tables bound here participate in `TableLineageEdge` edges when the
-///   statement has a write target.
-/// - `Predicate`: scope is referenced only in a constraint — WHERE,
-///   HAVING, JOIN ON, EXISTS, IN, QUALIFY. Tables bound under any
-///   Predicate ancestor are filtered out of `TableLineageEdge` regardless of
-///   their own kind, so `INSERT INTO t SELECT FROM s WHERE id IN
-///   (SELECT id FROM x)` emits `s → t` but not `x → t`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) enum ScopeKind {
-    #[default]
-    Body,
-    Predicate,
-}
-
-/// One lexical scope: a `name → Binding` map plus the links
-/// (`parent`, `kind`) used to walk up the scope chain at
-/// name-resolution and lineage-emission time. Self-id is implicit —
-/// the scope's id equals its index in [`super::Resolution::scopes`].
+/// Predicate-vs-value position is tracked **on the captured ref**
+/// ([`super::CapturedColumnRef::in_predicate`] /
+/// [`super::CapturedTableRef::in_predicate`]) rather than on the
+/// scope. This lets same-scope refs in different lexical positions
+/// (e.g. CASE WHEN cond vs THEN value) be classified independently.
 #[derive(Debug)]
 pub(crate) struct Scope {
     /// Lexically enclosing scope, or `None` for the root. Drives the
     /// walk-up for unqualified name resolution.
     pub(crate) parent: Option<ScopeId>,
-    /// `Body` vs `Predicate`. A `Predicate` anywhere along the
-    /// ancestor chain excludes nested scopes from `TableLineageEdge`
-    /// even if they themselves are `Body`.
-    pub(crate) kind: ScopeKind,
     /// Bindings introduced *in this scope* (FROM tables, CTE
     /// definitions, derived tables, table functions). Keyed by
     /// `BindingKey` (case-folded); `IndexMap` preserves definition
@@ -63,10 +47,9 @@ pub(super) fn parent_chain(scopes: &[Scope], from: ScopeId) -> impl Iterator<Ite
 }
 
 impl Scope {
-    fn new(parent: Option<ScopeId>, kind: ScopeKind) -> Self {
+    fn new(parent: Option<ScopeId>) -> Self {
         Self {
             parent,
-            kind,
             bindings: IndexMap::new(),
         }
     }
@@ -103,14 +86,13 @@ impl Scope {
 }
 
 impl<'a> Resolver<'a> {
-    /// Push a fresh scope as a child of `self.context.current_scope`,
-    /// with the given `kind`. Returns the new scope's id and makes
-    /// it current.
-    pub(super) fn push_scope(&mut self, kind: ScopeKind) -> ScopeId {
+    /// Push a fresh scope as a child of `self.context.current_scope`.
+    /// Returns the new scope's id and makes it current.
+    pub(super) fn push_scope(&mut self) -> ScopeId {
         let id = ScopeId(self.resolution.scopes.len());
         self.resolution
             .scopes
-            .push(Scope::new(self.context.current_scope, kind));
+            .push(Scope::new(self.context.current_scope));
         self.context.current_scope = Some(id);
         id
     }
@@ -129,7 +111,7 @@ impl<'a> Resolver<'a> {
     pub(super) fn current_scope_id(&mut self) -> ScopeId {
         match self.context.current_scope {
             Some(id) => id,
-            None => self.push_scope(ScopeKind::Body),
+            None => self.push_scope(),
         }
     }
 
@@ -155,10 +137,7 @@ impl<'a> Resolver<'a> {
             .find_map(|id| self.resolution.scopes[id.0].resolve(name))
     }
 
-    /// Push a fresh scope, run `f`, then pop it. The current
-    /// `current_scope_kind` is propagated onto the pushed scope, so a subquery
-    /// in a predicate stays classified as predicate-position for
-    /// table-lineage exclusion.
+    /// Push a fresh scope, run `f`, then pop it.
     ///
     /// Use at every "new query boundary":
     /// - the top of `resolve_query` (the query body's own scope),
@@ -170,28 +149,34 @@ impl<'a> Resolver<'a> {
     ///   binding doesn't share the enclosing query's scope with the
     ///   CTEs (CTEs stay reachable via the parent-scope walk-up).
     ///
+    /// Predicate-ness flows through automatically:
+    /// [`Context::in_predicate`](super::Context::in_predicate) stays
+    /// set across the nested walk, so refs captured inside the new
+    /// scope inherit the surrounding predicate context without any
+    /// per-scope kind bookkeeping.
+    ///
     /// Popping happens on the closure's return, including the `Err`
     /// path of a `Result`-returning closure, so this is the safe way
     /// to nest a `?`-bailing walk under a scope push.
     pub(crate) fn with_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let kind = self.context.current_scope_kind;
-        self.push_scope(kind);
+        self.push_scope();
         let r = f(self);
         self.pop_scope();
         r
     }
 
-    /// Walk a filter-position clause with `current_scope_kind =
-    /// Predicate`, so any subquery pushed inside is classified as a
-    /// predicate scope and thus excluded from table-lineage. Used
-    /// for WHERE, HAVING, QUALIFY, JOIN ON, AsOf match, MERGE ON,
-    /// CONNECT BY, pipe `|> WHERE`, etc. The previous
-    /// `current_scope_kind` is restored on return.
+    /// Walk a filter-position clause with `context.in_predicate = true`,
+    /// so column / table refs captured inside (whether directly in the
+    /// expression or transitively through a nested subquery) are tagged
+    /// as predicate-position and excluded from lineage. Used for WHERE,
+    /// HAVING, QUALIFY, JOIN ON, AsOf match, MERGE ON, CONNECT BY,
+    /// pipe `|> WHERE`, etc. The previous `in_predicate` value is
+    /// restored on return.
     pub(crate) fn with_filter_clause<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let prev = self.context.current_scope_kind;
-        self.context.current_scope_kind = ScopeKind::Predicate;
+        let prev = self.context.in_predicate;
+        self.context.in_predicate = true;
         let r = f(self);
-        self.context.current_scope_kind = prev;
+        self.context.in_predicate = prev;
         r
     }
 }

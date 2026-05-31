@@ -14,13 +14,19 @@ use super::{Resolver, ScopeId};
 /// sources.
 #[derive(Clone, Debug)]
 pub(crate) struct CapturedTableRef {
-    /// Scope where the use occurs — used for predicate-ancestor
-    /// filtering at collapse time.
+    /// Scope where the use occurs — used at collapse time to scope
+    /// the recursion into synthetic bodies.
     pub(crate) scope_id: ScopeId,
     /// What's being used: a real table (emits as a lineage source) or
     /// a synthetic relation (recurses into its body to find real
     /// tables underneath).
     pub(crate) target: TableRefTarget,
+    /// True iff the use appeared inside a predicate context
+    /// (WHERE / HAVING / JOIN ON / EXISTS / etc.) — set from
+    /// [`super::Context::in_predicate`] at capture time. Predicate-
+    /// position uses are filtered out of
+    /// [`super::Resolution::collapsed_feeding_table_sources`].
+    pub(crate) in_predicate: bool,
 }
 
 /// Resolution of a [`CapturedTableRef`] target.
@@ -69,9 +75,11 @@ impl<'a> Resolver<'a> {
     /// `bind_real_table` on Read-position binds.
     pub(super) fn capture_real_table_ref(&mut self, table: TableReference) {
         let scope_id = self.current_scope_id();
+        let in_predicate = self.context.in_predicate;
         self.resolution.table_refs.push(CapturedTableRef {
             scope_id,
             target: TableRefTarget::Real(table),
+            in_predicate,
         });
     }
 
@@ -80,9 +88,11 @@ impl<'a> Resolver<'a> {
     /// synthetic's body — collapse recurses into its subtree.
     pub(super) fn capture_synthetic_table_ref(&mut self, body_scope: ScopeId) {
         let scope_id = self.current_scope_id();
+        let in_predicate = self.context.in_predicate;
         self.resolution.table_refs.push(CapturedTableRef {
             scope_id,
             target: TableRefTarget::Synthetic { body_scope },
+            in_predicate,
         });
     }
 }
