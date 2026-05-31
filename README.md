@@ -12,33 +12,25 @@ across every SQL dialect sqlparser-rs supports.
 
 ## Features
 
-- **Table-level Operation Extraction**: `reads` / `writes` / `lineage`
-  surfaces with statement-kind classification per parsed statement.
-- **Column-level Operation Extraction**: the same three surfaces at
-  column granularity. `reads` / `writes` are plain occurrence lists
-  of column references; `lineage` forms a source → target graph, each
-  edge carrying a kind (`Passthrough` vs `Transformation`). The
-  value-vs-filter distinction is structural — a value contributor is a
-  `lineage` source, a filter-only column is in `reads` but not `lineage`.
-- **Optional Catalog**: supply a schema provider to make resolution
-  strict — column refs not in the catalog-provided schema surface as
-  unresolved references, INSERT positional values pair with target
-  columns. Every extractor still works catalog-free in best-effort mode.
-- **Diagnostics**: non-fatal issues (unsupported statements,
-  suppressed wildcards, ambiguous / unresolved columns) surface
-  alongside the result with optional source-location spans, rather
-  than failing the whole call. Split by granularity
-  (`TableLevelDiagnostic` / `ColumnLevelDiagnostic`) so a table-level
-  result never carries a column-only condition.
-- **Table Extraction / CRUD Table Extraction**: flat or
-  CRUD-bucketed table sets — lightweight extraction when the
-  operation graph isn't needed.
-- **SQL Formatting**: re-emit queries through sqlparser's `Display`
-  for a consistent shape (multi-line pretty-print via
-  `FormatterOptions::pretty`).
-- **SQL Normalization**: substitute literals with placeholders so
-  structurally identical queries hash to the same shape; three opt-in
-  collapses tighten the equivalence further.
+- **Table-level Operation Extraction**: identify which tables a
+  statement reads, which it writes, and the lineage between sources
+  and targets. Classifies the statement by verb (Insert / Update /
+  Merge / …).
+- **Column-level Operation Extraction**: the same at column granularity
+  — track lineage from individual source columns to target columns,
+  distinguishing pure forwarding from value-changing expressions.
+- **Optional Catalog**: pass column schemas to tighten column
+  resolution and pair INSERT values with target columns by position.
+  Best-effort without one.
+- **Table Extraction / CRUD Table Extraction**: flat or CRUD-bucketed
+  table list, for when you just need to know which tables a statement
+  touches.
+- **SQL Formatting**: emit a query in a consistent layout (single-line
+  by default, multi-line pretty-print on demand).
+- **SQL Normalization**: collapse structurally identical queries to
+  the same string (placeholder-substitute literals, optionally
+  collapse repetitive shapes), useful for query fingerprinting and
+  deduplication.
 
 ## Install
 
