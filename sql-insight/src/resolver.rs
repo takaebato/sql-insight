@@ -143,6 +143,8 @@ pub(crate) struct Resolver<'a> {
 }
 
 impl<'a> Resolver<'a> {
+    /// Internal constructor. Public callers go through
+    /// [`Self::resolve_statement`].
     fn new(catalog: Option<&'a dyn Catalog>) -> Self {
         Self {
             catalog,
@@ -157,6 +159,8 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Walk one [`Statement`] and return the final [`Resolution`].
+    /// The one-shot entry point used by all extractors.
     pub(crate) fn resolve_statement(
         catalog: Option<&'a dyn Catalog>,
         statement: &Statement,
@@ -166,6 +170,8 @@ impl<'a> Resolver<'a> {
         Ok(resolver.into_resolution())
     }
 
+    /// Drain the in-progress buffers into a [`Resolution`] and run
+    /// the two post-passes (lineage collapse + real-column filter).
     fn into_resolution(self) -> Resolution {
         let mut resolution = Resolution {
             diagnostics: self.diagnostics,
@@ -183,6 +189,12 @@ impl<'a> Resolver<'a> {
         resolution.column_refs = resolution.real_column_refs();
         resolution
     }
+    /// Walk one [`Query`] and return its [`ResolvedQuery`]. Swaps in
+    /// a fresh body buffer so set operands don't leak across queries,
+    /// pushes a body scope, walks WITH bindings, the body `SetExpr`,
+    /// and the trailing clauses (ORDER BY / LIMIT / FETCH / settings
+    /// / pipes), then hands back the collected body output + body
+    /// scope id.
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
         // Swap in a fresh body buffer for this query — restored on
         // return — so each ResolvedQuery owns exactly its own set
@@ -258,6 +270,9 @@ impl<'a> Resolver<'a> {
         })
     }
 
+    /// Dispatch one [`SetExpr`] node: SELECT body, parenthesised
+    /// query (bubble its operands up), set operation (each operand
+    /// in its own scope), DML wrapped under `WITH`, TABLE, or VALUES.
     fn visit_set_expr(&mut self, set_expr: &SetExpr) -> Result<(), Error> {
         match set_expr {
             SetExpr::Select(select) => self.visit_select(select),
@@ -304,6 +319,11 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Walk a SELECT body. Pushes one [`SetOperand`] of output
+    /// columns built from the projection list, then walks the
+    /// filter / clause expressions (DISTINCT / TOP / FROM /
+    /// WHERE / GROUP BY / HAVING / NAMED WINDOW / QUALIFY /
+    /// CONNECT BY) and any SELECT INTO target.
     fn visit_select(&mut self, select: &Select) -> Result<(), Error> {
         if let Some(Distinct::On(exprs)) = &select.distinct {
             self.visit_exprs(exprs)?;
@@ -390,6 +410,9 @@ impl<'a> Resolver<'a> {
         })
     }
 
+    /// Walk a single [`SelectItem`] for its side effects (recording
+    /// column refs / nested subqueries). Output-column construction
+    /// goes through [`Self::build_output_column`] instead.
     pub(super) fn visit_select_item(&mut self, item: &SelectItem) -> Result<(), Error> {
         match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
@@ -463,6 +486,11 @@ impl<'a> Resolver<'a> {
         }
         Ok(())
     }
+    /// Top-level [`Statement`] dispatch. Supported DML / DDL variants
+    /// route into a per-verb walker; the remaining variants are
+    /// enumerated explicitly and recorded as `UnsupportedStatement`
+    /// — the match is exhaustive, so a new sqlparser variant
+    /// surfaces as a compile error here.
     pub(super) fn visit_statement(&mut self, statement: &Statement) -> Result<(), Error> {
         // Keep this match exhaustive. Unsupported variants are listed explicitly so sqlparser
         // Statement additions become compile errors instead of silent misses.
@@ -679,6 +707,10 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Walk an INSERT: bind the target table (Write role), pair
+    /// source projections with the target's columns (explicit list
+    /// or catalog-inferred) for `Relation` lineage, walk RETURNING,
+    /// and dispatch the ON CONFLICT / ON DUPLICATE KEY clause.
     fn visit_insert(&mut self, insert: &sqlparser::ast::Insert) -> Result<(), Error> {
         let (table, alias) = TableReference::from_insert_with_alias(insert)?;
         let target_table = table.clone();
@@ -859,6 +891,10 @@ impl<'a> Resolver<'a> {
         });
     }
 
+    /// Walk an UPDATE: bind the target table (Write role) plus any
+    /// FROM source relations (Read), then per assignment emit
+    /// `Relation` lineage from the RHS expression to the SET target
+    /// column. WHERE and RETURNING follow.
     fn visit_update(&mut self, update: &Update) -> Result<(), Error> {
         // The head of update.table is the write target; joined tables
         // (inside visit_table_with_joins) are reads by definition.
@@ -915,6 +951,10 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
+    /// Walk a DELETE: bind the target tables (Write role) and any
+    /// USING / FROM source relations (Read), walk WHERE and
+    /// RETURNING. DELETE doesn't physically move data, so no
+    /// lineage edges are emitted here.
     fn visit_delete(&mut self, delete: &Delete) -> Result<(), Error> {
         // Visit in alias-defining order so that later Write binds merge
         // onto already-resolved `TableReference`s rather than overwriting
@@ -952,6 +992,11 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
+    /// Walk a MERGE: bind the target (Write) and source (Read)
+    /// relations, walk the ON clause as a predicate, then per
+    /// WHEN clause emit `Relation` lineage — assignment-style for
+    /// UPDATE, positional column-pair for INSERT VALUES; DELETE
+    /// actions emit nothing.
     fn visit_merge(&mut self, merge: &Merge) -> Result<(), Error> {
         use sqlparser::ast::{MergeAction, MergeInsertKind};
         self.visit_table_factor(&merge.table, TableRole::Write)?;
@@ -1032,6 +1077,11 @@ impl<'a> Resolver<'a> {
         }
         Ok(())
     }
+    /// Exhaustive dispatch over [`Expr`]. Most variants delegate to
+    /// `visit_expr` on their sub-expressions; `Identifier` /
+    /// `CompoundIdentifier` record a column ref; subquery variants
+    /// route through `resolve_query`. New sqlparser `Expr` variants
+    /// must be added here as compile errors.
     pub(super) fn visit_expr(&mut self, expr: &Expr) -> Result<(), Error> {
         // Keep this match exhaustive so sqlparser Expr additions are reviewed here.
         match expr {
@@ -1325,6 +1375,11 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
+    /// Dispatch one pipe-syntax operator (`|> WHERE`, `|> SELECT`,
+    /// `|> AGGREGATE`, etc.). Filter-position operators wrap their
+    /// expression walks with `with_filter_clause`; projection-shaped
+    /// operators (`|> SELECT` / `|> EXTEND` / `|> AGGREGATE`) push a
+    /// fresh `SetOperand` of output columns.
     pub(super) fn visit_pipe_operator(&mut self, operator: &PipeOperator) -> Result<(), Error> {
         match operator {
             PipeOperator::Limit { expr, offset } => {
