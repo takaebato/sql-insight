@@ -1,11 +1,11 @@
 //! Basic SQL formatting — round-trips through sqlparser's AST
 //! and emits its `Display`. See [`format()`] as the entry point.
 //!
-//! Whitespace and case follow sqlparser's `Display` (keywords
-//! uppercase, single-space separators on common shapes); comments
-//! are dropped. One output `String` per parsed statement, but the
-//! string itself may contain newlines for statements whose
-//! `Display` spans multiple lines.
+//! Output is a pass-through to [`sqlparser::ast::Statement`]'s
+//! `Display` impl (keywords uppercase, single-space separators,
+//! comments dropped). Default is single-line; opt into sqlparser's
+//! multi-line pretty-print by setting [`FormatterOptions::pretty`]
+//! and using [`format_with_options`].
 //!
 //! For value-normalization (collapsing `1` and `42` into the same
 //! literal, etc.) see [`crate::normalizer`].
@@ -31,6 +31,53 @@ pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
     Formatter::format(dialect, sql)
 }
 
+/// Parse `sql` under `dialect` and re-emit one formatted string per
+/// statement, with formatting controlled by `options`.
+///
+/// ## Example
+///
+/// ```rust
+/// use sql_insight::sqlparser::dialect::GenericDialect;
+/// use sql_insight::formatter::{format_with_options, FormatterOptions};
+///
+/// let dialect = GenericDialect {};
+/// let sql = "SELECT a, b FROM t1";
+/// let result = format_with_options(
+///     &dialect,
+///     sql,
+///     FormatterOptions::new().with_pretty(true),
+/// )
+/// .unwrap();
+/// assert_eq!(result[0], "SELECT\n  a,\n  b\nFROM\n  t1");
+/// ```
+pub fn format_with_options(
+    dialect: &dyn Dialect,
+    sql: &str,
+    options: FormatterOptions,
+) -> Result<Vec<String>, Error> {
+    Formatter::format_with_options(dialect, sql, options)
+}
+
+/// Options controlling [`format_with_options()`] / [`Formatter::format_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct FormatterOptions {
+    /// When `true`, emit the multi-line pretty-printed form via
+    /// sqlparser's `{:#}` alternate `Display` (indented, one item
+    /// per line). Defaults to `false` (single-line).
+    pub pretty: bool,
+}
+
+impl FormatterOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_pretty(mut self, pretty: bool) -> Self {
+        self.pretty = pretty;
+        self
+    }
+}
+
 /// Struct-style entry point. Equivalent to the free [`format()`]
 /// function.
 #[derive(Debug, Default)]
@@ -40,10 +87,26 @@ impl Formatter {
     /// Same as the free [`format()`] function — kept for users who
     /// prefer the struct-style API.
     pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
+        Self::format_with_options(dialect, sql, FormatterOptions::default())
+    }
+
+    /// Same as the free [`format_with_options()`] function — kept for
+    /// users who prefer the struct-style API.
+    pub fn format_with_options(
+        dialect: &dyn Dialect,
+        sql: &str,
+        options: FormatterOptions,
+    ) -> Result<Vec<String>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         Ok(statements
             .into_iter()
-            .map(|statement| statement.to_string())
+            .map(|statement| {
+                if options.pretty {
+                    format!("{statement:#}")
+                } else {
+                    statement.to_string()
+                }
+            })
             .collect::<Vec<String>>())
     }
 }
@@ -89,5 +152,35 @@ mod tests {
             "SELECT b FROM t2 WHERE c = 2".into(),
         ];
         assert_format(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_pretty_print_select() {
+        let result = format_with_options(
+            &sqlparser::dialect::GenericDialect {},
+            "SELECT a, b FROM t1",
+            FormatterOptions::new().with_pretty(true),
+        )
+        .unwrap();
+        assert_eq!(result, vec!["SELECT\n  a,\n  b\nFROM\n  t1"]);
+    }
+
+    #[test]
+    fn test_pretty_print_options_default_is_single_line() {
+        // `FormatterOptions::default()` should match `format()`'s
+        // single-line output — round-trip equality matters for the
+        // builder's invariant.
+        let single = format(
+            &sqlparser::dialect::GenericDialect {},
+            "SELECT a, b FROM t1",
+        )
+        .unwrap();
+        let via_options = format_with_options(
+            &sqlparser::dialect::GenericDialect {},
+            "SELECT a, b FROM t1",
+            FormatterOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(single, via_options);
     }
 }
