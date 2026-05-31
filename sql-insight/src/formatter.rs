@@ -1,12 +1,21 @@
-//! A Formatter that formats SQL into a standardized format.
+//! Basic SQL formatting — round-trips through sqlparser's AST
+//! and emits its `Display`. See [`format`] as the entry point.
 //!
-//! See [`format`](crate::formatter::format()) as the entry point for formatting SQL.
+//! Whitespace and case follow sqlparser's `Display` (keywords
+//! uppercase, single-space separators on common shapes); comments
+//! are dropped. One output `String` per parsed statement, but the
+//! string itself may contain newlines for statements whose
+//! `Display` spans multiple lines.
+//!
+//! For value-normalization (collapsing `1` and `42` into the same
+//! literal, etc.) see [`crate::normalizer`].
 
 use crate::error::Error;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
-/// Convenience function to format SQL.
+/// Parse `sql` under `dialect` and re-emit one formatted string per
+/// statement.
 ///
 /// ## Example
 ///
@@ -22,12 +31,14 @@ pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
     Formatter::format(dialect, sql)
 }
 
-/// Formatter for SQL.
+/// Struct-style entry point. Equivalent to the free [`format`]
+/// function.
 #[derive(Debug, Default)]
 pub struct Formatter;
 
 impl Formatter {
-    /// Format SQL.
+    /// Same as the free [`format`] function — kept for users who
+    /// prefer the struct-style API.
     pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         Ok(statements
