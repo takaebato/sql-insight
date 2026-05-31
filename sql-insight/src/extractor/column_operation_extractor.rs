@@ -327,7 +327,7 @@ fn extract_lineage(resolution: &Resolution) -> Vec<ColumnLineageEdge> {
         .collect()
 }
 
-/// Build a `ColumnReference` from a resolver-captured captured ref. The
+/// Build a `ColumnReference` from a resolver-captured ref. The
 /// resolver records owning-table resolution at walk time, so this is
 /// a 1:1 read of `(resolved, parts.last())`. Refs whose owning
 /// binding was synthetic at walk time are dropped upstream by the
@@ -391,8 +391,12 @@ fn column_ref_from_parts(parts: &[Ident]) -> Option<ColumnReference> {
 ///   relation's columns (explicit list when given, otherwise the
 ///   columns the resolver derived from the source projection — read
 ///   off the resolution's `Relation` lineage edges to that target).
-///
-/// MERGE WHEN clause writes are deferred.
+/// - ALTER TABLE column operations (ADD / DROP / RENAME / CHANGE /
+///   MODIFY / ALTER) → writes scoped to the altered table.
+/// - MERGE WHEN clauses → INSERT column lists and UPDATE SET targets
+///   per clause, scoped to the MERGE target.
+/// - ON CONFLICT DO UPDATE SET / ON DUPLICATE KEY UPDATE assignments
+///   on an INSERT → writes scoped to the INSERT target.
 fn collect_writes(
     statement: &Statement,
     resolution: &Resolution,
