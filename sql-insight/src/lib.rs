@@ -129,8 +129,11 @@
 //!   `generate_series`, `JSON_TABLE`, etc.) — catalog enrichment
 //!   doesn't reach them yet.
 //! - **Recursive CTE bodies** are pre-bound under a stub for
-//!   self-reference; their projection collapse is deferred, so
-//!   `lineage` won't trace through them end-to-end.
+//!   self-reference. Table-level lineage traces the anchor branch's
+//!   real tables; column-level projection collapse through the
+//!   recursive body is deferred, so a column lineage edge surfaces
+//!   with the CTE binding as the source rather than tracing into the
+//!   underlying table.
 //! - **Lineage kind is coarse** (`Passthrough` vs `Transformation`).
 //!   Aggregates, window functions, arithmetic, casts, etc. are all
 //!   `Transformation` — the model deliberately does not sub-classify
