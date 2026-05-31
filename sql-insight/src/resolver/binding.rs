@@ -277,7 +277,7 @@ impl<'a> Resolver<'a> {
             // `write_tables` separately and don't drive collapse.
             self.record_real_table_ref(table.clone());
         }
-        self.bind_relation(
+        self.bind_current(
             binding_name,
             Binding::Table {
                 table: Box::new(table),
@@ -337,7 +337,7 @@ impl<'a> Resolver<'a> {
         output_columns: Option<BodyOutput>,
         body_scope: ScopeId,
     ) {
-        self.bind_relation(
+        self.bind_current(
             name.clone(),
             Binding::Cte {
                 name,
@@ -353,7 +353,7 @@ impl<'a> Resolver<'a> {
         output_columns: Option<BodyOutput>,
         body_scope: Option<ScopeId>,
     ) {
-        self.bind_relation(
+        self.bind_current(
             alias.clone(),
             Binding::DerivedTable {
                 alias,
@@ -374,7 +374,7 @@ impl<'a> Resolver<'a> {
     }
 
     pub(super) fn bind_table_function(&mut self, alias: Ident) {
-        self.bind_relation(alias.clone(), Binding::TableFunction { alias });
+        self.bind_current(alias.clone(), Binding::TableFunction { alias });
     }
 
     pub(super) fn record_diagnostic(&mut self, diagnostic: ColumnLevelDiagnostic) {
@@ -400,9 +400,5 @@ impl<'a> Resolver<'a> {
             ),
             span,
         });
-    }
-
-    fn bind_relation(&mut self, name: Ident, binding: Binding) {
-        self.bind_current(name, binding);
     }
 }
