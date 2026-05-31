@@ -351,11 +351,14 @@ impl<'a> Resolver<'a> {
     /// CONNECT BY) and any SELECT INTO target.
     fn visit_select(&mut self, select: &Select) -> Result<(), Error> {
         if let Some(Distinct::On(exprs)) = &select.distinct {
-            self.visit_exprs(exprs)?;
+            // DISTINCT ON (a, b) — `a, b` decide which row of each
+            // duplicate group survives; not value sources.
+            self.suppress_lineage(|r| r.visit_exprs(exprs))?;
         }
         if let Some(top) = &select.top {
             if let Some(TopQuantity::Expr(expr)) = &top.quantity {
-                self.visit_expr(expr)?;
+                // TOP n — row-count bound.
+                self.suppress_lineage(|r| r.visit_expr(expr))?;
             }
         }
         for table in &select.from {
@@ -407,9 +410,11 @@ impl<'a> Resolver<'a> {
         }
         self.visit_group_by(&select.group_by)?;
         // CLUSTER BY / DISTRIBUTE BY (Hive / Spark) — partitioning /
-        // clustering directives, walked as plain reads.
-        self.visit_exprs(&select.cluster_by)?;
-        self.visit_exprs(&select.distribute_by)?;
+        // clustering directives — partition / distribution keys,
+        // not value sources. SORT BY's `visit_order_by_expr` already
+        // suppresses on its own.
+        self.suppress_lineage(|r| r.visit_exprs(&select.cluster_by))?;
+        self.suppress_lineage(|r| r.visit_exprs(&select.distribute_by))?;
         for order_by in &select.sort_by {
             self.visit_order_by_expr(order_by)?;
         }
@@ -502,13 +507,16 @@ impl<'a> Resolver<'a> {
     }
 
     fn visit_group_by(&mut self, group_by: &GroupByExpr) -> Result<(), Error> {
-        match group_by {
-            GroupByExpr::All(modifiers) => self.visit_group_by_modifiers(modifiers),
+        // GROUP BY keys partition rows; their values don't flow to
+        // the output (the same column referenced in projection is
+        // captured separately as a value source).
+        self.suppress_lineage(|r| match group_by {
+            GroupByExpr::All(modifiers) => r.visit_group_by_modifiers(modifiers),
             GroupByExpr::Expressions(exprs, modifiers) => {
-                self.visit_exprs(exprs)?;
-                self.visit_group_by_modifiers(modifiers)
+                r.visit_exprs(exprs)?;
+                r.visit_group_by_modifiers(modifiers)
             }
-        }
+        })
     }
 
     fn visit_group_by_modifiers(&mut self, modifiers: &[GroupByWithModifier]) -> Result<(), Error> {
@@ -1370,32 +1378,48 @@ impl<'a> Resolver<'a> {
     }
 
     pub(super) fn visit_order_by(&mut self, order_by: &OrderBy) -> Result<(), Error> {
-        if let OrderByKind::Expressions(exprs) = &order_by.kind {
-            for expr in exprs {
-                self.visit_order_by_expr(expr)?;
+        // ORDER BY sort keys decide row order; their values don't
+        // flow to the output. INTERPOLATE (ClickHouse) supplies
+        // fill values whose refs *would* flow, but they live
+        // inside an ORDER BY WITH FILL clause and are scoped to
+        // missing-row interpolation — treat them as non-lineage
+        // alongside the rest of the ORDER BY context.
+        self.suppress_lineage(|r| {
+            if let OrderByKind::Expressions(exprs) = &order_by.kind {
+                for expr in exprs {
+                    r.visit_order_by_expr(expr)?;
+                }
             }
-        }
-        if let Some(interpolate) = &order_by.interpolate {
-            self.visit_interpolate(interpolate)?;
-        }
-        Ok(())
+            if let Some(interpolate) = &order_by.interpolate {
+                r.visit_interpolate(interpolate)?;
+            }
+            Ok(())
+        })
     }
 
     pub(super) fn visit_order_by_expr(&mut self, order_by: &OrderByExpr) -> Result<(), Error> {
-        self.visit_expr(&order_by.expr)?;
-        if let Some(with_fill) = &order_by.with_fill {
-            for expr in [
-                with_fill.from.as_ref(),
-                with_fill.to.as_ref(),
-                with_fill.step.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                self.visit_expr(expr)?;
+        // Every caller of `visit_order_by_expr` walks an ordering
+        // position (top-level ORDER BY, window ORDER BY, WITHIN
+        // GROUP, MATCH_RECOGNIZE order_by, PIVOT, pipe `|> ORDER BY`,
+        // SORT BY). Refs collected here are sort keys, not value
+        // sources, so suppress lineage regardless of which caller
+        // invoked us.
+        self.suppress_lineage(|r| {
+            r.visit_expr(&order_by.expr)?;
+            if let Some(with_fill) = &order_by.with_fill {
+                for expr in [
+                    with_fill.from.as_ref(),
+                    with_fill.to.as_ref(),
+                    with_fill.step.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    r.visit_expr(expr)?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn visit_interpolate(&mut self, interpolate: &Interpolate) -> Result<(), Error> {
@@ -1410,32 +1434,39 @@ impl<'a> Resolver<'a> {
     }
 
     pub(super) fn visit_limit_clause(&mut self, limit_clause: &LimitClause) -> Result<(), Error> {
-        match limit_clause {
+        // LIMIT / OFFSET / LIMIT BY are row-count bounds and
+        // (for ClickHouse `LIMIT n BY col`) partition keys —
+        // none flow as value into the output.
+        self.suppress_lineage(|r| match limit_clause {
             LimitClause::LimitOffset {
                 limit,
                 offset,
                 limit_by,
             } => {
                 if let Some(expr) = limit {
-                    self.visit_expr(expr)?;
+                    r.visit_expr(expr)?;
                 }
                 if let Some(offset) = offset {
-                    self.visit_expr(&offset.value)?;
+                    r.visit_expr(&offset.value)?;
                 }
-                self.visit_exprs(limit_by)
+                r.visit_exprs(limit_by)
             }
             LimitClause::OffsetCommaLimit { offset, limit } => {
-                self.visit_expr(offset)?;
-                self.visit_expr(limit)
+                r.visit_expr(offset)?;
+                r.visit_expr(limit)
             }
-        }
+        })
     }
 
     pub(super) fn visit_fetch(&mut self, fetch: &Fetch) -> Result<(), Error> {
-        if let Some(expr) = &fetch.quantity {
-            self.visit_expr(expr)?;
-        }
-        Ok(())
+        // FETCH FIRST n ROWS — n is a row-count bound, not a
+        // value source.
+        self.suppress_lineage(|r| {
+            if let Some(expr) = &fetch.quantity {
+                r.visit_expr(expr)?;
+            }
+            Ok(())
+        })
     }
 
     /// Dispatch one pipe-syntax operator (`|> WHERE`, `|> SELECT`,
@@ -1445,13 +1476,13 @@ impl<'a> Resolver<'a> {
     /// fresh `SetOperand` of output columns.
     pub(super) fn visit_pipe_operator(&mut self, operator: &PipeOperator) -> Result<(), Error> {
         match operator {
-            PipeOperator::Limit { expr, offset } => {
-                self.visit_expr(expr)?;
+            PipeOperator::Limit { expr, offset } => self.suppress_lineage(|r| {
+                r.visit_expr(expr)?;
                 if let Some(expr) = offset {
-                    self.visit_expr(expr)?;
+                    r.visit_expr(expr)?;
                 }
                 Ok(())
-            }
+            }),
             PipeOperator::Where { expr } => self.suppress_lineage(|r| r.visit_expr(expr)),
             PipeOperator::OrderBy { exprs } => {
                 for expr in exprs {
@@ -1475,13 +1506,17 @@ impl<'a> Resolver<'a> {
                 full_table_exprs,
                 group_by_expr,
             } => {
+                // Aggregate expressions feed lineage like a SELECT
+                // body; GROUP BY exprs are partition keys.
                 for expr in full_table_exprs {
                     self.visit_expr(&expr.expr.expr)?;
                 }
-                for expr in group_by_expr {
-                    self.visit_expr(&expr.expr.expr)?;
-                }
-                Ok(())
+                self.suppress_lineage(|r| {
+                    for expr in group_by_expr {
+                        r.visit_expr(&expr.expr.expr)?;
+                    }
+                    Ok(())
+                })
             }
             PipeOperator::TableSample { sample } => self.visit_table_sample(sample),
             PipeOperator::Union { queries, .. }
@@ -1569,11 +1604,19 @@ impl<'a> Resolver<'a> {
                         self.visit_order_by_expr(order_by)?;
                     }
                 }
-                FunctionArgumentClause::Limit(expr) => self.visit_expr(expr)?,
+                // LIMIT inside aggregate args (BigQuery
+                // ARRAY_AGG ... LIMIT n) — row-count bound.
+                FunctionArgumentClause::Limit(expr) => {
+                    self.suppress_lineage(|r| r.visit_expr(expr))?
+                }
                 FunctionArgumentClause::OnOverflow(on_overflow) => {
                     self.visit_list_agg_on_overflow(on_overflow)?
                 }
-                FunctionArgumentClause::Having(bound) => self.visit_expr(&bound.1)?,
+                // HAVING bound inside an ordered-set / hypothetical
+                // aggregate's args — predicate.
+                FunctionArgumentClause::Having(bound) => {
+                    self.suppress_lineage(|r| r.visit_expr(&bound.1))?
+                }
                 FunctionArgumentClause::IgnoreOrRespectNulls(_)
                 | FunctionArgumentClause::Separator(_)
                 | FunctionArgumentClause::JsonNullClause(_)
@@ -1664,29 +1707,39 @@ impl<'a> Resolver<'a> {
     }
 
     pub(super) fn visit_window_spec(&mut self, spec: &WindowSpec) -> Result<(), Error> {
-        // OVER (...) — PARTITION BY / ORDER BY / frame-bound refs are
-        // all walked as plain reads (no clause kind is recorded).
-        self.visit_exprs(&spec.partition_by)?;
-        for expr in &spec.order_by {
-            self.visit_order_by_expr(expr)?;
-        }
-        if let Some(frame) = &spec.window_frame {
-            self.visit_window_frame_bound(&frame.start_bound)?;
-            if let Some(bound) = &frame.end_bound {
-                self.visit_window_frame_bound(bound)?;
+        // OVER (...) PARTITION BY are partition keys, ORDER BY are
+        // sort keys, frame bounds are row-count offsets — none
+        // contribute value to the window function's output.
+        // `visit_order_by_expr` self-suppresses too, but pinning
+        // PARTITION BY + the frame bounds here covers the rest.
+        self.suppress_lineage(|r| {
+            r.visit_exprs(&spec.partition_by)?;
+            for expr in &spec.order_by {
+                r.visit_order_by_expr(expr)?;
             }
-        }
-        Ok(())
+            if let Some(frame) = &spec.window_frame {
+                r.visit_window_frame_bound(&frame.start_bound)?;
+                if let Some(bound) = &frame.end_bound {
+                    r.visit_window_frame_bound(bound)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn visit_window_frame_bound(&mut self, bound: &WindowFrameBound) -> Result<(), Error> {
-        match bound {
+        // Frame bounds (ROWS / RANGE / GROUPS BETWEEN ...) are
+        // row-count offsets. Called from `visit_window_spec` which
+        // already suppresses lineage, but suppress here too so
+        // direct calls (none today, but cheap to keep correct) stay
+        // consistent.
+        self.suppress_lineage(|r| match bound {
             WindowFrameBound::CurrentRow => Ok(()),
             WindowFrameBound::Preceding(Some(expr)) | WindowFrameBound::Following(Some(expr)) => {
-                self.visit_expr(expr)
+                r.visit_expr(expr)
             }
             WindowFrameBound::Preceding(None) | WindowFrameBound::Following(None) => Ok(()),
-        }
+        })
     }
     /// Visit a `TableWithJoins`. `role` applies only to the head relation;
     /// joined tables are always read-position (a write target makes no
@@ -1905,16 +1958,23 @@ impl<'a> Resolver<'a> {
                 ..
             } => {
                 self.visit_table_factor(table, TableRole::Read)?;
-                self.visit_exprs(partition_by)?;
+                // MATCH_RECOGNIZE PARTITION BY are partition keys;
+                // pattern variable definitions (symbols) are
+                // row-classification predicates. ORDER BY's
+                // `visit_order_by_expr` self-suppresses already.
+                self.suppress_lineage(|r| r.visit_exprs(partition_by))?;
                 for order_by in order_by {
                     self.visit_order_by_expr(order_by)?;
                 }
                 for measure in measures {
                     self.visit_expr(&measure.expr)?;
                 }
-                for symbol in symbols {
-                    self.visit_expr(&symbol.definition)?;
-                }
+                self.suppress_lineage(|r| -> Result<(), Error> {
+                    for symbol in symbols {
+                        r.visit_expr(&symbol.definition)?;
+                    }
+                    Ok(())
+                })?;
                 if let Some(alias) = alias {
                     self.bind_derived_table(alias.name.clone(), None, None);
                 }

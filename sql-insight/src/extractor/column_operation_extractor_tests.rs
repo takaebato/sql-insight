@@ -788,6 +788,58 @@ mod reads_by_clause {
     }
 
     #[test]
+    fn group_by_key_not_projected_is_filter() {
+        // `g` is used only as a partition key — it appears in
+        // reads but doesn't flow to the output. `x` is the
+        // aggregated value (lineage source).
+        assert_column_ops(
+            "SELECT SUM(x) FROM t1 GROUP BY g",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "x"), read("t1", "g")],
+                writes: vec![],
+                lineage: vec![transformation(col("t1", "x"), out_anon(0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn distinct_on_key_is_filter() {
+        // DISTINCT ON (k) chooses which row of each duplicate
+        // group survives. `k` decides; it doesn't flow as value.
+        // (Qualified `t1.k` so it resolves even though the walker
+        // visits DISTINCT ON before binding FROM tables.)
+        assert_column_ops(
+            "SELECT DISTINCT ON (t1.k) a FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "k"), read("t1", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn limit_subquery_column_is_filter() {
+        // LIMIT (SELECT n FROM cfg) — the subquery's value
+        // determines the row count, but `cfg.n` itself doesn't
+        // flow to the output.
+        assert_column_ops(
+            "SELECT a FROM t1 LIMIT (SELECT n FROM cfg)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a"), read("cfg", "n")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn group_by_and_having_refs_both_surface() {
         // `a` (projection + GROUP BY) and `b` (HAVING) all surface.
         // Walk order: projection → HAVING → GROUP BY (the visitor
@@ -1064,56 +1116,51 @@ mod reads_by_clause {
     }
 
     #[test]
-    fn window_partition_by_refs_surface_and_transform() {
-        // OVER (PARTITION BY p) — both the aggregate arg `x` and
-        // the partition key `p` surface as reads, and both feed
-        // into the window output as Transformation (the whole
-        // SUM(...) OVER (...) expression is value-changing).
+    fn window_partition_by_is_filter() {
+        // OVER (PARTITION BY p) — `x` is the aggregated value,
+        // `p` is a partition key. Both surface in reads, but `p`
+        // doesn't flow to output (it decides per-row grouping,
+        // not the produced value), so only `x` is a lineage source.
         assert_column_ops(
             "SELECT SUM(x) OVER (PARTITION BY p) FROM t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t1", "x"), read("t1", "p")],
                 writes: vec![],
-                lineage: vec![
-                    transformation(col("t1", "x"), out_anon(0)),
-                    transformation(col("t1", "p"), out_anon(0)),
-                ],
+                lineage: vec![transformation(col("t1", "x"), out_anon(0))],
                 diagnostics: vec![],
             },
         );
     }
 
     #[test]
-    fn window_order_by_refs_surface_and_transform() {
+    fn window_order_by_is_filter() {
+        // OVER (ORDER BY o) — `o` is a sort key for the window
+        // frame, not a value source. Same disposition as a top-
+        // level ORDER BY column.
         assert_column_ops(
             "SELECT SUM(x) OVER (ORDER BY o) FROM t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t1", "x"), read("t1", "o")],
                 writes: vec![],
-                lineage: vec![
-                    transformation(col("t1", "x"), out_anon(0)),
-                    transformation(col("t1", "o"), out_anon(0)),
-                ],
+                lineage: vec![transformation(col("t1", "x"), out_anon(0))],
                 diagnostics: vec![],
             },
         );
     }
 
     #[test]
-    fn window_partition_and_order_refs_all_surface_and_transform() {
+    fn window_partition_and_order_are_filters() {
+        // Combined: `p` and `o` both surface in reads; neither
+        // contributes value to the output.
         assert_column_ops(
             "SELECT SUM(x) OVER (PARTITION BY p ORDER BY o) FROM t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t1", "x"), read("t1", "p"), read("t1", "o")],
                 writes: vec![],
-                lineage: vec![
-                    transformation(col("t1", "x"), out_anon(0)),
-                    transformation(col("t1", "p"), out_anon(0)),
-                    transformation(col("t1", "o"), out_anon(0)),
-                ],
+                lineage: vec![transformation(col("t1", "x"), out_anon(0))],
                 diagnostics: vec![],
             },
         );
@@ -1124,6 +1171,8 @@ mod reads_by_clause {
         // Frame bounds with literal integers (`3 PRECEDING`,
         // `CURRENT ROW`) walk via visit_expr but produce no
         // column refs — same shape as the no-frame version.
+        // PARTITION BY / ORDER BY columns are filters, so the
+        // lineage source list is `x` alone.
         assert_column_ops(
             "SELECT SUM(x) OVER (PARTITION BY p ORDER BY o \
                                  ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) FROM t1",
@@ -1131,11 +1180,7 @@ mod reads_by_clause {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t1", "x"), read("t1", "p"), read("t1", "o")],
                 writes: vec![],
-                lineage: vec![
-                    transformation(col("t1", "x"), out_anon(0)),
-                    transformation(col("t1", "p"), out_anon(0)),
-                    transformation(col("t1", "o"), out_anon(0)),
-                ],
+                lineage: vec![transformation(col("t1", "x"), out_anon(0))],
                 diagnostics: vec![],
             },
         );
@@ -1145,7 +1190,8 @@ mod reads_by_clause {
     fn window_with_unbounded_frame_bounds_does_not_add_refs() {
         // UNBOUNDED PRECEDING / UNBOUNDED FOLLOWING are bound
         // variants without an associated expr — visit_window_frame_bound
-        // returns Ok without walking anything.
+        // returns Ok without walking anything. ORDER BY `o` is
+        // a filter (sort key).
         assert_column_ops(
             "SELECT SUM(x) OVER (ORDER BY o \
                                  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) \
@@ -1154,10 +1200,7 @@ mod reads_by_clause {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t1", "x"), read("t1", "o")],
                 writes: vec![],
-                lineage: vec![
-                    transformation(col("t1", "x"), out_anon(0)),
-                    transformation(col("t1", "o"), out_anon(0)),
-                ],
+                lineage: vec![transformation(col("t1", "x"), out_anon(0))],
                 diagnostics: vec![],
             },
         );
