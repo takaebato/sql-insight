@@ -231,11 +231,14 @@ pub enum ColumnLineageKind {
     Transformation,
 }
 
-/// Extracts column-level operations from SQL.
+/// Struct-style entry point. Equivalent to the free
+/// [`extract_column_operations`] function.
 #[derive(Default, Debug)]
 pub struct ColumnOperationExtractor;
 
 impl ColumnOperationExtractor {
+    /// Same as the free [`extract_column_operations`] function — kept
+    /// for users who prefer the struct-style API.
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,
