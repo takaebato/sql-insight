@@ -67,14 +67,6 @@ pub(super) fn table_from_qualifier_parts(parts: &[Ident]) -> Option<TableReferen
 }
 
 impl<'a> Resolver<'a> {
-    pub(super) fn column_refs_len(&self) -> usize {
-        self.column_refs.len()
-    }
-
-    pub(super) fn column_refs_slice(&self, since: usize) -> &[RawColumnRef] {
-        &self.column_refs[since..]
-    }
-
     /// Record a column reference observed in the current scope.
     /// Resolution (owning table) and synthetic-vs-real classification
     /// are computed right now, while scope state is authoritative —

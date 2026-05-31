@@ -60,16 +60,12 @@ pub(crate) enum LineageTargetSpec {
 }
 
 impl<'a> Resolver<'a> {
-    pub(super) fn push_lineage_edge(&mut self, edge: LineageEdge) {
-        self.lineage_edges.push(edge);
-    }
-
     /// Emit one `LineageEdge` per `RawColumnRef` recorded into
     /// `column_refs` since position `since`, all pointing to the same
     /// `target` with the given `kind`. The typical caller snapshots
-    /// `column_refs_len()` before walking an expression, walks it,
-    /// then calls this with the snapshot to fan the new refs out as
-    /// edges. Used by UPDATE / MERGE assignment loops and MERGE
+    /// `self.column_refs.len()` before walking an expression, walks
+    /// it, then calls this with the snapshot to fan the new refs out
+    /// as edges. Used by UPDATE / MERGE assignment loops and MERGE
     /// INSERT-VALUES emission.
     pub(super) fn push_edges_from_refs_since(
         &mut self,
@@ -77,9 +73,9 @@ impl<'a> Resolver<'a> {
         target: LineageTargetSpec,
         kind: ColumnLineageKind,
     ) {
-        for offset in 0..(self.column_refs_len() - since) {
-            let source = self.column_refs_slice(since)[offset].clone();
-            self.push_lineage_edge(LineageEdge {
+        let sources: Vec<RawColumnRef> = self.column_refs[since..].to_vec();
+        for source in sources {
+            self.lineage_edges.push(LineageEdge {
                 source,
                 target: target.clone(),
                 kind,
@@ -104,7 +100,7 @@ impl<'a> Resolver<'a> {
                     continue;
                 };
                 for source in &column.source_refs {
-                    self.push_lineage_edge(LineageEdge {
+                    self.lineage_edges.push(LineageEdge {
                         source: source.clone(),
                         target: target.clone(),
                         kind: column.kind,

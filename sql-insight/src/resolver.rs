@@ -380,9 +380,9 @@ impl<'a> Resolver<'a> {
     /// refs it records, packaging name / source_refs / kind into an
     /// [`OutputColumn`].
     pub(super) fn build_output_column(&mut self, item: &SelectItem) -> Result<OutputColumn, Error> {
-        let refs_before = self.column_refs_len();
+        let refs_before = self.column_refs.len();
         self.visit_select_item(item)?;
-        let source_refs = self.column_refs_slice(refs_before).to_vec();
+        let source_refs = self.column_refs[refs_before..].to_vec();
         Ok(OutputColumn {
             name: output_column_name(item),
             source_refs,
@@ -897,7 +897,7 @@ impl<'a> Resolver<'a> {
         for assignment in assignments {
             let target_parts = assignment_target_parts(&assignment.target);
             let kind = body_output::expr_kind(&assignment.value);
-            let refs_before = self.column_refs_len();
+            let refs_before = self.column_refs.len();
             self.visit_expr(&assignment.value)?;
             let Some(target_parts) = target_parts else {
                 continue;
@@ -1016,7 +1016,7 @@ impl<'a> Resolver<'a> {
         for row in &values.rows {
             for (position, value_expr) in row.iter().enumerate() {
                 let kind = body_output::expr_kind(value_expr);
-                let refs_before = self.column_refs_len();
+                let refs_before = self.column_refs.len();
                 self.visit_expr(value_expr)?;
                 let (Some(target_table), Some(col_ident)) =
                     (target_table, effective_idents.get(position))
