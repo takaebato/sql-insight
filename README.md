@@ -22,9 +22,11 @@ across every SQL dialect sqlparser-rs supports.
 - **Optional Catalog**: pass column schemas to tighten column
   resolution and pair INSERT values with target columns by position.
   Best-effort without one.
-- **Table Extraction / CRUD Table Extraction**: flat or CRUD-bucketed
-  table list, for when you just need to know which tables a statement
-  touches.
+- **Table Extraction**: flat list of tables a statement touches —
+  the lightest extraction when you don't need a read/write split or
+  lineage.
+- **CRUD Table Extraction**: tables bucketed by Create / Read /
+  Update / Delete role, for CRUD-style access analysis.
 - **SQL Formatting**: emit a query in a consistent layout (single-line
   by default, multi-line pretty-print on demand).
 - **SQL Normalization**: collapse structurally identical queries to
