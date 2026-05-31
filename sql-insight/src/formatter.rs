@@ -1,5 +1,5 @@
 //! Basic SQL formatting — round-trips through sqlparser's AST
-//! and emits its `Display`. See [`format`] as the entry point.
+//! and emits its `Display`. See [`format()`] as the entry point.
 //!
 //! Whitespace and case follow sqlparser's `Display` (keywords
 //! uppercase, single-space separators on common shapes); comments
@@ -31,13 +31,13 @@ pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
     Formatter::format(dialect, sql)
 }
 
-/// Struct-style entry point. Equivalent to the free [`format`]
+/// Struct-style entry point. Equivalent to the free [`format()`]
 /// function.
 #[derive(Debug, Default)]
 pub struct Formatter;
 
 impl Formatter {
-    /// Same as the free [`format`] function — kept for users who
+    /// Same as the free [`format()`] function — kept for users who
     /// prefer the struct-style API.
     pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
