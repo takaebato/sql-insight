@@ -42,11 +42,7 @@ pub struct ColumnReference {
 }
 
 impl TableReference {
-    pub fn has_qualifiers(&self) -> bool {
-        self.catalog.is_some() || self.schema.is_some()
-    }
-
-    pub fn try_from_name(name: &ObjectName) -> Result<Self, Error> {
+    pub(crate) fn try_from_name(name: &ObjectName) -> Result<Self, Error> {
         match name.0.len() {
             0 => unreachable!("Parser should not allow empty identifiers"),
             1 => Ok(TableReference {
@@ -147,7 +143,7 @@ impl TryFrom<&ObjectName> for TableReference {
 
 impl TableReference {
     /// Parse an INSERT statement's target into (identity, alias) pair.
-    pub fn from_insert_with_alias(value: &Insert) -> Result<(Self, Option<Ident>), Error> {
+    pub(crate) fn from_insert_with_alias(value: &Insert) -> Result<(Self, Option<Ident>), Error> {
         let name = match &value.table {
             TableObject::TableName(object_name) => object_name,
             TableObject::TableFunction(function) => &function.name,
@@ -156,7 +152,7 @@ impl TableReference {
     }
 
     /// Parse a TableFactor (must be `TableFactor::Table`) into (identity, alias) pair.
-    pub fn from_table_factor_with_alias(
+    pub(crate) fn from_table_factor_with_alias(
         table: &TableFactor,
     ) -> Result<(Self, Option<Ident>), Error> {
         match table {
