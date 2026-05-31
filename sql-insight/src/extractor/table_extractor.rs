@@ -72,9 +72,7 @@ impl TableExtractor {
         Ok(results)
     }
 
-    /// Extract from an already-parsed [`Statement`]. Use when you
-    /// have an AST in hand and want to skip the parse step.
-    pub fn extract_from_statement(statement: &Statement) -> Result<TableExtraction, Error> {
+    fn extract_from_statement(statement: &Statement) -> Result<TableExtraction, Error> {
         // The legacy table-extraction API does not surface columns, so a
         // catalog would not influence its output; pass `None`.
         let resolution = Resolver::resolve_statement(None, statement)?;

@@ -248,7 +248,7 @@ impl ColumnOperationExtractor {
             .collect())
     }
 
-    pub fn extract_from_statement(
+    fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&dyn Catalog>,
     ) -> Result<ColumnOperation, Error> {

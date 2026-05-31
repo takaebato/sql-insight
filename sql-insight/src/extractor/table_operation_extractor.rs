@@ -175,7 +175,7 @@ impl TableOperationExtractor {
             .collect())
     }
 
-    pub fn extract_from_statement(
+    pub(crate) fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&dyn Catalog>,
     ) -> Result<TableOperation, Error> {
