@@ -10,6 +10,36 @@ across every SQL dialect sqlparser-rs supports.
 [![codecov](https://codecov.io/gh/takaebato/sql-insight/graph/badge.svg?token=Z1KYAWA3HY)](https://codecov.io/gh/takaebato/sql-insight)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
+## Features
+
+- **Table-level Operation Extraction**: `reads` / `writes` / `lineage`
+  surfaces with statement-kind classification per parsed statement.
+- **Column-level Operation Extraction**: the same three surfaces at
+  column granularity. `reads` / `writes` are plain occurrence lists
+  of column references; `lineage` forms a source → target graph, each
+  edge carrying a kind (`Passthrough` vs `Transformation`). The
+  value-vs-filter distinction is structural — a value contributor is a
+  `lineage` source, a filter-only column is in `reads` but not `lineage`.
+- **Optional Catalog**: supply a schema provider to make resolution
+  strict — column refs not in the catalog-provided schema surface as
+  unresolved references, INSERT positional values pair with target
+  columns. Every extractor still works catalog-free in best-effort mode.
+- **Diagnostics**: non-fatal issues (unsupported statements,
+  suppressed wildcards, ambiguous / unresolved columns) surface
+  alongside the result with optional source-location spans, rather
+  than failing the whole call. Split by granularity
+  (`TableLevelDiagnostic` / `ColumnLevelDiagnostic`) so a table-level
+  result never carries a column-only condition.
+- **Table Extraction / CRUD Table Extraction**: flat or
+  CRUD-bucketed table sets — lightweight extraction when the
+  operation graph isn't needed.
+- **SQL Formatting**: re-emit queries through sqlparser's `Display`
+  for a consistent shape (multi-line pretty-print via
+  `FormatterOptions::pretty`).
+- **SQL Normalization**: substitute literals with placeholders so
+  structurally identical queries hash to the same shape; three opt-in
+  collapses tighten the equivalence further.
+
 ## Install
 
 ```toml
@@ -62,24 +92,30 @@ let ops = result[0].as_ref().unwrap();
 assert_eq!(ops.lineage.len(), 2);
 ```
 
-### Diagnostics
+### Table Extraction (lightweight)
 
-Non-fatal issues surface alongside the result. Each diagnostic carries
-a `kind`, a human-readable `message`, and an optional source-location
-`span`:
+Flat list of table references touched by a statement:
 
 ```rust
 use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::diagnostic::ColumnLevelDiagnosticKind;
-use sql_insight::extractor::extract_column_operations;
+use sql_insight::extractor::extract_tables;
 
 let dialect = GenericDialect {};
-let result = extract_column_operations(&dialect, "SELECT * FROM users", None).unwrap();
-let ops = result[0].as_ref().unwrap();
-assert!(ops
-    .diagnostics
-    .iter()
-    .any(|d| matches!(d.kind, ColumnLevelDiagnosticKind::WildcardSuppressed)));
+let extractions = extract_tables(&dialect, "SELECT * FROM catalog.schema.users").unwrap();
+println!("{:?}", extractions);
+```
+
+### CRUD Table Extraction
+
+Bucket tables by create / read / update / delete role:
+
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+use sql_insight::extractor::extract_crud_tables;
+
+let dialect = GenericDialect {};
+let crud_tables = extract_crud_tables(&dialect, "INSERT INTO users (name) SELECT name FROM employees").unwrap();
+println!("{:?}", crud_tables);
 ```
 
 ### SQL Formatting
@@ -117,32 +153,6 @@ assert_eq!(normalized, ["SELECT * FROM users WHERE id = ?"]);
 `VALUES (1, 2, 3), (4, 5, 6)` → `VALUES (...)`, and
 `INSERT INTO t (c, b, a) VALUES (1, 2, 3)` → `INSERT INTO t (a, b, c) VALUES (...)`.
 
-### Table Extraction (lightweight)
-
-Flat list of table references touched by a statement:
-
-```rust
-use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::extractor::extract_tables;
-
-let dialect = GenericDialect {};
-let extractions = extract_tables(&dialect, "SELECT * FROM catalog.schema.users").unwrap();
-println!("{:?}", extractions);
-```
-
-### CRUD Table Extraction
-
-Bucket tables by create / read / update / delete role:
-
-```rust
-use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::extractor::extract_crud_tables;
-
-let dialect = GenericDialect {};
-let crud_tables = extract_crud_tables(&dialect, "INSERT INTO users (name) SELECT name FROM employees").unwrap();
-println!("{:?}", crud_tables);
-```
-
 ## Catalog
 
 An optional [`Catalog`](https://docs.rs/sql-insight/latest/sql_insight/catalog/)
@@ -159,21 +169,9 @@ section of the crate docs.
 
 ## Examples
 
-Runnable examples under
-[`sql-insight/examples/`](sql-insight/examples):
-
-- [`table_operations.rs`](sql-insight/examples/table_operations.rs) —
-  table-level `reads` / `writes` / `lineage` across a multi-statement
-  batch, with `StatementKind`-based dispatch.
-- [`column_operations.rs`](sql-insight/examples/column_operations.rs) —
-  per-column reads and lineage classified by `ColumnLineageKind`
-  (Passthrough vs Transformation) into `Relation` vs `QueryOutput`
-  targets.
-- [`with_catalog.rs`](sql-insight/examples/with_catalog.rs) — supplying
-  a `Catalog` enables INSERT positional column pairing and surfaces
-  `AmbiguousColumn` / `UnresolvedColumn` diagnostics.
-
-Run with `cargo run --example <name> -p sql-insight`.
+See [`sql-insight/examples/`](sql-insight/examples) for runnable
+samples covering table-level operations, column-level lineage, and the
+catalog path. Run with `cargo run --example <name> -p sql-insight`.
 
 ## Supported SQL Dialects
 
