@@ -1,8 +1,8 @@
 //! Walks a `sqlparser` `Statement` once and produces a
 //! [`Resolution`] carrying scope bindings, captured refs, and lineage
 //! edges. Two post-passes ([`Resolution::collapsed_lineage_edges`]
-//! and [`Resolution::real_column_refs`]) refine the raw walk data
-//! into the public extraction surfaces.
+//! and [`Resolution::real_column_refs`]) refine the captured walk
+//! data into the public extraction surfaces.
 //!
 //! Module layout (all sub-modules are crate-internal):
 //!
@@ -13,10 +13,10 @@
 //!   a clause walk.
 //! - [`binding`]: `Binding` enum + `BindingKey` + `bind_*` /
 //!   lookup / diagnostic-record methods on `Resolver`.
-//! - [`column_ref`]: `RawColumnRef` and walk-time resolution of
+//! - [`column_ref`]: `CapturedColumnRef` and walk-time resolution of
 //!   identifier parts to owning tables.
-//! - [`table_ref`]: `RawTableRef` / `TableRefTarget` and the
-//!   `record_*_table_ref` constructors. Parallel to `column_ref`.
+//! - [`table_ref`]: `CapturedTableRef` / `TableRefTarget` and the
+//!   `capture_*_table_ref` constructors. Parallel to `column_ref`.
 //! - [`query_body_output`]: `QueryBodyOutput` / `OutputColumn` and the helpers
 //!   that derive each output column's name / kind from a `SelectItem`.
 //! - [`lineage`]: `LineageEdge` / `LineageTargetSpec` and the emit
@@ -30,20 +30,20 @@
 //! table walkers all live here as one consolidated `impl` block).
 
 mod binding;
-mod query_body_output;
 mod column_ref;
 mod lineage;
+mod query_body_output;
 mod resolution;
 mod scope;
 mod table_ref;
 
 pub(crate) use binding::{Binding, TableRole};
-pub(crate) use query_body_output::{OutputColumn, QueryBodyOutput, SetOperand};
-pub(crate) use column_ref::RawColumnRef;
+pub(crate) use column_ref::CapturedColumnRef;
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
+pub(crate) use query_body_output::{OutputColumn, QueryBodyOutput, SetOperand};
 pub(crate) use resolution::Resolution;
 pub(crate) use scope::{Scope, ScopeId, ScopeKind};
-pub(crate) use table_ref::{RawTableRef, TableRefTarget};
+pub(crate) use table_ref::{CapturedTableRef, TableRefTarget};
 
 use query_body_output::{output_column_kind, output_column_name};
 
@@ -822,7 +822,7 @@ impl<'a> Resolver<'a> {
                     // synthesized from the INSERT source's per-operand
                     // columns, not walked into a fresh scope. The
                     // INSERT source's real tables are already covered
-                    // by their own RawTableRefs, so EXCLUDED needs no
+                    // by their own CapturedTableRefs, so EXCLUDED needs no
                     // collapse path for table lineage.
                     let excluded_output = excluded_body_output(effective_columns, source_output);
                     self.bind_derived_table(Ident::new("EXCLUDED"), excluded_output, None);
@@ -1273,11 +1273,11 @@ impl<'a> Resolver<'a> {
                 self.visit_expr(&member_of.array)
             }
             Expr::Identifier(ident) => {
-                self.record_column_ref(vec![ident.clone()]);
+                self.capture_column_ref(vec![ident.clone()]);
                 Ok(())
             }
             Expr::CompoundIdentifier(parts) => {
-                self.record_column_ref(parts.clone());
+                self.capture_column_ref(parts.clone());
                 Ok(())
             }
             Expr::Value(_)
@@ -1712,7 +1712,7 @@ impl<'a> Resolver<'a> {
                     // table-lineage collapse reaches the same place
                     // from either definition or use site.
                     self.bind_cte(bind_name, output, body_scope.unwrap());
-                    self.record_synthetic_table_ref(body_scope.unwrap());
+                    self.capture_synthetic_table_ref(body_scope.unwrap());
                     return Ok(());
                 }
                 let (table, alias_ident) =
@@ -1760,7 +1760,7 @@ impl<'a> Resolver<'a> {
                     let renames = &alias.columns;
                     let renamed = resolved.output_columns.map(|o| o.renamed(renames));
                     self.bind_derived_table(alias.name.clone(), renamed, Some(resolved.body_scope));
-                    self.record_synthetic_table_ref(resolved.body_scope);
+                    self.capture_synthetic_table_ref(resolved.body_scope);
                 }
                 if let Some(sample) = sample {
                     self.visit_table_sample_kind(sample)?;
@@ -1774,7 +1774,7 @@ impl<'a> Resolver<'a> {
                 if let Some(alias) = alias {
                     // Wrapper alias — the inner tables are bound directly
                     // in the current scope (via visit_table_with_joins
-                    // above), so they emit their own Real RawTableRefs.
+                    // above), so they emit their own Real CapturedTableRefs.
                     // The alias itself doesn't drive collapse.
                     self.bind_derived_table(alias.name.clone(), None, None);
                 }

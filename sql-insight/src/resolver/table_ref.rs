@@ -1,5 +1,5 @@
-//! `RawTableRef` — `FROM`-position table-source captures the walker
-//! produces during the AST walk — plus the `record_*_table_ref`
+//! `CapturedTableRef` — `FROM`-position table-source captures the walker
+//! produces during the AST walk — plus the `capture_*_table_ref`
 //! constructor methods on `Resolver`. Parallel to [`super::column_ref`]
 //! for the table-granularity side of lineage tracking.
 
@@ -13,7 +13,7 @@ use super::{Resolver, ScopeId};
 /// names but whose body is never `FROM`-used — contributes no lineage
 /// sources.
 #[derive(Clone, Debug)]
-pub(crate) struct RawTableRef {
+pub(crate) struct CapturedTableRef {
     /// Scope where the use occurs — used for predicate-ancestor
     /// filtering at collapse time.
     pub(crate) scope_id: ScopeId,
@@ -23,7 +23,7 @@ pub(crate) struct RawTableRef {
     pub(crate) target: TableRefTarget,
 }
 
-/// Resolution of a [`RawTableRef`] target.
+/// Resolution of a [`CapturedTableRef`] target.
 ///
 /// **Terminology note**: "Synthetic" is this codebase's chosen
 /// umbrella term for `{Binding::Cte, Binding::DerivedTable,
@@ -43,14 +43,14 @@ pub(crate) struct RawTableRef {
 ///
 /// Despite the inexact fit, "synthetic" is chosen for being short,
 /// distinct, free of dialect collision, and consistent with the
-/// existing [`RawColumnRef::synthetic`](super::RawColumnRef) field
+/// existing [`CapturedColumnRef::synthetic`](super::CapturedColumnRef) field
 /// and [`is_synthetic_binding`](super::binding::is_synthetic_binding)
 /// helper.
 ///
 /// Variants represent **what to do during table-lineage collapse**,
 /// not raw storage classification. `Binding::TableFunction` is
 /// synthetic at the binding level but is omitted here (and from
-/// `RawTableRef` emission entirely), since it has no inspectable
+/// `CapturedTableRef` emission entirely), since it has no inspectable
 /// body to recurse into.
 #[derive(Clone, Debug)]
 pub(crate) enum TableRefTarget {
@@ -67,9 +67,9 @@ pub(crate) enum TableRefTarget {
 impl<'a> Resolver<'a> {
     /// Record a use of a real table at the current scope. Called by
     /// `bind_real_table` on Read-position binds.
-    pub(super) fn record_real_table_ref(&mut self, table: TableReference) {
+    pub(super) fn capture_real_table_ref(&mut self, table: TableReference) {
         let scope_id = self.current_scope_id();
-        self.resolution.table_refs.push(RawTableRef {
+        self.resolution.table_refs.push(CapturedTableRef {
             scope_id,
             target: TableRefTarget::Real(table),
         });
@@ -78,9 +78,9 @@ impl<'a> Resolver<'a> {
     /// Record a use of a synthetic relation (CTE / true derived) at
     /// the current scope. `body_scope` is the arena id of the
     /// synthetic's body — collapse recurses into its subtree.
-    pub(super) fn record_synthetic_table_ref(&mut self, body_scope: ScopeId) {
+    pub(super) fn capture_synthetic_table_ref(&mut self, body_scope: ScopeId) {
         let scope_id = self.current_scope_id();
-        self.resolution.table_refs.push(RawTableRef {
+        self.resolution.table_refs.push(CapturedTableRef {
             scope_id,
             target: TableRefTarget::Synthetic { body_scope },
         });

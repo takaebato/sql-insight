@@ -12,7 +12,7 @@
 //!   derived body's output columns.
 //! - Table-lineage post-pass:
 //!   [`Resolution::collapsed_feeding_table_sources`] walks the
-//!   captured `RawTableRef` events and recursively expands synthetic
+//!   captured `CapturedTableRef` events and recursively expands synthetic
 //!   uses (CTE / derived) into the real tables underneath,
 //!   producing the lineage-source list at table granularity.
 
@@ -26,14 +26,14 @@ use super::binding::binding_alias_key;
 use super::binding::BindingKey;
 use super::scope::parent_chain;
 use super::{
-    Binding, LineageEdge, RawColumnRef, RawTableRef, Scope, ScopeId, ScopeKind, TableRefTarget,
-    TableRole,
+    Binding, CapturedColumnRef, CapturedTableRef, LineageEdge, Scope, ScopeId, ScopeKind,
+    TableRefTarget, TableRole,
 };
 
 /// The end-of-walk result the resolver produces. Holds the scope
-/// arena and the raw column refs / lineage edges collected during the
-/// walk, plus accumulated diagnostics. Two post-passes inside
-/// `Resolver::into_resolution` refine `column_refs` and
+/// arena and the captured column refs / lineage edges collected
+/// during the walk, plus accumulated diagnostics. Two post-passes
+/// inside `Resolver::into_resolution` refine `column_refs` and
 /// `lineage_edges` before the resolution leaves the resolver.
 #[derive(Debug, Default)]
 pub(crate) struct Resolution {
@@ -48,7 +48,7 @@ pub(crate) struct Resolution {
     pub(crate) scopes: Vec<Scope>,
     /// Column refs that survive the synthetic-binding filter (see
     /// [`Resolution::real_column_refs`]).
-    pub(crate) column_refs: Vec<RawColumnRef>,
+    pub(crate) column_refs: Vec<CapturedColumnRef>,
     /// Lineage edges after end-to-end collapse through CTE / derived
     /// synthetics (see [`Resolution::collapsed_lineage_edges`]).
     pub(crate) lineage_edges: Vec<LineageEdge>,
@@ -57,7 +57,7 @@ pub(crate) struct Resolution {
     /// [`Resolution::collapsed_feeding_table_sources`]) — an entry per
     /// physical use, occurrence-based (no dedup), matching
     /// `ColumnLineageEdge` semantics.
-    pub(crate) table_refs: Vec<RawTableRef>,
+    pub(crate) table_refs: Vec<CapturedTableRef>,
 }
 
 /// Recursion ceiling for `collapse_source` — guards against
@@ -73,10 +73,10 @@ impl Resolution {
     /// relation (`Cte` / `DerivedTable` / `TableFunction`) are dropped
     /// — synthetics aren't storage, so they don't belong in the public
     /// reads surface.
-    pub(crate) fn real_column_refs(&self) -> Vec<RawColumnRef> {
+    pub(crate) fn real_column_refs(&self) -> Vec<CapturedColumnRef> {
         self.column_refs
             .iter()
-            .filter(|raw| !raw.synthetic)
+            .filter(|captured| !captured.synthetic)
             .cloned()
             .collect()
     }
@@ -109,14 +109,14 @@ impl Resolution {
 
     fn collapse_source(
         &self,
-        raw: &RawColumnRef,
+        captured: &CapturedColumnRef,
         outer_kind: ColumnLineageKind,
         depth: usize,
-    ) -> Vec<(RawColumnRef, ColumnLineageKind)> {
+    ) -> Vec<(CapturedColumnRef, ColumnLineageKind)> {
         if depth >= MAX_COLLAPSE_DEPTH {
-            return vec![(raw.clone(), outer_kind)];
+            return vec![(captured.clone(), outer_kind)];
         }
-        let output = match self.synthetic_owning_binding(raw) {
+        let output = match self.synthetic_owning_binding(captured) {
             Some(
                 Binding::Cte {
                     output_columns: Some(o),
@@ -127,10 +127,10 @@ impl Resolution {
                     ..
                 },
             ) => o,
-            _ => return vec![(raw.clone(), outer_kind)],
+            _ => return vec![(captured.clone(), outer_kind)],
         };
-        let Some(col_name) = raw.parts.last() else {
-            return vec![(raw.clone(), outer_kind)];
+        let Some(col_name) = captured.parts.last() else {
+            return vec![(captured.clone(), outer_kind)];
         };
         let key = BindingKey::from_ident(col_name);
         let mut result = Vec::new();
@@ -150,13 +150,13 @@ impl Resolution {
             }
         }
         if result.is_empty() {
-            vec![(raw.clone(), outer_kind)]
+            vec![(captured.clone(), outer_kind)]
         } else {
             result
         }
     }
 
-    /// Collapse [`RawTableRef`]s into the real-table lineage source
+    /// Collapse [`CapturedTableRef`]s into the real-table lineage source
     /// list: for each top-level use, emit the real table directly, or
     /// recurse into the synthetic's `body_scope` subtree to gather the
     /// real tables underneath. Uses whose scope has a `Predicate`
@@ -194,31 +194,31 @@ impl Resolution {
             .collect();
         let mut out = Vec::new();
         let mut visited = HashSet::new();
-        for raw in &self.table_refs {
-            // Both filters reduce to "does any ancestor of raw.scope_id
-            // satisfy a predicate?" — fold them into a single parent
-            // walk with O(1) HashSet lookup per step, instead of one
-            // walk for the predicate check and one walk per synthetic
-            // body scope.
-            let skip = parent_chain(&self.scopes, raw.scope_id).any(|id| {
+        for captured in &self.table_refs {
+            // Both filters reduce to "does any ancestor of
+            // captured.scope_id satisfy a predicate?" — fold them
+            // into a single parent walk with O(1) HashSet lookup per
+            // step, instead of one walk for the predicate check and
+            // one walk per synthetic body scope.
+            let skip = parent_chain(&self.scopes, captured.scope_id).any(|id| {
                 self.scopes[id.0].kind == ScopeKind::Predicate
                     || synthetic_body_scopes.contains(&id)
             });
             if skip {
                 continue;
             }
-            self.collect_use(raw, &mut out, &mut visited);
+            self.collect_use(captured, &mut out, &mut visited);
         }
         out
     }
 
     fn collect_use(
         &self,
-        raw: &RawTableRef,
+        captured: &CapturedTableRef,
         out: &mut Vec<TableReference>,
         visited: &mut HashSet<ScopeId>,
     ) {
-        match &raw.target {
+        match &captured.target {
             TableRefTarget::Real(table) => out.push(table.clone()),
             TableRefTarget::Synthetic { body_scope } => {
                 if !visited.insert(*body_scope) {
@@ -246,19 +246,19 @@ impl Resolution {
         parent_chain(&self.scopes, scope_id).any(|id| id == ancestor)
     }
 
-    /// Look up the binding a synthetic-owning raw ref points at, by
-    /// matching the walk-time-captured table name against scope
-    /// bindings. Name match is unique within IndexMap, so this avoids
-    /// the column-membership ambiguity that scope-chain resolution
-    /// can hit when CTEs accumulate. Returns `None` for non-synthetic
-    /// refs.
-    fn synthetic_owning_binding(&self, raw: &RawColumnRef) -> Option<&Binding> {
-        if !raw.synthetic {
+    /// Look up the binding a synthetic-owning captured ref points
+    /// at, by matching the walk-time-captured table name against
+    /// scope bindings. Name match is unique within IndexMap, so this
+    /// avoids the column-membership ambiguity that scope-chain
+    /// resolution can hit when CTEs accumulate. Returns `None` for
+    /// non-synthetic refs.
+    fn synthetic_owning_binding(&self, captured: &CapturedColumnRef) -> Option<&Binding> {
+        if !captured.synthetic {
             return None;
         }
-        let table = raw.resolved.as_ref()?;
+        let table = captured.resolved.as_ref()?;
         let key = BindingKey::from_ident(&table.name);
-        parent_chain(&self.scopes, raw.scope_id).find_map(|id| {
+        parent_chain(&self.scopes, captured.scope_id).find_map(|id| {
             self.scopes[id.0]
                 .iter_bindings()
                 .find(|b| binding_alias_key(b) == key)

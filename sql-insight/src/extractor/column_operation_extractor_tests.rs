@@ -2520,7 +2520,7 @@ mod join_using_and_natural {
     #[test]
     fn join_using_id_in_projection_and_where_yields_two_independent_unresolved_refs() {
         // The same `id` ref in projection vs. WHERE produces two
-        // SEPARATE RawColumnRefs, each with a single-kind `kinds`
+        // SEPARATE CapturedColumnRefs, each with a single-kind `kinds`
         // vec. There is no merge into one ref-with-multi-kinds
         // here — that would require resolver-level tracking of
         // ref identity across clauses, which we don't do.

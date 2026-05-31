@@ -10,7 +10,7 @@ use crate::error::Error;
 use crate::extractor::ColumnLineageKind;
 use crate::reference::TableReference;
 
-use super::{OutputColumn, RawColumnRef, ResolvedQuery, Resolver, SetOperand};
+use super::{CapturedColumnRef, OutputColumn, ResolvedQuery, Resolver, SetOperand};
 
 /// A pre-resolution column lineage record. `source` still needs
 /// scope-chain resolution (for unqualified parts); `target` is fully
@@ -27,7 +27,7 @@ pub(crate) struct LineageEdge {
     /// Source column ref as recorded at the walk site. Still carries
     /// `scope_id` so collapse can re-resolve through synthetic
     /// relations.
-    pub(crate) source: RawColumnRef,
+    pub(crate) source: CapturedColumnRef,
     /// Where the value flows to — a transient SELECT output column
     /// or a real-relation column.
     pub(crate) target: LineageTargetSpec,
@@ -60,7 +60,7 @@ pub(crate) enum LineageTargetSpec {
 }
 
 impl<'a> Resolver<'a> {
-    /// Emit one `LineageEdge` per `RawColumnRef` recorded into
+    /// Emit one `LineageEdge` per `CapturedColumnRef` recorded into
     /// `column_refs` since position `since`, all pointing to the same
     /// `target` with the given `kind`. The typical caller snapshots
     /// `self.column_refs.len()` before walking an expression, walks
@@ -73,7 +73,7 @@ impl<'a> Resolver<'a> {
         target: LineageTargetSpec,
         kind: ColumnLineageKind,
     ) {
-        let sources: Vec<RawColumnRef> = self.resolution.column_refs[since..].to_vec();
+        let sources: Vec<CapturedColumnRef> = self.resolution.column_refs[since..].to_vec();
         for source in sources {
             self.resolution.lineage_edges.push(LineageEdge {
                 source,

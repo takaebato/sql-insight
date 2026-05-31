@@ -72,7 +72,7 @@ use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::error::Error;
 use crate::extractor::table_operation_extractor::StatementKind;
 use crate::reference::{ColumnReference, TableReference};
-use crate::resolver::{LineageTargetSpec, RawColumnRef, Resolution, Resolver};
+use crate::resolver::{CapturedColumnRef, LineageTargetSpec, Resolution, Resolver};
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, Ident, OnConflictAction, OnInsert, Statement,
     TableFactor,
@@ -305,7 +305,7 @@ fn extract_lineage(resolution: &Resolution) -> Vec<ColumnLineageEdge> {
         .lineage_edges
         .iter()
         .filter_map(|edge| {
-            let source = resolve_raw_ref(&edge.source)?;
+            let source = resolve_captured_ref(&edge.source)?;
             let target = match &edge.target {
                 LineageTargetSpec::QueryOutput { name, position } => ColumnTarget::QueryOutput {
                     name: name.clone(),
@@ -327,16 +327,16 @@ fn extract_lineage(resolution: &Resolution) -> Vec<ColumnLineageEdge> {
         .collect()
 }
 
-/// Build a `ColumnReference` from a resolver-captured raw ref. The
+/// Build a `ColumnReference` from a resolver-captured captured ref. The
 /// resolver records owning-table resolution at walk time, so this is
 /// a 1:1 read of `(resolved, parts.last())`. Refs whose owning
 /// binding was synthetic at walk time are dropped upstream by the
 /// resolver itself before they reach the extractor — see
 /// `Resolution::real_column_refs`.
-fn resolve_raw_ref(raw: &RawColumnRef) -> Option<ColumnReference> {
-    let name = raw.parts.last()?.clone();
+fn resolve_captured_ref(captured: &CapturedColumnRef) -> Option<ColumnReference> {
+    let name = captured.parts.last()?.clone();
     Some(ColumnReference {
-        table: raw.resolved.clone(),
+        table: captured.resolved.clone(),
         name,
     })
 }
@@ -345,7 +345,7 @@ fn collect_reads(resolution: &Resolution) -> Vec<ColumnReference> {
     resolution
         .column_refs
         .iter()
-        .filter_map(resolve_raw_ref)
+        .filter_map(resolve_captured_ref)
         .collect()
 }
 

@@ -19,7 +19,7 @@ use sqlparser::ast::{Expr, Ident, SelectItem, TableAliasColumnDef};
 
 use crate::extractor::ColumnLineageKind;
 
-use super::{RawColumnRef, Resolver};
+use super::{CapturedColumnRef, Resolver};
 
 /// Body-walk output of a SELECT-derived relation (CTE / true
 /// derived), with full per-column lineage.
@@ -55,7 +55,7 @@ pub(crate) struct SetOperand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutputColumn {
     pub(crate) name: Option<Ident>,
-    pub(crate) source_refs: Vec<RawColumnRef>,
+    pub(crate) source_refs: Vec<CapturedColumnRef>,
     pub(crate) kind: ColumnLineageKind,
 }
 

@@ -277,10 +277,10 @@ impl<'a> Resolver<'a> {
         let binding_name = alias.clone().unwrap_or_else(|| table.name.clone());
         let output_columns = self.lookup_catalog_columns(&table);
         if role == TableRole::Read {
-            // Read-position FROM/JOIN — emit a RawTableRef so table-lineage
+            // Read-position FROM/JOIN — emit a CapturedTableRef so table-lineage
             // collapse sees this as a real source. Write targets feed
             // `write_tables` separately and don't drive collapse.
-            self.record_real_table_ref(table.clone());
+            self.capture_real_table_ref(table.clone());
         }
         self.bind_current(
             binding_name,

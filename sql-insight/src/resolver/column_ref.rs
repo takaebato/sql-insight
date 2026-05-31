@@ -1,4 +1,4 @@
-//! `RawColumnRef` — column references captured during the walk —
+//! `CapturedColumnRef` — column references captured during the walk —
 //! plus the walk-time resolution that fills its `resolved` /
 //! `synthetic` fields.
 
@@ -26,7 +26,7 @@ use super::{Binding, Resolver, ScopeId};
 /// point in the walk — necessary for multi-CTE chains where later
 /// CTE bindings would otherwise ambify earlier resolutions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct RawColumnRef {
+pub(crate) struct CapturedColumnRef {
     pub(crate) parts: Vec<Ident>,
     pub(crate) scope_id: ScopeId,
     /// Owning table captured at walk time. `None` for ambiguous /
@@ -71,10 +71,10 @@ impl<'a> Resolver<'a> {
     /// Resolution (owning table) and synthetic-vs-real classification
     /// are computed right now, while scope state is authoritative —
     /// later CTE bindings won't ambify what this reference saw.
-    pub(super) fn record_column_ref(&mut self, parts: Vec<Ident>) {
+    pub(super) fn capture_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.current_scope_id();
         let (resolved, synthetic) = self.resolve_ref_at_walk(&parts, scope_id);
-        self.resolution.column_refs.push(RawColumnRef {
+        self.resolution.column_refs.push(CapturedColumnRef {
             parts,
             scope_id,
             resolved,
