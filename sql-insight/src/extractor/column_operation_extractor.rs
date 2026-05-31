@@ -1,6 +1,6 @@
 //! Extracts the column-level operations a SQL statement performs.
 //!
-//! Where [`extract_table_operations`](crate::extract_table_operations)
+//! Where [`extract_table_operations`](crate::extractor::extract_table_operations)
 //! answers "what tables does this statement touch / write / lineage", this
 //! module answers the same questions at column granularity.
 //!
@@ -134,7 +134,7 @@ pub fn extract_column_operations(
 
 /// Column-level operations performed by a single SQL statement.
 ///
-/// Mirrors [`TableOperation`](crate::TableOperation)
+/// Mirrors [`TableOperation`](crate::extractor::TableOperation)
 /// with the same three surfaces — `reads`, `writes`, `lineage` — at
 /// column granularity.
 #[derive(Debug, Clone, PartialEq, Eq)]

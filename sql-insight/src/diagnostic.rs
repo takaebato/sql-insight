@@ -38,7 +38,7 @@ pub enum TableLevelDiagnosticKind {
 }
 
 /// A non-fatal diagnostic from column-level extraction
-/// ([`extract_column_operations`](crate::extract_column_operations)).
+/// ([`extract_column_operations`](crate::extractor::extract_column_operations)).
 ///
 /// Carries the same `message` / `span` shape as [`TableLevelDiagnostic`].
 #[derive(Clone, Debug, PartialEq, Eq)]

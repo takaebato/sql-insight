@@ -1,7 +1,7 @@
 //! Extracts the application-level operations a SQL statement performs.
 //!
-//! Where [`extract_tables`](crate::extract_tables()) answers "what tables
-//! does this SQL touch?" and [`extract_crud_tables`](crate::extract_crud_tables())
+//! Where [`extract_tables`](crate::extractor::extract_tables()) answers "what tables
+//! does this SQL touch?" and [`extract_crud_tables`](crate::extractor::extract_crud_tables())
 //! answers it in CRUD buckets, this module answers "what operations does
 //! this SQL perform, on which tables, and how do those tables relate?".
 //!
@@ -134,7 +134,7 @@ pub enum StatementKind {
 /// **Occurrence-based**: a statement using the same source more than
 /// once (`FROM s AS x JOIN s AS y`, repeated `FROM cte` across UNION
 /// branches) emits one entry per use, not one deduped entry. Matches
-/// [`ColumnLineageEdge`](crate::extractor::column_operation_extractor::ColumnLineageEdge)
+/// [`ColumnLineageEdge`](crate::extractor::ColumnLineageEdge)
 /// on multiplicity. Consumers wanting set-union semantics dedup
 /// explicitly via `HashSet::from_iter`.
 ///
