@@ -20,7 +20,7 @@ use std::ops::DerefMut;
 ///
 /// let dialect = GenericDialect {};
 /// let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'";
-/// let result = sql_insight::normalize(&dialect, sql).unwrap();
+/// let result = sql_insight::normalizer::normalize(&dialect, sql).unwrap();
 /// assert_eq!(result, ["SELECT a FROM t1 WHERE b = ? AND c IN (?, ?) AND d LIKE ?"]);
 /// ```
 pub fn normalize(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
@@ -33,11 +33,11 @@ pub fn normalize(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error>
 ///
 /// ```rust
 /// use sql_insight::sqlparser::dialect::GenericDialect;
-/// use sql_insight::NormalizerOptions;
+/// use sql_insight::normalizer::{normalize_with_options, NormalizerOptions};
 ///
 /// let dialect = GenericDialect {};
 /// let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3, 4)";
-/// let result = sql_insight::normalize_with_options(&dialect, sql, NormalizerOptions::new().with_unify_in_list(true)).unwrap();
+/// let result = normalize_with_options(&dialect, sql, NormalizerOptions::new().with_unify_in_list(true)).unwrap();
 /// assert_eq!(result, ["SELECT a FROM t1 WHERE b = ? AND c IN (...)"]);
 /// ```
 pub fn normalize_with_options(

@@ -9,8 +9,8 @@
 //! Demonstrates per-column lineage: classification by `ColumnLineageKind`,
 //! `Relation` vs `QueryOutput` targets, and occurrence-based reads.
 
+use sql_insight::extractor::{extract_column_operations, ColumnLineageKind, ColumnTarget};
 use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::{extract_column_operations, ColumnLineageKind, ColumnTarget};
 
 fn main() {
     let dialect = GenericDialect {};

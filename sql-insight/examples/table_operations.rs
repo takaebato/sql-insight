@@ -9,8 +9,8 @@
 //! Shows how a single call yields the statement kind plus the
 //! `reads` / `writes` / `lineage` surfaces for each parsed statement.
 
+use sql_insight::extractor::{extract_table_operations, StatementKind};
 use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::{extract_table_operations, StatementKind};
 
 fn main() {
     let dialect = GenericDialect {};

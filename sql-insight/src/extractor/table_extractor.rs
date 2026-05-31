@@ -23,7 +23,7 @@ use sqlparser::parser::Parser;
 ///
 /// let dialect = GenericDialect {};
 /// let sql = "SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id";
-/// let result = sql_insight::extract_tables(&dialect, sql).unwrap();
+/// let result = sql_insight::extractor::extract_tables(&dialect, sql).unwrap();
 /// println!("{:#?}", result);
 /// assert_eq!(result[0].as_ref().unwrap().to_string(), "t1, t2");
 /// ```
@@ -212,7 +212,7 @@ mod tests {
             assert_eq!(extraction.diagnostics.len(), 1);
             assert_eq!(
                 extraction.diagnostics[0].kind,
-                crate::TableLevelDiagnosticKind::UnsupportedStatement
+                crate::diagnostic::TableLevelDiagnosticKind::UnsupportedStatement
             );
             assert!(extraction.diagnostics[0]
                 .message

@@ -1,6 +1,6 @@
 use sql_insight::error::Error;
+use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::sqlparser::dialect;
-use sql_insight::NormalizerOptions;
 
 pub trait CliExecutable {
     fn execute(&self) -> Result<Vec<String>, Error>;
@@ -25,7 +25,7 @@ impl FormatExecutor {
 
 impl CliExecutable for FormatExecutor {
     fn execute(&self) -> Result<Vec<String>, Error> {
-        sql_insight::format(
+        sql_insight::formatter::format(
             get_dialect(self.dialect_name.as_deref())?.as_ref(),
             self.sql.as_ref(),
         )
@@ -55,7 +55,7 @@ impl NormalizeExecutor {
 
 impl CliExecutable for NormalizeExecutor {
     fn execute(&self) -> Result<Vec<String>, Error> {
-        sql_insight::normalize_with_options(
+        sql_insight::normalizer::normalize_with_options(
             get_dialect(self.dialect_name.as_deref())?.as_ref(),
             self.sql.as_ref(),
             self.options.clone(),
@@ -76,7 +76,7 @@ impl TableExtractExecutor {
 
 impl CliExecutable for TableExtractExecutor {
     fn execute(&self) -> Result<Vec<String>, Error> {
-        let result = sql_insight::extract_tables(
+        let result = sql_insight::extractor::extract_tables(
             get_dialect(self.dialect_name.as_deref())?.as_ref(),
             self.sql.as_ref(),
         )?;
@@ -103,7 +103,7 @@ impl CrudTableExtractExecutor {
 
 impl CliExecutable for CrudTableExtractExecutor {
     fn execute(&self) -> Result<Vec<String>, Error> {
-        let result = sql_insight::extract_crud_tables(
+        let result = sql_insight::extractor::extract_crud_tables(
             get_dialect(self.dialect_name.as_deref())?.as_ref(),
             self.sql.as_ref(),
         )?;

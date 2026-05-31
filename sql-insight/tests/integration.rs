@@ -4,14 +4,18 @@
 //! top-level items are equivalent to a `mod tests` in the library —
 //! no extra wrapper module needed.
 
+use sql_insight::catalog::{Catalog, ColumnSchema};
+use sql_insight::diagnostic::{
+    ColumnLevelDiagnostic, ColumnLevelDiagnosticKind, TableLevelDiagnosticKind,
+};
+use sql_insight::extractor::{
+    extract_column_operations, extract_crud_tables, extract_table_operations, extract_tables,
+    ColumnLineageKind, ColumnTarget, CrudTables, StatementKind, TableExtraction, Tables,
+};
+use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::test_utils::all_dialects;
-use sql_insight::{
-    extract_column_operations, extract_crud_tables, extract_table_operations, extract_tables,
-    Catalog, ColumnLevelDiagnostic, ColumnLevelDiagnosticKind, ColumnLineageKind, ColumnSchema,
-    ColumnTarget, CrudTables, NormalizerOptions, StatementKind, TableExtraction,
-    TableLevelDiagnosticKind, TableReference, Tables,
-};
+use sql_insight::TableReference;
 use std::collections::HashMap;
 
 mod format {
@@ -21,7 +25,7 @@ mod format {
     fn test_format() {
         let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'";
         for dialect in all_dialects() {
-            let result = sql_insight::format(dialect.as_ref(), sql).unwrap();
+            let result = sql_insight::formatter::format(dialect.as_ref(), sql).unwrap();
             assert_eq!(
                 result,
                 ["SELECT a FROM t1 WHERE b = 1 AND c IN (2, 3) AND d LIKE '%foo'"],
@@ -38,7 +42,7 @@ mod normalize {
     fn test_normalize() {
         let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3) AND d LIKE '%foo'";
         for dialect in all_dialects() {
-            let result = sql_insight::normalize(dialect.as_ref(), sql).unwrap();
+            let result = sql_insight::normalizer::normalize(dialect.as_ref(), sql).unwrap();
             assert_eq!(
                 result,
                 ["SELECT a FROM t1 WHERE b = ? AND c IN (?, ?) AND d LIKE ?"],
@@ -51,7 +55,7 @@ mod normalize {
     fn test_normalize_with_options() {
         let sql = "SELECT a FROM t1 WHERE b = 1 AND c in (2, 3, 4); INSERT INTO t2 (a, b, c) VALUES (1, 2, 3), (4, 5, 6)";
         for dialect in all_dialects() {
-            let result = sql_insight::normalize_with_options(
+            let result = sql_insight::normalizer::normalize_with_options(
                 dialect.as_ref(),
                 sql,
                 NormalizerOptions::new()
@@ -531,7 +535,8 @@ mod diagnostics {
 /// what changed.
 mod invariants {
     use super::*;
-    use sql_insight::{ColumnLineageEdge, ColumnOperation, ColumnReference, TableOperation};
+    use sql_insight::extractor::{ColumnLineageEdge, ColumnOperation, TableOperation};
+    use sql_insight::ColumnReference;
     use std::collections::HashSet;
 
     /// Curated corpus chosen to stress the major shapes the resolver

@@ -16,11 +16,11 @@
 //!    not in any in-scope binding; same silence rule applies without
 //!    a catalog.
 
+use sql_insight::catalog::{Catalog, ColumnSchema};
+use sql_insight::diagnostic::ColumnLevelDiagnosticKind;
+use sql_insight::extractor::{extract_column_operations, ColumnTarget};
 use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::{
-    extract_column_operations, Catalog, ColumnLevelDiagnosticKind, ColumnSchema, ColumnTarget,
-    TableReference,
-};
+use sql_insight::TableReference;
 use std::collections::HashMap;
 
 #[derive(Debug, Default)]
@@ -126,7 +126,7 @@ fn main() {
 }
 
 fn count_kind(
-    diagnostics: &[sql_insight::ColumnLevelDiagnostic],
+    diagnostics: &[sql_insight::diagnostic::ColumnLevelDiagnostic],
     kind: ColumnLevelDiagnosticKind,
 ) -> usize {
     diagnostics.iter().filter(|d| d.kind == kind).count()

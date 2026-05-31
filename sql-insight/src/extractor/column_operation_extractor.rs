@@ -92,7 +92,7 @@ use sqlparser::parser::Parser;
 ///
 /// ```rust
 /// use sql_insight::sqlparser::dialect::GenericDialect;
-/// use sql_insight::{
+/// use sql_insight::extractor::{
 ///     extract_column_operations, ColumnLineageKind, ColumnTarget, StatementKind,
 /// };
 ///

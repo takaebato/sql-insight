@@ -16,30 +16,31 @@
 //!   [`normalizer`].
 //! - **Table Extraction** — flat list of
 //!   [`TableReference`]s touched by a statement. See
-//!   [`extract_tables`].
+//!   [`extractor::extract_tables`].
 //! - **CRUD Table Extraction** — CRUD-bucketed table sets per
-//!   statement. See [`extract_crud_tables`].
+//!   statement. See [`extractor::extract_crud_tables`].
 //! - **Table-level Operation Extraction** — `reads` / `writes` /
-//!   `lineage` surfaces with [`StatementKind`] classification. See
-//!   [`extract_table_operations`].
+//!   `lineage` surfaces with [`extractor::StatementKind`] classification.
+//!   See [`extractor::extract_table_operations`].
 //! - **Column-level Operation Extraction** — the same three
 //!   surfaces at column granularity. `reads` / `writes` are plain
 //!   occurrence lists of [`ColumnReference`]s; `lineage` form a
-//!   source → target graph carrying [`ColumnLineageKind`]
+//!   source → target graph carrying [`extractor::ColumnLineageKind`]
 //!   (`Passthrough` vs `Transformation`). The value-vs-filter
 //!   distinction is structural: a value contributor is a `lineage`
 //!   source, a filter-only column is in `reads` but not `lineage`.
-//!   See [`extract_column_operations`].
-//! - **Optional [`Catalog`]** — supply a schema provider to make
+//!   See [`extractor::extract_column_operations`].
+//! - **Optional [`catalog::Catalog`]** — supply a schema provider to make
 //!   resolution strict (catch typos as
-//!   [`UnresolvedColumn`](ColumnLevelDiagnosticKind::UnresolvedColumn),
+//!   [`UnresolvedColumn`](diagnostic::ColumnLevelDiagnosticKind::UnresolvedColumn),
 //!   pair INSERT positional values with target columns, etc.).
 //!   Every extractor works catalog-free in best-effort mode.
-//! - **Diagnostics** ([`TableLevelDiagnostic`] / [`ColumnLevelDiagnostic`])
-//!   — non-fatal issues surface alongside the extraction result rather
-//!   than failing the whole call: unsupported statements, suppressed
-//!   wildcards, ambiguous / unresolved columns. Split by granularity so a
-//!   table-level result can't carry a column-only condition.
+//! - **Diagnostics** ([`diagnostic::TableLevelDiagnostic`] /
+//!   [`diagnostic::ColumnLevelDiagnostic`]) — non-fatal issues surface
+//!   alongside the extraction result rather than failing the whole call:
+//!   unsupported statements, suppressed wildcards, ambiguous / unresolved
+//!   columns. Split by granularity so a table-level result can't carry a
+//!   column-only condition.
 //!
 //! ## Quick Start
 //!
@@ -48,7 +49,7 @@
 //!
 //! ```rust
 //! use sql_insight::sqlparser::dialect::GenericDialect;
-//! use sql_insight::{extract_table_operations, StatementKind};
+//! use sql_insight::extractor::{extract_table_operations, StatementKind};
 //!
 //! let dialect = GenericDialect {};
 //! let result = extract_table_operations(
@@ -69,11 +70,24 @@
 //! use sql_insight::sqlparser::dialect::GenericDialect;
 //!
 //! let dialect = GenericDialect {};
-//! let formatted = sql_insight::format(
+//! let formatted = sql_insight::formatter::format(
 //!     &dialect, "SELECT * \n from users   WHERE id = 1"
 //! ).unwrap();
 //! assert_eq!(formatted, ["SELECT * FROM users WHERE id = 1"]);
 //! ```
+//!
+//! ## API Layout
+//!
+//! Public types live in domain-named modules ([`catalog`],
+//! [`diagnostic`], [`error`], [`extractor`], [`formatter`],
+//! [`normalizer`]); access them via their module path
+//! (`sql_insight::extractor::extract_tables`,
+//! `sql_insight::formatter::format`, etc.). The two identity types
+//! [`TableReference`] / [`ColumnReference`] are re-exported at the
+//! crate root because they show up across modules; their containing
+//! module is internal and may be reshaped without an API change.
+//! [`sqlparser`] is re-exported so consumers can name `Dialect` /
+//! `Ident` / etc. without depending on the crate directly.
 //!
 //! ## Vocabulary
 //!
@@ -88,8 +102,8 @@
 //!   statements that physically move data (`INSERT` / `UPDATE` /
 //!   `MERGE` / `CREATE TABLE AS` / `CREATE VIEW`).
 //!
-//! For column-level lineage, [`ColumnLineageKind`] makes one clean
-//! distinction: `Passthrough` (the value is forwarded unchanged; a
+//! For column-level lineage, [`extractor::ColumnLineageKind`] makes one
+//! clean distinction: `Passthrough` (the value is forwarded unchanged; a
 //! rename still counts) vs `Transformation` (any expression that
 //! changes the value — arithmetic, function calls, aggregates,
 //! window functions, CASE, casts, …). `reads` / `writes` are plain
@@ -109,8 +123,8 @@
 //!   require modelling USING / NATURAL JOIN merge, EXCLUDE / REPLACE
 //!   clauses, and multi-level aliases — too much rigor for a
 //!   SQL-text-only library. Surfaced as
-//!   [`WildcardSuppressed`](ColumnLevelDiagnosticKind::WildcardSuppressed) so
-//!   consumers can detect incomplete projections.
+//!   [`WildcardSuppressed`](diagnostic::ColumnLevelDiagnosticKind::WildcardSuppressed)
+//!   so consumers can detect incomplete projections.
 //! - **TableFunction schemas stay `Unknown`** (`UNNEST`,
 //!   `generate_series`, `JSON_TABLE`, etc.) — catalog enrichment
 //!   doesn't reach them yet.
@@ -160,12 +174,13 @@
 //!   `UNION` / `INTERSECT` / `EXCEPT` takes its column names from
 //!   the left branch, mirroring SQL's conventional behaviour.
 //! - **Public enums are exhaustive while the crate is pre-1.0.** Adding
-//!   a variant to [`StatementKind`] / [`ColumnLineageKind`] /
-//!   [`ColumnTarget`] / the diagnostic-kind enums is therefore a visible
-//!   breaking change — deliberate, so consumers re-acknowledge each new
-//!   case rather than silently routing it to a wildcard arm. They will
-//!   likely gain `#[non_exhaustive]` at the 1.0 freeze, once the variant
-//!   sets stabilize.
+//!   a variant to [`extractor::StatementKind`] /
+//!   [`extractor::ColumnLineageKind`] / [`extractor::ColumnTarget`] /
+//!   the diagnostic-kind enums is therefore a visible breaking change —
+//!   deliberate, so consumers re-acknowledge each new case rather than
+//!   silently routing it to a wildcard arm. They will likely gain
+//!   `#[non_exhaustive]` at the 1.0 freeze, once the variant sets
+//!   stabilize.
 
 pub mod catalog;
 pub mod diagnostic;
@@ -173,15 +188,19 @@ pub mod error;
 pub mod extractor;
 pub mod formatter;
 pub mod normalizer;
-pub mod reference;
 pub(crate) mod resolver;
 
-pub use catalog::{Catalog, ColumnSchema};
-pub use diagnostic::*;
-pub use extractor::*;
-pub use formatter::*;
-pub use normalizer::*;
-pub use reference::*;
+// `reference` is intentionally private: the module name itself is not
+// stable enough to commit to as part of the public API. The two
+// identity types it contains (`TableReference` / `ColumnReference`)
+// are re-exported at the crate root because they thread through
+// every other module's public surface.
+mod reference;
+pub use reference::{ColumnReference, TableReference};
+
+// `sqlparser` is re-exported so consumers can name `Dialect` /
+// `Ident` / etc. via `sql_insight::sqlparser::...` without taking a
+// direct dependency (and risking a version mismatch).
 pub use sqlparser;
 
 #[doc(hidden)]

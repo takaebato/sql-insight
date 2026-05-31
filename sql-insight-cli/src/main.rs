@@ -6,7 +6,7 @@ use crate::executor::{
 };
 use clap::{ArgGroup, Parser, Subcommand};
 use sql_insight::error::Error;
-use sql_insight::NormalizerOptions;
+use sql_insight::normalizer::NormalizerOptions;
 use std::io::{self, Write};
 use std::process::ExitCode;
 

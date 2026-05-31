@@ -15,7 +15,7 @@ use sqlparser::parser::Parser;
 ///
 /// let dialect = GenericDialect {};
 /// let sql = "SELECT a FROM t1 \n WHERE b =   1";
-/// let result = sql_insight::format(&dialect, sql).unwrap();
+/// let result = sql_insight::formatter::format(&dialect, sql).unwrap();
 /// assert_eq!(result, ["SELECT a FROM t1 WHERE b = 1"]);
 /// ```
 pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {

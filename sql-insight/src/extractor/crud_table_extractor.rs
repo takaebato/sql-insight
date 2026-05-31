@@ -1,13 +1,13 @@
 //! A Extractor that extracts CRUD tables from SQL queries.
 //!
-//! See [`extract_crud_tables`](crate::extract_crud_tables()) as the entry point for extracting CRUD tables from SQL.
+//! See [`extract_crud_tables`](crate::extractor::extract_crud_tables()) as the entry point for extracting CRUD tables from SQL.
 
 use std::fmt;
 
 use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
+use crate::extractor::{StatementKind, TableOperationExtractor};
 use crate::reference::TableReference;
-use crate::{StatementKind, TableOperationExtractor};
 use sqlparser::ast::{MergeAction, Statement};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -21,7 +21,7 @@ use sqlparser::parser::Parser;
 ///
 /// let dialect = GenericDialect {};
 /// let sql = "INSERT INTO t1 (a) SELECT a FROM t2";
-/// let result = sql_insight::extract_crud_tables(&dialect, sql).unwrap();
+/// let result = sql_insight::extractor::extract_crud_tables(&dialect, sql).unwrap();
 /// println!("{:#?}", result);
 /// assert_eq!(result[0].as_ref().unwrap().to_string(), "Create: [t1], Read: [t2], Update: [], Delete: []");
 /// ```
@@ -40,7 +40,7 @@ pub struct CrudTables {
     pub update_tables: Vec<TableReference>,
     pub delete_tables: Vec<TableReference>,
     /// Non-fatal diagnostics, forwarded from the underlying table-level
-    /// extraction (only [`UnsupportedStatement`](crate::TableLevelDiagnosticKind::UnsupportedStatement)
+    /// extraction (only [`UnsupportedStatement`](crate::diagnostic::TableLevelDiagnosticKind::UnsupportedStatement)
     /// arises at this granularity).
     pub diagnostics: Vec<TableLevelDiagnostic>,
 }

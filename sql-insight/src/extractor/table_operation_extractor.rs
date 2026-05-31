@@ -39,7 +39,7 @@ use sqlparser::parser::Parser;
 ///
 /// ```rust
 /// use sql_insight::sqlparser::dialect::GenericDialect;
-/// use sql_insight::{extract_table_operations, StatementKind};
+/// use sql_insight::extractor::{extract_table_operations, StatementKind};
 ///
 /// let dialect = GenericDialect {};
 /// let result = extract_table_operations(&dialect, "SELECT * FROM users", None).unwrap();
