@@ -221,7 +221,11 @@ impl TableOperationExtractor {
             writes = resolution.write_tables();
         }
 
-        let lineage = extract_table_lineage(&resolution, &kind);
+        let lineage = if matches!(kind, StatementKind::Merge) && !merge_moves_data(statement) {
+            Vec::new()
+        } else {
+            extract_table_lineage(&resolution, &kind)
+        };
 
         Ok(TableOperation {
             statement_kind: kind,
@@ -268,7 +272,28 @@ fn is_data_moving(kind: &StatementKind) -> bool {
             | StatementKind::Merge
             | StatementKind::CreateTable
             | StatementKind::CreateView
+            | StatementKind::AlterView
     )
+}
+
+/// `MERGE` is `is_data_moving` whenever it appears, but a MERGE
+/// whose WHEN clauses are only `DELETE` actions doesn't actually
+/// move data from the source into the target — the source is just
+/// used to pick which rows of the target to delete. Inspect the
+/// statement and report whether at least one WHEN clause is an
+/// INSERT or UPDATE, so the lineage path can short-circuit for the
+/// DELETE-only case.
+fn merge_moves_data(statement: &Statement) -> bool {
+    use sqlparser::ast::MergeAction;
+    let Statement::Merge(merge) = statement else {
+        return true;
+    };
+    merge.clauses.iter().any(|clause| {
+        matches!(
+            clause.action,
+            MergeAction::Insert(_) | MergeAction::Update { .. }
+        )
+    })
 }
 
 pub(super) fn classify_statement(statement: &Statement) -> StatementKind {
@@ -465,6 +490,22 @@ mod tests {
                 TableOperation {
                     statement_kind: StatementKind::Select,
                     reads: vec![table("t1")],
+                    writes: vec![],
+                    lineage: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn bare_values_emits_nothing() {
+            // `VALUES (1, 2)` parses as a query whose body is a VALUES
+            // clause — no table references, no writes, no lineage.
+            assert_ops(
+                "VALUES (1, 2)",
+                TableOperation {
+                    statement_kind: StatementKind::Select,
+                    reads: vec![],
                     writes: vec![],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -828,6 +869,51 @@ mod tests {
         }
 
         #[test]
+        fn alter_view_emits_write_and_read_with_lineage() {
+            // ALTER VIEW ... AS SELECT replaces the view definition with
+            // a new SELECT body — semantically the same shape as CREATE
+            // VIEW, so it should emit lineage too.
+            assert_ops(
+                "ALTER VIEW v1 AS SELECT * FROM t1",
+                TableOperation {
+                    statement_kind: StatementKind::AlterView,
+                    reads: vec![table("t1")],
+                    writes: vec![table("v1")],
+                    lineage: vec![edge("t1", "v1")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn drop_view_emits_one_write_per_name() {
+            assert_ops(
+                "DROP VIEW v1, v2",
+                TableOperation {
+                    statement_kind: StatementKind::Drop,
+                    reads: vec![],
+                    writes: vec![table("v1"), table("v2")],
+                    lineage: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn drop_materialized_view_emits_one_write_per_name() {
+            assert_ops(
+                "DROP MATERIALIZED VIEW mv1",
+                TableOperation {
+                    statement_kind: StatementKind::Drop,
+                    reads: vec![],
+                    writes: vec![table("mv1")],
+                    lineage: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
         fn drop_table_emits_one_write_per_name() {
             assert_ops(
                 "DROP TABLE t1, t2",
@@ -1118,6 +1204,42 @@ mod tests {
                     reads: vec![table("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn merge_when_not_matched_insert_emits_lineage() {
+            // WHEN NOT MATCHED THEN INSERT moves a value from the
+            // source row into the target, same as WHEN MATCHED UPDATE.
+            assert_ops(
+                "MERGE INTO t1 USING t2 ON t1.id = t2.id \
+                 WHEN NOT MATCHED THEN INSERT (a) VALUES (t2.b)",
+                TableOperation {
+                    statement_kind: StatementKind::Merge,
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
+                    lineage: vec![edge("t2", "t1")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn merge_with_only_delete_action_emits_no_lineage() {
+            // WHEN MATCHED THEN DELETE doesn't move data — the source
+            // is only used to pick which target rows to delete. A
+            // MERGE whose only WHEN clauses are DELETEs therefore
+            // emits no lineage.
+            assert_ops(
+                "MERGE INTO t1 USING t2 ON t1.id = t2.id \
+                 WHEN MATCHED THEN DELETE",
+                TableOperation {
+                    statement_kind: StatementKind::Merge,
+                    reads: vec![table("t2")],
+                    writes: vec![table("t1")],
+                    lineage: vec![],
                     diagnostics: vec![],
                 },
             );
