@@ -3,6 +3,17 @@
 //! output columns with their inferred names, source refs, and
 //! `Passthrough` / `Transformation` kind. Plus the helpers that derive
 //! each output column's name / kind from a `SelectItem`.
+//!
+//! **Terminology — "body":** throughout this module (and the resolver
+//! in general) "body" means `sqlparser::ast::Query::body` — the
+//! [`SetExpr`](sqlparser::ast::SetExpr) node holding the SELECT /
+//! UNION / INTERSECT / EXCEPT / VALUES / TABLE expression. It maps
+//! directly to the SQL standard's `<query expression body>` (the
+//! part of a query stripped of WITH / ORDER BY / LIMIT / FETCH /
+//! settings / pipes). So [`BodyOutput`] is "the projection columns
+//! produced by walking that body", `current_body` is the in-progress
+//! such buffer, and `body_scope` on a synthetic binding is the
+//! arena scope of that body's FROM bindings.
 
 use sqlparser::ast::{Expr, Ident, SelectItem, TableAliasColumnDef};
 
