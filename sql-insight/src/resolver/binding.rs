@@ -10,7 +10,7 @@ use crate::catalog::ColumnSchema;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::reference::TableReference;
 
-use super::{BodyOutput, Resolver, ScopeId};
+use super::{QueryBodyOutput, Resolver, ScopeId};
 
 /// A normalized identifier key for binding lookup.
 ///
@@ -70,7 +70,7 @@ pub(crate) enum TableRole {
 /// binding kind:
 /// - `Table::output_columns: Option<Vec<Ident>>` — naked catalog
 ///   column names (`Some` = catalog hit, `None` = miss / no catalog).
-/// - `Cte` / `DerivedTable` `output_columns: Option<BodyOutput>` —
+/// - `Cte` / `DerivedTable` `output_columns: Option<QueryBodyOutput>` —
 ///   one [`super::SetOperand`] per set-operation operand, each
 ///   carrying the SELECT body's [`super::OutputColumn`]s with full
 ///   lineage info (name, source_refs, kind). `None` covers recursive
@@ -109,7 +109,7 @@ pub(crate) enum Binding {
         /// recursive CTEs pre-bound under a stub (fixpoint-aware capture
         /// is deferred). Renamed via the CTE's column-alias list when
         /// one is given.
-        output_columns: Option<BodyOutput>,
+        output_columns: Option<QueryBodyOutput>,
         /// Arena id of the scope that holds the CTE body's bindings.
         /// Table-lineage collapse walks descendant scopes of this id
         /// to collect the real tables underneath the CTE — so a
@@ -126,7 +126,7 @@ pub(crate) enum Binding {
         /// `None` for wrapper aliases (`NestedJoin`, `Pivot`,
         /// `Unpivot`, `MatchRecognize`) whose body isn't a real
         /// subquery with its own projection.
-        output_columns: Option<BodyOutput>,
+        output_columns: Option<QueryBodyOutput>,
         /// Arena id of the scope holding the derived subquery body's
         /// bindings (`Some`) — or `None` for wrapper aliases whose
         /// inner tables are bound directly in the current scope and
@@ -329,7 +329,7 @@ impl<'a> Resolver<'a> {
     /// reference is multi-segment, not bound, or not a Cte binding —
     /// the caller (alias-bound Cte construction) treats that as "no
     /// collapse through this alias", matching recursive-CTE behavior.
-    pub(super) fn cte_output_columns(&self, cte_name: &ObjectName) -> Option<BodyOutput> {
+    pub(super) fn cte_output_columns(&self, cte_name: &ObjectName) -> Option<QueryBodyOutput> {
         match self.resolve_unqualified_relation(cte_name) {
             Some(Binding::Cte { output_columns, .. }) => output_columns.clone(),
             _ => None,
@@ -339,7 +339,7 @@ impl<'a> Resolver<'a> {
     pub(super) fn bind_cte(
         &mut self,
         name: Ident,
-        output_columns: Option<BodyOutput>,
+        output_columns: Option<QueryBodyOutput>,
         body_scope: ScopeId,
     ) {
         self.bind_current(
@@ -355,7 +355,7 @@ impl<'a> Resolver<'a> {
     pub(super) fn bind_derived_table(
         &mut self,
         alias: Ident,
-        output_columns: Option<BodyOutput>,
+        output_columns: Option<QueryBodyOutput>,
         body_scope: Option<ScopeId>,
     ) {
         self.bind_current(

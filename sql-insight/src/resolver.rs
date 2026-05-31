@@ -17,7 +17,7 @@
 //!   identifier parts to owning tables.
 //! - [`table_ref`]: `RawTableRef` / `TableRefTarget` and the
 //!   `record_*_table_ref` constructors. Parallel to `column_ref`.
-//! - [`body_output`]: `BodyOutput` / `OutputColumn` and the helpers
+//! - [`body_output`]: `QueryBodyOutput` / `OutputColumn` and the helpers
 //!   that derive each output column's name / kind from a `SelectItem`.
 //! - [`lineage`]: `LineageEdge` / `LineageTargetSpec` and the emit
 //!   helpers that drive INSERT / CTAS / QueryOutput edge construction.
@@ -38,7 +38,7 @@ mod scope;
 mod table_ref;
 
 pub(crate) use binding::{Binding, TableRole};
-pub(crate) use body_output::{BodyOutput, OutputColumn, SetOperand};
+pub(crate) use body_output::{QueryBodyOutput, OutputColumn, SetOperand};
 pub(crate) use column_ref::RawColumnRef;
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
 pub(crate) use resolution::Resolution;
@@ -76,7 +76,7 @@ pub(crate) struct ResolvedQuery {
     /// recursive CTE pre-bind stub, `VALUES`-only query). Callers
     /// (CTE / derived bind, INSERT pairing, etc.) consume this
     /// directly.
-    pub(crate) output_columns: Option<BodyOutput>,
+    pub(crate) output_columns: Option<QueryBodyOutput>,
     /// Arena id of the scope pushed for this query's body — exposed
     /// so callers binding the query as a synthetic relation (CTE /
     /// derived table) can record it on the binding for table-lineage
@@ -120,13 +120,13 @@ pub(crate) struct Resolver<'a> {
 /// [`Resolution`]. Reset implicitly when the walker is dropped.
 #[derive(Debug, Default)]
 pub(crate) struct Context {
-    /// Per-query in-progress [`BodyOutput`], filled by `visit_select`
+    /// Per-query in-progress [`QueryBodyOutput`], filled by `visit_select`
     /// (one [`SetOperand`] per SELECT body, accumulated across the
     /// operands of a set operation chain). `resolve_query` swaps a
     /// fresh buffer in for the duration of its walk and hands the
     /// collected body back via the returned `ResolvedQuery`'s
     /// `output_columns`, so each query gets exactly its own operands.
-    pub(crate) current_body: BodyOutput,
+    pub(crate) current_body: QueryBodyOutput,
     /// Cursor into [`Resolution::scopes`]: the currently-open scope.
     /// `None` before any push (then `current_scope_id` lazily inserts
     /// a root); set on each `push_scope` and walked back to the
@@ -792,7 +792,7 @@ impl<'a> Resolver<'a> {
         on: &OnInsert,
         target_table: &TableReference,
         effective_columns: &[Ident],
-        source_output: Option<&BodyOutput>,
+        source_output: Option<&QueryBodyOutput>,
     ) -> Result<(), Error> {
         match on {
             OnInsert::DuplicateKeyUpdate(assignments) => {
@@ -1965,8 +1965,8 @@ impl<'a> Resolver<'a> {
 /// `EXCLUDED.<col>` as the lineage source.
 fn excluded_body_output(
     effective_columns: &[Ident],
-    source_output: Option<&BodyOutput>,
-) -> Option<BodyOutput> {
+    source_output: Option<&QueryBodyOutput>,
+) -> Option<QueryBodyOutput> {
     if effective_columns.is_empty() {
         return None;
     }
@@ -1989,7 +1989,7 @@ fn excluded_body_output(
                 .collect(),
         })
         .collect();
-    Some(BodyOutput { set_operands })
+    Some(QueryBodyOutput { set_operands })
 }
 
 fn from_table_items(from: &FromTable) -> &[TableWithJoins] {

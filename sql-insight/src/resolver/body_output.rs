@@ -10,7 +10,7 @@
 //! UNION / INTERSECT / EXCEPT / VALUES / TABLE expression. It maps
 //! directly to the SQL standard's `<query expression body>` (the
 //! part of a query stripped of WITH / ORDER BY / LIMIT / FETCH /
-//! settings / pipes). So [`BodyOutput`] is "the projection columns
+//! settings / pipes). So [`QueryBodyOutput`] is "the projection columns
 //! produced by walking that body", `current_body` is the in-progress
 //! such buffer, and `body_scope` on a synthetic binding is the
 //! arena scope of that body's FROM bindings.
@@ -31,7 +31,7 @@ use super::{RawColumnRef, Resolver};
 /// instance of this — their column info comes from the catalog and
 /// is just a name list.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct BodyOutput {
+pub(crate) struct QueryBodyOutput {
     pub(crate) set_operands: Vec<SetOperand>,
 }
 
@@ -39,7 +39,7 @@ pub(crate) struct BodyOutput {
 /// equivalently, the output columns of one SELECT body. A plain
 /// SELECT yields one of these; `A UNION B` yields two; an N-way
 /// chain yields N. Kept as a named wrapper so the `Vec<SetOperand>`
-/// inside [`BodyOutput`] reads as "the operands" rather than as a
+/// inside [`QueryBodyOutput`] reads as "the operands" rather than as a
 /// generic nested vec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SetOperand {
@@ -59,7 +59,7 @@ pub(crate) struct OutputColumn {
     pub(crate) kind: ColumnLineageKind,
 }
 
-impl BodyOutput {
+impl QueryBodyOutput {
     /// First operand's column names if all of them have an inferable
     /// name. `None` if any column has no name (wildcards, computed
     /// without alias) — equivalent to "column names unknown" for the

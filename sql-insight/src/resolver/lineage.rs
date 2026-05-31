@@ -1,7 +1,7 @@
 //! `LineageEdge` / `LineageTargetSpec` and the resolver helpers that
 //! emit them — directly into the `lineage_edges` buffer, fanned out
 //! from a snapshot of recorded column refs, or driven by a
-//! [`BodyOutput`](super::BodyOutput)'s set operands via a
+//! [`QueryBodyOutput`](super::QueryBodyOutput)'s set operands via a
 //! closure-supplied target.
 
 use sqlparser::ast::{Ident, Query};
@@ -18,7 +18,7 @@ use super::{OutputColumn, RawColumnRef, ResolvedQuery, Resolver, SetOperand};
 /// surface (collapsed further by `collapsed_lineage_edges` when the
 /// source goes through a synthetic relation).
 ///
-/// Created by callers from a [`super::BodyOutput`]'s set operands
+/// Created by callers from a [`super::QueryBodyOutput`]'s set operands
 /// (for SELECT-style lineage edges — INSERT pairs with target columns,
 /// top-level / nested SELECTs emit `QueryOutput`) or directly by
 /// UPDATE / similar walkers that already know their write target.
