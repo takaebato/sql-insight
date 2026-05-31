@@ -1,6 +1,23 @@
-//! A Normalizer that converts SQL queries to a canonical form.
+//! SQL normalization — rewrite the AST so structurally identical
+//! queries hash to the same string. See [`normalize`] as the entry
+//! point.
 //!
-//! See [`normalize`](crate::normalizer::normalize()) as the entry point for normalizing SQL.
+//! The base pass replaces every literal `Value` with a `?`
+//! placeholder, so queries that differ only in their parameter
+//! values collapse to the same string. Three opt-in toggles
+//! ([`NormalizerOptions`]) further collapse repetitive shapes:
+//!
+//! - [`unify_in_list`](NormalizerOptions::unify_in_list):
+//!   `IN (1, 2, 3)` → `IN (...)`.
+//! - [`unify_values`](NormalizerOptions::unify_values):
+//!   `VALUES (1, 2, 3), (4, 5, 6)` → `VALUES (...)`.
+//! - [`alphabetize_insert_columns`](NormalizerOptions::alphabetize_insert_columns):
+//!   `INSERT INTO t (c, b, a) VALUES (...)` →
+//!   `INSERT INTO t (a, b, c) VALUES (...)`, only when VALUES is
+//!   unified.
+//!
+//! Output is one `String` per parsed statement, formatted by
+//! sqlparser's `Display` after the rewrite.
 
 use std::ops::{ControlFlow, Deref};
 
@@ -11,7 +28,8 @@ use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 use std::ops::DerefMut;
 
-/// Convenience function to normalize SQL with default options.
+/// Parse `sql` under `dialect` and normalize each statement with
+/// default options (literal-to-`?` placeholder substitution only).
 ///
 /// ## Example
 ///
@@ -27,7 +45,8 @@ pub fn normalize(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error>
     Normalizer::normalize(dialect, sql, NormalizerOptions::new())
 }
 
-/// Convenience function to normalize SQL with options.
+/// Parse `sql` under `dialect` and normalize each statement,
+/// applying any extra collapses enabled in `options`.
 ///
 /// ## Example
 ///
@@ -48,7 +67,8 @@ pub fn normalize_with_options(
     Normalizer::normalize(dialect, sql, options)
 }
 
-/// Options for normalizing SQL.
+/// Toggles for [`normalize_with_options`]. Defaults to all `false`
+/// (placeholder substitution only).
 #[derive(Default, Clone)]
 pub struct NormalizerOptions {
     /// Unify IN lists to a single form when all elements are literal values.
@@ -84,7 +104,11 @@ impl NormalizerOptions {
     }
 }
 
-/// A visitor for SQL AST nodes that normalizes SQL queries.
+/// `VisitorMut` impl that performs the normalization rewrite.
+/// Most callers go through [`normalize`] / [`normalize_with_options`]
+/// or [`Normalizer::normalize`] (which constructs and drives this
+/// visitor internally). Use the struct directly only when you want
+/// to integrate the rewrite into a larger AST traversal.
 #[derive(Default)]
 pub struct Normalizer {
     pub options: NormalizerOptions,
@@ -181,7 +205,8 @@ impl Normalizer {
         self
     }
 
-    /// Normalize SQL.
+    /// Parse and normalize `sql`. [`normalize`] / [`normalize_with_options`]
+    /// are thin free-function wrappers around this.
     pub fn normalize(
         dialect: &dyn Dialect,
         sql: &str,

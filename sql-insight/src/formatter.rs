@@ -28,7 +28,7 @@ use sqlparser::parser::Parser;
 /// assert_eq!(result, ["SELECT a FROM t1 WHERE b = 1"]);
 /// ```
 pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
-    Formatter::format(dialect, sql)
+    Formatter::format(dialect, sql, FormatterOptions::default())
 }
 
 /// Parse `sql` under `dialect` and re-emit one formatted string per
@@ -55,10 +55,10 @@ pub fn format_with_options(
     sql: &str,
     options: FormatterOptions,
 ) -> Result<Vec<String>, Error> {
-    Formatter::format_with_options(dialect, sql, options)
+    Formatter::format(dialect, sql, options)
 }
 
-/// Options controlling [`format_with_options()`] / [`Formatter::format_with_options`].
+/// Options controlling [`format_with_options()`] / [`Formatter::format`].
 #[derive(Debug, Clone, Default)]
 pub struct FormatterOptions {
     /// When `true`, emit the multi-line pretty-printed form via
@@ -78,21 +78,16 @@ impl FormatterOptions {
     }
 }
 
-/// Struct-style entry point. Equivalent to the free [`format()`]
-/// function.
+/// Struct-style entry point. Used by both [`format()`] and
+/// [`format_with_options()`].
 #[derive(Debug, Default)]
 pub struct Formatter;
 
 impl Formatter {
-    /// Same as the free [`format()`] function — kept for users who
-    /// prefer the struct-style API.
-    pub fn format(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, Error> {
-        Self::format_with_options(dialect, sql, FormatterOptions::default())
-    }
-
-    /// Same as the free [`format_with_options()`] function — kept for
-    /// users who prefer the struct-style API.
-    pub fn format_with_options(
+    /// Parse `sql` under `dialect` and re-emit each statement,
+    /// formatted according to `options`. [`format()`] / [`format_with_options()`]
+    /// are thin free-function wrappers around this.
+    pub fn format(
         dialect: &dyn Dialect,
         sql: &str,
         options: FormatterOptions,
@@ -118,7 +113,8 @@ mod tests {
 
     fn assert_format(sql: &str, expected: Vec<String>, dialects: Vec<Box<dyn Dialect>>) {
         for dialect in dialects {
-            let result = Formatter::format(dialect.as_ref(), sql).unwrap();
+            let result =
+                Formatter::format(dialect.as_ref(), sql, FormatterOptions::default()).unwrap();
             assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
         }
     }
