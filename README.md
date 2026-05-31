@@ -17,9 +17,11 @@ across every SQL dialect sqlparser-rs supports.
 sql-insight = "0.2.0"
 ```
 
-## Quick start
+## Usage
 
-`reads` / `writes` / `lineage` from a single call:
+### Table-level Operation Extraction
+
+Get the statement kind plus `reads` / `writes` / `lineage` in one call:
 
 ```rust
 use sql_insight::sqlparser::dialect::GenericDialect;
@@ -38,28 +40,110 @@ assert_eq!(ops.writes.len(), 1);  // orders
 assert_eq!(ops.lineage.len(), 1); // staging → orders
 ```
 
-## API
+### Column-level Operation Extraction
 
-Six entry points, organized by module:
+Same surfaces, at column granularity. `reads` / `writes` are plain
+occurrence lists of column references; `lineage` edges carry a kind
+(`Passthrough` vs `Transformation`) describing how each source
+reaches its target:
 
-- [`extractor::extract_tables`](https://docs.rs/sql-insight/latest/sql_insight/extractor/fn.extract_tables.html) —
-  flat list of `TableReference`s per statement.
-- [`extractor::extract_crud_tables`](https://docs.rs/sql-insight/latest/sql_insight/extractor/fn.extract_crud_tables.html) —
-  tables bucketed by CRUD verb.
-- [`extractor::extract_table_operations`](https://docs.rs/sql-insight/latest/sql_insight/extractor/fn.extract_table_operations.html) —
-  per-statement `reads` / `writes` / `lineage` at table granularity.
-- [`extractor::extract_column_operations`](https://docs.rs/sql-insight/latest/sql_insight/extractor/fn.extract_column_operations.html) —
-  same surfaces at column granularity, with `Passthrough` / `Transformation` kinds.
-- [`formatter::format`](https://docs.rs/sql-insight/latest/sql_insight/formatter/fn.format.html) /
-  `format_with_options` — re-emit SQL via sqlparser's `Display`
-  (multi-line pretty-print via `FormatterOptions::pretty`).
-- [`normalizer::normalize`](https://docs.rs/sql-insight/latest/sql_insight/normalizer/fn.normalize.html) /
-  `normalize_with_options` — substitute literals with placeholders
-  (`1` → `?`) so structurally identical queries hash to the same shape.
-  Three opt-in collapses tighten the equivalence further:
-  `IN (1, 2, 3)` → `IN (...)`,
-  `VALUES (1, 2, 3), (4, 5, 6)` → `VALUES (...)`, and
-  `INSERT INTO t (c, b, a) VALUES (1, 2, 3)` → `INSERT INTO t (a, b, c) VALUES (...)`.
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+use sql_insight::extractor::extract_column_operations;
+
+let dialect = GenericDialect {};
+let result = extract_column_operations(
+    &dialect,
+    "INSERT INTO orders (id, total) SELECT id, SUM(amount) FROM staging GROUP BY id",
+    None,
+).unwrap();
+let ops = result[0].as_ref().unwrap();
+// id → id (Passthrough), amount → total (Transformation, via SUM).
+assert_eq!(ops.lineage.len(), 2);
+```
+
+### Diagnostics
+
+Non-fatal issues surface alongside the result. Each diagnostic carries
+a `kind`, a human-readable `message`, and an optional source-location
+`span`:
+
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+use sql_insight::diagnostic::ColumnLevelDiagnosticKind;
+use sql_insight::extractor::extract_column_operations;
+
+let dialect = GenericDialect {};
+let result = extract_column_operations(&dialect, "SELECT * FROM users", None).unwrap();
+let ops = result[0].as_ref().unwrap();
+assert!(ops
+    .diagnostics
+    .iter()
+    .any(|d| matches!(d.kind, ColumnLevelDiagnosticKind::WildcardSuppressed)));
+```
+
+### SQL Formatting
+
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+
+let dialect = GenericDialect {};
+let formatted = sql_insight::formatter::format(
+    &dialect, "SELECT * \n from users   WHERE id = 1"
+).unwrap();
+assert_eq!(formatted, ["SELECT * FROM users WHERE id = 1"]);
+```
+
+`format_with_options` + `FormatterOptions::pretty` switches to
+sqlparser's multi-line pretty-print.
+
+### SQL Normalization
+
+Substitute literals with placeholders so structurally identical
+queries hash to the same shape:
+
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+
+let dialect = GenericDialect {};
+let normalized = sql_insight::normalizer::normalize(
+    &dialect, "SELECT * \n from users   WHERE id = 1"
+).unwrap();
+assert_eq!(normalized, ["SELECT * FROM users WHERE id = ?"]);
+```
+
+`normalize_with_options` adds three opt-in collapses:
+`IN (1, 2, 3)` → `IN (...)`,
+`VALUES (1, 2, 3), (4, 5, 6)` → `VALUES (...)`, and
+`INSERT INTO t (c, b, a) VALUES (1, 2, 3)` → `INSERT INTO t (a, b, c) VALUES (...)`.
+
+### Table Extraction (lightweight)
+
+Flat list of table references touched by a statement:
+
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+use sql_insight::extractor::extract_tables;
+
+let dialect = GenericDialect {};
+let extractions = extract_tables(&dialect, "SELECT * FROM catalog.schema.users").unwrap();
+println!("{:?}", extractions);
+```
+
+### CRUD Table Extraction
+
+Bucket tables by create / read / update / delete role:
+
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+use sql_insight::extractor::extract_crud_tables;
+
+let dialect = GenericDialect {};
+let crud_tables = extract_crud_tables(&dialect, "INSERT INTO users (name) SELECT name FROM employees").unwrap();
+println!("{:?}", crud_tables);
+```
+
+## Catalog
 
 An optional [`Catalog`](https://docs.rs/sql-insight/latest/sql_insight/catalog/)
 makes column resolution strict (typos surface as
@@ -72,13 +156,46 @@ See the
 [Limitations](https://docs.rs/sql-insight/latest/sql_insight/#limitations)
 section of the crate docs.
 
-## Examples & docs
+## Examples
 
-- Runnable examples in
-  [`sql-insight/examples/`](sql-insight/examples) — table-level
-  operations, column-level operations, and the catalog-on path.
-- Full API and design notes on
-  [docs.rs](https://docs.rs/sql-insight/).
+Runnable examples under
+[`sql-insight/examples/`](sql-insight/examples):
+
+- [`table_operations.rs`](sql-insight/examples/table_operations.rs) —
+  table-level `reads` / `writes` / `lineage` across a multi-statement
+  batch, with `StatementKind`-based dispatch.
+- [`column_operations.rs`](sql-insight/examples/column_operations.rs) —
+  per-column reads and lineage classified by `ColumnLineageKind`
+  (Passthrough vs Transformation) into `Relation` vs `QueryOutput`
+  targets.
+- [`with_catalog.rs`](sql-insight/examples/with_catalog.rs) — supplying
+  a `Catalog` enables INSERT positional column pairing and surfaces
+  `AmbiguousColumn` / `UnresolvedColumn` diagnostics.
+
+Run with `cargo run --example <name> -p sql-insight`.
+
+## Supported SQL Dialects
+
+- Generic
+- MySQL
+- PostgreSQL
+- Hive
+- SQLite
+- Snowflake
+- Redshift
+- Microsoft SQL Server
+- ClickHouse
+- BigQuery
+- ANSI
+- DuckDB
+- Databricks
+- Oracle
+
+## Contributing
+
+Contributions are welcome. Feel free to open an issue or pull
+request — features, bug fixes, and documentation improvements all
+appreciated.
 
 ## License
 
