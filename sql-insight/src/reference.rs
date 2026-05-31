@@ -73,7 +73,7 @@ impl TableReference {
     /// Format a slice of `TableReference`s as a comma-separated string
     /// (e.g. `"t1, schema.t2, catalog.schema.t3"`). Shared by the
     /// table-extractor `Display` surfaces.
-    pub fn format_list(tables: &[Self]) -> String {
+    pub(crate) fn format_list(tables: &[Self]) -> String {
         tables
             .iter()
             .map(|t| t.to_string())
@@ -85,7 +85,7 @@ impl TableReference {
     /// bare name, 2 = `schema.name`, 3 = `catalog.schema.name`. Returns
     /// `None` for 0 or 4+ parts. Use [`Self::try_from_name`] when the
     /// input is an [`ObjectName`] (4+ parts surface as `Error` there).
-    pub fn try_from_parts(parts: &[Ident]) -> Option<Self> {
+    pub(crate) fn try_from_parts(parts: &[Ident]) -> Option<Self> {
         match parts {
             [name] => Some(TableReference {
                 catalog: None,
