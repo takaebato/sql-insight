@@ -146,9 +146,10 @@ println!("{:?}", crud_tables);
 ## Catalog
 
 An optional [`Catalog`](https://docs.rs/sql-insight/latest/sql_insight/catalog/)
-makes column resolution strict (typos surface as
-`UnresolvedColumn`, INSERT positional values pair with target
-columns). Every extractor works catalog-free in best-effort mode.
+makes column resolution strict (column refs not in the
+catalog-provided schema surface as `UnresolvedColumn`, INSERT
+positional values pair with target columns). Every extractor works
+catalog-free in best-effort mode.
 
 ## Limitations
 

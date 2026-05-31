@@ -30,8 +30,9 @@
 //!   distinction is structural: a value contributor is a `lineage`
 //!   source, a filter-only column is in `reads` but not `lineage`.
 //!   See [`extractor::extract_column_operations`].
-//! - **Optional [`catalog::Catalog`]** — supply a schema provider to make
-//!   resolution strict (catch typos as
+//! - **Optional [`catalog::Catalog`]** — supply a schema provider to
+//!   make resolution strict (column refs not in the catalog-provided
+//!   schema surface as
 //!   [`UnresolvedColumn`](diagnostic::ColumnLevelDiagnosticKind::UnresolvedColumn),
 //!   pair INSERT positional values with target columns, etc.).
 //!   Every extractor works catalog-free in best-effort mode.
