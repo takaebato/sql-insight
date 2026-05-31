@@ -138,7 +138,7 @@ pub(crate) struct Context {
     /// HAVING / JOIN ON etc. are excluded from table-lineage. Propagates
     /// *through* subquery boundaries (a subquery in a predicate is itself
     /// predicate-position).
-    pub(crate) scope_kind: ScopeKind,
+    pub(crate) current_scope_kind: ScopeKind,
 }
 
 impl<'a> Resolver<'a> {
@@ -165,7 +165,7 @@ impl<'a> Resolver<'a> {
 
     /// Finalize the embedded [`Resolution`] via the two post-passes
     /// (lineage collapse + real-column filter) and hand it back. The
-    /// walk state (current_body / current_scope / scope_kind) is
+    /// walk state (current_body / current_scope / current_scope_kind) is
     /// dropped at this point — only `resolution` survives.
     fn into_resolution(self) -> Resolution {
         let mut resolution = self.resolution;

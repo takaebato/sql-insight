@@ -156,7 +156,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// Push a fresh scope, run `f`, then pop it. The current
-    /// `scope_kind` is propagated onto the pushed scope, so a subquery
+    /// `current_scope_kind` is propagated onto the pushed scope, so a subquery
     /// in a predicate stays classified as predicate-position for
     /// table-lineage exclusion.
     ///
@@ -174,23 +174,24 @@ impl<'a> Resolver<'a> {
     /// path of a `Result`-returning closure, so this is the safe way
     /// to nest a `?`-bailing walk under a scope push.
     pub(crate) fn with_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let kind = self.context.scope_kind;
+        let kind = self.context.current_scope_kind;
         self.push_scope(kind);
         let r = f(self);
         self.pop_scope();
         r
     }
 
-    /// Walk a filter-position clause with `scope_kind = Predicate`, so
-    /// any subquery pushed inside is classified as a predicate scope
-    /// and thus excluded from table-lineage. Used for WHERE, HAVING,
-    /// QUALIFY, JOIN ON, AsOf match, MERGE ON, CONNECT BY, pipe
-    /// `|> WHERE`, etc. The previous `scope_kind` is restored on return.
+    /// Walk a filter-position clause with `current_scope_kind =
+    /// Predicate`, so any subquery pushed inside is classified as a
+    /// predicate scope and thus excluded from table-lineage. Used
+    /// for WHERE, HAVING, QUALIFY, JOIN ON, AsOf match, MERGE ON,
+    /// CONNECT BY, pipe `|> WHERE`, etc. The previous
+    /// `current_scope_kind` is restored on return.
     pub(crate) fn with_filter_clause<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let prev = self.context.scope_kind;
-        self.context.scope_kind = ScopeKind::Predicate;
+        let prev = self.context.current_scope_kind;
+        self.context.current_scope_kind = ScopeKind::Predicate;
         let r = f(self);
-        self.context.scope_kind = prev;
+        self.context.current_scope_kind = prev;
         r
     }
 }
