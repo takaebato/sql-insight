@@ -139,10 +139,18 @@ impl CrudTableExtractor {
                 }
                 crud.read_tables = reads;
             }
-            // SELECT, CreateTable, CreateView, AlterTable, AlterView,
-            // Drop, Truncate, Unsupported — every touched table goes to
-            // read_tables, matching the legacy catch-all behavior.
-            _ => {
+            // Every touched table goes to `read_tables`, matching the
+            // legacy catch-all behavior. Listed explicitly (rather
+            // than `_ =>`) so a new `StatementKind` variant becomes a
+            // compile error here and forces a placement decision.
+            StatementKind::Select
+            | StatementKind::CreateTable
+            | StatementKind::CreateView
+            | StatementKind::AlterTable
+            | StatementKind::AlterView
+            | StatementKind::Drop
+            | StatementKind::Truncate
+            | StatementKind::Unsupported => {
                 crud.read_tables = reads;
                 crud.read_tables.extend(writes);
             }
