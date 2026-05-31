@@ -1127,11 +1127,19 @@ impl<'a> Resolver<'a> {
             }
             Expr::BinaryOp { left, right, .. }
             | Expr::IsDistinctFrom(left, right)
-            | Expr::IsNotDistinctFrom(left, right)
-            | Expr::AnyOp { left, right, .. }
-            | Expr::AllOp { left, right, .. } => {
+            | Expr::IsNotDistinctFrom(left, right) => {
                 self.visit_expr(left)?;
                 self.visit_expr(right)
+            }
+            // ANY / ALL's RHS (typically a subquery) is shape-based
+            // predicate — `x = ANY (SELECT col FROM y)` tests `x`
+            // against the rows of the RHS and returns boolean. The
+            // RHS columns don't flow as values, only the comparison
+            // result does. Same rationale as `Expr::InSubquery`. LHS
+            // stays in the surrounding context.
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                self.visit_expr(left)?;
+                self.with_predicate(|r| r.visit_expr(right))
             }
             Expr::UnaryOp { expr, .. }
             | Expr::Nested(expr)
@@ -2007,7 +2015,6 @@ impl<'a> Resolver<'a> {
         self.context.in_predicate = prev;
         r
     }
-
 }
 
 /// Rename each source operand's columns positionally to the INSERT

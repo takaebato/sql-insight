@@ -1011,6 +1011,45 @@ mod tests {
         }
 
         #[test]
+        fn any_subquery_rhs_in_projection_is_filter() {
+            // `x = ANY (SELECT col FROM y)` tests `x` against the
+            // rows of y and returns boolean — y's column values
+            // don't flow as values. Even when the ANY sits in a
+            // projection-position CASE, `x` must not become a
+            // lineage source.
+            assert_ops(
+                "INSERT INTO t1 SELECT \
+                 CASE WHEN s.id = ANY (SELECT id FROM x) THEN 1 ELSE 0 END \
+             FROM s",
+                TableOperation {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![table("s"), table("x")],
+                    writes: vec![table("t1")],
+                    lineage: vec![edge("s", "t1")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn all_subquery_rhs_in_projection_is_filter() {
+            // ALL has the same shape as ANY — RHS is filter, not
+            // value contributor.
+            assert_ops(
+                "INSERT INTO t1 SELECT \
+                 CASE WHEN s.id > ALL (SELECT id FROM x) THEN 1 ELSE 0 END \
+             FROM s",
+                TableOperation {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![table("s"), table("x")],
+                    writes: vec![table("t1")],
+                    lineage: vec![edge("s", "t1")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
         fn update_scalar_subquery_in_set_feeds_lineage() {
             assert_ops(
                 "UPDATE t1 SET col = (SELECT v FROM t2)",
