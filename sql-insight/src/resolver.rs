@@ -38,7 +38,7 @@ mod scope;
 mod table_ref;
 
 pub(crate) use binding::{Binding, TableRole};
-pub(crate) use body_output::{QueryBodyOutput, OutputColumn, SetOperand};
+pub(crate) use body_output::{OutputColumn, QueryBodyOutput, SetOperand};
 pub(crate) use column_ref::RawColumnRef;
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
 pub(crate) use resolution::Resolution;
@@ -126,7 +126,7 @@ pub(crate) struct Context {
     /// fresh buffer in for the duration of its walk and hands the
     /// collected body back via the returned `ResolvedQuery`'s
     /// `output_columns`, so each query gets exactly its own operands.
-    pub(crate) current_body: QueryBodyOutput,
+    pub(crate) current_query_body: QueryBodyOutput,
     /// Cursor into [`Resolution::scopes`]: the currently-open scope.
     /// `None` before any push (then `current_scope_id` lazily inserts
     /// a root); set on each `push_scope` and walked back to the
@@ -165,7 +165,7 @@ impl<'a> Resolver<'a> {
 
     /// Finalize the embedded [`Resolution`] via the two post-passes
     /// (lineage collapse + real-column filter) and hand it back. The
-    /// walk state (current_body / current_scope / current_scope_kind) is
+    /// walk state (current_query_body / current_scope / current_scope_kind) is
     /// dropped at this point — only `resolution` survives.
     fn into_resolution(self) -> Resolution {
         let mut resolution = self.resolution;
@@ -190,7 +190,7 @@ impl<'a> Resolver<'a> {
         // operands without leaking into siblings or ancestors. This is
         // independent of the scope-arena push below: operands
         // accumulate into the resolver's own buffer, not into the scope.
-        let prev_body = std::mem::take(&mut self.context.current_body);
+        let prev_body = std::mem::take(&mut self.context.current_query_body);
         let body_scope = self.with_scope(|r| -> Result<ScopeId, Error> {
             let body_scope = r.current_scope_id();
             if let Some(with) = &query.with {
@@ -247,7 +247,7 @@ impl<'a> Resolver<'a> {
             }
             Ok(body_scope)
         })?;
-        let body = std::mem::replace(&mut self.context.current_body, prev_body);
+        let body = std::mem::replace(&mut self.context.current_query_body, prev_body);
         let output_columns = if body.set_operands.is_empty() {
             None
         } else {
