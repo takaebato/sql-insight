@@ -52,14 +52,14 @@ use sql_insight::extractor::{extract_table_operations, StatementKind};
 let dialect = GenericDialect {};
 let result = extract_table_operations(
     &dialect,
-    "INSERT INTO orders (id) SELECT id FROM staging",
+    "INSERT INTO users (id) SELECT id FROM signups",
     None,
 ).unwrap();
 let ops = result[0].as_ref().unwrap();
 assert_eq!(ops.statement_kind, StatementKind::Insert);
-assert_eq!(ops.reads.len(), 1);   // staging
-assert_eq!(ops.writes.len(), 1);  // orders
-assert_eq!(ops.lineage.len(), 1); // staging → orders
+assert_eq!(ops.reads.len(), 1);   // signups
+assert_eq!(ops.writes.len(), 1);  // users
+assert_eq!(ops.lineage.len(), 1); // signups → users
 ```
 
 ### Column-level Operation Extraction
@@ -76,11 +76,11 @@ use sql_insight::extractor::extract_column_operations;
 let dialect = GenericDialect {};
 let result = extract_column_operations(
     &dialect,
-    "INSERT INTO orders (id, total) SELECT id, SUM(amount) FROM staging GROUP BY id",
+    "INSERT INTO users (id, email) SELECT id, LOWER(email) FROM signups",
     None,
 ).unwrap();
 let ops = result[0].as_ref().unwrap();
-// id → id (Passthrough), amount → total (Transformation, via SUM).
+// id → id (Passthrough), email → email (Transformation, via LOWER).
 assert_eq!(ops.lineage.len(), 2);
 ```
 
@@ -106,7 +106,7 @@ use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::extractor::extract_crud_tables;
 
 let dialect = GenericDialect {};
-let crud_tables = extract_crud_tables(&dialect, "INSERT INTO users (name) SELECT name FROM employees").unwrap();
+let crud_tables = extract_crud_tables(&dialect, "INSERT INTO users (name) SELECT name FROM signups").unwrap();
 println!("{:?}", crud_tables);
 ```
 
