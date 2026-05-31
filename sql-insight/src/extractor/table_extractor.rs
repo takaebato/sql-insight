@@ -1,6 +1,11 @@
-//! A Extractor that extracts tables from SQL queries.
+//! Flat table-identity extraction (legacy). See [`extract_tables`]
+//! as the entry point.
 //!
-//! See [`extract_tables`](crate::extractor::extract_tables()) as the entry point for extracting tables from SQL.
+//! Newer code should prefer
+//! [`extract_table_operations`](crate::extractor::extract_table_operations)
+//! for `reads` / `writes` / lineage splits, or
+//! [`extract_column_operations`](crate::extractor::extract_column_operations)
+//! for column granularity.
 
 use core::fmt;
 
@@ -12,9 +17,8 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
-/// Convenience function to extract tables from SQL.
-///
-/// Each statement returns extracted table references plus non-fatal diagnostics.
+/// Parse `sql` under `dialect` and return one [`TableExtraction`] per
+/// statement.
 ///
 /// ## Example
 ///
@@ -34,27 +38,13 @@ pub fn extract_tables(
     TableExtractor::extract(dialect, sql)
 }
 
-/// [`Tables`] represents a list of [`TableReference`] that found in SQL.
-#[derive(Debug, PartialEq)]
-pub struct Tables(pub Vec<TableReference>);
-
-impl fmt::Display for Tables {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", TableReference::format_list(&self.0))
-    }
-}
-
-/// [`TableExtraction`] represents extracted tables and non-fatal diagnostics.
+/// Per-statement output of [`extract_tables`]: the table list plus
+/// any non-fatal diagnostics surfaced during the walk. `Display`
+/// renders just the comma-joined table list.
 #[derive(Debug, PartialEq)]
 pub struct TableExtraction {
     pub tables: Vec<TableReference>,
     pub diagnostics: Vec<TableLevelDiagnostic>,
-}
-
-impl TableExtraction {
-    pub fn into_tables(self) -> Tables {
-        Tables(self.tables)
-    }
 }
 
 impl fmt::Display for TableExtraction {
@@ -63,14 +53,14 @@ impl fmt::Display for TableExtraction {
     }
 }
 
-/// Extracts tables from SQL.
+/// Struct-style entry point. Equivalent to the free
+/// [`extract_tables`] function.
 #[derive(Default, Debug)]
 pub struct TableExtractor;
 
 impl TableExtractor {
-    /// Extract tables from SQL.
-    ///
-    /// Each statement returns extracted table references plus non-fatal diagnostics.
+    /// Same as the free [`extract_tables`] function — kept for
+    /// users who prefer the struct-style API.
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,
@@ -83,6 +73,8 @@ impl TableExtractor {
         Ok(results)
     }
 
+    /// Extract from an already-parsed [`Statement`]. Use when you
+    /// have an AST in hand and want to skip the parse step.
     pub fn extract_from_statement(statement: &Statement) -> Result<TableExtraction, Error> {
         // The legacy table-extraction API does not surface columns, so a
         // catalog would not influence its output; pass `None`.
@@ -130,8 +122,8 @@ mod tests {
         }
     }
 
-    fn ok_tables(tables: Vec<TableReference>) -> Result<Tables, Error> {
-        Ok(Tables(tables))
+    fn ok_tables(tables: Vec<TableReference>) -> Result<Vec<TableReference>, Error> {
+        Ok(tables)
     }
 
     fn generic_dialect() -> Vec<Box<dyn Dialect>> {
@@ -144,7 +136,7 @@ mod tests {
 
     fn assert_table_extraction(
         sql: &str,
-        expected: Vec<Result<Tables, Error>>,
+        expected: Vec<Result<Vec<TableReference>, Error>>,
         dialects: Vec<Box<dyn Dialect>>,
     ) {
         for dialect in dialects {
@@ -153,8 +145,8 @@ mod tests {
             });
             let result = result
                 .into_iter()
-                .map(|result| result.map(TableExtraction::into_tables))
-                .collect::<Vec<Result<Tables, Error>>>();
+                .map(|result| result.map(|extraction| extraction.tables))
+                .collect::<Vec<Result<Vec<TableReference>, Error>>>();
             assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
         }
     }
@@ -174,13 +166,6 @@ mod tests {
             let sql = "SELECT a FROM t1; SELECT b FROM t2";
             let expected = vec![ok_tables(vec![table("t1")]), ok_tables(vec![table("t2")])];
             assert_table_extraction(sql, expected, all_dialects());
-        }
-
-        #[test]
-        fn test_tables_display() {
-            let tables = Tables(vec![catalog_schema_table("c1", "s1", "t1"), table("t2")]);
-
-            assert_eq!(tables.to_string(), "c1.s1.t1, t2");
         }
 
         #[test]

@@ -10,7 +10,7 @@ use sql_insight::diagnostic::{
 };
 use sql_insight::extractor::{
     extract_column_operations, extract_crud_tables, extract_table_operations, extract_tables,
-    ColumnLineageKind, ColumnTarget, CrudTables, StatementKind, TableExtraction, Tables,
+    ColumnLineageKind, ColumnTarget, CrudTables, StatementKind,
 };
 use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::sqlparser::dialect::GenericDialect;
@@ -148,21 +148,21 @@ mod extract_tables {
             let result = extract_tables(dialect.as_ref(), sql).unwrap();
             let result = result
                 .into_iter()
-                .map(|result| result.map(TableExtraction::into_tables))
-                .collect::<Vec<Result<Tables, sql_insight::error::Error>>>();
+                .map(|result| result.map(|extraction| extraction.tables))
+                .collect::<Vec<Result<Vec<TableReference>, sql_insight::error::Error>>>();
             assert_eq!(
                 result,
                 vec![
-                    Ok(Tables(vec![TableReference {
+                    Ok(vec![TableReference {
                         catalog: None,
                         schema: None,
                         name: "t1".into(),
-                    }])),
-                    Ok(Tables(vec![TableReference {
+                    }]),
+                    Ok(vec![TableReference {
                         catalog: None,
                         schema: None,
                         name: "t2".into(),
-                    }])),
+                    }]),
                 ],
                 "Failed for dialect: {dialect:?}"
             )
@@ -176,15 +176,15 @@ mod extract_tables {
             let result = extract_tables(dialect.as_ref(), sql).unwrap();
             let result = result
                 .into_iter()
-                .map(|result| result.map(TableExtraction::into_tables))
-                .collect::<Vec<Result<Tables, sql_insight::error::Error>>>();
+                .map(|result| result.map(|extraction| extraction.tables))
+                .collect::<Vec<Result<Vec<TableReference>, sql_insight::error::Error>>>();
             assert_eq!(
                 result,
-                vec![Ok(Tables(vec![TableReference {
+                vec![Ok(vec![TableReference {
                     catalog: None,
                     schema: None,
                     name: "t1".into(),
-                }]))],
+                }])],
                 "Failed for dialect: {dialect:?}"
             )
         }
