@@ -117,14 +117,16 @@ impl Resolution {
             return vec![(raw.clone(), outer_kind)];
         }
         let output = match self.synthetic_owning_binding(raw) {
-            Some(Binding::Cte {
-                output_columns: Some(o),
-                ..
-            }) => o,
-            Some(Binding::DerivedTable {
-                output_columns: Some(o),
-                ..
-            }) => o,
+            Some(
+                Binding::Cte {
+                    output_columns: Some(o),
+                    ..
+                }
+                | Binding::DerivedTable {
+                    output_columns: Some(o),
+                    ..
+                },
+            ) => o,
             _ => return vec![(raw.clone(), outer_kind)],
         };
         let Some(col_name) = raw.parts.last() else {
@@ -193,13 +195,16 @@ impl Resolution {
         let mut out = Vec::new();
         let mut visited = HashSet::new();
         for raw in &self.table_refs {
-            if self.has_predicate_ancestor(raw.scope_id) {
-                continue;
-            }
-            if synthetic_body_scopes
-                .iter()
-                .any(|body| self.is_in_scope_subtree(raw.scope_id, *body))
-            {
+            // Both filters reduce to "does any ancestor of raw.scope_id
+            // satisfy a predicate?" — fold them into a single parent
+            // walk with O(1) HashSet lookup per step, instead of one
+            // walk for the predicate check and one walk per synthetic
+            // body scope.
+            let skip = parent_chain(&self.scopes, raw.scope_id).any(|id| {
+                self.scopes[id.0].kind == ScopeKind::Predicate
+                    || synthetic_body_scopes.contains(&id)
+            });
+            if skip {
                 continue;
             }
             self.collect_use(raw, &mut out, &mut visited);
