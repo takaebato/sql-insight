@@ -44,7 +44,9 @@ pub struct ColumnReference {
 impl TableReference {
     pub(crate) fn try_from_name(name: &ObjectName) -> Result<Self, Error> {
         match name.0.len() {
-            0 => unreachable!("Parser should not allow empty identifiers"),
+            0 => Err(Error::AnalysisError(
+                "ObjectName has no identifiers".to_string(),
+            )),
             1 => Ok(TableReference {
                 catalog: None,
                 schema: None,
@@ -101,6 +103,34 @@ impl TableReference {
             _ => None,
         }
     }
+
+    /// Parse an INSERT statement's target into (identity, alias) pair.
+    pub(crate) fn from_insert_with_alias(value: &Insert) -> Result<(Self, Option<Ident>), Error> {
+        let name = match &value.table {
+            TableObject::TableName(object_name) => object_name,
+            TableObject::TableFunction(function) => &function.name,
+        };
+        Ok((Self::try_from_name(name)?, value.table_alias.clone()))
+    }
+
+    /// Parse a `TableFactor::Table` into (identity, alias) pair. Other
+    /// `TableFactor` variants (Derived / NestedJoin / Pivot / Unpivot /
+    /// MatchRecognize / TableFunction / Function) do not name a stored
+    /// table, so they surface as an `AnalysisError`.
+    pub(crate) fn from_table_factor_with_alias(
+        table: &TableFactor,
+    ) -> Result<(Self, Option<Ident>), Error> {
+        match table {
+            TableFactor::Table { name, alias, .. } => Ok((
+                Self::try_from_name(name)?,
+                alias.as_ref().map(|a| a.name.clone()),
+            )),
+            _ => Err(Error::AnalysisError(
+                "TableFactor variant other than Table cannot be converted to a TableReference"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 impl fmt::Display for TableReference {
@@ -138,29 +168,5 @@ impl TryFrom<&ObjectName> for TableReference {
 
     fn try_from(obj_name: &ObjectName) -> Result<Self, Self::Error> {
         Self::try_from_name(obj_name)
-    }
-}
-
-impl TableReference {
-    /// Parse an INSERT statement's target into (identity, alias) pair.
-    pub(crate) fn from_insert_with_alias(value: &Insert) -> Result<(Self, Option<Ident>), Error> {
-        let name = match &value.table {
-            TableObject::TableName(object_name) => object_name,
-            TableObject::TableFunction(function) => &function.name,
-        };
-        Ok((Self::try_from_name(name)?, value.table_alias.clone()))
-    }
-
-    /// Parse a TableFactor (must be `TableFactor::Table`) into (identity, alias) pair.
-    pub(crate) fn from_table_factor_with_alias(
-        table: &TableFactor,
-    ) -> Result<(Self, Option<Ident>), Error> {
-        match table {
-            TableFactor::Table { name, alias, .. } => Ok((
-                Self::try_from_name(name)?,
-                alias.as_ref().map(|a| a.name.clone()),
-            )),
-            _ => unreachable!("TableFactor::Table expected"),
-        }
     }
 }
