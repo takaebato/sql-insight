@@ -185,9 +185,9 @@ impl<'a> Resolver<'a> {
     ///
     /// Use at every "new query boundary":
     /// - the top of `resolve_query` (the query body's own scope),
-    /// - each branch of a `SetExpr::SetOperation` so the branches'
+    /// - each operand of a `SetExpr::SetOperation` so the operands'
     ///   FROM bindings don't shadow each other and unqualified column
-    ///   refs in each branch resolve only against its own FROMs —
+    ///   refs in each operand resolve only against its own FROMs —
     ///   matching SQL's per-SELECT name resolution,
     /// - the DML statement inside `WITH … <DML>` so its target
     ///   binding doesn't share the enclosing query's scope with the

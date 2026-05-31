@@ -131,8 +131,8 @@ impl Resolution {
         };
         let key = BindingKey::from_ident(col_name);
         let mut result = Vec::new();
-        for branch in &output.per_branch {
-            for column in branch {
+        for operand in &output.set_operands {
+            for column in &operand.columns {
                 let matches = column
                     .name
                     .as_ref()
@@ -162,7 +162,7 @@ impl Resolution {
     ///
     /// Occurrence-based: a statement using the same source more than
     /// once (`FROM s AS x JOIN s AS y`, repeated `FROM cte` across
-    /// UNION branches) emits one entry per use. Consumers wanting set
+    /// UNION operands) emits one entry per use. Consumers wanting set
     /// semantics dedup via `HashSet::from_iter`. Matches
     /// [`Resolution::collapsed_lineage_edges`] (column-level) on
     /// multiplicity.

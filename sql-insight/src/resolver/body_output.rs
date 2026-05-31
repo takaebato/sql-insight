@@ -1,7 +1,8 @@
-//! Per-SELECT body output captured during the walk: per-branch
-//! lists of output columns with their inferred names, source refs,
-//! and `Passthrough` / `Transformation` kind. Plus the helpers
-//! that derive each output column's name / kind from a `SelectItem`.
+//! Per-SELECT body output captured during the walk: one
+//! [`SetOperand`] per set-operation operand, each carrying the SELECT's
+//! output columns with their inferred names, source refs, and
+//! `Passthrough` / `Transformation` kind. Plus the helpers that derive
+//! each output column's name / kind from a `SelectItem`.
 
 use sqlparser::ast::{Expr, Ident, SelectItem, TableAliasColumnDef};
 
@@ -12,15 +13,26 @@ use super::{RawColumnRef, Resolver};
 /// Body-walk output of a SELECT-derived relation (CTE / true
 /// derived), with full per-column lineage.
 ///
-/// `per_branch[i][j]` is the `j`-th output column of the `i`-th UNION
-/// branch (plain SELECT contributes a single branch). Branches are
-/// kept separate so INSERT pairing can match each branch's columns
+/// One [`SetOperand`] per set-operation operand (UNION / INTERSECT /
+/// EXCEPT); a plain SELECT contributes a single operand. Operands are
+/// kept separate so INSERT pairing can match each operand's columns
 /// against the same target columns. Real tables don't carry an
 /// instance of this — their column info comes from the catalog and
 /// is just a name list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct BodyOutput {
-    pub(crate) per_branch: Vec<Vec<OutputColumn>>,
+    pub(crate) set_operands: Vec<SetOperand>,
+}
+
+/// One operand of a set operation (UNION / INTERSECT / EXCEPT) — or
+/// equivalently, the output columns of one SELECT body. A plain
+/// SELECT yields one of these; `A UNION B` yields two; an N-way
+/// chain yields N. Kept as a named wrapper so the `Vec<SetOperand>`
+/// inside [`BodyOutput`] reads as "the operands" rather than as a
+/// generic nested vec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetOperand {
+    pub(crate) columns: Vec<OutputColumn>,
 }
 
 /// One output column slot — name, the input refs that produced its
@@ -37,37 +49,37 @@ pub(crate) struct OutputColumn {
 }
 
 impl BodyOutput {
-    /// First branch's column names if all of them have an inferable
+    /// First operand's column names if all of them have an inferable
     /// name. `None` if any column has no name (wildcards, computed
     /// without alias) — equivalent to "column names unknown" for the
     /// relation as a whole.
     pub(super) fn column_names(&self) -> Option<Vec<Ident>> {
-        let first = self.per_branch.first()?;
-        first.iter().map(|c| c.name.clone()).collect()
+        let first = self.set_operands.first()?;
+        first.columns.iter().map(|c| c.name.clone()).collect()
     }
 
     /// Apply a CTE / derived column-alias rename list (`WITH cte(a, b)
     /// AS (...)` or `(SELECT ...) d(a, b)`). Position N in the rename
     /// list overrides position N's column name; positions beyond the
     /// body's columns are appended as name-only entries (no source
-    /// refs). Each branch is renamed independently. An empty rename
+    /// refs). Each operand is renamed independently. An empty rename
     /// list returns the body unchanged.
     pub(crate) fn renamed(mut self, renames: &[TableAliasColumnDef]) -> Self {
         if renames.is_empty() {
             return self;
         }
-        for branch in &mut self.per_branch {
-            apply_renames(branch, renames);
+        for operand in &mut self.set_operands {
+            apply_renames(&mut operand.columns, renames);
         }
         self
     }
 }
 
-fn apply_renames(branch: &mut Vec<OutputColumn>, renames: &[TableAliasColumnDef]) {
+fn apply_renames(columns: &mut Vec<OutputColumn>, renames: &[TableAliasColumnDef]) {
     for (position, rename) in renames.iter().enumerate() {
-        match branch.get_mut(position) {
+        match columns.get_mut(position) {
             Some(col) => col.name = Some(rename.name.clone()),
-            None => branch.push(rename_only_column(rename.name.clone())),
+            None => columns.push(rename_only_column(rename.name.clone())),
         }
     }
 }
@@ -81,19 +93,18 @@ fn rename_only_column(name: Ident) -> OutputColumn {
 }
 
 impl<'a> Resolver<'a> {
-    /// Push a fully-built branch of output columns into the active
-    /// query's per-branch buffer. Called by `visit_select` once per
-    /// SELECT body.
-    pub(super) fn push_output_branch(&mut self, branch: Vec<OutputColumn>) {
-        self.current_branches.push(branch);
+    /// Push a fully-built set operand into the active query's body
+    /// output. Called by `visit_select` once per SELECT body.
+    pub(super) fn push_set_operand(&mut self, operand: SetOperand) {
+        self.current_body.set_operands.push(operand);
     }
 
-    /// Extend the active query's per-branch buffer with externally
-    /// produced branches — used by `SetExpr::Query` to bubble the
-    /// inner query's branches up into the enclosing query (so INSERT
+    /// Extend the active query's body output with externally produced
+    /// operands — used by `SetExpr::Query` to bubble the inner
+    /// query's operands up into the enclosing query (so INSERT
     /// pairing reaches through a parenthesized source).
-    pub(super) fn extend_branches(&mut self, branches: Vec<Vec<OutputColumn>>) {
-        self.current_branches.extend(branches);
+    pub(super) fn extend_set_operands(&mut self, operands: Vec<SetOperand>) {
+        self.current_body.set_operands.extend(operands);
     }
 }
 

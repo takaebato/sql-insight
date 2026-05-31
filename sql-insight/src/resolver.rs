@@ -35,7 +35,7 @@ mod scope;
 mod table_ref;
 
 pub(crate) use binding::{Binding, TableRole};
-pub(crate) use body_output::{BodyOutput, OutputColumn};
+pub(crate) use body_output::{BodyOutput, OutputColumn, SetOperand};
 pub(crate) use column_ref::RawColumnRef;
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
 pub(crate) use resolution::Resolution;
@@ -64,18 +64,19 @@ use crate::diagnostic::ColumnLevelDiagnostic;
 use crate::error::Error;
 use crate::reference::TableReference;
 
-/// What `resolve_query` returns: the body's per-branch output
-/// columns and the body's scope id. Callers decide whether to emit
-/// `QueryOutput` edges (default), pair positionally with relation
-/// target columns (INSERT / CTAS), or bubble them through
-/// `SetExpr::Query`.
+/// What `resolve_query` returns: the body's output columns (grouped
+/// by set-operation operand) and the body's scope id. Callers decide
+/// whether to emit `QueryOutput` edges (default), pair positionally
+/// with relation target columns (INSERT / CTAS), or bubble them
+/// through `SetExpr::Query`.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedQuery {
-    /// Body-walk output of the query — per-branch list of
-    /// [`OutputColumn`]s with full lineage info. `None` when nothing
-    /// was captured (e.g. recursive CTE pre-bind stub, `VALUES`-only
-    /// query). Callers (CTE / derived bind, INSERT pairing, etc.)
-    /// consume this directly.
+    /// Body-walk output of the query — one [`SetOperand`] per
+    /// set-operation operand, each carrying [`OutputColumn`]s with
+    /// full lineage info. `None` when nothing was captured (e.g.
+    /// recursive CTE pre-bind stub, `VALUES`-only query). Callers
+    /// (CTE / derived bind, INSERT pairing, etc.) consume this
+    /// directly.
     pub(crate) output_columns: Option<BodyOutput>,
     /// Arena id of the scope pushed for this query's body — exposed
     /// so callers binding the query as a synthetic relation (CTE /
@@ -88,7 +89,7 @@ pub(crate) struct ResolvedQuery {
 }
 
 /// The walker. Owns the scope stack, the in-progress refs / edges,
-/// the current branch buffer, and the lexical `scope_kind`. All
+/// the current body buffer, and the lexical `scope_kind`. All
 /// `visit_*` methods and the various `bind_*` / `record_*` / `with_*`
 /// helpers live as `impl` blocks in this file or in the sub-modules —
 /// this is just the data shape and the top-level entry point.
@@ -116,12 +117,13 @@ pub(crate) struct Resolver<'a> {
     /// every `FROM`-position bind site (real tables, CTE references,
     /// true derived subqueries).
     table_refs: Vec<RawTableRef>,
-    /// Per-query buffer of branch-shaped output columns collected by
-    /// `visit_select` (one inner `Vec` per branch). `resolve_query`
-    /// swaps a fresh buffer in for the duration of its walk and packs
-    /// the collected branches into the returned `ResolvedQuery`'s
-    /// `output_columns`, so each query gets exactly its own branches.
-    current_branches: Vec<Vec<OutputColumn>>,
+    /// Per-query in-progress [`BodyOutput`], filled by `visit_select`
+    /// (one [`SetOperand`] per SELECT body, accumulated across the
+    /// operands of a set operation chain). `resolve_query` swaps a
+    /// fresh buffer in for the duration of its walk and hands the
+    /// collected body back via the returned `ResolvedQuery`'s
+    /// `output_columns`, so each query gets exactly its own operands.
+    current_body: BodyOutput,
     /// Lexical context stamped onto every scope pushed while it is in
     /// effect: `Body` by default, flipped to `Predicate` by
     /// [`Resolver::with_filter_clause`] so subqueries nested in WHERE /
@@ -140,7 +142,7 @@ impl<'a> Resolver<'a> {
             column_refs: Vec::new(),
             lineage_edges: Vec::new(),
             table_refs: Vec::new(),
-            current_branches: Vec::new(),
+            current_body: BodyOutput::default(),
             scope_kind: ScopeKind::Body,
         }
     }
@@ -172,12 +174,12 @@ impl<'a> Resolver<'a> {
         resolution
     }
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
-        // Swap in a fresh per-branch buffer for this query — restored
-        // on return — so each ResolvedQuery owns exactly its own
-        // branches without leaking into siblings or ancestors. This is
-        // independent of the scope-arena push below: branches
+        // Swap in a fresh body buffer for this query — restored on
+        // return — so each ResolvedQuery owns exactly its own set
+        // operands without leaking into siblings or ancestors. This is
+        // independent of the scope-arena push below: operands
         // accumulate into the resolver's own buffer, not into the scope.
-        let prev_branches = std::mem::take(&mut self.current_branches);
+        let prev_body = std::mem::take(&mut self.current_body);
         let body_scope = self.with_scope(|r| -> Result<ScopeId, Error> {
             let body_scope = r.scopes_mut().current_scope_id();
             if let Some(with) = &query.with {
@@ -234,13 +236,11 @@ impl<'a> Resolver<'a> {
             }
             Ok(body_scope)
         })?;
-        let branches = std::mem::replace(&mut self.current_branches, prev_branches);
-        let output_columns = if branches.is_empty() {
+        let body = std::mem::replace(&mut self.current_body, prev_body);
+        let output_columns = if body.set_operands.is_empty() {
             None
         } else {
-            Some(BodyOutput {
-                per_branch: branches,
-            })
+            Some(body)
         };
         Ok(ResolvedQuery {
             output_columns,
@@ -253,21 +253,21 @@ impl<'a> Resolver<'a> {
             SetExpr::Select(select) => self.visit_select(select),
             SetExpr::Query(query) => {
                 // Parenthesized continuation of the enclosing query —
-                // bubble the inner branches up so an outer INSERT (or
+                // bubble the inner operands up so an outer INSERT (or
                 // any other caller) sees them as if they were inline.
                 let resolved = self.resolve_query(query)?;
                 if let Some(output) = resolved.output_columns {
-                    self.extend_branches(output.per_branch);
+                    self.extend_set_operands(output.set_operands);
                 }
                 Ok(())
             }
             SetExpr::SetOperation { left, right, .. } => {
-                // Each branch lives in its own scope so name resolution
-                // doesn't see sibling branches' FROM bindings — matching
-                // SQL's per-SELECT name resolution. The branches' own
-                // visit_select calls each contribute one branch entry
+                // Each operand lives in its own scope so name resolution
+                // doesn't see sibling operands' FROM bindings — matching
+                // SQL's per-SELECT name resolution. The operands' own
+                // visit_select calls each contribute one SetOperand entry
                 // of output columns, so UNION INSERT naturally pairs
-                // every branch with the same target columns.
+                // every operand with the same target columns.
                 self.with_scope(|r| r.visit_set_expr(left))?;
                 self.with_scope(|r| r.visit_set_expr(right))?;
                 Ok(())
@@ -306,11 +306,13 @@ impl<'a> Resolver<'a> {
         for table in &select.from {
             self.visit_table_with_joins(table, TableRole::Read)?;
         }
-        let mut branch_columns = Vec::with_capacity(select.projection.len());
+        let mut operand_columns = Vec::with_capacity(select.projection.len());
         for item in &select.projection {
-            branch_columns.push(self.build_output_column(item)?);
+            operand_columns.push(self.build_output_column(item)?);
         }
-        self.push_output_branch(branch_columns);
+        self.push_set_operand(SetOperand {
+            columns: operand_columns,
+        });
         if let Some(into) = &select.into {
             // SELECT ... INTO new_table acts like CTAS — INTO is the write target.
             self.bind_real_table(
@@ -680,11 +682,11 @@ impl<'a> Resolver<'a> {
             // Raw resolve_query (not the QueryOutput-emitting wrapper):
             // INSERT pairs each output column positionally with its
             // target column instead, emitting Relation edges. UNION
-            // sources surface as multiple branches, so each branch
+            // sources surface as multiple set operands, so each operand
             // pairs against the same target columns naturally.
             let resolved = self.resolve_query(source)?;
             if let Some(output) = resolved.output_columns.as_ref() {
-                self.emit_per_output_column(&output.per_branch, |position, _col| {
+                self.emit_per_output_column(&output.set_operands, |position, _col| {
                     effective_columns
                         .get(position)
                         .map(|col| LineageTargetSpec::Relation {
@@ -730,8 +732,8 @@ impl<'a> Resolver<'a> {
         for item in items {
             columns.push(self.build_output_column(item)?);
         }
-        let branches = vec![columns];
-        self.emit_per_output_column(&branches, |position, col| {
+        let operands = vec![SetOperand { columns }];
+        self.emit_per_output_column(&operands, |position, col| {
             Some(LineageTargetSpec::QueryOutput {
                 name: col.name.clone(),
                 position,
@@ -776,7 +778,7 @@ impl<'a> Resolver<'a> {
                     // EXCLUDED in Postgres / Sqlite exposes the
                     // would-be-inserted row as a row source. Bind it
                     // as a synthetic derived-table whose `output_columns`
-                    // is the INSERT source's per-branch columns renamed
+                    // is the INSERT source's per-operand columns renamed
                     // positionally to the target column names. That way
                     // `EXCLUDED.<col>` collapses back to whatever
                     // expression feeds that position of the source
@@ -786,7 +788,7 @@ impl<'a> Resolver<'a> {
                     // (like CTE / derived).
                     //
                     // `body_scope: None` — EXCLUDED's output is
-                    // synthesized from the INSERT source's per-branch
+                    // synthesized from the INSERT source's per-operand
                     // columns, not walked into a fresh scope. The
                     // INSERT source's real tables are already covered
                     // by their own RawTableRefs, so EXCLUDED needs no
@@ -816,9 +818,9 @@ impl<'a> Resolver<'a> {
     /// Used by CTAS, CREATE VIEW, and ALTER VIEW.
     ///
     /// For UNION-bodied sources the result schema follows the LEFT
-    /// branch's names (SQL standard), so the inferred-name fallback
-    /// reads the first branch's column names rather than the current
-    /// branch's — making every branch pair against the same target
+    /// operand's names (SQL standard), so the inferred-name fallback
+    /// reads the first operand's column names rather than the current
+    /// operand's — making every operand pair against the same target
     /// column at each position. Mirrors INSERT-SELECT-UNION
     /// positional pairing.
     fn emit_relation_to_created(
@@ -831,11 +833,11 @@ impl<'a> Resolver<'a> {
             return;
         };
         let inferred_left_names: Vec<Option<Ident>> = output
-            .per_branch
+            .set_operands
             .first()
-            .map(|branch| branch.iter().map(|c| c.name.clone()).collect())
+            .map(|operand| operand.columns.iter().map(|c| c.name.clone()).collect())
             .unwrap_or_default();
-        self.emit_per_output_column(&output.per_branch, |position, _col| {
+        self.emit_per_output_column(&output.set_operands, |position, _col| {
             explicit_columns
                 .get(position)
                 .cloned()
@@ -1899,7 +1901,7 @@ impl<'a> Resolver<'a> {
     }
 }
 
-/// Rename each source branch's columns positionally to the INSERT
+/// Rename each source operand's columns positionally to the INSERT
 /// target's column names — the EXCLUDED pseudo-table exposes the
 /// would-be-inserted row, so `EXCLUDED.<target_col>` should collapse
 /// back to whatever expression feeds that position of the source.
@@ -1915,11 +1917,12 @@ fn excluded_body_output(
         return None;
     }
     let source = source_output?;
-    let per_branch: Vec<Vec<OutputColumn>> = source
-        .per_branch
+    let set_operands: Vec<SetOperand> = source
+        .set_operands
         .iter()
-        .map(|branch| {
-            branch
+        .map(|operand| SetOperand {
+            columns: operand
+                .columns
                 .iter()
                 .enumerate()
                 .map(|(position, col)| {
@@ -1929,10 +1932,10 @@ fn excluded_body_output(
                     }
                     renamed
                 })
-                .collect()
+                .collect(),
         })
         .collect();
-    Some(BodyOutput { per_branch })
+    Some(BodyOutput { set_operands })
 }
 
 fn from_table_items(from: &FromTable) -> &[TableWithJoins] {

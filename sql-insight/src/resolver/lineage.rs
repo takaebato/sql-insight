@@ -1,8 +1,8 @@
 //! `LineageEdge` / `LineageTargetSpec` and the resolver helpers that
 //! emit them — directly into the `lineage_edges` buffer, fanned out
 //! from a snapshot of recorded column refs, or driven by a
-//! [`BodyOutput`](super::BodyOutput)'s branches via a closure-supplied
-//! target.
+//! [`BodyOutput`](super::BodyOutput)'s set operands via a
+//! closure-supplied target.
 
 use sqlparser::ast::{Ident, Query};
 
@@ -10,7 +10,7 @@ use crate::error::Error;
 use crate::extractor::ColumnLineageKind;
 use crate::reference::TableReference;
 
-use super::{OutputColumn, RawColumnRef, ResolvedQuery, Resolver};
+use super::{OutputColumn, RawColumnRef, ResolvedQuery, Resolver, SetOperand};
 
 /// A pre-resolution column lineage record. `source` still needs
 /// scope-chain resolution (for unqualified parts); `target` is fully
@@ -18,8 +18,8 @@ use super::{OutputColumn, RawColumnRef, ResolvedQuery, Resolver};
 /// surface (collapsed further by `collapsed_lineage_edges` when the
 /// source goes through a synthetic relation).
 ///
-/// Created by callers from a [`super::BodyOutput`]'s branches (for
-/// SELECT-style lineage edges — INSERT pairs with target columns,
+/// Created by callers from a [`super::BodyOutput`]'s set operands
+/// (for SELECT-style lineage edges — INSERT pairs with target columns,
 /// top-level / nested SELECTs emit `QueryOutput`) or directly by
 /// UPDATE / similar walkers that already know their write target.
 #[derive(Debug, Clone)]
@@ -87,22 +87,19 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// For each `(branch, position, column)` across `branches`, ask
+    /// For each `(operand, position, column)` across `operands`, ask
     /// `target_for(position, column)` to produce a `LineageTargetSpec`;
     /// when it returns `Some(target)`, fan out one `LineageEdge` per
     /// `column.source_refs` to that target, carrying the column's
     /// `ColumnLineageKind`. The closure shape lets the same loop drive
     /// `QueryOutput` emission, INSERT positional pairing, and CTAS /
     /// view's explicit-or-inferred column pairing.
-    pub(super) fn emit_per_output_column<F>(
-        &mut self,
-        branches: &[Vec<OutputColumn>],
-        mut target_for: F,
-    ) where
+    pub(super) fn emit_per_output_column<F>(&mut self, operands: &[SetOperand], mut target_for: F)
+    where
         F: FnMut(usize, &OutputColumn) -> Option<LineageTargetSpec>,
     {
-        for branch in branches {
-            for (position, column) in branch.iter().enumerate() {
+        for operand in operands {
+            for (position, column) in operand.columns.iter().enumerate() {
                 let Some(target) = target_for(position, column) else {
                     continue;
                 };
@@ -125,7 +122,7 @@ impl<'a> Resolver<'a> {
         let Some(output) = resolved.output_columns.as_ref() else {
             return;
         };
-        self.emit_per_output_column(&output.per_branch, |position, column| {
+        self.emit_per_output_column(&output.set_operands, |position, column| {
             Some(LineageTargetSpec::QueryOutput {
                 name: column.name.clone(),
                 position,

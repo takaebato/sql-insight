@@ -71,9 +71,10 @@ pub(crate) enum TableRole {
 /// - `Table::output_columns: Option<Vec<Ident>>` — naked catalog
 ///   column names (`Some` = catalog hit, `None` = miss / no catalog).
 /// - `Cte` / `DerivedTable` `output_columns: Option<BodyOutput>` —
-///   per-branch list of [`super::OutputColumn`]s with full lineage
-///   info (name, source_refs, kind). `None` covers recursive CTE
-///   stubs, wrapper aliases (NestedJoin / Pivot / etc.), and
+///   one [`super::SetOperand`] per set-operation operand, each
+///   carrying the SELECT body's [`super::OutputColumn`]s with full
+///   lineage info (name, source_refs, kind). `None` covers recursive
+///   CTE stubs, wrapper aliases (NestedJoin / Pivot / etc.), and
 ///   walk-failed bodies.
 /// - `TableFunction` carries no column info — always unknown.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,11 +103,12 @@ pub(crate) enum Binding {
         /// The CTE's declared name (the `<name>` in `WITH <name> AS …`).
         /// Lookup keys derive from this via `BindingKey`.
         name: Ident,
-        /// Body-walk output of the CTE: per-branch list of
-        /// [`super::OutputColumn`]s with full lineage info (name,
-        /// source refs, kind). `None` for recursive CTEs pre-bound
-        /// under a stub (fixpoint-aware capture is deferred). Renamed
-        /// via the CTE's column-alias list when one is given.
+        /// Body-walk output of the CTE: one [`super::SetOperand`] per
+        /// set-operation operand, each carrying [`super::OutputColumn`]s
+        /// with full lineage info (name, source refs, kind). `None` for
+        /// recursive CTEs pre-bound under a stub (fixpoint-aware capture
+        /// is deferred). Renamed via the CTE's column-alias list when
+        /// one is given.
         output_columns: Option<BodyOutput>,
         /// Arena id of the scope that holds the CTE body's bindings.
         /// Table-lineage collapse walks descendant scopes of this id
