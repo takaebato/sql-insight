@@ -136,13 +136,13 @@ pub(crate) struct Context {
     /// parent on each `pop_scope`.
     pub(crate) current_scope: Option<ScopeId>,
     /// True while walking a predicate clause (WHERE / HAVING / JOIN ON
-    /// / etc.) or a predicate-shape expression. Stamped onto every
-    /// captured column / table ref's `in_predicate` field at capture
-    /// time, so predicate-position refs are excluded from lineage
-    /// regardless of which scope they happen to land in. Stays set
-    /// across subquery boundaries — a subquery inside a predicate is
-    /// itself predicate-position. Toggled by
-    /// [`Resolver::with_filter_clause`].
+    /// / etc.) or a predicate-shape expression (EXISTS / IN-subquery
+    /// RHS). Stamped onto every captured column / table ref's
+    /// `in_predicate` field at capture time, so predicate-position
+    /// refs are excluded from lineage regardless of which scope they
+    /// happen to land in. Stays set across subquery boundaries — a
+    /// subquery inside a predicate is itself predicate-position.
+    /// Toggled by [`Resolver::with_predicate`].
     pub(crate) in_predicate: bool,
 }
 
@@ -379,13 +379,13 @@ impl<'a> Resolver<'a> {
         .into_iter()
         .flatten()
         {
-            self.with_filter_clause(|r| r.visit_expr(expr))?;
+            self.with_predicate(|r| r.visit_expr(expr))?;
         }
         for connect_by in &select.connect_by {
             // CONNECT BY / START WITH are predicate-style hierarchical
             // join conditions (Oracle / Snowflake) — subqueries nested
             // here do not feed the enclosing write target.
-            self.with_filter_clause(|r| match connect_by {
+            self.with_predicate(|r| match connect_by {
                 ConnectByKind::ConnectBy { relationships, .. } => r.visit_exprs(relationships),
                 ConnectByKind::StartWith { condition, .. } => r.visit_expr(condition),
             })?;
@@ -849,7 +849,7 @@ impl<'a> Resolver<'a> {
                     self.bind_derived_table(Ident::new("EXCLUDED"), excluded_output, None);
                     self.emit_assignment_lineage(&do_update.assignments, Some(target_table))?;
                     if let Some(selection) = &do_update.selection {
-                        self.with_filter_clause(|r| r.visit_expr(selection))?;
+                        self.with_predicate(|r| r.visit_expr(selection))?;
                     }
                 }
             }
@@ -922,7 +922,7 @@ impl<'a> Resolver<'a> {
         let target_table = try_target_table_from_factor(&update.table.relation);
         self.emit_assignment_lineage(&update.assignments, target_table.as_ref())?;
         if let Some(selection) = &update.selection {
-            self.with_filter_clause(|r| r.visit_expr(selection))?;
+            self.with_predicate(|r| r.visit_expr(selection))?;
         }
         self.visit_returning(update.returning.as_deref())?;
         Ok(())
@@ -996,7 +996,7 @@ impl<'a> Resolver<'a> {
             self.bind_real_table(TableReference::try_from_name(name)?, None, TableRole::Write);
         }
         if let Some(selection) = &delete.selection {
-            self.with_filter_clause(|r| r.visit_expr(selection))?;
+            self.with_predicate(|r| r.visit_expr(selection))?;
         }
         self.visit_returning(delete.returning.as_deref())?;
         Ok(())
@@ -1011,16 +1011,16 @@ impl<'a> Resolver<'a> {
         use sqlparser::ast::{MergeAction, MergeInsertKind};
         self.visit_table_factor(&merge.table, TableRole::Write)?;
         self.visit_table_factor(&merge.source, TableRole::Read)?;
-        self.with_filter_clause(|r| r.visit_expr(&merge.on))?;
+        self.with_predicate(|r| r.visit_expr(&merge.on))?;
         let target_table = try_target_table_from_factor(&merge.table);
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
-                self.with_filter_clause(|r| r.visit_expr(predicate))?;
+                self.with_predicate(|r| r.visit_expr(predicate))?;
             }
             match &clause.action {
                 MergeAction::Insert(insert_expr) => {
                     if let Some(pred) = &insert_expr.insert_predicate {
-                        self.with_filter_clause(|r| r.visit_expr(pred))?;
+                        self.with_predicate(|r| r.visit_expr(pred))?;
                     }
                     if let MergeInsertKind::Values(values) = &insert_expr.kind {
                         self.emit_merge_insert_lineage(
@@ -1110,20 +1110,20 @@ impl<'a> Resolver<'a> {
             // predicate-shape regardless of where they're written:
             // EXISTS returns a boolean (column values never flow),
             // and IN's RHS columns are match-test targets (only the
-            // boolean result flows). Force `with_filter_clause` so
+            // boolean result flows). Force `with_predicate` so
             // refs captured inside are tagged `in_predicate` even
             // when the surrounding context is Body (e.g. a CASE
             // WHEN inside a projection).
             Expr::Subquery(query) => self.resolve_query(query).map(|_| ()),
             Expr::Exists { subquery, .. } => {
-                self.with_filter_clause(|r| r.resolve_query(subquery).map(|_| ()))
+                self.with_predicate(|r| r.resolve_query(subquery).map(|_| ()))
             }
             Expr::InSubquery { expr, subquery, .. } => {
                 // LHS stays in the surrounding context — its value
                 // participates in the comparison and (transitively)
                 // in the boolean result.
                 self.visit_expr(expr)?;
-                self.with_filter_clause(|r| r.resolve_query(subquery).map(|_| ()))
+                self.with_predicate(|r| r.resolve_query(subquery).map(|_| ()))
             }
             Expr::BinaryOp { left, right, .. }
             | Expr::IsDistinctFrom(left, right)
@@ -1403,7 +1403,7 @@ impl<'a> Resolver<'a> {
 
     /// Dispatch one pipe-syntax operator (`|> WHERE`, `|> SELECT`,
     /// `|> AGGREGATE`, etc.). Filter-position operators wrap their
-    /// expression walks with `with_filter_clause`; projection-shaped
+    /// expression walks with `with_predicate`; projection-shaped
     /// operators (`|> SELECT` / `|> EXTEND` / `|> AGGREGATE`) push a
     /// fresh `SetOperand` of output columns.
     pub(super) fn visit_pipe_operator(&mut self, operator: &PipeOperator) -> Result<(), Error> {
@@ -1415,7 +1415,7 @@ impl<'a> Resolver<'a> {
                 }
                 Ok(())
             }
-            PipeOperator::Where { expr } => self.with_filter_clause(|r| r.visit_expr(expr)),
+            PipeOperator::Where { expr } => self.with_predicate(|r| r.visit_expr(expr)),
             PipeOperator::OrderBy { exprs } => {
                 for expr in exprs {
                     self.visit_order_by_expr(expr)?;
@@ -1684,7 +1684,7 @@ impl<'a> Resolver<'a> {
                 match_condition,
                 constraint,
             } => {
-                self.with_filter_clause(|r| r.visit_expr(match_condition))?;
+                self.with_predicate(|r| r.visit_expr(match_condition))?;
                 self.visit_join_constraint(constraint)
             }
             JoinOperator::CrossApply | JoinOperator::OuterApply => Ok(()),
@@ -1693,7 +1693,7 @@ impl<'a> Resolver<'a> {
 
     fn visit_join_constraint(&mut self, constraint: &JoinConstraint) -> Result<(), Error> {
         match constraint {
-            JoinConstraint::On(expr) => self.with_filter_clause(|r| r.visit_expr(expr)),
+            JoinConstraint::On(expr) => self.with_predicate(|r| r.visit_expr(expr)),
             JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
         }
     }
@@ -1990,6 +1990,24 @@ impl<'a> Resolver<'a> {
             PivotValueSource::Subquery(query) => self.resolve_query(query).map(|_| ()),
         }
     }
+
+    /// Walk a predicate context with `context.in_predicate = true`, so
+    /// column / table refs captured inside (whether directly in the
+    /// expression or transitively through a nested subquery) are
+    /// tagged as predicate-position and excluded from lineage. Used
+    /// for both lexical predicate clauses (WHERE / HAVING / QUALIFY /
+    /// JOIN ON / MERGE ON / AsOf match / CONNECT BY / pipe `|> WHERE`)
+    /// and predicate-shape expressions (`Expr::Exists`,
+    /// `Expr::InSubquery` RHS). The previous `in_predicate` value is
+    /// restored on return.
+    fn with_predicate<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.context.in_predicate;
+        self.context.in_predicate = true;
+        let r = f(self);
+        self.context.in_predicate = prev;
+        r
+    }
+
 }
 
 /// Rename each source operand's columns positionally to the INSERT

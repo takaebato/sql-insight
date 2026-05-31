@@ -1,8 +1,10 @@
 //! Scope arena types — `ScopeId`, `Scope` — plus the arena-management
 //! methods on [`Resolver`] (`push_scope` / `pop_scope` / `bind_current`
-//! / `resolve_unqualified_relation` / etc.) and the lexical `with_*`
-//! helpers. Owns the "container" side of name resolution; the
-//! `Binding` "contents" live in [`super::binding`].
+//! / `resolve_unqualified_relation` / `with_scope`). Owns the
+//! "container" side of name resolution; the `Binding` "contents" live
+//! in [`super::binding`]. Predicate-position bookkeeping
+//! ([`Resolver::with_predicate`]) lives in the parent module since
+//! it touches walker state, not the scope arena.
 
 use indexmap::IndexMap;
 use sqlparser::ast::{Ident, ObjectName};
@@ -162,21 +164,6 @@ impl<'a> Resolver<'a> {
         self.push_scope();
         let r = f(self);
         self.pop_scope();
-        r
-    }
-
-    /// Walk a filter-position clause with `context.in_predicate = true`,
-    /// so column / table refs captured inside (whether directly in the
-    /// expression or transitively through a nested subquery) are tagged
-    /// as predicate-position and excluded from lineage. Used for WHERE,
-    /// HAVING, QUALIFY, JOIN ON, AsOf match, MERGE ON, CONNECT BY,
-    /// pipe `|> WHERE`, etc. The previous `in_predicate` value is
-    /// restored on return.
-    pub(crate) fn with_filter_clause<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let prev = self.context.in_predicate;
-        self.context.in_predicate = true;
-        let r = f(self);
-        self.context.in_predicate = prev;
         r
     }
 }
