@@ -66,14 +66,21 @@ impl<'a> Resolver<'a> {
     /// `self.column_refs.len()` before walking an expression, walks
     /// it, then calls this with the snapshot to fan the new refs out
     /// as edges. Used by UPDATE / MERGE assignment loops and MERGE
-    /// INSERT-VALUES emission.
+    /// INSERT-VALUES emission. Predicate-position refs captured
+    /// during the walk (e.g. a column inside a CASE WHEN cond,
+    /// EXISTS subquery, or aggregate FILTER predicate) are skipped —
+    /// they don't contribute value, so they aren't lineage sources.
     pub(super) fn push_edges_from_refs_since(
         &mut self,
         since: usize,
         target: LineageTargetSpec,
         kind: ColumnLineageKind,
     ) {
-        let sources: Vec<CapturedColumnRef> = self.resolution.column_refs[since..].to_vec();
+        let sources: Vec<CapturedColumnRef> = self.resolution.column_refs[since..]
+            .iter()
+            .filter(|r| !r.in_predicate)
+            .cloned()
+            .collect();
         for source in sources {
             self.resolution.lineage_edges.push(LineageEdge {
                 source,

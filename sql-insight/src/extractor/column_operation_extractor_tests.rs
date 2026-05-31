@@ -923,8 +923,10 @@ mod reads_by_clause {
 
     #[test]
     fn case_in_projection_refs_surface_and_transform() {
-        // Condition (`a`), THEN (`b`), and ELSE (`c`) all surface as
-        // reads and feed into the CASE output as Transformation.
+        // All three columns surface in `reads`, but only THEN (`b`)
+        // and ELSE (`c`) carry value to the output. The WHEN
+        // condition (`a`) is a predicate — it decides which
+        // result is selected, its own value doesn't flow.
         assert_column_ops(
             "SELECT CASE WHEN a > 0 THEN b ELSE c END FROM t1",
             ColumnOperation {
@@ -932,7 +934,6 @@ mod reads_by_clause {
                 reads: vec![read("t1", "a"), read("t1", "b"), read("t1", "c")],
                 writes: vec![],
                 lineage: vec![
-                    transformation(col("t1", "a"), out_anon(0)),
                     transformation(col("t1", "b"), out_anon(0)),
                     transformation(col("t1", "c"), out_anon(0)),
                 ],
@@ -964,22 +965,50 @@ mod reads_by_clause {
     }
 
     #[test]
-    fn scalar_subquery_in_case_condition_collapses_to_outer_only() {
-        // A scalar subquery in a CASE condition emits no lineage of its
-        // own (Option B: raw resolve). The outer CASE projection
-        // item captures the subquery's refs (`s.x` from its
-        // projection, `s.y` from its WHERE) as its source refs, so
-        // both feed into the outer anonymous output as
-        // Transformation. Refs still surface in reads.
+    fn scalar_subquery_in_case_condition_contributes_no_lineage() {
+        // The scalar subquery lives entirely inside the CASE WHEN
+        // cond, which is a predicate. Inner refs (`s.x` from its
+        // projection, `s.y` from its WHERE) are tagged
+        // `in_predicate` at capture and dropped from the outer
+        // projection's `source_refs`. The output is `1 / NULL`,
+        // determined by the subquery's IS NULL test — no inner
+        // column's value flows out.
         assert_column_ops(
             "SELECT CASE WHEN (SELECT x FROM s WHERE y > 0) IS NULL THEN 1 END FROM t",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("s", "x"), read("s", "y")],
                 writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn exists_subquery_inside_projection_case_excludes_inner() {
+        // The EXISTS subquery sits in the CASE WHEN cond — a
+        // doubly-predicate position. `x.id` is in the EXISTS
+        // subquery's WHERE, `s.flag` in the EXISTS subquery's
+        // projection — both `in_predicate=true`. THEN / ELSE
+        // carry values from `s.a` / `s.b`, which flow.
+        assert_column_ops(
+            "SELECT \
+             CASE WHEN EXISTS (SELECT s.flag FROM x WHERE x.id = s.id) THEN s.a ELSE s.b END \
+         FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("s", "flag"),
+                    read("x", "id"),
+                    read("s", "id"),
+                    read("s", "a"),
+                    read("s", "b"),
+                ],
+                writes: vec![],
                 lineage: vec![
-                    transformation(col("s", "x"), out_anon(0)),
-                    transformation(col("s", "y"), out_anon(0)),
+                    transformation(col("s", "a"), out_anon(0)),
+                    transformation(col("s", "b"), out_anon(0)),
                 ],
                 diagnostics: vec![],
             },
@@ -988,9 +1017,11 @@ mod reads_by_clause {
 
     #[test]
     fn simple_case_operand_and_results_surface() {
-        // `CASE x WHEN 1 THEN a WHEN 2 THEN b END` — the operand
-        // `x` and the results `a` / `b` all surface as reads and
-        // feed into the CASE output as Transformation.
+        // `CASE x WHEN 1 THEN a WHEN 2 THEN b END` — `x` is the
+        // value being matched (predicate), `1` and `2` are literal
+        // patterns, `a` and `b` are the values that flow when the
+        // match succeeds. All three columns appear in reads; only
+        // `a` and `b` feed lineage.
         assert_column_ops(
             "SELECT CASE x WHEN 1 THEN a WHEN 2 THEN b END FROM t1",
             ColumnOperation {
@@ -998,7 +1029,6 @@ mod reads_by_clause {
                 reads: vec![read("t1", "x"), read("t1", "a"), read("t1", "b")],
                 writes: vec![],
                 lineage: vec![
-                    transformation(col("t1", "x"), out_anon(0)),
                     transformation(col("t1", "a"), out_anon(0)),
                     transformation(col("t1", "b"), out_anon(0)),
                 ],
@@ -1009,9 +1039,10 @@ mod reads_by_clause {
 
     #[test]
     fn simple_case_with_column_when_pattern_all_surface() {
-        // `CASE x WHEN y THEN a ELSE b END` — operand `x`,
-        // WHEN-pattern `y`, and results `a` / `b` all surface as
-        // reads and feed into the CASE output as Transformation.
+        // `CASE x WHEN y THEN a ELSE b END` — `x` (operand) and `y`
+        // (WHEN-pattern) are both predicate-position: they decide
+        // the match, their values don't flow. `a` and `b` are the
+        // value-position results.
         assert_column_ops(
             "SELECT CASE x WHEN y THEN a ELSE b END FROM t1",
             ColumnOperation {
@@ -1024,8 +1055,6 @@ mod reads_by_clause {
                 ],
                 writes: vec![],
                 lineage: vec![
-                    transformation(col("t1", "x"), out_anon(0)),
-                    transformation(col("t1", "y"), out_anon(0)),
                     transformation(col("t1", "a"), out_anon(0)),
                     transformation(col("t1", "b"), out_anon(0)),
                 ],
@@ -2016,21 +2045,18 @@ mod ctas_view {
 
     #[test]
     fn aggregate_with_filter_clause_marker() {
-        // SUM(x) FILTER (WHERE y > 0) — both `x` and `y` surface as
-        // reads, and both feed into the aggregate's output as
-        // Transformation. Anything mentioned inside the aggregate's
-        // syntactic boundary (args + FILTER predicate) is a lineage
-        // source, not just the bare argument.
+        // SUM(x) FILTER (WHERE y > 0) — `x` is the aggregated
+        // value (lineage source). `y` is the filter predicate; same
+        // disposition as a WHERE clause's column — it gates which
+        // rows are summed but its value doesn't flow. `y` surfaces
+        // in `reads` only.
         assert_column_ops(
             "SELECT SUM(x) FILTER (WHERE y > 0) FROM t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t1", "x"), read("t1", "y")],
                 writes: vec![],
-                lineage: vec![
-                    transformation(col("t1", "x"), out_anon(0)),
-                    transformation(col("t1", "y"), out_anon(0)),
-                ],
+                lineage: vec![transformation(col("t1", "x"), out_anon(0))],
                 diagnostics: vec![],
             },
         );

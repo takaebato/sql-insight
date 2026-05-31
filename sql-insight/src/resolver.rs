@@ -408,11 +408,19 @@ impl<'a> Resolver<'a> {
 
     /// Walk a single projection item's expression and snapshot the
     /// refs it records, packaging name / source_refs / kind into an
-    /// [`OutputColumn`].
+    /// [`OutputColumn`]. Predicate-position refs captured during the
+    /// walk (e.g. a column inside a CASE WHEN cond, EXISTS subquery,
+    /// or aggregate FILTER predicate) are filtered out — they appear
+    /// in `reads` but don't contribute value, so they're not lineage
+    /// sources.
     pub(super) fn build_output_column(&mut self, item: &SelectItem) -> Result<OutputColumn, Error> {
         let refs_before = self.resolution.column_refs.len();
         self.visit_select_item(item)?;
-        let source_refs = self.resolution.column_refs[refs_before..].to_vec();
+        let source_refs = self.resolution.column_refs[refs_before..]
+            .iter()
+            .filter(|r| !r.in_predicate)
+            .cloned()
+            .collect();
         Ok(OutputColumn {
             name: output_column_name(item),
             source_refs,
@@ -1266,15 +1274,21 @@ impl<'a> Resolver<'a> {
                 else_result,
                 ..
             } => {
-                // All CASE sub-expressions (operand, WHEN conditions,
-                // THEN/ELSE results) are walked the same way — refs no
-                // longer carry a clause kind, so there is nothing to
-                // distinguish the condition position from the result.
+                // CASE sub-expressions split by role:
+                // - `operand` (simple CASE): the value being tested
+                //   against each WHEN value. Filter — its value
+                //   doesn't flow to the output, it selects which
+                //   THEN to evaluate.
+                // - `condition` (WHEN ...): a boolean test (searched
+                //   CASE) or a match pattern (simple CASE). Filter.
+                // - `result` (THEN ...) and `else_result` (ELSE ...):
+                //   the actual values that flow to the output. Value
+                //   position.
                 if let Some(expr) = operand {
-                    self.visit_expr(expr)?;
+                    self.with_predicate(|r| r.visit_expr(expr))?;
                 }
                 for condition in conditions {
-                    self.visit_expr(&condition.condition)?;
+                    self.with_predicate(|r| r.visit_expr(&condition.condition))?;
                     self.visit_expr(&condition.result)?;
                 }
                 if let Some(expr) = else_result {
@@ -1504,7 +1518,11 @@ impl<'a> Resolver<'a> {
         self.visit_function_arguments(&function.parameters)?;
         self.visit_function_arguments(&function.args)?;
         if let Some(expr) = &function.filter {
-            self.visit_expr(expr)?;
+            // Aggregate `FILTER (WHERE …)` is a row-selection
+            // predicate, semantically identical to a WHERE clause
+            // scoped to the aggregate. Same disposition as WHERE —
+            // refs inside don't flow as values.
+            self.with_predicate(|r| r.visit_expr(expr))?;
         }
         for expr in &function.within_group {
             self.visit_order_by_expr(expr)?;
