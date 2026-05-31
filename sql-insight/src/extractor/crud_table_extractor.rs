@@ -294,7 +294,7 @@ mod tests {
     }
 
     mod delete_statement {
-        use crate::test_utils::all_dialects_except;
+        use crate::test_utils::{all_dialects_except, DialectName};
 
         use super::*;
 
@@ -351,7 +351,11 @@ mod tests {
             assert_crud_table_extraction(
                 sql,
                 expected,
-                all_dialects_except(&["GenericDialect", "BigQueryDialect", "OracleDialect"]),
+                all_dialects_except(&[
+                    DialectName::Generic,
+                    DialectName::BigQuery,
+                    DialectName::Oracle,
+                ]),
             );
         }
 
@@ -370,7 +374,11 @@ mod tests {
             assert_crud_table_extraction(
                 sql,
                 expected,
-                all_dialects_except(&["GenericDialect", "BigQueryDialect", "OracleDialect"]),
+                all_dialects_except(&[
+                    DialectName::Generic,
+                    DialectName::BigQuery,
+                    DialectName::Oracle,
+                ]),
             );
         }
 

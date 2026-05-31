@@ -233,7 +233,7 @@ impl Normalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{all_dialects, all_dialects_except};
+    use crate::test_utils::{all_dialects, all_dialects_except, DialectName};
 
     fn assert_normalize(
         sql: &str,
@@ -282,7 +282,7 @@ mod tests {
         assert_normalize(
             sql,
             expected,
-            all_dialects_except(&["MsSqlDialect", "OracleDialect"]),
+            all_dialects_except(&[DialectName::MsSql, DialectName::Oracle]),
             NormalizerOptions::new(),
         );
     }
