@@ -79,7 +79,7 @@ impl<'a> Resolver<'a> {
     /// are computed right now, while scope state is authoritative —
     /// later CTE bindings won't ambify what this reference saw.
     pub(super) fn record_column_ref(&mut self, parts: Vec<Ident>) {
-        let scope_id = self.scopes_mut().current_scope_id();
+        let scope_id = self.current_scope_id();
         let (resolved, synthetic) = self.resolve_ref_at_walk(&parts, scope_id);
         self.column_refs.push(RawColumnRef {
             parts,
@@ -121,7 +121,7 @@ impl<'a> Resolver<'a> {
         let mut ambiguity: Option<(Vec<TableReference>, usize)> = None;
 
         while let Some(id) = current {
-            let scope = self.scopes().scope(id);
+            let scope = self.scope(id);
             if scope.iter_bindings().any(binding_has_known_columns) {
                 had_known_schemas_anywhere = true;
             }
@@ -220,7 +220,7 @@ impl<'a> Resolver<'a> {
         let key = BindingKey::from_ident(head);
         let mut current = Some(scope_id);
         while let Some(id) = current {
-            let scope = self.scopes().scope(id);
+            let scope = self.scope(id);
             for binding in scope.iter_bindings() {
                 if binding_alias_key(binding) == key {
                     return Some(binding);

@@ -258,7 +258,7 @@ pub(super) fn span_suffix(span: Option<Span>) -> String {
 impl<'a> Resolver<'a> {
     pub(super) fn is_cte_reference(&self, relation: &ObjectName) -> bool {
         matches!(
-            self.scopes().resolve_unqualified_relation(relation),
+            self.resolve_unqualified_relation(relation),
             Some(Binding::Cte { .. })
         )
     }
@@ -325,7 +325,7 @@ impl<'a> Resolver<'a> {
     /// the caller (alias-bound Cte construction) treats that as "no
     /// collapse through this alias", matching recursive-CTE behavior.
     pub(super) fn cte_output_columns(&self, cte_name: &ObjectName) -> Option<BodyOutput> {
-        match self.scopes().resolve_unqualified_relation(cte_name) {
+        match self.resolve_unqualified_relation(cte_name) {
             Some(Binding::Cte { output_columns, .. }) => output_columns.clone(),
             _ => None,
         }
@@ -367,7 +367,7 @@ impl<'a> Resolver<'a> {
     /// name does not resolve to a `Cte` binding — same fall-through
     /// semantics as [`Self::cte_output_columns`].
     pub(super) fn cte_body_scope(&self, cte_name: &ObjectName) -> Option<ScopeId> {
-        match self.scopes().resolve_unqualified_relation(cte_name) {
+        match self.resolve_unqualified_relation(cte_name) {
             Some(Binding::Cte { body_scope, .. }) => Some(*body_scope),
             _ => None,
         }
@@ -403,6 +403,6 @@ impl<'a> Resolver<'a> {
     }
 
     fn bind_relation(&mut self, name: Ident, binding: Binding) {
-        self.scopes_mut().bind_current(name, binding);
+        self.bind_current(name, binding);
     }
 }

@@ -1,6 +1,8 @@
-//! Scope arena: `ScopeId`, `ScopeKind`, `BindingKey`, `Scope`, and
-//! `ScopeStack`. Owns the "container" side of name resolution; the
-//! `Binding` "contents" live in [`super::binding`].
+//! Scope arena types — `ScopeId`, `ScopeKind`, `Scope` — plus the
+//! arena-management methods on [`Resolver`] (`push_scope` / `pop_scope`
+//! / `bind_current` / `resolve_unqualified_relation` / etc.) and the
+//! lexical `with_*` helpers. Owns the "container" side of name
+//! resolution; the `Binding` "contents" live in [`super::binding`].
 
 use indexmap::IndexMap;
 use sqlparser::ast::{Ident, ObjectName};
@@ -12,7 +14,7 @@ use super::{Binding, Resolver};
 /// arena only grows during a resolver run, so a `ScopeId` captured
 /// during the walk still resolves correctly in post-passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ScopeId(pub(super) usize);
+pub(crate) struct ScopeId(pub(crate) usize);
 
 /// Whether a scope contributes data to its enclosing write target.
 ///
@@ -34,7 +36,7 @@ pub(crate) enum ScopeKind {
 /// One lexical scope: a `name → Binding` map plus the links
 /// (`parent`, `kind`) used to walk up the scope chain at
 /// name-resolution and lineage-emission time. Self-id is implicit —
-/// the scope's id equals its index in [`ScopeStack::scopes`].
+/// the scope's id equals its index in [`Resolver::scopes`].
 #[derive(Debug)]
 pub(crate) struct Scope {
     /// Lexically enclosing scope, or `None` for the root. Drives the
@@ -60,7 +62,7 @@ impl Scope {
         }
     }
 
-    fn bind(&mut self, name: &Ident, binding: Binding) {
+    pub(super) fn bind(&mut self, name: &Ident, binding: Binding) {
         let key = BindingKey::from_ident(name);
         // Re-binding the same name as a Table merges roles rather than
         // replacing — this captures the `DELETE t1 FROM t1` style case
@@ -82,7 +84,7 @@ impl Scope {
         self.bindings.insert(key, binding);
     }
 
-    fn resolve(&self, name: &Ident) -> Option<&Binding> {
+    pub(super) fn resolve(&self, name: &Ident) -> Option<&Binding> {
         self.bindings.get(&BindingKey::from_ident(name))
     }
 
@@ -91,91 +93,56 @@ impl Scope {
     }
 }
 
-/// Arena + active-stack model of the scope tree. `scopes` retains
-/// every scope by id so post-passes can still look them up after they
-/// have been popped from the active stack; `stack` tracks what is
-/// currently "open" as the walker descends.
-#[derive(Default, Debug)]
-pub(super) struct ScopeStack {
-    /// All scopes ever opened during the walk. Kept after `pop_scope`
-    /// so later passes (lineage collapse, column-ref resolution)
-    /// can address scopes by `ScopeId`. Index in this Vec equals
-    /// `ScopeId.0`.
-    pub(super) scopes: Vec<Scope>,
-    /// Currently-open scope ids, innermost at the top. Drives parent
-    /// derivation in `push_scope` and the walk-up in
-    /// `resolve_unqualified_relation`.
-    stack: Vec<ScopeId>,
-}
-
-impl ScopeStack {
+impl<'a> Resolver<'a> {
+    /// Borrow the scope at `id` from the arena. Stable across later
+    /// pushes since the arena only grows.
     pub(super) fn scope(&self, id: ScopeId) -> &Scope {
         &self.scopes[id.0]
     }
 
-    pub(super) fn into_scopes(self) -> Vec<Scope> {
-        self.scopes
-    }
-
-    /// Push a fresh scope as a child of the current stack top, with
-    /// the given `kind`. Parent is derived from the stack — this is
-    /// the normal "open a nested scope" operation.
+    /// Push a fresh scope as a child of `self.current_scope`, with
+    /// the given `kind`. Returns the new scope's id and makes it
+    /// current.
     pub(super) fn push_scope(&mut self, kind: ScopeKind) -> ScopeId {
-        let parent = self.stack.last().copied();
-        self.insert_scope(parent, kind)
+        let id = ScopeId(self.scopes.len());
+        self.scopes.push(Scope::new(self.current_scope, kind));
+        self.current_scope = Some(id);
+        id
     }
 
+    /// Close the current scope by walking back to its parent. The
+    /// popped scope stays in the arena for post-pass lookups.
     pub(super) fn pop_scope(&mut self) {
-        self.stack.pop();
+        self.current_scope = self.current_scope.and_then(|id| self.scopes[id.0].parent);
     }
 
+    /// Id of the currently-open scope. Lazily inserts a root scope
+    /// on first call so the very first bind has somewhere to land.
+    pub(super) fn current_scope_id(&mut self) -> ScopeId {
+        match self.current_scope {
+            Some(id) => id,
+            None => self.push_scope(ScopeKind::Body),
+        }
+    }
+
+    /// Insert a binding into the current scope, creating a root
+    /// scope on demand if nothing is open yet.
     pub(super) fn bind_current(&mut self, name: Ident, binding: Binding) {
-        self.current_scope_mut().bind(&name, binding);
+        let id = self.current_scope_id();
+        self.scopes[id.0].bind(&name, binding);
     }
 
+    /// Resolve an unqualified single-segment relation name by walking
+    /// up the parent chain from `current_scope`, returning the first
+    /// matching binding. Multi-segment qualified names return `None`
+    /// — those route through schema/catalog resolution elsewhere.
     pub(super) fn resolve_unqualified_relation(&self, relation: &ObjectName) -> Option<&Binding> {
         if relation.0.len() != 1 {
             return None;
         }
         let name = relation.0[0].as_ident()?;
-        self.stack
-            .iter()
-            .rev()
-            .find_map(|scope_id| self.scopes[scope_id.0].resolve(name))
-    }
-
-    /// Low-level: allocate a `ScopeId`, append to the `scopes` arena, and
-    /// push onto the active `stack`, with an arbitrary `parent` (including
-    /// `None` for a root scope). Maintains the invariant that a newly
-    /// inserted scope's `ScopeId.0` equals its index in `scopes`.
-    fn insert_scope(&mut self, parent: Option<ScopeId>, kind: ScopeKind) -> ScopeId {
-        let id = ScopeId(self.scopes.len());
-        self.scopes.push(Scope::new(parent, kind));
-        self.stack.push(id);
-        id
-    }
-
-    pub(super) fn current_scope_id(&mut self) -> ScopeId {
-        if let Some(id) = self.stack.last() {
-            *id
-        } else {
-            self.insert_scope(None, ScopeKind::Body)
-        }
-    }
-
-    fn current_scope_mut(&mut self) -> &mut Scope {
-        let id = self.current_scope_id();
-        &mut self.scopes[id.0]
-    }
-}
-
-impl<'a> Resolver<'a> {
-    pub(super) fn scopes(&self) -> &ScopeStack {
-        &self.scopes
-    }
-
-    pub(super) fn scopes_mut(&mut self) -> &mut ScopeStack {
-        &mut self.scopes
+        std::iter::successors(self.current_scope, |id| self.scopes[id.0].parent)
+            .find_map(|id| self.scopes[id.0].resolve(name))
     }
 
     /// Push a fresh scope, run `f`, then pop it. The current
@@ -198,9 +165,9 @@ impl<'a> Resolver<'a> {
     /// to nest a `?`-bailing walk under a scope push.
     pub(crate) fn with_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let kind = self.scope_kind;
-        self.scopes_mut().push_scope(kind);
+        self.push_scope(kind);
         let r = f(self);
-        self.scopes_mut().pop_scope();
+        self.pop_scope();
         r
     }
 

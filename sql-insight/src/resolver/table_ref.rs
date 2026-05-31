@@ -68,7 +68,7 @@ impl<'a> Resolver<'a> {
     /// Record a use of a real table at the current scope. Called by
     /// `bind_real_table` on Read-position binds.
     pub(super) fn record_real_table_ref(&mut self, table: TableReference) {
-        let scope_id = self.scopes_mut().current_scope_id();
+        let scope_id = self.current_scope_id();
         self.table_refs.push(RawTableRef {
             scope_id,
             target: TableRefTarget::Real(table),
@@ -79,7 +79,7 @@ impl<'a> Resolver<'a> {
     /// the current scope. `body_scope` is the arena id of the
     /// synthetic's body — collapse recurses into its subtree.
     pub(super) fn record_synthetic_table_ref(&mut self, body_scope: ScopeId) {
-        let scope_id = self.scopes_mut().current_scope_id();
+        let scope_id = self.current_scope_id();
         self.table_refs.push(RawTableRef {
             scope_id,
             target: TableRefTarget::Synthetic { body_scope },

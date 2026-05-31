@@ -6,8 +6,11 @@
 //!
 //! Module layout (all sub-modules are crate-internal):
 //!
-//! - [`scope`]: `Scope`, `ScopeStack`, and the `with_*` helpers that
-//!   save / restore scope state around a clause walk.
+//! - [`scope`]: `Scope`, `ScopeId`, `ScopeKind`, plus the arena-
+//!   management methods on `Resolver` (`push_scope` / `pop_scope` /
+//!   `bind_current` / `resolve_unqualified_relation` / etc.) and the
+//!   lexical `with_*` helpers that save / restore scope state around
+//!   a clause walk.
 //! - [`binding`]: `Binding` enum + `BindingKey` + `bind_*` /
 //!   lookup / diagnostic-record methods on `Resolver`.
 //! - [`column_ref`]: `RawColumnRef` and walk-time resolution of
@@ -41,9 +44,6 @@ pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
 pub(crate) use resolution::Resolution;
 pub(crate) use scope::{Scope, ScopeId, ScopeKind};
 pub(crate) use table_ref::{RawTableRef, TableRefTarget};
-
-// Internal infrastructure used by sub-modules via `super::*`.
-use scope::ScopeStack;
 
 use body_output::{output_column_kind, output_column_name};
 
@@ -88,7 +88,7 @@ pub(crate) struct ResolvedQuery {
     pub(crate) body_scope: ScopeId,
 }
 
-/// The walker. Owns the scope stack, the in-progress refs / edges,
+/// The walker. Owns the scope arena, the in-progress refs / edges,
 /// the current body buffer, and the lexical `scope_kind`. All
 /// `visit_*` methods and the various `bind_*` / `record_*` / `with_*`
 /// helpers live as `impl` blocks in this file or in the sub-modules —
@@ -101,9 +101,6 @@ pub(crate) struct Resolver<'a> {
     /// In-progress diagnostics buffer; moved into
     /// [`Resolution::diagnostics`] at `into_resolution`.
     diagnostics: Vec<ColumnLevelDiagnostic>,
-    /// Active scope arena + stack. Pushes/pops during the walk,
-    /// flattens into [`Resolution::scopes`] at `into_resolution`.
-    scopes: ScopeStack,
     /// Column refs captured by `record_column_ref` in walk order.
     /// Post-pass filters synthetic-owned ones out into
     /// [`Resolution::column_refs`].
@@ -124,6 +121,18 @@ pub(crate) struct Resolver<'a> {
     /// collected body back via the returned `ResolvedQuery`'s
     /// `output_columns`, so each query gets exactly its own operands.
     current_body: BodyOutput,
+    /// Scope arena: all scopes ever opened during the walk. Each
+    /// `Scope` carries its `parent: Option<ScopeId>` so the active
+    /// path from root to current is derivable from `current_scope` +
+    /// `parent` links — no separate stack needed. Indexed by
+    /// [`ScopeId`]; flattens into [`Resolution::scopes`] at
+    /// `into_resolution`.
+    scopes: Vec<Scope>,
+    /// Cursor into [`Self::scopes`]: the currently-open scope. `None`
+    /// before any push (then `current_scope_id` lazily inserts a
+    /// root); set on each `push_scope` and walked back to the parent
+    /// on each `pop_scope`.
+    current_scope: Option<ScopeId>,
     /// Lexical context stamped onto every scope pushed while it is in
     /// effect: `Body` by default, flipped to `Predicate` by
     /// [`Resolver::with_filter_clause`] so subqueries nested in WHERE /
@@ -138,11 +147,12 @@ impl<'a> Resolver<'a> {
         Self {
             catalog,
             diagnostics: Vec::new(),
-            scopes: ScopeStack::default(),
             column_refs: Vec::new(),
             lineage_edges: Vec::new(),
             table_refs: Vec::new(),
             current_body: BodyOutput::default(),
+            scopes: Vec::new(),
+            current_scope: None,
             scope_kind: ScopeKind::Body,
         }
     }
@@ -159,7 +169,7 @@ impl<'a> Resolver<'a> {
     fn into_resolution(self) -> Resolution {
         let mut resolution = Resolution {
             diagnostics: self.diagnostics,
-            scopes: self.scopes.into_scopes(),
+            scopes: self.scopes,
             column_refs: self.column_refs,
             lineage_edges: self.lineage_edges,
             table_refs: self.table_refs,
@@ -181,7 +191,7 @@ impl<'a> Resolver<'a> {
         // accumulate into the resolver's own buffer, not into the scope.
         let prev_body = std::mem::take(&mut self.current_body);
         let body_scope = self.with_scope(|r| -> Result<ScopeId, Error> {
-            let body_scope = r.scopes_mut().current_scope_id();
+            let body_scope = r.current_scope_id();
             if let Some(with) = &query.with {
                 if with.recursive {
                     for cte in &with.cte_tables {
