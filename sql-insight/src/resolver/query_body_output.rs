@@ -11,9 +11,10 @@
 //! directly to the SQL standard's `<query expression body>` (the
 //! part of a query stripped of WITH / ORDER BY / LIMIT / FETCH /
 //! settings / pipes). So [`QueryBodyOutput`] is "the projection columns
-//! produced by walking that body", `current_query_body_output` is the in-progress
-//! such buffer, and `body_scope` on a synthetic binding is the
-//! arena scope of that body's FROM bindings.
+//! produced by walking that body", `body_output_stack` is the
+//! `resolve_query`-scoped stack of such buffers (the top is the
+//! one currently being filled), and `body_scope` on a synthetic
+//! binding is the arena scope of that body's FROM bindings.
 
 use sqlparser::ast::{Expr, Ident, SelectItem, TableAliasColumnDef};
 
@@ -104,11 +105,38 @@ fn rename_only_column(name: Ident) -> OutputColumn {
 }
 
 impl<'a> Resolver<'a> {
+    /// Push a fresh frame onto [`Context::body_output_stack`] so the
+    /// next [`Self::push_set_operand`] / [`Self::extend_set_operands`]
+    /// lands on it. Pair with [`Self::pop_body_output`] on `resolve_query`
+    /// return.
+    pub(super) fn push_body_output(&mut self) {
+        self.context
+            .body_output_stack
+            .push(QueryBodyOutput::default());
+    }
+
+    /// Pop the active body-output frame off
+    /// [`Context::body_output_stack`] and return it. `expect`
+    /// documents the invariant: every `pop_body_output` is paired
+    /// with a preceding `push_body_output` in `resolve_query`, so the
+    /// stack is non-empty here.
+    pub(super) fn pop_body_output(&mut self) -> QueryBodyOutput {
+        self.context
+            .body_output_stack
+            .pop()
+            .expect("pop_body_output must be paired with push_body_output")
+    }
+
     /// Push a fully-built set operand into the active query's body
-    /// output. Called by `visit_select` once per SELECT body.
+    /// output (the top of [`Context::body_output_stack`]). Called by
+    /// `visit_select` once per SELECT body. `expect` documents the
+    /// invariant — `push_set_operand` is only reachable transitively
+    /// from `resolve_query`, which always pushes a fresh top first.
     pub(super) fn push_set_operand(&mut self, operand: SetOperand) {
         self.context
-            .current_query_body_output
+            .body_output_stack
+            .last_mut()
+            .expect("push_set_operand must be called inside resolve_query")
             .set_operands
             .push(operand);
     }
@@ -119,7 +147,9 @@ impl<'a> Resolver<'a> {
     /// pairing reaches through a parenthesized source).
     pub(super) fn extend_set_operands(&mut self, operands: Vec<SetOperand>) {
         self.context
-            .current_query_body_output
+            .body_output_stack
+            .last_mut()
+            .expect("extend_set_operands must be called inside resolve_query")
             .set_operands
             .extend(operands);
     }

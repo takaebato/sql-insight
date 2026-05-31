@@ -120,13 +120,16 @@ pub(crate) struct Resolver<'a> {
 /// [`Resolution`]. Reset implicitly when the walker is dropped.
 #[derive(Debug, Default)]
 pub(crate) struct Context {
-    /// Per-query in-progress [`QueryBodyOutput`], filled by `visit_select`
-    /// (one [`SetOperand`] per SELECT body, accumulated across the
-    /// operands of a set operation chain). `resolve_query` swaps a
-    /// fresh buffer in for the duration of its walk and hands the
-    /// collected body back via the returned `ResolvedQuery`'s
-    /// `output_columns`, so each query gets exactly its own operands.
-    pub(crate) current_query_body_output: QueryBodyOutput,
+    /// Stack of in-progress [`QueryBodyOutput`]s — one per active
+    /// `resolve_query` call. The top is the buffer that
+    /// `visit_select` currently fills (one [`SetOperand`] per SELECT
+    /// body, accumulated across the operands of a set operation
+    /// chain). `resolve_query` pushes a fresh buffer on entry and
+    /// pops it on return, handing the popped buffer back via the
+    /// returned `ResolvedQuery`'s `output_columns`. Nested
+    /// `resolve_query` (e.g. CTE bodies, derived subqueries) just
+    /// grow the stack — each level has its own top.
+    pub(crate) body_output_stack: Vec<QueryBodyOutput>,
     /// Cursor into [`Resolution::scopes`]: the currently-open scope.
     /// `None` before any push (then `current_scope_id` lazily inserts
     /// a root); set on each `push_scope` and walked back to the
@@ -185,12 +188,14 @@ impl<'a> Resolver<'a> {
     /// / pipes), then hands back the collected body output + body
     /// scope id.
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
-        // Swap in a fresh body buffer for this query — restored on
-        // return — so each ResolvedQuery owns exactly its own set
-        // operands without leaking into siblings or ancestors. This is
-        // independent of the scope-arena push below: operands
-        // accumulate into the resolver's own buffer, not into the scope.
-        let prev_body = std::mem::take(&mut self.context.current_query_body_output);
+        // Push a fresh body buffer onto the stack for this query;
+        // the matching `pop_body_output` after the walk pulls the
+        // populated buffer back out. Nested `resolve_query` (CTE
+        // bodies, derived subqueries) grow the stack — each level
+        // writes to its own top, restored automatically on pop.
+        // Independent of the scope-arena push below: operands
+        // accumulate into the stack, not into the scope.
+        self.push_body_output();
         let body_scope = self.with_scope(|r| -> Result<ScopeId, Error> {
             let body_scope = r.current_scope_id();
             if let Some(with) = &query.with {
@@ -247,7 +252,7 @@ impl<'a> Resolver<'a> {
             }
             Ok(body_scope)
         })?;
-        let body = std::mem::replace(&mut self.context.current_query_body_output, prev_body);
+        let body = self.pop_body_output();
         let output_columns = if body.set_operands.is_empty() {
             None
         } else {
