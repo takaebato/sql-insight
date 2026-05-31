@@ -352,32 +352,15 @@ fn collect_reads(resolution: &Resolution) -> Vec<ColumnReference> {
 /// Build a `ColumnReference` from a `CompoundIdentifier`'s parts —
 /// used by UPDATE SET target parsing where the target's qualifier
 /// hasn't been resolver-walked. The last part is the column name;
-/// preceding parts decode into `TableReference` by length (1 / 2 / 3).
+/// preceding parts decode into `TableReference` via
+/// [`TableReference::try_from_parts`].
 fn column_ref_from_parts(parts: &[Ident]) -> Option<ColumnReference> {
     let (col, table_parts) = match parts.split_last() {
         Some((col, rest)) if !rest.is_empty() => (col.clone(), rest),
         _ => return None,
     };
-    let table = match table_parts.len() {
-        1 => TableReference {
-            catalog: None,
-            schema: None,
-            name: table_parts[0].clone(),
-        },
-        2 => TableReference {
-            catalog: None,
-            schema: Some(table_parts[0].clone()),
-            name: table_parts[1].clone(),
-        },
-        3 => TableReference {
-            catalog: Some(table_parts[0].clone()),
-            schema: Some(table_parts[1].clone()),
-            name: table_parts[2].clone(),
-        },
-        _ => return None,
-    };
     Some(ColumnReference {
-        table: Some(table),
+        table: Some(TableReference::try_from_parts(table_parts)?),
         name: col,
     })
 }

@@ -69,6 +69,31 @@ impl TableReference {
             )),
         }
     }
+
+    /// Decode an `[Ident]` slice into a `TableReference`. 1 element =
+    /// bare name, 2 = `schema.name`, 3 = `catalog.schema.name`. Returns
+    /// `None` for 0 or 4+ parts. Use [`Self::try_from_name`] when the
+    /// input is an [`ObjectName`] (4+ parts surface as `Error` there).
+    pub fn try_from_parts(parts: &[Ident]) -> Option<Self> {
+        match parts {
+            [name] => Some(TableReference {
+                catalog: None,
+                schema: None,
+                name: name.clone(),
+            }),
+            [schema, name] => Some(TableReference {
+                catalog: None,
+                schema: Some(schema.clone()),
+                name: name.clone(),
+            }),
+            [catalog, schema, name] => Some(TableReference {
+                catalog: Some(catalog.clone()),
+                schema: Some(schema.clone()),
+                name: name.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for TableReference {

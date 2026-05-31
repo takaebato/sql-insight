@@ -39,33 +39,6 @@ pub(crate) struct CapturedColumnRef {
     pub(crate) synthetic: bool,
 }
 
-/// Decode a qualified ref's leading parts (everything before the
-/// column name) into a `TableReference`. 1 part = bare name, 2 =
-/// schema.name, 3 = catalog.schema.name. Other lengths (0 / 4+)
-/// return `None` — they're either accidentally invalid or
-/// struct-field accesses on a fully qualified column, which we don't
-/// model yet.
-pub(super) fn table_from_qualifier_parts(parts: &[Ident]) -> Option<TableReference> {
-    match parts.len() {
-        1 => Some(TableReference {
-            catalog: None,
-            schema: None,
-            name: parts[0].clone(),
-        }),
-        2 => Some(TableReference {
-            catalog: None,
-            schema: Some(parts[0].clone()),
-            name: parts[1].clone(),
-        }),
-        3 => Some(TableReference {
-            catalog: Some(parts[0].clone()),
-            schema: Some(parts[1].clone()),
-            name: parts[2].clone(),
-        }),
-        _ => None,
-    }
-}
-
 impl<'a> Resolver<'a> {
     /// Record a column reference observed in the current scope.
     /// Resolution (owning table) and synthetic-vs-real classification
@@ -202,7 +175,7 @@ impl<'a> Resolver<'a> {
             Some(Binding::Table { table, .. }) if qualifier_parts.len() == 1 => {
                 Some((**table).clone())
             }
-            _ => table_from_qualifier_parts(qualifier_parts),
+            _ => TableReference::try_from_parts(qualifier_parts),
         };
         (table, synthetic)
     }
