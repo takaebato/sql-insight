@@ -4,9 +4,9 @@
 //! projecting the resolution into a different surface:
 //!
 //! - [`extract_tables`] — flat list of `TableReference`s per
-//!   statement (legacy).
+//!   statement, no read/write distinction.
 //! - [`extract_crud_tables`] — tables bucketed by CRUD verb
-//!   (legacy).
+//!   (Create / Read / Update / Delete).
 //! - [`extract_table_operations`] — per-statement
 //!   `TableOperation` with `reads` / `writes` / `lineage` at table
 //!   granularity.

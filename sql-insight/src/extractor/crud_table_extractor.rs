@@ -1,6 +1,11 @@
-//! A Extractor that extracts CRUD tables from SQL queries.
+//! CRUD-bucketed table extraction. See [`extract_crud_tables`] as
+//! the entry point.
 //!
-//! See [`extract_crud_tables`](crate::extractor::extract_crud_tables()) as the entry point for extracting CRUD tables from SQL.
+//! Buckets the tables touched by a statement into the four CRUD
+//! positions (Create / Read / Update / Delete). For finer detail —
+//! keeping the precise verb (Insert / Update / Delete / Merge),
+//! separating reads from writes, and per-statement lineage — see
+//! [`extract_table_operations`](crate::extractor::extract_table_operations).
 
 use std::fmt;
 
@@ -12,7 +17,8 @@ use sqlparser::ast::{MergeAction, Statement};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
-/// Convenience function to extract CRUD tables from SQL.
+/// Parse `sql` under `dialect` and return one [`CrudTables`] per
+/// statement.
 ///
 /// ## Example
 ///
@@ -32,7 +38,9 @@ pub fn extract_crud_tables(
     CrudTableExtractor::extract(dialect, sql)
 }
 
-/// [`CrudTables`] represents the tables involved in CRUD operations.
+/// Per-statement output of [`extract_crud_tables`]: tables bucketed
+/// by CRUD position plus non-fatal diagnostics. `Display` renders
+/// `"Create: [...], Read: [...], Update: [...], Delete: [...]"`.
 #[derive(Default, Debug, PartialEq)]
 pub struct CrudTables {
     pub create_tables: Vec<TableReference>,
@@ -58,7 +66,8 @@ impl fmt::Display for CrudTables {
     }
 }
 
-/// Extracts CRUD tables from SQL. A thin shim over
+/// Struct-style entry point. Equivalent to the free
+/// [`extract_crud_tables`] function. A thin shim over
 /// [`TableOperationExtractor`] that buckets `reads`/`writes` into the
 /// CRUD positions and consults the AST only for MERGE clauses (whose
 /// target placement depends on WHEN actions).
@@ -66,7 +75,8 @@ impl fmt::Display for CrudTables {
 pub struct CrudTableExtractor;
 
 impl CrudTableExtractor {
-    /// Extract CRUD tables from SQL.
+    /// Same as the free [`extract_crud_tables`] function — kept for
+    /// users who prefer the struct-style API.
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,

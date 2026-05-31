@@ -1,11 +1,10 @@
-//! Flat table-identity extraction (legacy). See [`extract_tables`]
-//! as the entry point.
+//! Flat table-identity extraction. See [`extract_tables`] as the
+//! entry point.
 //!
-//! Newer code should prefer
+//! Returns the list of tables a statement references, with no
+//! read/write distinction or lineage information. For those, see
 //! [`extract_table_operations`](crate::extractor::extract_table_operations)
-//! for `reads` / `writes` / lineage splits, or
-//! [`extract_column_operations`](crate::extractor::extract_column_operations)
-//! for column granularity.
+//! / [`extract_column_operations`](crate::extractor::extract_column_operations).
 
 use core::fmt;
 
