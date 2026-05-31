@@ -3,7 +3,7 @@
 //! / `resolve_unqualified_relation` / `with_scope`). Owns the
 //! "container" side of name resolution; the `Binding` "contents" live
 //! in [`super::binding`]. Predicate-position bookkeeping
-//! ([`Resolver::with_predicate`]) lives in the parent module since
+//! ([`Resolver::suppress_lineage`]) lives in the parent module since
 //! it touches walker state, not the scope arena.
 
 use indexmap::IndexMap;

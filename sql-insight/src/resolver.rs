@@ -137,14 +137,15 @@ pub(crate) struct Context {
     pub(crate) current_scope: Option<ScopeId>,
     /// True (the default) while walking a value-position expression
     /// whose refs would contribute to lineage; flipped to `false`
-    /// while walking a predicate context entered via
-    /// [`Resolver::with_predicate`] (WHERE / HAVING / JOIN ON /
+    /// inside [`Resolver::suppress_lineage`] for positions where the
+    /// column's value doesn't flow out (WHERE / HAVING / JOIN ON /
     /// EXISTS / IN-subquery RHS / CASE WHEN cond / aggregate FILTER
     /// / etc.). Stamped onto every captured column / table ref's
     /// `is_lineage_source` field at capture time, so refs are
     /// classified by their lexical role regardless of which scope
-    /// they happen to land in. Stays set across subquery boundaries
-    /// — a subquery inside a predicate is itself non-lineage.
+    /// they happen to land in. Stays at its current value across
+    /// subquery boundaries — a subquery inside a suppressed context
+    /// is itself non-lineage.
     pub(crate) is_lineage_source: bool,
 }
 
@@ -153,8 +154,8 @@ impl Default for Context {
         Self {
             body_output_stack: Vec::new(),
             current_scope: None,
-            // Walks start in value position. `with_predicate` flips
-            // this to `false` for the duration of a predicate sub-walk.
+            // Walks start in value position. `suppress_lineage` flips
+            // this to `false` for the duration of a non-lineage walk.
             is_lineage_source: true,
         }
     }
@@ -393,13 +394,13 @@ impl<'a> Resolver<'a> {
         .into_iter()
         .flatten()
         {
-            self.with_predicate(|r| r.visit_expr(expr))?;
+            self.suppress_lineage(|r| r.visit_expr(expr))?;
         }
         for connect_by in &select.connect_by {
             // CONNECT BY / START WITH are predicate-style hierarchical
             // join conditions (Oracle / Snowflake) — subqueries nested
             // here do not feed the enclosing write target.
-            self.with_predicate(|r| match connect_by {
+            self.suppress_lineage(|r| match connect_by {
                 ConnectByKind::ConnectBy { relationships, .. } => r.visit_exprs(relationships),
                 ConnectByKind::StartWith { condition, .. } => r.visit_expr(condition),
             })?;
@@ -871,7 +872,7 @@ impl<'a> Resolver<'a> {
                     self.bind_derived_table(Ident::new("EXCLUDED"), excluded_output, None);
                     self.emit_assignment_lineage(&do_update.assignments, Some(target_table))?;
                     if let Some(selection) = &do_update.selection {
-                        self.with_predicate(|r| r.visit_expr(selection))?;
+                        self.suppress_lineage(|r| r.visit_expr(selection))?;
                     }
                 }
             }
@@ -944,7 +945,7 @@ impl<'a> Resolver<'a> {
         let target_table = try_target_table_from_factor(&update.table.relation);
         self.emit_assignment_lineage(&update.assignments, target_table.as_ref())?;
         if let Some(selection) = &update.selection {
-            self.with_predicate(|r| r.visit_expr(selection))?;
+            self.suppress_lineage(|r| r.visit_expr(selection))?;
         }
         self.visit_returning(update.returning.as_deref())?;
         Ok(())
@@ -1018,7 +1019,7 @@ impl<'a> Resolver<'a> {
             self.bind_real_table(TableReference::try_from_name(name)?, None, TableRole::Write);
         }
         if let Some(selection) = &delete.selection {
-            self.with_predicate(|r| r.visit_expr(selection))?;
+            self.suppress_lineage(|r| r.visit_expr(selection))?;
         }
         self.visit_returning(delete.returning.as_deref())?;
         Ok(())
@@ -1033,16 +1034,16 @@ impl<'a> Resolver<'a> {
         use sqlparser::ast::{MergeAction, MergeInsertKind};
         self.visit_table_factor(&merge.table, TableRole::Write)?;
         self.visit_table_factor(&merge.source, TableRole::Read)?;
-        self.with_predicate(|r| r.visit_expr(&merge.on))?;
+        self.suppress_lineage(|r| r.visit_expr(&merge.on))?;
         let target_table = try_target_table_from_factor(&merge.table);
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
-                self.with_predicate(|r| r.visit_expr(predicate))?;
+                self.suppress_lineage(|r| r.visit_expr(predicate))?;
             }
             match &clause.action {
                 MergeAction::Insert(insert_expr) => {
                     if let Some(pred) = &insert_expr.insert_predicate {
-                        self.with_predicate(|r| r.visit_expr(pred))?;
+                        self.suppress_lineage(|r| r.visit_expr(pred))?;
                     }
                     if let MergeInsertKind::Values(values) = &insert_expr.kind {
                         self.emit_merge_insert_lineage(
@@ -1132,20 +1133,20 @@ impl<'a> Resolver<'a> {
             // predicate-shape regardless of where they're written:
             // EXISTS returns a boolean (column values never flow),
             // and IN's RHS columns are match-test targets (only the
-            // boolean result flows). Force `with_predicate` so
+            // boolean result flows). Force `suppress_lineage` so
             // refs captured inside are tagged non-lineage even
             // when the surrounding context is Body (e.g. a CASE
             // WHEN inside a projection).
             Expr::Subquery(query) => self.resolve_query(query).map(|_| ()),
             Expr::Exists { subquery, .. } => {
-                self.with_predicate(|r| r.resolve_query(subquery).map(|_| ()))
+                self.suppress_lineage(|r| r.resolve_query(subquery).map(|_| ()))
             }
             Expr::InSubquery { expr, subquery, .. } => {
                 // LHS stays in the surrounding context — its value
                 // participates in the comparison and (transitively)
                 // in the boolean result.
                 self.visit_expr(expr)?;
-                self.with_predicate(|r| r.resolve_query(subquery).map(|_| ()))
+                self.suppress_lineage(|r| r.resolve_query(subquery).map(|_| ()))
             }
             Expr::BinaryOp { left, right, .. }
             | Expr::IsDistinctFrom(left, right)
@@ -1161,7 +1162,7 @@ impl<'a> Resolver<'a> {
             // stays in the surrounding context.
             Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
                 self.visit_expr(left)?;
-                self.with_predicate(|r| r.visit_expr(right))
+                self.suppress_lineage(|r| r.visit_expr(right))
             }
             Expr::UnaryOp { expr, .. }
             | Expr::Nested(expr)
@@ -1299,10 +1300,10 @@ impl<'a> Resolver<'a> {
                 //   the actual values that flow to the output. Value
                 //   position.
                 if let Some(expr) = operand {
-                    self.with_predicate(|r| r.visit_expr(expr))?;
+                    self.suppress_lineage(|r| r.visit_expr(expr))?;
                 }
                 for condition in conditions {
-                    self.with_predicate(|r| r.visit_expr(&condition.condition))?;
+                    self.suppress_lineage(|r| r.visit_expr(&condition.condition))?;
                     self.visit_expr(&condition.result)?;
                 }
                 if let Some(expr) = else_result {
@@ -1439,7 +1440,7 @@ impl<'a> Resolver<'a> {
 
     /// Dispatch one pipe-syntax operator (`|> WHERE`, `|> SELECT`,
     /// `|> AGGREGATE`, etc.). Filter-position operators wrap their
-    /// expression walks with `with_predicate`; projection-shaped
+    /// expression walks with `suppress_lineage`; projection-shaped
     /// operators (`|> SELECT` / `|> EXTEND` / `|> AGGREGATE`) push a
     /// fresh `SetOperand` of output columns.
     pub(super) fn visit_pipe_operator(&mut self, operator: &PipeOperator) -> Result<(), Error> {
@@ -1451,7 +1452,7 @@ impl<'a> Resolver<'a> {
                 }
                 Ok(())
             }
-            PipeOperator::Where { expr } => self.with_predicate(|r| r.visit_expr(expr)),
+            PipeOperator::Where { expr } => self.suppress_lineage(|r| r.visit_expr(expr)),
             PipeOperator::OrderBy { exprs } => {
                 for expr in exprs {
                     self.visit_order_by_expr(expr)?;
@@ -1536,7 +1537,7 @@ impl<'a> Resolver<'a> {
             // predicate, semantically identical to a WHERE clause
             // scoped to the aggregate. Same disposition as WHERE —
             // refs inside don't flow as values.
-            self.with_predicate(|r| r.visit_expr(expr))?;
+            self.suppress_lineage(|r| r.visit_expr(expr))?;
         }
         for expr in &function.within_group {
             self.visit_order_by_expr(expr)?;
@@ -1724,7 +1725,7 @@ impl<'a> Resolver<'a> {
                 match_condition,
                 constraint,
             } => {
-                self.with_predicate(|r| r.visit_expr(match_condition))?;
+                self.suppress_lineage(|r| r.visit_expr(match_condition))?;
                 self.visit_join_constraint(constraint)
             }
             JoinOperator::CrossApply | JoinOperator::OuterApply => Ok(()),
@@ -1733,7 +1734,7 @@ impl<'a> Resolver<'a> {
 
     fn visit_join_constraint(&mut self, constraint: &JoinConstraint) -> Result<(), Error> {
         match constraint {
-            JoinConstraint::On(expr) => self.with_predicate(|r| r.visit_expr(expr)),
+            JoinConstraint::On(expr) => self.suppress_lineage(|r| r.visit_expr(expr)),
             JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
         }
     }
@@ -2031,18 +2032,21 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// Walk a predicate context with `context.is_lineage_source =
-    /// false`, so column / table refs captured inside (whether
-    /// directly in the expression or transitively through a nested
-    /// subquery) are tagged as non-lineage and dropped from lineage
-    /// edges. Used for both lexical predicate clauses (WHERE /
-    /// HAVING / QUALIFY / JOIN ON / MERGE ON / AsOf match / CONNECT
-    /// BY / pipe `|> WHERE` / aggregate FILTER) and predicate-shape
-    /// expressions (`Expr::Exists`, `Expr::InSubquery` RHS,
-    /// `Expr::AnyOp` / `Expr::AllOp` RHS, `Expr::Case` operand and
-    /// WHEN conditions). The previous `is_lineage_source` value is
-    /// restored on return.
-    fn with_predicate<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+    /// Temporarily set `context.is_lineage_source = false` for the
+    /// duration of `f`, so column / table refs captured inside
+    /// (whether directly in the expression or transitively through a
+    /// nested subquery) are tagged as non-lineage and dropped from
+    /// lineage edges. The previous value is restored on return.
+    ///
+    /// Used for any walk position where the column's value doesn't
+    /// flow into the output:
+    /// - lexical predicate clauses: WHERE / HAVING / QUALIFY / JOIN
+    ///   ON / MERGE ON / AsOf match / CONNECT BY / pipe `|> WHERE` /
+    ///   aggregate FILTER
+    /// - predicate-shape expressions: `Expr::Exists`,
+    ///   `Expr::InSubquery` RHS, `Expr::AnyOp` / `Expr::AllOp` RHS,
+    ///   `Expr::Case` operand and WHEN conditions
+    fn suppress_lineage<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let prev = self.context.is_lineage_source;
         self.context.is_lineage_source = false;
         let r = f(self);
