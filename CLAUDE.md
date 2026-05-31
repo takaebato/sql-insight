@@ -11,6 +11,9 @@ by hand.
 - Format: `cargo fmt`
 - Test: `cargo test --all`
 - Lint: `cargo clippy --all-targets -- -D warnings` (zero-warning policy)
+- Docs: `RUSTDOCFLAGS=-Dwarnings cargo doc --document-private-items --no-deps --workspace --all-features`
+  (matches CI; `--document-private-items` catches broken intra-doc
+  links in private rustdoc that plain `cargo doc` silently skips)
 
 ## Architecture
 
