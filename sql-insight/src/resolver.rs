@@ -118,7 +118,7 @@ pub(crate) struct Resolver<'a> {
 /// Per-walk scratch state for the [`Resolver`]: the things that change
 /// as the walk progresses but don't survive into the final
 /// [`Resolution`]. Reset implicitly when the walker is dropped.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Context {
     /// Stack of in-progress [`QueryBodyOutput`]s — one per active
     /// `resolve_query` call. The top is the buffer that
@@ -135,15 +135,29 @@ pub(crate) struct Context {
     /// a root); set on each `push_scope` and walked back to the
     /// parent on each `pop_scope`.
     pub(crate) current_scope: Option<ScopeId>,
-    /// True while walking a predicate clause (WHERE / HAVING / JOIN ON
-    /// / etc.) or a predicate-shape expression (EXISTS / IN-subquery
-    /// RHS). Stamped onto every captured column / table ref's
-    /// `in_predicate` field at capture time, so predicate-position
-    /// refs are excluded from lineage regardless of which scope they
-    /// happen to land in. Stays set across subquery boundaries — a
-    /// subquery inside a predicate is itself predicate-position.
-    /// Toggled by [`Resolver::with_predicate`].
-    pub(crate) in_predicate: bool,
+    /// True (the default) while walking a value-position expression
+    /// whose refs would contribute to lineage; flipped to `false`
+    /// while walking a predicate context entered via
+    /// [`Resolver::with_predicate`] (WHERE / HAVING / JOIN ON /
+    /// EXISTS / IN-subquery RHS / CASE WHEN cond / aggregate FILTER
+    /// / etc.). Stamped onto every captured column / table ref's
+    /// `is_lineage_source` field at capture time, so refs are
+    /// classified by their lexical role regardless of which scope
+    /// they happen to land in. Stays set across subquery boundaries
+    /// — a subquery inside a predicate is itself non-lineage.
+    pub(crate) is_lineage_source: bool,
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Self {
+            body_output_stack: Vec::new(),
+            current_scope: None,
+            // Walks start in value position. `with_predicate` flips
+            // this to `false` for the duration of a predicate sub-walk.
+            is_lineage_source: true,
+        }
+    }
 }
 
 impl<'a> Resolver<'a> {
@@ -170,7 +184,7 @@ impl<'a> Resolver<'a> {
 
     /// Finalize the embedded [`Resolution`] via the two post-passes
     /// (lineage collapse + real-column filter) and hand it back. The
-    /// walk state (body_output_stack / current_scope / in_predicate) is
+    /// walk state (body_output_stack / current_scope / is_lineage_source) is
     /// dropped at this point — only `resolution` survives.
     fn into_resolution(self) -> Resolution {
         let mut resolution = self.resolution;
@@ -418,7 +432,7 @@ impl<'a> Resolver<'a> {
         self.visit_select_item(item)?;
         let source_refs = self.resolution.column_refs[refs_before..]
             .iter()
-            .filter(|r| !r.in_predicate)
+            .filter(|r| r.is_lineage_source)
             .cloned()
             .collect();
         Ok(OutputColumn {
@@ -1119,7 +1133,7 @@ impl<'a> Resolver<'a> {
             // EXISTS returns a boolean (column values never flow),
             // and IN's RHS columns are match-test targets (only the
             // boolean result flows). Force `with_predicate` so
-            // refs captured inside are tagged `in_predicate` even
+            // refs captured inside are tagged non-lineage even
             // when the surrounding context is Body (e.g. a CASE
             // WHEN inside a projection).
             Expr::Subquery(query) => self.resolve_query(query).map(|_| ()),
@@ -2017,20 +2031,22 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// Walk a predicate context with `context.in_predicate = true`, so
-    /// column / table refs captured inside (whether directly in the
-    /// expression or transitively through a nested subquery) are
-    /// tagged as predicate-position and excluded from lineage. Used
-    /// for both lexical predicate clauses (WHERE / HAVING / QUALIFY /
-    /// JOIN ON / MERGE ON / AsOf match / CONNECT BY / pipe `|> WHERE`)
-    /// and predicate-shape expressions (`Expr::Exists`,
-    /// `Expr::InSubquery` RHS). The previous `in_predicate` value is
+    /// Walk a predicate context with `context.is_lineage_source =
+    /// false`, so column / table refs captured inside (whether
+    /// directly in the expression or transitively through a nested
+    /// subquery) are tagged as non-lineage and dropped from lineage
+    /// edges. Used for both lexical predicate clauses (WHERE /
+    /// HAVING / QUALIFY / JOIN ON / MERGE ON / AsOf match / CONNECT
+    /// BY / pipe `|> WHERE` / aggregate FILTER) and predicate-shape
+    /// expressions (`Expr::Exists`, `Expr::InSubquery` RHS,
+    /// `Expr::AnyOp` / `Expr::AllOp` RHS, `Expr::Case` operand and
+    /// WHEN conditions). The previous `is_lineage_source` value is
     /// restored on return.
     fn with_predicate<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let prev = self.context.in_predicate;
-        self.context.in_predicate = true;
+        let prev = self.context.is_lineage_source;
+        self.context.is_lineage_source = false;
         let r = f(self);
-        self.context.in_predicate = prev;
+        self.context.is_lineage_source = prev;
         r
     }
 }

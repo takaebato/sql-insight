@@ -21,12 +21,13 @@ use super::{Binding, Resolver, ScopeId};
 /// `scope_id` is the scope in which the reference appeared (kept for
 /// diagnostics and for binding lookups at collapse time).
 ///
-/// `resolved`, `synthetic`, and `in_predicate` are computed at record
-/// time, when walk state still reflects what was visible to the SQL
-/// author at that point — necessary for multi-CTE chains where later
-/// CTE bindings would otherwise ambify earlier resolutions, and for
-/// recording the lexical role of the reference (value vs predicate)
-/// before the walker leaves the surrounding clause.
+/// `resolved`, `synthetic`, and `is_lineage_source` are computed at
+/// record time, when walk state still reflects what was visible to
+/// the SQL author at that point — necessary for multi-CTE chains
+/// where later CTE bindings would otherwise ambify earlier
+/// resolutions, and for recording the lexical role of the reference
+/// (value vs predicate) before the walker leaves the surrounding
+/// clause.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CapturedColumnRef {
     pub(crate) parts: Vec<Ident>,
@@ -39,11 +40,14 @@ pub(crate) struct CapturedColumnRef {
     /// filtering and lineage collapse. `false` when `resolved` is
     /// `None`.
     pub(crate) synthetic: bool,
-    /// True iff the reference appeared inside a predicate context
-    /// (WHERE / HAVING / JOIN ON / EXISTS / etc.) — set from
-    /// [`super::Context::in_predicate`] at capture time. Predicate-
-    /// position refs are excluded from lineage collapse.
-    pub(crate) in_predicate: bool,
+    /// True (the default) iff the reference appeared in a value
+    /// position and its value flows out; `false` for refs captured
+    /// in a predicate context (WHERE / HAVING / JOIN ON / EXISTS /
+    /// CASE WHEN cond / aggregate FILTER / etc.). Set from
+    /// [`super::Context::is_lineage_source`] at capture time. Refs
+    /// with `is_lineage_source = false` are dropped from lineage
+    /// edges; they still surface in `reads`.
+    pub(crate) is_lineage_source: bool,
 }
 
 impl<'a> Resolver<'a> {
@@ -53,14 +57,14 @@ impl<'a> Resolver<'a> {
     /// later CTE bindings won't ambify what this reference saw.
     pub(super) fn capture_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.current_scope_id();
-        let in_predicate = self.context.in_predicate;
+        let is_lineage_source = self.context.is_lineage_source;
         let (resolved, synthetic) = self.resolve_ref(&parts, scope_id);
         self.resolution.column_refs.push(CapturedColumnRef {
             parts,
             scope_id,
             resolved,
             synthetic,
-            in_predicate,
+            is_lineage_source,
         });
     }
 

@@ -969,7 +969,7 @@ mod reads_by_clause {
         // The scalar subquery lives entirely inside the CASE WHEN
         // cond, which is a predicate. Inner refs (`s.x` from its
         // projection, `s.y` from its WHERE) are tagged
-        // `in_predicate` at capture and dropped from the outer
+        // `is_lineage_source = false` at capture and dropped from the outer
         // projection's `source_refs`. The output is `1 / NULL`,
         // determined by the subquery's IS NULL test — no inner
         // column's value flows out.
@@ -990,7 +990,7 @@ mod reads_by_clause {
         // The EXISTS subquery sits in the CASE WHEN cond — a
         // doubly-predicate position. `x.id` is in the EXISTS
         // subquery's WHERE, `s.flag` in the EXISTS subquery's
-        // projection — both `in_predicate=true`. THEN / ELSE
+        // projection — both `is_lineage_source = false`. THEN / ELSE
         // carry values from `s.a` / `s.b`, which flow.
         assert_column_ops(
             "SELECT \

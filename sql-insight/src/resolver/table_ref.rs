@@ -21,12 +21,14 @@ pub(crate) struct CapturedTableRef {
     /// a synthetic relation (recurses into its body to find real
     /// tables underneath).
     pub(crate) target: TableRefTarget,
-    /// True iff the use appeared inside a predicate context
-    /// (WHERE / HAVING / JOIN ON / EXISTS / etc.) — set from
-    /// [`super::Context::in_predicate`] at capture time. Predicate-
-    /// position uses are filtered out of
+    /// True (the default) iff the use appeared in a value position
+    /// and feeds the enclosing write target; `false` for uses
+    /// captured in a predicate context (WHERE / HAVING / JOIN ON /
+    /// EXISTS / etc.). Set from
+    /// [`super::Context::is_lineage_source`] at capture time. Uses
+    /// with `is_lineage_source = false` are filtered out of
     /// [`super::Resolution::collapsed_feeding_table_sources`].
-    pub(crate) in_predicate: bool,
+    pub(crate) is_lineage_source: bool,
 }
 
 /// Resolution of a [`CapturedTableRef`] target.
@@ -75,11 +77,11 @@ impl<'a> Resolver<'a> {
     /// `bind_real_table` on Read-position binds.
     pub(super) fn capture_real_table_ref(&mut self, table: TableReference) {
         let scope_id = self.current_scope_id();
-        let in_predicate = self.context.in_predicate;
+        let is_lineage_source = self.context.is_lineage_source;
         self.resolution.table_refs.push(CapturedTableRef {
             scope_id,
             target: TableRefTarget::Real(table),
-            in_predicate,
+            is_lineage_source,
         });
     }
 
@@ -88,11 +90,11 @@ impl<'a> Resolver<'a> {
     /// synthetic's body — collapse recurses into its subtree.
     pub(super) fn capture_synthetic_table_ref(&mut self, body_scope: ScopeId) {
         let scope_id = self.current_scope_id();
-        let in_predicate = self.context.in_predicate;
+        let is_lineage_source = self.context.is_lineage_source;
         self.resolution.table_refs.push(CapturedTableRef {
             scope_id,
             target: TableRefTarget::Synthetic { body_scope },
-            in_predicate,
+            is_lineage_source,
         });
     }
 }

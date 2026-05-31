@@ -24,10 +24,11 @@ pub(crate) struct ScopeId(pub(crate) usize);
 /// [`super::Resolution::scopes`].
 ///
 /// Predicate-vs-value position is tracked **on the captured ref**
-/// ([`super::CapturedColumnRef::in_predicate`] /
-/// [`super::CapturedTableRef::in_predicate`]) rather than on the
-/// scope. This lets same-scope refs in different lexical positions
-/// (e.g. CASE WHEN cond vs THEN value) be classified independently.
+/// ([`super::CapturedColumnRef::is_lineage_source`] /
+/// [`super::CapturedTableRef::is_lineage_source`]) rather than on
+/// the scope. This lets same-scope refs in different lexical
+/// positions (e.g. CASE WHEN cond vs THEN value) be classified
+/// independently.
 #[derive(Debug)]
 pub(crate) struct Scope {
     /// Lexically enclosing scope, or `None` for the root. Drives the
@@ -152,10 +153,10 @@ impl<'a> Resolver<'a> {
     ///   CTEs (CTEs stay reachable via the parent-scope walk-up).
     ///
     /// Predicate-ness flows through automatically:
-    /// [`Context::in_predicate`](super::Context::in_predicate) stays
-    /// set across the nested walk, so refs captured inside the new
-    /// scope inherit the surrounding predicate context without any
-    /// per-scope kind bookkeeping.
+    /// [`Context::is_lineage_source`](super::Context::is_lineage_source)
+    /// stays at its current value across the nested walk, so refs
+    /// captured inside the new scope inherit the surrounding
+    /// classification without any per-scope kind bookkeeping.
     ///
     /// Popping happens on the closure's return, including the `Err`
     /// path of a `Result`-returning closure, so this is the safe way

@@ -78,7 +78,7 @@ impl<'a> Resolver<'a> {
     ) {
         let sources: Vec<CapturedColumnRef> = self.resolution.column_refs[since..]
             .iter()
-            .filter(|r| !r.in_predicate)
+            .filter(|r| r.is_lineage_source)
             .cloned()
             .collect();
         for source in sources {

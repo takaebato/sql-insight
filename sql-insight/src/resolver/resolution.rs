@@ -161,7 +161,7 @@ impl Resolution {
     /// recurse into the synthetic's `body_scope` subtree to gather the
     /// real tables underneath. Uses captured in predicate position
     /// (WHERE / JOIN ON / EXISTS / etc.) are filtered out via the
-    /// captured-ref's own `in_predicate` flag — they're filter
+    /// captured-ref's own `is_lineage_source` flag — they're filter
     /// position, not data-feeding.
     ///
     /// Occurrence-based: a statement using the same source more than
@@ -196,7 +196,7 @@ impl Resolution {
         let mut out = Vec::new();
         let mut visited = HashSet::new();
         for captured in &self.table_refs {
-            if captured.in_predicate {
+            if !captured.is_lineage_source {
                 continue;
             }
             // Uses inside a synthetic's body subtree are reachable via
@@ -227,7 +227,7 @@ impl Resolution {
                     return;
                 }
                 for nested in &self.table_refs {
-                    if nested.in_predicate {
+                    if !nested.is_lineage_source {
                         continue;
                     }
                     if !self.is_in_scope_subtree(nested.scope_id, *body_scope) {
