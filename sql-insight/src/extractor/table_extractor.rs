@@ -40,13 +40,7 @@ pub struct Tables(pub Vec<TableReference>);
 
 impl fmt::Display for Tables {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let tables = self
-            .0
-            .iter()
-            .map(|t| t.to_string())
-            .collect::<Vec<String>>()
-            .join(", ");
-        write!(f, "{}", tables)
+        write!(f, "{}", TableReference::format_list(&self.0))
     }
 }
 
@@ -65,13 +59,7 @@ impl TableExtraction {
 
 impl fmt::Display for TableExtraction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let tables = self
-            .tables
-            .iter()
-            .map(|t| t.to_string())
-            .collect::<Vec<String>>()
-            .join(", ");
-        write!(f, "{}", tables)
+        write!(f, "{}", TableReference::format_list(&self.tables))
     }
 }
 

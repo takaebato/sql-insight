@@ -70,6 +70,17 @@ impl TableReference {
         }
     }
 
+    /// Format a slice of `TableReference`s as a comma-separated string
+    /// (e.g. `"t1, schema.t2, catalog.schema.t3"`). Shared by the
+    /// table-extractor `Display` surfaces.
+    pub fn format_list(tables: &[Self]) -> String {
+        tables
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Decode an `[Ident]` slice into a `TableReference`. 1 element =
     /// bare name, 2 = `schema.name`, 3 = `catalog.schema.name`. Returns
     /// `None` for 0 or 4+ parts. Use [`Self::try_from_name`] when the

@@ -47,25 +47,14 @@ pub struct CrudTables {
 
 impl fmt::Display for CrudTables {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let create_tables = self.format_tables(&self.create_tables);
-        let read_tables = self.format_tables(&self.read_tables);
-        let update_tables = self.format_tables(&self.update_tables);
-        let delete_tables = self.format_tables(&self.delete_tables);
         write!(
             f,
             "Create: [{}], Read: [{}], Update: [{}], Delete: [{}]",
-            create_tables, read_tables, update_tables, delete_tables
+            TableReference::format_list(&self.create_tables),
+            TableReference::format_list(&self.read_tables),
+            TableReference::format_list(&self.update_tables),
+            TableReference::format_list(&self.delete_tables),
         )
-    }
-}
-
-impl CrudTables {
-    fn format_tables(&self, tables: &[TableReference]) -> String {
-        tables
-            .iter()
-            .map(|t| t.to_string())
-            .collect::<Vec<String>>()
-            .join(", ")
     }
 }
 
