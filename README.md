@@ -177,6 +177,9 @@ Run with `cargo run --example <name> -p sql-insight`.
 
 ## Supported SQL Dialects
 
+`sql-insight` supports a comprehensive range of SQL dialects through
+[sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs):
+
 - Generic
 - MySQL
 - PostgreSQL
@@ -192,11 +195,15 @@ Run with `cargo run --example <name> -p sql-insight`.
 - Databricks
 - Oracle
 
+See the
+[sqlparser-rs documentation](https://docs.rs/sqlparser/latest/sqlparser/dialect/index.html#structs)
+for dialect-specific details.
+
 ## Contributing
 
-Contributions are welcome. Feel free to open an issue or pull
-request — features, bug fixes, and documentation improvements all
-appreciated.
+Contributions to `sql-insight` are welcome! Whether it's adding new
+features, fixing bugs, or improving documentation, feel free to fork
+the repository and submit a pull request.
 
 ## License
 
