@@ -60,7 +60,6 @@ use sqlparser::ast::{
 };
 
 use crate::catalog::Catalog;
-use crate::diagnostic::ColumnLevelDiagnostic;
 use crate::error::Error;
 use crate::reference::TableReference;
 
@@ -88,32 +87,28 @@ pub(crate) struct ResolvedQuery {
     pub(crate) body_scope: ScopeId,
 }
 
-/// The walker. Owns the scope arena, the in-progress refs / edges,
-/// the current body buffer, and the lexical `scope_kind`. All
-/// `visit_*` methods and the various `bind_*` / `record_*` / `with_*`
-/// helpers live as `impl` blocks in this file or in the sub-modules —
-/// this is just the data shape and the top-level entry point.
+/// The walker. Owns the [`Resolution`] being built (scope arena +
+/// in-progress refs / edges / diagnostics) plus the active walk
+/// state (current body buffer, current scope cursor, lexical scope
+/// kind). On `into_resolution` the embedded `Resolution` is finalized
+/// via the post-passes and handed back.
+///
+/// All `visit_*` methods and the various `bind_*` / `record_*` /
+/// `with_*` helpers live as `impl` blocks in this file or in the
+/// sub-modules — this is just the data shape and the top-level entry
+/// point.
 #[derive(Debug)]
 pub(crate) struct Resolver<'a> {
     /// `None` means the resolver runs without external schema
     /// enrichment; tables bound here carry `output_columns: None`.
     catalog: Option<&'a dyn Catalog>,
-    /// In-progress diagnostics buffer; moved into
-    /// [`Resolution::diagnostics`] at `into_resolution`.
-    diagnostics: Vec<ColumnLevelDiagnostic>,
-    /// Column refs captured by `record_column_ref` in walk order.
-    /// Post-pass filters synthetic-owned ones out into
-    /// [`Resolution::column_refs`].
-    column_refs: Vec<RawColumnRef>,
-    /// Lineage edges emitted directly during the walk. Post-pass
-    /// collapses through CTE / derived synthetics into
-    /// [`Resolution::lineage_edges`].
-    lineage_edges: Vec<LineageEdge>,
-    /// In-progress `RawTableRef` buffer; moved into
-    /// [`Resolution::table_refs`] at `into_resolution`. Emit happens at
-    /// every `FROM`-position bind site (real tables, CTE references,
-    /// true derived subqueries).
-    table_refs: Vec<RawTableRef>,
+    /// The [`Resolution`] under construction. Walk-time methods push
+    /// directly into its `diagnostics` / `column_refs` /
+    /// `lineage_edges` / `table_refs` buffers and the `scopes` arena;
+    /// `into_resolution` runs the two post-passes on it and hands it
+    /// back to the caller. Sub-modules access these via
+    /// `self.resolution.<field>`.
+    resolution: Resolution,
     /// Per-query in-progress [`BodyOutput`], filled by `visit_select`
     /// (one [`SetOperand`] per SELECT body, accumulated across the
     /// operands of a set operation chain). `resolve_query` swaps a
@@ -121,17 +116,10 @@ pub(crate) struct Resolver<'a> {
     /// collected body back via the returned `ResolvedQuery`'s
     /// `output_columns`, so each query gets exactly its own operands.
     current_body: BodyOutput,
-    /// Scope arena: all scopes ever opened during the walk. Each
-    /// `Scope` carries its `parent: Option<ScopeId>` so the active
-    /// path from root to current is derivable from `current_scope` +
-    /// `parent` links — no separate stack needed. Indexed by
-    /// [`ScopeId`]; flattens into [`Resolution::scopes`] at
-    /// `into_resolution`.
-    scopes: Vec<Scope>,
-    /// Cursor into [`Self::scopes`]: the currently-open scope. `None`
-    /// before any push (then `current_scope_id` lazily inserts a
-    /// root); set on each `push_scope` and walked back to the parent
-    /// on each `pop_scope`.
+    /// Cursor into [`Resolution::scopes`]: the currently-open scope.
+    /// `None` before any push (then `current_scope_id` lazily inserts
+    /// a root); set on each `push_scope` and walked back to the
+    /// parent on each `pop_scope`.
     current_scope: Option<ScopeId>,
     /// Lexical context stamped onto every scope pushed while it is in
     /// effect: `Body` by default, flipped to `Predicate` by
@@ -148,12 +136,8 @@ impl<'a> Resolver<'a> {
     fn new(catalog: Option<&'a dyn Catalog>) -> Self {
         Self {
             catalog,
-            diagnostics: Vec::new(),
-            column_refs: Vec::new(),
-            lineage_edges: Vec::new(),
-            table_refs: Vec::new(),
+            resolution: Resolution::default(),
             current_body: BodyOutput::default(),
-            scopes: Vec::new(),
             current_scope: None,
             scope_kind: ScopeKind::Body,
         }
@@ -170,17 +154,13 @@ impl<'a> Resolver<'a> {
         Ok(resolver.into_resolution())
     }
 
-    /// Drain the in-progress buffers into a [`Resolution`] and run
-    /// the two post-passes (lineage collapse + real-column filter).
+    /// Finalize the embedded [`Resolution`] via the two post-passes
+    /// (lineage collapse + real-column filter) and hand it back. The
+    /// walk state (current_body / current_scope / scope_kind) is
+    /// dropped at this point — only `resolution` survives.
     fn into_resolution(self) -> Resolution {
-        let mut resolution = Resolution {
-            diagnostics: self.diagnostics,
-            scopes: self.scopes,
-            column_refs: self.column_refs,
-            lineage_edges: self.lineage_edges,
-            table_refs: self.table_refs,
-        };
-        // Two post-passes, both rely on the scope arena being final:
+        let mut resolution = self.resolution;
+        // Both post-passes rely on the scope arena being final:
         // - collapse lineage edges so synthetic-binding (Cte/Derived)
         //   sources are collapsed with their body's source refs;
         // - filter column refs so synthetic-owned ones don't surface
@@ -400,9 +380,9 @@ impl<'a> Resolver<'a> {
     /// refs it records, packaging name / source_refs / kind into an
     /// [`OutputColumn`].
     pub(super) fn build_output_column(&mut self, item: &SelectItem) -> Result<OutputColumn, Error> {
-        let refs_before = self.column_refs.len();
+        let refs_before = self.resolution.column_refs.len();
         self.visit_select_item(item)?;
-        let source_refs = self.column_refs[refs_before..].to_vec();
+        let source_refs = self.resolution.column_refs[refs_before..].to_vec();
         Ok(OutputColumn {
             name: output_column_name(item),
             source_refs,
@@ -933,7 +913,7 @@ impl<'a> Resolver<'a> {
         for assignment in assignments {
             let target_parts = assignment_target_parts(&assignment.target);
             let kind = body_output::expr_kind(&assignment.value);
-            let refs_before = self.column_refs.len();
+            let refs_before = self.resolution.column_refs.len();
             self.visit_expr(&assignment.value)?;
             let Some(target_parts) = target_parts else {
                 continue;
@@ -1061,7 +1041,7 @@ impl<'a> Resolver<'a> {
         for row in &values.rows {
             for (position, value_expr) in row.iter().enumerate() {
                 let kind = body_output::expr_kind(value_expr);
-                let refs_before = self.column_refs.len();
+                let refs_before = self.resolution.column_refs.len();
                 self.visit_expr(value_expr)?;
                 let (Some(target_table), Some(col_ident)) =
                     (target_table, effective_idents.get(position))

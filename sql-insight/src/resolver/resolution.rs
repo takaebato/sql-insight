@@ -35,7 +35,7 @@ use super::{
 /// walk, plus accumulated diagnostics. Two post-passes inside
 /// `Resolver::into_resolution` refine `column_refs` and
 /// `lineage_edges` before the resolution leaves the resolver.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct Resolution {
     /// Column-level diagnostics accumulated during the walk
     /// (`WildcardSuppressed`, `AmbiguousColumn`, `UnresolvedColumn`,

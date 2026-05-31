@@ -74,7 +74,7 @@ impl<'a> Resolver<'a> {
     pub(super) fn record_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.current_scope_id();
         let (resolved, synthetic) = self.resolve_ref_at_walk(&parts, scope_id);
-        self.column_refs.push(RawColumnRef {
+        self.resolution.column_refs.push(RawColumnRef {
             parts,
             scope_id,
             resolved,
@@ -112,8 +112,8 @@ impl<'a> Resolver<'a> {
         // (candidate tables, confirmed-by-Known count)
         let mut ambiguity: Option<(Vec<TableReference>, usize)> = None;
 
-        for id in parent_chain(&self.scopes, scope_id) {
-            let scope = &self.scopes[id.0];
+        for id in parent_chain(&self.resolution.scopes, scope_id) {
+            let scope = &self.resolution.scopes[id.0];
             if scope.iter_bindings().any(binding_has_known_columns) {
                 had_known_schemas_anywhere = true;
             }
@@ -209,8 +209,8 @@ impl<'a> Resolver<'a> {
 
     fn binding_for_qualifier(&self, head: &Ident, scope_id: ScopeId) -> Option<&Binding> {
         let key = BindingKey::from_ident(head);
-        parent_chain(&self.scopes, scope_id).find_map(|id| {
-            self.scopes[id.0]
+        parent_chain(&self.resolution.scopes, scope_id).find_map(|id| {
+            self.resolution.scopes[id.0]
                 .iter_bindings()
                 .find(|b| binding_alias_key(b) == key)
         })

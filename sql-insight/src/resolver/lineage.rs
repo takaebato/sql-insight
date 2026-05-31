@@ -73,9 +73,9 @@ impl<'a> Resolver<'a> {
         target: LineageTargetSpec,
         kind: ColumnLineageKind,
     ) {
-        let sources: Vec<RawColumnRef> = self.column_refs[since..].to_vec();
+        let sources: Vec<RawColumnRef> = self.resolution.column_refs[since..].to_vec();
         for source in sources {
-            self.lineage_edges.push(LineageEdge {
+            self.resolution.lineage_edges.push(LineageEdge {
                 source,
                 target: target.clone(),
                 kind,
@@ -100,7 +100,7 @@ impl<'a> Resolver<'a> {
                     continue;
                 };
                 for source in &column.source_refs {
-                    self.lineage_edges.push(LineageEdge {
+                    self.resolution.lineage_edges.push(LineageEdge {
                         source: source.clone(),
                         target: target.clone(),
                         kind: column.kind,

@@ -106,8 +106,10 @@ impl<'a> Resolver<'a> {
     /// the given `kind`. Returns the new scope's id and makes it
     /// current.
     pub(super) fn push_scope(&mut self, kind: ScopeKind) -> ScopeId {
-        let id = ScopeId(self.scopes.len());
-        self.scopes.push(Scope::new(self.current_scope, kind));
+        let id = ScopeId(self.resolution.scopes.len());
+        self.resolution
+            .scopes
+            .push(Scope::new(self.current_scope, kind));
         self.current_scope = Some(id);
         id
     }
@@ -115,7 +117,9 @@ impl<'a> Resolver<'a> {
     /// Close the current scope by walking back to its parent. The
     /// popped scope stays in the arena for post-pass lookups.
     pub(super) fn pop_scope(&mut self) {
-        self.current_scope = self.current_scope.and_then(|id| self.scopes[id.0].parent);
+        self.current_scope = self
+            .current_scope
+            .and_then(|id| self.resolution.scopes[id.0].parent);
     }
 
     /// Id of the currently-open scope. Lazily inserts a root scope
@@ -131,7 +135,7 @@ impl<'a> Resolver<'a> {
     /// scope on demand if nothing is open yet.
     pub(super) fn bind_current(&mut self, name: Ident, binding: Binding) {
         let id = self.current_scope_id();
-        self.scopes[id.0].bind(&name, binding);
+        self.resolution.scopes[id.0].bind(&name, binding);
     }
 
     /// Resolve an unqualified single-segment relation name by walking
@@ -144,7 +148,8 @@ impl<'a> Resolver<'a> {
         }
         let name = relation.0[0].as_ident()?;
         let from = self.current_scope?;
-        parent_chain(&self.scopes, from).find_map(|id| self.scopes[id.0].resolve(name))
+        parent_chain(&self.resolution.scopes, from)
+            .find_map(|id| self.resolution.scopes[id.0].resolve(name))
     }
 
     /// Push a fresh scope, run `f`, then pop it. The current

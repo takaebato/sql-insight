@@ -383,7 +383,7 @@ impl<'a> Resolver<'a> {
     }
 
     pub(super) fn record_diagnostic(&mut self, diagnostic: ColumnLevelDiagnostic) {
-        self.diagnostics.push(diagnostic);
+        self.resolution.diagnostics.push(diagnostic);
     }
 
     pub(super) fn record_unsupported_statement(&mut self, statement: &Statement) {
