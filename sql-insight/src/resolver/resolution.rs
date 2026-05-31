@@ -259,21 +259,7 @@ impl Resolution {
                 .find(|b| binding_alias_key(b) == key)
         })
     }
-}
 
-/// Combine two lineage kinds along one collapse step: the result is
-/// `Passthrough` only when both sides are `Passthrough`; any
-/// `Transformation` step makes the whole collapsed chain a
-/// `Transformation`.
-fn collapse_lineage_kinds(outer: ColumnLineageKind, inner: ColumnLineageKind) -> ColumnLineageKind {
-    if outer == ColumnLineageKind::Passthrough && inner == ColumnLineageKind::Passthrough {
-        ColumnLineageKind::Passthrough
-    } else {
-        ColumnLineageKind::Transformation
-    }
-}
-
-impl Resolution {
     /// All tables touched by the statement, in scope-arena order. The
     /// union of [`Self::read_tables`] and [`Self::write_tables`] (with
     /// duplicates when a single table carries both roles).
@@ -322,5 +308,17 @@ impl Resolution {
     pub(super) fn has_predicate_ancestor(&self, scope_id: ScopeId) -> bool {
         parent_chain(&self.scopes, scope_id)
             .any(|id| self.scopes[id.0].kind == ScopeKind::Predicate)
+    }
+}
+
+/// Combine two lineage kinds along one collapse step: the result is
+/// `Passthrough` only when both sides are `Passthrough`; any
+/// `Transformation` step makes the whole collapsed chain a
+/// `Transformation`.
+fn collapse_lineage_kinds(outer: ColumnLineageKind, inner: ColumnLineageKind) -> ColumnLineageKind {
+    if outer == ColumnLineageKind::Passthrough && inner == ColumnLineageKind::Passthrough {
+        ColumnLineageKind::Passthrough
+    } else {
+        ColumnLineageKind::Transformation
     }
 }
