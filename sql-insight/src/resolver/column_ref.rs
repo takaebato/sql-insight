@@ -11,6 +11,7 @@ use super::binding::{
     binding_alias_key, binding_confirms_column, binding_could_contain_column,
     binding_has_known_columns, is_synthetic_binding, normalize_span, span_suffix, BindingKey,
 };
+use super::scope::parent_chain;
 use super::{Binding, Resolver, ScopeId};
 
 /// A column reference captured by the resolver during the AST walk.
@@ -114,14 +115,13 @@ impl<'a> Resolver<'a> {
         name: &Ident,
         scope_id: ScopeId,
     ) -> (Option<TableReference>, bool) {
-        let mut current = Some(scope_id);
         let mut had_known_schemas_anywhere = false;
         let mut resolved: Option<(TableReference, bool)> = None;
         // (candidate tables, confirmed-by-Known count)
         let mut ambiguity: Option<(Vec<TableReference>, usize)> = None;
 
-        while let Some(id) = current {
-            let scope = self.scope(id);
+        for id in parent_chain(&self.scopes, scope_id) {
+            let scope = &self.scopes[id.0];
             if scope.iter_bindings().any(binding_has_known_columns) {
                 had_known_schemas_anywhere = true;
             }
@@ -148,7 +148,6 @@ impl<'a> Resolver<'a> {
                 }
                 break;
             }
-            current = scope.parent;
         }
 
         if let Some((tbl, syn)) = resolved {
@@ -218,16 +217,10 @@ impl<'a> Resolver<'a> {
 
     fn binding_for_qualifier(&self, head: &Ident, scope_id: ScopeId) -> Option<&Binding> {
         let key = BindingKey::from_ident(head);
-        let mut current = Some(scope_id);
-        while let Some(id) = current {
-            let scope = self.scope(id);
-            for binding in scope.iter_bindings() {
-                if binding_alias_key(binding) == key {
-                    return Some(binding);
-                }
-            }
-            current = scope.parent;
-        }
-        None
+        parent_chain(&self.scopes, scope_id).find_map(|id| {
+            self.scopes[id.0]
+                .iter_bindings()
+                .find(|b| binding_alias_key(b) == key)
+        })
     }
 }

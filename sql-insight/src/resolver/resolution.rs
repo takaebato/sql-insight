@@ -24,6 +24,7 @@ use crate::reference::TableReference;
 
 use super::binding::binding_alias_key;
 use super::binding::BindingKey;
+use super::scope::parent_chain;
 use super::{
     Binding, LineageEdge, RawColumnRef, RawTableRef, Scope, ScopeId, ScopeKind, TableRefTarget,
     TableRole,
@@ -237,14 +238,7 @@ impl Resolution {
     /// Walk parent chain from `scope_id`; return true iff `ancestor` is
     /// reached. Inclusive (a scope is its own subtree's root).
     fn is_in_scope_subtree(&self, scope_id: ScopeId, ancestor: ScopeId) -> bool {
-        let mut current = Some(scope_id);
-        while let Some(id) = current {
-            if id == ancestor {
-                return true;
-            }
-            current = self.scopes[id.0].parent;
-        }
-        false
+        parent_chain(&self.scopes, scope_id).any(|id| id == ancestor)
     }
 
     /// Look up the binding a synthetic-owning raw ref points at, by
@@ -259,17 +253,11 @@ impl Resolution {
         }
         let table = raw.resolved.as_ref()?;
         let key = BindingKey::from_ident(&table.name);
-        let mut current = Some(raw.scope_id);
-        while let Some(id) = current {
-            let scope = &self.scopes[id.0];
-            for binding in scope.iter_bindings() {
-                if binding_alias_key(binding) == key {
-                    return Some(binding);
-                }
-            }
-            current = scope.parent;
-        }
-        None
+        parent_chain(&self.scopes, raw.scope_id).find_map(|id| {
+            self.scopes[id.0]
+                .iter_bindings()
+                .find(|b| binding_alias_key(b) == key)
+        })
     }
 }
 
@@ -332,14 +320,7 @@ impl Resolution {
     /// filter-position exclusion in
     /// [`Self::collapsed_feeding_table_sources`].
     pub(super) fn has_predicate_ancestor(&self, scope_id: ScopeId) -> bool {
-        let mut current = Some(scope_id);
-        while let Some(id) = current {
-            let scope = &self.scopes[id.0];
-            if scope.kind == ScopeKind::Predicate {
-                return true;
-            }
-            current = scope.parent;
-        }
-        false
+        parent_chain(&self.scopes, scope_id)
+            .any(|id| self.scopes[id.0].kind == ScopeKind::Predicate)
     }
 }

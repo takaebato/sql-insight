@@ -53,6 +53,14 @@ pub(crate) struct Scope {
     pub(super) bindings: IndexMap<BindingKey, Binding>,
 }
 
+/// Iterate the scope ids on the chain `from → parent → parent → … → root`,
+/// inclusive of `from`. Underlies every "walk up the parent links"
+/// loop in the resolver / resolution side. `scopes` is the arena to
+/// index into; both `Resolver` and `Resolution` hold their own.
+pub(super) fn parent_chain(scopes: &[Scope], from: ScopeId) -> impl Iterator<Item = ScopeId> + '_ {
+    std::iter::successors(Some(from), move |id| scopes[id.0].parent)
+}
+
 impl Scope {
     fn new(parent: Option<ScopeId>, kind: ScopeKind) -> Self {
         Self {
@@ -94,12 +102,6 @@ impl Scope {
 }
 
 impl<'a> Resolver<'a> {
-    /// Borrow the scope at `id` from the arena. Stable across later
-    /// pushes since the arena only grows.
-    pub(super) fn scope(&self, id: ScopeId) -> &Scope {
-        &self.scopes[id.0]
-    }
-
     /// Push a fresh scope as a child of `self.current_scope`, with
     /// the given `kind`. Returns the new scope's id and makes it
     /// current.
@@ -141,8 +143,8 @@ impl<'a> Resolver<'a> {
             return None;
         }
         let name = relation.0[0].as_ident()?;
-        std::iter::successors(self.current_scope, |id| self.scopes[id.0].parent)
-            .find_map(|id| self.scopes[id.0].resolve(name))
+        let from = self.current_scope?;
+        parent_chain(&self.scopes, from).find_map(|id| self.scopes[id.0].resolve(name))
     }
 
     /// Push a fresh scope, run `f`, then pop it. The current
