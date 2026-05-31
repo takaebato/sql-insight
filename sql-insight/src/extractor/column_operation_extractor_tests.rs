@@ -4882,3 +4882,36 @@ mod unsupported_statement_coverage {
         );
     }
 }
+
+mod supported_kind_only_coverage {
+    //! Statements that classify as a supported `StatementKind` but
+    //! produce no column-level reads / writes / lineage / diagnostics.
+    //! Pins that these don't accidentally fall through to
+    //! `Unsupported`, and that the column-level path returns empty
+    //! surfaces for DDL-only / DROP / TRUNCATE / bare VALUES shapes.
+
+    use super::*;
+    use sqlparser::dialect::GenericDialect;
+
+    const KIND_ONLY: &[(&str, StatementKind)] = &[
+        ("CREATE TABLE t (a INT)", StatementKind::CreateTable),
+        ("DROP TABLE t", StatementKind::Drop),
+        ("DROP VIEW v", StatementKind::Drop),
+        ("DROP MATERIALIZED VIEW mv", StatementKind::Drop),
+        ("TRUNCATE TABLE t", StatementKind::Truncate),
+        ("VALUES (1, 2)", StatementKind::Select),
+    ];
+
+    #[test]
+    fn supported_kind_only_statements_produce_empty_surfaces() {
+        for (sql, expected_kind) in KIND_ONLY {
+            let result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
+            let op = result[0].as_ref().unwrap();
+            assert_eq!(op.statement_kind, *expected_kind, "kind for SQL: {sql}");
+            assert!(op.reads.is_empty(), "reads for SQL: {sql}");
+            assert!(op.writes.is_empty(), "writes for SQL: {sql}");
+            assert!(op.lineage.is_empty(), "lineage for SQL: {sql}");
+            assert!(op.diagnostics.is_empty(), "diagnostics for SQL: {sql}");
+        }
+    }
+}
