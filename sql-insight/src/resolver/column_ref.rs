@@ -73,7 +73,7 @@ impl<'a> Resolver<'a> {
     /// later CTE bindings won't ambify what this reference saw.
     pub(super) fn capture_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.current_scope_id();
-        let (resolved, synthetic) = self.resolve_ref_at_walk(&parts, scope_id);
+        let (resolved, synthetic) = self.resolve_ref(&parts, scope_id);
         self.resolution.column_refs.push(CapturedColumnRef {
             parts,
             scope_id,
@@ -82,15 +82,15 @@ impl<'a> Resolver<'a> {
         });
     }
 
-    fn resolve_ref_at_walk(
+    fn resolve_ref(
         &mut self,
         parts: &[Ident],
         scope_id: ScopeId,
     ) -> (Option<TableReference>, bool) {
         match parts.len() {
             0 => (None, false),
-            1 => self.resolve_unqualified_at_walk(&parts[0], scope_id),
-            n => self.resolve_qualified_at_walk(&parts[..n - 1], scope_id),
+            1 => self.resolve_unqualified_ref(&parts[0], scope_id),
+            n => self.resolve_qualified_ref(&parts[..n - 1], scope_id),
         }
     }
 
@@ -102,7 +102,7 @@ impl<'a> Resolver<'a> {
     /// candidate / scope is `Unknown`, since `Unknown` schemas could
     /// hold anything and silence is the safer default without catalog
     /// enrichment.
-    fn resolve_unqualified_at_walk(
+    fn resolve_unqualified_ref(
         &mut self,
         name: &Ident,
         scope_id: ScopeId,
@@ -177,7 +177,7 @@ impl<'a> Resolver<'a> {
         (None, false)
     }
 
-    fn resolve_qualified_at_walk(
+    fn resolve_qualified_ref(
         &self,
         qualifier_parts: &[Ident],
         scope_id: ScopeId,
