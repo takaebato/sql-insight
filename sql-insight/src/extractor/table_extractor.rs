@@ -669,11 +669,11 @@ mod tests {
             // sources appear, so the target reference no longer duplicates.
             let sql = "DELETE t1 FROM t1";
             let expected = vec![ok_tables(vec![table("t1")])];
-            // BigQuery and Generic do not support DELETE ... FROM
+            // BigQuery / Generic / Oracle do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
                 expected,
-                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+                all_dialects_except(&["GenericDialect", "BigQueryDialect", "OracleDialect"]),
             );
         }
 
@@ -681,11 +681,11 @@ mod tests {
         fn test_delete_statement_with_aliases() {
             let sql = "DELETE t1_alias FROM t1 AS t1_alias JOIN t2 AS t2_alias ON t1_alias.a = t2_alias.a WHERE t2_alias.b = 1";
             let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
-            // BigQuery and Generic do not support DELETE ... FROM
+            // BigQuery / Generic / Oracle do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
                 expected,
-                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+                all_dialects_except(&["GenericDialect", "BigQueryDialect", "OracleDialect"]),
             );
         }
 
@@ -693,11 +693,11 @@ mod tests {
         fn test_delete_statement_with_case_insensitive_alias_target() {
             let sql = "DELETE T1_ALIAS FROM t1 AS t1_alias JOIN t2 ON t1_alias.a = t2.a";
             let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
-            // BigQuery and Generic do not support DELETE ... FROM
+            // BigQuery / Generic / Oracle do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
                 expected,
-                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+                all_dialects_except(&["GenericDialect", "BigQueryDialect", "OracleDialect"]),
             );
         }
 
@@ -706,11 +706,11 @@ mod tests {
             let sql =
                 "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3 WHERE t1.a = t2.a AND t2.a = t3.a";
             let expected = vec![ok_tables(vec![table("t1"), table("t2"), table("t3")])];
-            // BigQuery and Generic do not support DELETE ... FROM
+            // BigQuery / Generic / Oracle do not support DELETE ... FROM
             assert_table_extraction(
                 sql,
                 expected,
-                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+                all_dialects_except(&["GenericDialect", "BigQueryDialect", "OracleDialect"]),
             );
         }
 

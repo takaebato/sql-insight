@@ -278,11 +278,11 @@ mod tests {
     fn test_unary_operators_preceding_booleans() {
         let sql = "SELECT * FROM t1 WHERE a=TRUE AND b=NOT TRUE AND c=NOT(TRUE)";
         let expected = vec!["SELECT * FROM t1 WHERE a = ? AND b = ? AND c = NOT (?)".into()];
-        // The MsSQL parser considers "TRUE" and "FALSE" to be identifiers rather than constants
+        // The MsSQL / Oracle parsers consider "TRUE" and "FALSE" to be identifiers rather than constants
         assert_normalize(
             sql,
             expected,
-            all_dialects_except(&vec!["MsSqlDialect"]),
+            all_dialects_except(&["MsSqlDialect", "OracleDialect"]),
             NormalizerOptions::new(),
         );
     }

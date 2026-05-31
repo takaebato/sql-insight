@@ -351,7 +351,7 @@ mod tests {
             assert_crud_table_extraction(
                 sql,
                 expected,
-                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+                all_dialects_except(&["GenericDialect", "BigQueryDialect", "OracleDialect"]),
             );
         }
 
@@ -370,7 +370,7 @@ mod tests {
             assert_crud_table_extraction(
                 sql,
                 expected,
-                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
+                all_dialects_except(&["GenericDialect", "BigQueryDialect", "OracleDialect"]),
             );
         }
 
