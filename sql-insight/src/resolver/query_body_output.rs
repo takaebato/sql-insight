@@ -105,7 +105,7 @@ fn rename_only_column(name: Ident) -> OutputColumn {
 }
 
 impl<'a> Resolver<'a> {
-    /// Push a fresh frame onto [`Context::body_output_stack`] so the
+    /// Push a fresh frame onto [`super::Context::body_output_stack`] so the
     /// next [`Self::push_set_operand`] / [`Self::extend_set_operands`]
     /// lands on it. Pair with [`Self::pop_body_output`] on `resolve_query`
     /// return.
@@ -116,7 +116,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// Pop the active body-output frame off
-    /// [`Context::body_output_stack`] and return it. `expect`
+    /// [`super::Context::body_output_stack`] and return it. `expect`
     /// documents the invariant: every `pop_body_output` is paired
     /// with a preceding `push_body_output` in `resolve_query`, so the
     /// stack is non-empty here.
@@ -128,7 +128,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// Push a fully-built set operand into the active query's body
-    /// output (the top of [`Context::body_output_stack`]). Called by
+    /// output (the top of [`super::Context::body_output_stack`]). Called by
     /// `visit_select` once per SELECT body. `expect` documents the
     /// invariant — `push_set_operand` is only reachable transitively
     /// from `resolve_query`, which always pushes a fresh top first.

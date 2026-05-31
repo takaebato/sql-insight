@@ -14,8 +14,7 @@ across every SQL dialect sqlparser-rs supports.
 
 - **Table-level Operation Extraction**: identify which tables a
   statement reads, which it writes, and the lineage between sources
-  and targets. Classifies the statement by verb (Insert / Update /
-  Merge / …).
+  and targets. 
 - **Column-level Operation Extraction**: the same at column granularity
   — track lineage from individual source columns to target columns,
   distinguishing pure forwarding from value-changing expressions.
