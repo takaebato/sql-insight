@@ -43,7 +43,9 @@ sql-insight = "0.2.0"
 
 ### Table-level Operation Extraction
 
-Get the statement kind plus `reads` / `writes` / `lineage` in one call:
+Get the statement kind plus three surfaces — `reads` (tables read),
+`writes` (tables written), and `lineage` (source → target edges, only
+for statements that physically move data) — in one call:
 
 ```rust
 use sql_insight::sqlparser::dialect::GenericDialect;
@@ -94,7 +96,9 @@ use sql_insight::extractor::extract_tables;
 
 let dialect = GenericDialect {};
 let extractions = extract_tables(&dialect, "SELECT * FROM catalog.schema.t1").unwrap();
-println!("{:?}", extractions);
+let extraction = extractions[0].as_ref().unwrap();
+assert_eq!(extraction.tables.len(), 1);
+assert_eq!(extraction.tables[0].to_string(), "catalog.schema.t1");
 ```
 
 ### CRUD Table Extraction
@@ -106,8 +110,12 @@ use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::extractor::extract_crud_tables;
 
 let dialect = GenericDialect {};
-let crud_tables = extract_crud_tables(&dialect, "INSERT INTO t1 (a) SELECT a FROM t2").unwrap();
-println!("{:?}", crud_tables);
+let result = extract_crud_tables(&dialect, "INSERT INTO t1 (a) SELECT a FROM t2").unwrap();
+let crud = result[0].as_ref().unwrap();
+assert_eq!(crud.create_tables.len(), 1); // t1
+assert_eq!(crud.read_tables.len(), 1);   // t2
+assert!(crud.update_tables.is_empty());
+assert!(crud.delete_tables.is_empty());
 ```
 
 ### SQL Formatting
