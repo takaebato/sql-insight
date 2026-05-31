@@ -37,7 +37,7 @@ pub(crate) enum ScopeKind {
 /// One lexical scope: a `name → Binding` map plus the links
 /// (`parent`, `kind`) used to walk up the scope chain at
 /// name-resolution and lineage-emission time. Self-id is implicit —
-/// the scope's id equals its index in [`Resolver::scopes`].
+/// the scope's id equals its index in [`super::Resolution::scopes`].
 #[derive(Debug)]
 pub(crate) struct Scope {
     /// Lexically enclosing scope, or `None` for the root. Drives the
