@@ -158,11 +158,14 @@ pub struct TableLineageEdge {
     pub target: TableReference,
 }
 
-/// Extracts operations from SQL.
+/// Struct-style entry point. Equivalent to the free
+/// [`extract_table_operations`] function.
 #[derive(Default, Debug)]
 pub struct TableOperationExtractor;
 
 impl TableOperationExtractor {
+    /// Same as the free [`extract_table_operations`] function — kept
+    /// for users who prefer the struct-style API.
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,
