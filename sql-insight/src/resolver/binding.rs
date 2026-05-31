@@ -166,21 +166,26 @@ pub(super) fn binding_could_contain_column(
     name: &Ident,
 ) -> Option<TableReference> {
     match binding {
-        Binding::Table { table, .. } => {
-            names_could_contain(binding_column_names(binding).as_deref(), name)
-                .then(|| (**table).clone())
-        }
-        Binding::Cte { name: cte_name, .. } => {
-            names_could_contain(binding_column_names(binding).as_deref(), name)
-                .then(|| synthetic_table_ref(cte_name))
-        }
-        Binding::DerivedTable { alias, .. } => {
-            names_could_contain(binding_column_names(binding).as_deref(), name)
-                .then(|| synthetic_table_ref(alias))
-        }
         // TableFunction columns are unmodeled, so any unqualified
         // column could plausibly come from one.
-        Binding::TableFunction { alias } => Some(synthetic_table_ref(alias)),
+        Binding::TableFunction { .. } => Some(binding_table_ref(binding)),
+        _ => names_could_contain(binding_column_names(binding).as_deref(), name)
+            .then(|| binding_table_ref(binding)),
+    }
+}
+
+/// The `TableReference` that surfaces in `reads` / `lineage` when this
+/// binding is the owner of a column ref. Real tables surface their
+/// alias-free underlying `TableReference`; synthetic bindings (CTE /
+/// derived / table function) surface a name-only synthetic ref so
+/// lineage collapse can re-find the owning binding by name.
+fn binding_table_ref(binding: &Binding) -> TableReference {
+    match binding {
+        Binding::Table { table, .. } => (**table).clone(),
+        Binding::Cte { name, .. } => synthetic_table_ref(name),
+        Binding::DerivedTable { alias, .. } | Binding::TableFunction { alias, .. } => {
+            synthetic_table_ref(alias)
+        }
     }
 }
 
