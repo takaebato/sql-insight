@@ -148,7 +148,15 @@ pub struct ColumnOperation {
     /// Columns written by the statement, in walk order. Occurrence-based
     /// like `reads`.
     pub writes: Vec<ColumnReference>,
+    /// Lineage edges in emission order. Statements that physically
+    /// move data emit collapsed end-to-end edges (source →
+    /// `ColumnTarget::Relation`); bare `SELECT` emits source →
+    /// `ColumnTarget::QueryOutput` edges.
     pub lineage: Vec<ColumnLineageEdge>,
+    /// Column-level diagnostics: wildcard suppression, ambiguous /
+    /// unresolved column references, plus the
+    /// `UnsupportedStatement` projection inherited from table
+    /// granularity.
     pub diagnostics: Vec<ColumnLevelDiagnostic>,
 }
 

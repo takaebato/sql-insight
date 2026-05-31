@@ -60,10 +60,21 @@ pub fn extract_table_operations(
 /// Operations performed by a single SQL statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableOperation {
+    /// What the statement does at a coarse level (Insert / Update /
+    /// Merge / CTAS / …).
     pub statement_kind: StatementKind,
+    /// Tables read by the statement, in walk order. Occurrence-based:
+    /// a table referenced more than once appears more than once.
     pub reads: Vec<TableReference>,
+    /// Tables written by the statement, in walk order.
+    /// Occurrence-based like `reads`.
     pub writes: Vec<TableReference>,
+    /// Lineage edges, only for statements that physically move data
+    /// (`INSERT`, `UPDATE`, `MERGE` with an Insert / Update WHEN
+    /// clause, CTAS, `CREATE VIEW`, `ALTER VIEW`).
     pub lineage: Vec<TableLineageEdge>,
+    /// Non-fatal diagnostics from the walk; only
+    /// `UnsupportedStatement` arises at this granularity.
     pub diagnostics: Vec<TableLevelDiagnostic>,
 }
 
