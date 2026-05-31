@@ -200,21 +200,35 @@ impl<'a> Resolver<'a> {
             let body_scope = r.current_scope_id();
             if let Some(with) = &query.with {
                 if with.recursive {
+                    // Two-pass bind so the body can self-refer. The
+                    // pre-bind needs *some* `body_scope`, but it must
+                    // not be one whose subtree contains the body we
+                    // are about to walk — otherwise every captured
+                    // ref in that subtree gets skipped by the
+                    // synthetic-body filter in
+                    // [`Resolution::collapsed_feeding_table_sources`]
+                    // and lineage collapses to empty. Use a fresh
+                    // empty stub scope (sibling of the body) so the
+                    // filter walks past it without effect; rebind
+                    // after the body walk with the real `body_scope`
+                    // so external `FROM cte` uses collapse end to end
+                    // into the body's real-table feeders.
+                    //
+                    // Self-references captured during the body walk
+                    // still point at the pre-bind stub — collapse
+                    // recurses into stub, finds no refs, terminates.
+                    // The same `visited` cycle guard handles the rest.
+                    //
+                    // `output_columns` is left `None` for now —
+                    // fixpoint-aware column capture is deferred.
                     for cte in &with.cte_tables {
-                        // Recursive CTEs pre-bind with `None`
-                        // output_columns; fixpoint-aware capture is
-                        // deferred. `body_scope` here is the enclosing
-                        // WITH scope (no real body has been walked
-                        // yet) — collapse treats `None` as a terminal
-                        // stub.
-                        r.bind_cte(cte.alias.name.clone(), None, body_scope);
+                        let stub = r.push_scope(ScopeKind::Body);
+                        r.pop_scope();
+                        r.bind_cte(cte.alias.name.clone(), None, stub);
                     }
                     for cte in &with.cte_tables {
-                        // Body output is discarded for recursive CTEs
-                        // (no collapse either). Raw resolve_query so
-                        // the intermediate QueryOutput edges aren't
-                        // emitted.
-                        r.resolve_query(&cte.query)?;
+                        let resolved = r.resolve_query(&cte.query)?;
+                        r.bind_cte(cte.alias.name.clone(), None, resolved.body_scope);
                     }
                 } else {
                     for cte in &with.cte_tables {

@@ -147,9 +147,11 @@ pub enum StatementKind {
 /// data-feeding chain from the CTE body up through the INSERT target.
 /// An unreferenced CTE contributes nothing — `WITH cte AS (SELECT a
 /// FROM s) INSERT INTO t SELECT 1` emits no edge (the `cte` is bound
-/// but never `FROM`-used, so `s` doesn't feed `t`). Deeper transitivity
-/// (recursive CTEs are walked best-effort, with self-references
-/// terminated after one pass via cycle detection.
+/// but never `FROM`-used, so `s` doesn't feed `t`).
+///
+/// Recursive CTEs collapse the same way: the anchor branch's real
+/// tables feed the target, and the self-reference terminates against
+/// the pre-bind stub without re-emitting the cycle.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableLineageEdge {
     pub source: TableReference,
@@ -1047,19 +1049,61 @@ mod tests {
             //
             // This pins down the boundary between "table is referenced
             // in the SQL" (reads) and "data actually moves from this
-            // table to the target" (lineage). The current scope-arena
-            // walk in `feeding_read_tables` over-includes any Body-
-            // position Table binding regardless of whether its owning
-            // synthetic (CTE / derived) was ever used downstream — a
-            // ref+collapse rewrite of the lineage path would fix
-            // it. See the discussion in the resolver scope-kind
-            // analysis.
+            // table to the target" (lineage). Driven by
+            // `collapsed_feeding_table_sources`: real-table captures
+            // sitting inside an unreferenced synthetic body sit under
+            // that body's scope, get filtered by the synthetic-body
+            // mask in the top loop, and never get reached by a
+            // top-level `FROM cte` recursion either.
             assert_ops(
                 "WITH cte AS (SELECT a FROM s) INSERT INTO t1 SELECT 1",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
                     reads: vec![table("s")],
                     writes: vec![table("t1")],
+                    lineage: vec![],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn recursive_cte_emits_lineage_from_anchor_real_table() {
+            // The recursive CTE's anchor reads `x`; the recursive
+            // branch's self-reference contributes no new real source.
+            // External `FROM cte` use feeds the INSERT target, so
+            // collapse should reach through the body to `x` and emit
+            // a single `x → t` edge.
+            assert_ops(
+                "WITH RECURSIVE cte AS (\
+                 SELECT id FROM x UNION ALL \
+                 SELECT id + 1 FROM cte WHERE id < 10\
+             ) INSERT INTO t SELECT id FROM cte",
+                TableOperation {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![table("x")],
+                    writes: vec![table("t")],
+                    lineage: vec![edge("x", "t")],
+                    diagnostics: vec![],
+                },
+            );
+        }
+
+        #[test]
+        fn recursive_cte_self_only_emits_no_lineage() {
+            // Pathological body — only a self-reference, no real
+            // anchor source. The CTE has no real feeder, so no edge
+            // is emitted even though the INSERT has a target. Pins
+            // that the self-reference collapse terminates at the
+            // pre-bind stub without traversing into the body scope
+            // and re-emitting the self-cycle.
+            assert_ops(
+                "WITH RECURSIVE cte AS (SELECT id FROM cte) \
+             INSERT INTO t SELECT id FROM cte",
+                TableOperation {
+                    statement_kind: StatementKind::Insert,
+                    reads: vec![],
+                    writes: vec![table("t")],
                     lineage: vec![],
                     diagnostics: vec![],
                 },
