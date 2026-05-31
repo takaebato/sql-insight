@@ -52,14 +52,14 @@ use sql_insight::extractor::{extract_table_operations, StatementKind};
 let dialect = GenericDialect {};
 let result = extract_table_operations(
     &dialect,
-    "INSERT INTO users (id) SELECT id FROM signups",
+    "INSERT INTO t1 (a) SELECT a FROM t2",
     None,
 ).unwrap();
 let ops = result[0].as_ref().unwrap();
 assert_eq!(ops.statement_kind, StatementKind::Insert);
-assert_eq!(ops.reads.len(), 1);   // signups
-assert_eq!(ops.writes.len(), 1);  // users
-assert_eq!(ops.lineage.len(), 1); // signups → users
+assert_eq!(ops.reads.len(), 1);   // t2
+assert_eq!(ops.writes.len(), 1);  // t1
+assert_eq!(ops.lineage.len(), 1); // t2 → t1
 ```
 
 ### Column-level Operation Extraction
@@ -76,11 +76,11 @@ use sql_insight::extractor::extract_column_operations;
 let dialect = GenericDialect {};
 let result = extract_column_operations(
     &dialect,
-    "INSERT INTO users (id, email) SELECT id, LOWER(email) FROM signups",
+    "INSERT INTO t1 (a, b) SELECT a, LOWER(b) FROM t2",
     None,
 ).unwrap();
 let ops = result[0].as_ref().unwrap();
-// id → id (Passthrough), email → email (Transformation, via LOWER).
+// a → a (Passthrough), b → b (Transformation, via LOWER).
 assert_eq!(ops.lineage.len(), 2);
 ```
 
@@ -93,7 +93,7 @@ use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::extractor::extract_tables;
 
 let dialect = GenericDialect {};
-let extractions = extract_tables(&dialect, "SELECT * FROM catalog.schema.users").unwrap();
+let extractions = extract_tables(&dialect, "SELECT * FROM catalog.schema.t1").unwrap();
 println!("{:?}", extractions);
 ```
 
@@ -106,7 +106,7 @@ use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::extractor::extract_crud_tables;
 
 let dialect = GenericDialect {};
-let crud_tables = extract_crud_tables(&dialect, "INSERT INTO users (name) SELECT name FROM signups").unwrap();
+let crud_tables = extract_crud_tables(&dialect, "INSERT INTO t1 (a) SELECT a FROM t2").unwrap();
 println!("{:?}", crud_tables);
 ```
 
@@ -117,9 +117,9 @@ use sql_insight::sqlparser::dialect::GenericDialect;
 
 let dialect = GenericDialect {};
 let formatted = sql_insight::formatter::format(
-    &dialect, "SELECT * \n from users   WHERE id = 1"
+    &dialect, "SELECT * \n from t1   WHERE a = 1"
 ).unwrap();
-assert_eq!(formatted, ["SELECT * FROM users WHERE id = 1"]);
+assert_eq!(formatted, ["SELECT * FROM t1 WHERE a = 1"]);
 ```
 
 `format_with_options` + `FormatterOptions::pretty` switches to
@@ -135,9 +135,9 @@ use sql_insight::sqlparser::dialect::GenericDialect;
 
 let dialect = GenericDialect {};
 let normalized = sql_insight::normalizer::normalize(
-    &dialect, "SELECT * \n from users   WHERE id = 1"
+    &dialect, "SELECT * \n from t1   WHERE a = 1"
 ).unwrap();
-assert_eq!(normalized, ["SELECT * FROM users WHERE id = ?"]);
+assert_eq!(normalized, ["SELECT * FROM t1 WHERE a = ?"]);
 ```
 
 `normalize_with_options` adds three opt-in collapses:
