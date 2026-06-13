@@ -12,25 +12,48 @@ use crate::reference::TableReference;
 
 use super::{CaseFold, IdentifierCasing, QueryBodyOutput, Resolver, ScopeId};
 
-/// A normalized identifier key for binding lookup.
+/// A normalized identifier key for binding comparison.
 ///
-/// Two identifiers match iff their normalized forms are equal. The
-/// normalization is supplied by a [`CaseFold`] chosen from the active
+/// Holds one normalized segment per identifier component (so a bare
+/// name is one segment, a `schema.table` path is two, etc.). Each
+/// segment is folded by a [`CaseFold`] chosen from the active
 /// dialect's [`IdentifierCasing`] for the identifier's class (table /
 /// table-alias / column) — so e.g. an unquoted name folds to lower
 /// under PostgreSQL, to upper under Snowflake, and quoting matters
 /// under both but not under MySQL / BigQuery / DuckDB. See
 /// [`super::casing`] for the full per-dialect matrix.
+///
+/// Used purely for equality: the scope arena merges two bindings iff
+/// their keys are equal (full path for real tables, single name for
+/// aliases / synthetics — see [`binding_alias_key`]), and qualified
+/// column resolution compares per-segment. It is *not* an index;
+/// nothing looks bindings up by key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct BindingKey(String);
+pub(super) struct BindingKey(Vec<String>);
 
 impl BindingKey {
-    /// Normalize `ident` under the given [`CaseFold`] for matching.
-    /// The fold comes from the active dialect's [`IdentifierCasing`],
-    /// picked per identifier class (table / table-alias / column) at
-    /// the call site.
+    /// A single-segment key — one folded identifier. Used for column
+    /// names, aliases, and per-segment qualifier comparison.
     pub(super) fn new(ident: &Ident, fold: CaseFold) -> Self {
-        Self(fold.normalize(ident))
+        Self(vec![fold.normalize(ident)])
+    }
+
+    /// The full qualified-path key of a real table:
+    /// `catalog.schema.name` with each present segment folded. Two
+    /// tables compare equal only when their full paths match, so
+    /// `mydb.users` and `otherdb.users` stay distinct (and a bare
+    /// `users` does not merge with a schema-qualified `mydb.users` —
+    /// we don't assume a default schema).
+    pub(super) fn from_table(table: &TableReference, fold: CaseFold) -> Self {
+        let mut segments = Vec::with_capacity(3);
+        if let Some(catalog) = &table.catalog {
+            segments.push(fold.normalize(catalog));
+        }
+        if let Some(schema) = &table.schema {
+            segments.push(fold.normalize(schema));
+        }
+        segments.push(fold.normalize(&table.name));
+        Self(segments)
     }
 }
 
@@ -133,15 +156,16 @@ pub(super) fn is_synthetic_binding(binding: &Binding) -> bool {
 
 /// The scope-arena key for a binding's exposed name. The fold is
 /// picked per binding kind: a non-aliased real table keys by its
-/// `table` name (the [`IdentifierCasing::table`] class); an aliased
-/// table and every synthetic relation (CTE / derived / table
-/// function) key by their alias / name (the
+/// full `catalog.schema.name` path (the [`IdentifierCasing::table`]
+/// class), so same-name tables from different schemas stay distinct;
+/// an aliased table and every synthetic relation (CTE / derived /
+/// table function) key by their single alias / name (the
 /// [`IdentifierCasing::table_alias`] class).
 pub(super) fn binding_alias_key(binding: &Binding, casing: IdentifierCasing) -> BindingKey {
     match binding {
         Binding::Table {
             table, alias: None, ..
-        } => BindingKey::new(&table.name, casing.table),
+        } => BindingKey::from_table(table, casing.table),
         Binding::Table {
             alias: Some(alias), ..
         } => BindingKey::new(alias, casing.table_alias),

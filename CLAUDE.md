@@ -58,6 +58,18 @@ by hand.
   default; a per-deployment override API is a future addition. Only
   matching folds — surfaced `TableReference` / `ColumnReference`
   keep the original identifier text.
+- The scope arena keys bindings by **merge-identity**
+  (`binding_alias_key`): a non-aliased real table by its full
+  `catalog.schema.name` path (`BindingKey::from_table`), an aliased
+  table / CTE / derived / table function by its single name. So
+  `mydb.users` and `otherdb.users` are distinct bindings (coexist),
+  and a bare `users` does not merge into a qualified `mydb.users`
+  (no default-schema assumption — catalog-driven canonicalization is
+  a future layer). The key drives the two **exact-identity**
+  operations — merge-on-bind and CTE-name lookup
+  (`resolve_unqualified_relation`); **right-anchored** column
+  resolution scans `iter_bindings` instead (a partial qualifier like
+  `users.col` matching `mydb.users` is not a hashable equivalence).
 - Extractors consume the resolver's output:
   - `table_extractor` — flat list of `TableReference`s (legacy API).
   - `crud_table_extractor` — CRUD-bucketed tables (legacy API).

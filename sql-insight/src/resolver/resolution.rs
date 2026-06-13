@@ -188,7 +188,7 @@ impl Resolution {
         let synthetic_body_scopes: HashSet<ScopeId> = self
             .scopes
             .iter()
-            .flat_map(|scope| scope.bindings.values())
+            .flat_map(|scope| scope.iter_bindings())
             .filter_map(|binding| match binding {
                 Binding::Cte { body_scope, .. } => Some(*body_scope),
                 Binding::DerivedTable {
@@ -252,10 +252,9 @@ impl Resolution {
 
     /// Look up the binding a synthetic-owning captured ref points
     /// at, by matching the walk-time-captured table name against
-    /// scope bindings. Name match is unique within IndexMap, so this
-    /// avoids the column-membership ambiguity that scope-chain
-    /// resolution can hit when CTEs accumulate. Returns `None` for
-    /// non-synthetic refs.
+    /// scope bindings (by merge-identity). Name match avoids the
+    /// column-membership ambiguity that scope-chain resolution can hit
+    /// when CTEs accumulate. Returns `None` for non-synthetic refs.
     fn synthetic_owning_binding(&self, captured: &CapturedColumnRef) -> Option<&Binding> {
         if !captured.synthetic {
             return None;

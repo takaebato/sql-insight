@@ -498,6 +498,32 @@ mod tests {
         }
 
         #[test]
+        fn test_same_name_tables_in_different_schemas_coexist() {
+            // Two tables sharing a last segment but in different schemas
+            // are distinct bindings — both surface. (The scope arena
+            // keys bindings by full path, so they don't collide.)
+            let sql = "SELECT a FROM mydb.users, otherdb.users";
+            let expected = vec![ok_tables(vec![
+                schema_table("mydb", "users"),
+                schema_table("otherdb", "users"),
+            ])];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
+
+        #[test]
+        fn test_bare_and_qualified_same_name_are_distinct() {
+            // A bare `users` and a schema-qualified `mydb.users` are
+            // kept distinct — we don't assume a default schema, so the
+            // bare name is not merged into the qualified one.
+            let sql = "SELECT a FROM users, mydb.users";
+            let expected = vec![ok_tables(vec![
+                table("users"),
+                schema_table("mydb", "users"),
+            ])];
+            assert_table_extraction(sql, expected, all_dialects());
+        }
+
+        #[test]
         fn test_statement_where_same_tables_appear_multiple_times() {
             let sql = "SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id WHERE b = ( SELECT c FROM t3 INNER JOIN t1 ON t3.id = t1.id )";
             let expected = vec![ok_tables(vec![
@@ -741,6 +767,25 @@ mod tests {
                     DialectName::BigQuery,
                     DialectName::Oracle,
                     DialectName::MySql,
+                ]),
+            );
+        }
+
+        #[test]
+        fn test_delete_bare_target_against_qualified_from_stays_distinct() {
+            // The DELETE target `t1` (bare) and the FROM `mydb.t1`
+            // (schema-qualified) are different paths → distinct bindings,
+            // so they do not merge. We don't assume bare `t1` is
+            // `mydb.t1` (no default-schema assumption); both surface.
+            let sql = "DELETE t1 FROM mydb.t1 WHERE a > 0";
+            let expected = vec![ok_tables(vec![schema_table("mydb", "t1"), table("t1")])];
+            assert_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&[
+                    DialectName::Generic,
+                    DialectName::BigQuery,
+                    DialectName::Oracle,
                 ]),
             );
         }

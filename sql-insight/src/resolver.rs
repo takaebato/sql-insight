@@ -2272,7 +2272,7 @@ mod tests {
         resolution
             .scopes
             .iter()
-            .flat_map(|scope| scope.bindings.values())
+            .flat_map(|scope| scope.iter_bindings())
             .find_map(|binding| match binding {
                 Binding::Table { output_columns, .. } => Some(output_columns),
                 _ => None,

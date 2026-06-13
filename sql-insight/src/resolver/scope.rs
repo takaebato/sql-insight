@@ -35,9 +35,12 @@ pub(crate) struct Scope {
     /// walk-up for unqualified name resolution.
     pub(crate) parent: Option<ScopeId>,
     /// Bindings introduced *in this scope* (FROM tables, CTE
-    /// definitions, derived tables, table functions). Keyed by
-    /// `BindingKey` (case-folded); `IndexMap` preserves definition
-    /// order for deterministic iteration.
+    /// definitions, derived tables, table functions), keyed by
+    /// merge-identity ([`binding_alias_key`]). The key is used for the
+    /// two exact-identity operations — merge-on-bind and
+    /// exact-name lookup (CTE detection) — while right-anchored column
+    /// resolution scans [`Scope::iter_bindings`] instead. `IndexMap`
+    /// preserves definition order for deterministic iteration.
     pub(super) bindings: IndexMap<BindingKey, Binding>,
 }
 
@@ -57,14 +60,12 @@ impl Scope {
         }
     }
 
-    /// Insert `binding` under its precomputed `key` (the caller folds
-    /// the exposed name through the active
-    /// [`IdentifierCasing`](super::IdentifierCasing) — table /
-    /// table-alias class as appropriate).
+    /// Insert `binding` under its precomputed merge-identity `key`.
+    /// When the key already exists:
+    /// - both `Table` → merge roles (the `DELETE t1 FROM t1` case where
+    ///   one name plays Read and Write);
+    /// - otherwise → the new binding replaces it (last definition wins).
     pub(super) fn bind(&mut self, key: BindingKey, binding: Binding) {
-        // Re-binding the same name as a Table merges roles rather than
-        // replacing — this captures the `DELETE t1 FROM t1` style case
-        // where a single name plays multiple roles in one statement.
         if let (
             Some(Binding::Table {
                 roles: existing, ..
@@ -82,6 +83,9 @@ impl Scope {
         self.bindings.insert(key, binding);
     }
 
+    /// Exact-identity lookup by key — the merge / CTE-detection path.
+    /// Right-anchored column resolution uses [`Self::iter_bindings`]
+    /// instead.
     pub(super) fn resolve(&self, key: &BindingKey) -> Option<&Binding> {
         self.bindings.get(key)
     }
@@ -122,24 +126,24 @@ impl<'a> Resolver<'a> {
     }
 
     /// Insert a binding into the current scope, creating a root
-    /// scope on demand if nothing is open yet. The scope key is folded
-    /// per binding kind via [`binding_alias_key`] under the active
-    /// [`IdentifierCasing`](super::IdentifierCasing).
+    /// scope on demand if nothing is open yet. The merge-identity key
+    /// is folded per binding kind via [`binding_alias_key`] under the
+    /// active [`IdentifierCasing`](super::IdentifierCasing).
     pub(super) fn bind_current(&mut self, binding: Binding) {
-        let id = self.current_scope_id();
         let key = binding_alias_key(&binding, self.resolution.casing);
+        let id = self.current_scope_id();
         self.resolution.scopes[id.0].bind(key, binding);
     }
 
     /// Resolve an unqualified single-segment relation name by walking
     /// up the parent chain from `context.current_scope`, returning
-    /// the first matching binding. Multi-segment qualified names
-    /// return `None` — those route through schema/catalog resolution
-    /// elsewhere.
+    /// the first binding with that exact identity. Multi-segment
+    /// qualified names return `None` — those route through
+    /// schema/catalog resolution elsewhere.
     ///
-    /// Used to detect CTE references (`FROM cte`), so the lookup folds
-    /// the name under the table-alias class — CTE / derived names live
-    /// there.
+    /// Used to detect CTE references (`FROM cte`): an exact single-name
+    /// lookup (CTE names are unqualified), folded under the table-alias
+    /// class. Callers filter for the `Cte` kind.
     pub(super) fn resolve_unqualified_relation(&self, relation: &ObjectName) -> Option<&Binding> {
         if relation.0.len() != 1 {
             return None;

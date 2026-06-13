@@ -5100,18 +5100,16 @@ mod qualified_ref_arm_coverage {
     }
 
     #[test]
-    fn row9_two_unaliased_same_name_tables_collide_in_scope() {
-        // IDEAL (real engine): `users` matches both `s1.users` and
-        // `s2.users` → AMBIGUOUS. KNOWN LIMITATION: the scope arena
-        // keys bindings by exposed name, and both tables expose
-        // `users`, so binding the second merges it into the first
-        // (role-merge) and drops `s2.users`. Only `s1.users` survives,
-        // so the ref resolves to it (Inferred) and the ambiguity is
-        // not detected. Aliasing the tables (row 13) sidesteps the
-        // collision. Pre-existing — independent of qualifier matching.
+    fn row9_two_unaliased_same_name_tables_are_ambiguous() {
+        // `s1.users` and `s2.users` are distinct bindings (the scope
+        // arena keys by full path, so same-name-different-schema tables
+        // coexist). The bare qualifier `users` right-anchors to both →
+        // AMBIGUOUS. (Before full-path keying these collided on the
+        // last segment and the second was dropped, hiding the
+        // ambiguity.)
         assert_eq!(
             reads("SELECT users.id FROM s1.users, s2.users"),
-            vec![read2("s1", "users", "id")]
+            vec![ambiguous("id")]
         );
     }
 
