@@ -8,7 +8,7 @@ use sqlparser::tokenizer::Span;
 
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
-use crate::reference::TableReference;
+use crate::reference::{ResolutionKind, TableReference};
 
 use super::{CaseFold, IdentifierCasing, QueryBodyOutput, Resolver, ScopeId};
 
@@ -98,6 +98,15 @@ pub(crate) enum Binding {
         /// Catalog-derived column names. `Some` when the catalog has
         /// the table, `None` otherwise (no catalog or catalog miss).
         output_columns: Option<Vec<Ident>>,
+        /// How the catalog matched this table:
+        /// [`ResolutionKind::Cataloged`] for a unique registered hit,
+        /// [`ResolutionKind::Ambiguous`] for several, and
+        /// [`ResolutionKind::Inferred`] for a catalog miss or
+        /// catalog-less mode. Surfaced on the table-level read /
+        /// lineage-source surfaces via [`crate::reference::TableRead`].
+        /// (`Unresolved` never applies — a table name is always
+        /// present.)
+        resolution: ResolutionKind,
         /// How this binding is used in the statement — Read, Write,
         /// or both (e.g. `DELETE t1 FROM t1`). Re-binding the same
         /// name merges roles rather than overwriting (see
@@ -303,6 +312,21 @@ pub(super) fn synthetic_table_ref(name: &Ident) -> TableReference {
     }
 }
 
+/// Outcome of matching a query [`TableReference`] against the catalog.
+/// Drives both the table-level [`ResolutionKind`] and the column list.
+enum CatalogMatch {
+    /// Exactly one registered table matched. Carries its column names
+    /// (possibly empty = schema known, columns unknown). →
+    /// [`ResolutionKind::Cataloged`].
+    Unique(Vec<String>),
+    /// Two or more registered tables matched the (under-qualified)
+    /// reference — can't pick one. → [`ResolutionKind::Ambiguous`].
+    Ambiguous,
+    /// No catalog supplied, or no registered table matched. →
+    /// [`ResolutionKind::Inferred`].
+    Miss,
+}
+
 /// A quoted `Ident` over a catalog-side string. Quoting makes the
 /// segment fold with *exact* semantics (preserved under `Upper` /
 /// `Lower`, case-folded only under `Insensitive`, preserved under
@@ -375,60 +399,67 @@ impl<'a> Resolver<'a> {
         alias: Option<Ident>,
         role: TableRole,
     ) {
-        // A catalog hit supplies the table's column list; a miss (or no
-        // catalog) leaves columns unknown. The surfaced identity is left
+        // The catalog match drives both the table-level resolution (how
+        // the catalog identified the table) and the column list (for
+        // strict column resolution). The surfaced identity is left
         // exactly as written — catalog-driven canonicalization (filling
         // the schema of a bare `users` from a matched `public.users`) is
-        // a separate layer landed with the table-level resolution
-        // surface (see CLAUDE.md).
-        let output_columns = self.catalog_match(&table).and_then(|columns| {
-            // An empty registered column list means "schema known,
-            // columns unknown" (see `CatalogTable` docs) → leave `None`
-            // so any column could plausibly belong here, rather than
-            // `Some([])` which would reject every ref.
-            (!columns.is_empty()).then(|| {
-                columns
-                    .into_iter()
-                    .map(|c| Ident::with_quote('"', c))
-                    .collect()
-            })
-        });
+        // a separate layer (see CLAUDE.md).
+        let (resolution, output_columns) = match self.catalog_match(&table) {
+            CatalogMatch::Unique(columns) => {
+                // An empty registered column list means "schema known,
+                // columns unknown" (see `CatalogTable` docs) → leave
+                // `None` so any column could plausibly belong here,
+                // rather than `Some([])` which would reject every ref.
+                let output_columns = (!columns.is_empty()).then(|| {
+                    columns
+                        .into_iter()
+                        .map(|c| Ident::with_quote('"', c))
+                        .collect()
+                });
+                (ResolutionKind::Cataloged, output_columns)
+            }
+            CatalogMatch::Ambiguous => (ResolutionKind::Ambiguous, None),
+            CatalogMatch::Miss => (ResolutionKind::Inferred, None),
+        };
         if role == TableRole::Read {
             // Read-position FROM/JOIN — emit a CapturedTableRef so table-lineage
             // collapse sees this as a real source. Write targets feed
             // `write_tables` separately and don't drive collapse.
-            self.capture_real_table_ref(table.clone());
+            self.capture_real_table_ref(table.clone(), resolution);
         }
         self.bind_current(Binding::Table {
             table: Box::new(table),
             alias,
             output_columns,
+            resolution,
             roles: vec![role],
         });
     }
 
     /// Match a query [`TableReference`] against the catalog by
-    /// right-anchored, dialect-cased comparison (after default-fill). On
-    /// a *unique* match returns the registered table's column names;
-    /// multiple matches (ambiguous registration) or none yield `None`,
-    /// leaving the reference best-effort with unknown columns. See the
-    /// [`crate::catalog`] module docs for the matching contract.
-    fn catalog_match(&self, table: &TableReference) -> Option<Vec<String>> {
-        let catalog = self.catalog?;
+    /// right-anchored, dialect-cased comparison (after default-fill).
+    /// See the [`crate::catalog`] module docs for the matching contract.
+    fn catalog_match(&self, table: &TableReference) -> CatalogMatch {
+        let Some(catalog) = self.catalog else {
+            return CatalogMatch::Miss;
+        };
         let filled = fill_query_defaults(table, catalog);
         let table_fold = self.resolution.casing.table;
         let mut hits = catalog
             .tables()
             .iter()
             .filter(|t| qualifier_matches_table(&filled, &catalog_match_ref(t), table_fold));
-        let first = hits.next()?;
+        let Some(first) = hits.next() else {
+            return CatalogMatch::Miss;
+        };
         if hits.next().is_some() {
             // Ambiguous registration (e.g. a bare `users` matching two
             // distinct `*.users` entries) — stay best-effort rather
             // than arbitrarily pick one.
-            return None;
+            return CatalogMatch::Ambiguous;
         }
-        Some(first.column_names().to_vec())
+        CatalogMatch::Unique(first.column_names().to_vec())
     }
 
     /// Resolve the effective target column list for INSERT-style
@@ -446,9 +477,10 @@ impl<'a> Resolver<'a> {
         if !explicit.is_empty() {
             return explicit.to_vec();
         }
-        self.catalog_match(target)
-            .map(|columns| columns.into_iter().map(Ident::new).collect())
-            .unwrap_or_default()
+        match self.catalog_match(target) {
+            CatalogMatch::Unique(columns) => columns.into_iter().map(Ident::new).collect(),
+            CatalogMatch::Ambiguous | CatalogMatch::Miss => Vec::new(),
+        }
     }
 
     /// Look up an in-scope CTE's `output_columns`, for re-binding

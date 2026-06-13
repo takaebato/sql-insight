@@ -26,6 +26,39 @@ pub struct TableReference {
     pub name: Ident,
 }
 
+/// One read-side occurrence of a [`TableReference`], pairing the
+/// identity with how the resolver resolved it ([`ResolutionKind`]).
+///
+/// The table-granularity mirror of [`ColumnRead`]. Read-side surfaces
+/// ([`TableOperation::reads`] and [`TableLineageEdge::source`]) use this
+/// wrapper so each occurrence can carry resolution metadata while
+/// [`TableReference`] stays identity-only. Write-side surfaces
+/// ([`TableOperation::writes`], [`TableLineageEdge::target`]) stay bare
+/// [`TableReference`] — write targets come straight from SQL syntax and
+/// are trivially resolved by construction.
+///
+/// Unlike [`ColumnRead`], `reference` is **always present**: a table's
+/// name is written out in the SQL, so even an
+/// [`Ambiguous`](ResolutionKind::Ambiguous) table read (the catalog
+/// holds several tables matching an under-qualified name) still surfaces
+/// the reference as written. [`Unresolved`](ResolutionKind::Unresolved)
+/// therefore never arises at table granularity — it is columns-only.
+/// The resolution records how the catalog matched the table:
+/// [`Cataloged`](ResolutionKind::Cataloged) for a unique registered hit,
+/// [`Ambiguous`](ResolutionKind::Ambiguous) for several, and
+/// [`Inferred`](ResolutionKind::Inferred) for a catalog miss or
+/// catalog-less mode.
+///
+/// [`TableOperation::reads`]: crate::extractor::TableOperation::reads
+/// [`TableOperation::writes`]: crate::extractor::TableOperation::writes
+/// [`TableLineageEdge::source`]: crate::extractor::TableLineageEdge::source
+/// [`TableLineageEdge::target`]: crate::extractor::TableLineageEdge::target
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TableRead {
+    pub reference: TableReference,
+    pub resolution: ResolutionKind,
+}
+
 /// A column-level identity reference: an optional owning table plus the
 /// column name.
 ///

@@ -3,7 +3,7 @@
 //! constructor methods on `Resolver`. Parallel to [`super::column_ref`]
 //! for the table-granularity side of lineage tracking.
 
-use crate::reference::TableReference;
+use crate::reference::{ResolutionKind, TableReference};
 
 use super::{Resolver, ScopeId};
 
@@ -63,8 +63,14 @@ pub(crate) struct CapturedTableRef {
 #[derive(Clone, Debug)]
 pub(crate) enum TableRefTarget {
     /// A real table — `collapsed_feeding_table_sources` emits this
-    /// `TableReference` directly. Terminal.
-    Real(TableReference),
+    /// `TableReference` directly (paired with its catalog-match
+    /// `resolution`). Terminal.
+    Real {
+        table: TableReference,
+        /// How the catalog matched the table (mirrors the owning
+        /// `Binding::Table.resolution`); surfaced on lineage sources.
+        resolution: ResolutionKind,
+    },
     /// A CTE or derived subquery whose body lives at `body_scope`.
     /// Collapse recurses into that scope's subtree, collecting the
     /// real tables underneath. Covers `Binding::Cte` and
@@ -74,13 +80,19 @@ pub(crate) enum TableRefTarget {
 
 impl<'a> Resolver<'a> {
     /// Record a use of a real table at the current scope. Called by
-    /// `bind_real_table` on Read-position binds.
-    pub(super) fn capture_real_table_ref(&mut self, table: TableReference) {
+    /// `bind_real_table` on Read-position binds. `resolution` is the
+    /// table's catalog-match outcome, carried through to lineage
+    /// sources.
+    pub(super) fn capture_real_table_ref(
+        &mut self,
+        table: TableReference,
+        resolution: ResolutionKind,
+    ) {
         let scope_id = self.current_scope_id();
         let is_lineage_source = self.context.is_lineage_source;
         self.resolution.table_refs.push(CapturedTableRef {
             scope_id,
-            target: TableRefTarget::Real(table),
+            target: TableRefTarget::Real { table, resolution },
             is_lineage_source,
         });
     }

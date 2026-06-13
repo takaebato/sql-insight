@@ -88,16 +88,23 @@ by hand.
 ## Vocabulary
 
 - `TableOperation` carries three parallel surfaces:
-  - `reads: Vec<TableReference>` — every table the statement reads
-    from (occurrence-based; a table read more than once appears more
-    than once).
+  - `reads: Vec<TableRead>` — every table the statement reads from
+    (occurrence-based; a table read more than once appears more than
+    once). Each `TableRead` pairs a `TableReference` identity with the
+    catalog-match `ResolutionKind` (Cataloged for a unique registered
+    hit, Ambiguous for several, Inferred for a miss / catalog-less).
+    Unlike `ColumnRead`, the reference is always present (table names
+    are written out), so `Unresolved` never arises at table
+    granularity.
   - `writes: Vec<TableReference>` — every table the statement writes
-    to.
+    to. Bare `TableReference` — write targets are trivially resolved
+    by construction.
   - `lineage: Vec<TableLineageEdge>` — directed `source → target`
     edges, only for statements that physically move data (INSERT /
-    UPDATE / MERGE / CTAS / CREATE VIEW). A table that plays both
-    roles (e.g. `DELETE t1 FROM t1`) appears in both `reads` and
-    `writes`.
+    UPDATE / MERGE / CTAS / CREATE VIEW). `source` is a `TableRead`
+    (same shape as `reads`'s entries); `target` stays a bare
+    `TableReference`. A table that plays both roles (e.g. `DELETE t1
+    FROM t1`) appears in both `reads` and `writes`.
 - `ColumnOperation` mirrors the same surfaces at column
   granularity:
   - `reads: Vec<ColumnRead>` — every column reference, as a plain
@@ -134,6 +141,10 @@ by hand.
   so `HashSet<TableReference>` dedup and cross-statement comparison
   behave intuitively. Resolver bindings carry alias as a separate
   field; the public API does not currently surface it.
+  Per-occurrence metadata lives on the read-side wrapper
+  `TableRead { reference, resolution }` (mirrors `ColumnRead`), so
+  `TableReference` stays a pure identity. Write-side surfaces
+  (`writes`, `TableLineageEdge::target`) stay bare `TableReference`.
 - `ColumnReference` is identity-only too (`table: Option<TableReference>`,
   `name: Ident`). `table` is `Option` for cases where resolution
   fails (ambiguous, no candidate); the column name still surfaces.
@@ -143,13 +154,17 @@ by hand.
   dedup / cross-statement comparison. Write-side surfaces stay bare
   `ColumnReference` since writes are trivially resolved by construction.
 - `ResolutionKind` (`Cataloged` / `Inferred` / `Ambiguous` /
-  `Unresolved`) records *how* a `ColumnRead` resolved, not the SQL's
+  `Unresolved`) records *how* a `ColumnRead` / `TableRead` resolved,
+  not the SQL's
   correctness. `Cataloged` means a `Known` schema (catalog or CTE /
   derived body) positively confirmed the reference; `Inferred` means
   the resolver adopted a candidate without firm evidence (catalog-less
   mode, qualifier-only resolution, or Known-witness-over-Unknown-suspects
   tiebreaker). `Ambiguous` / `Unresolved` are the two failure modes —
-  both come with `table: None` (`Unresolved` is columns-only). Invariant:
+  both come with `table: None` on a `ColumnRead` (`Unresolved` is
+  columns-only). At table granularity the reference is always present,
+  so a `TableRead` can be `Ambiguous` (the catalog matched several
+  registrations) but never `Unresolved`. Invariant:
   catalog-less mode never produces `ResolutionKind::Cataloged` on the
   public surface (CTE-confirmed refs are synthetic and dropped by the
   post-pass), so detecting catalog-aware analysis is as simple as

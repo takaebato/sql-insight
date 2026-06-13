@@ -95,7 +95,9 @@ impl CrudTableExtractor {
         casing: IdentifierCasing,
     ) -> Result<CrudTables, Error> {
         let ops = TableOperationExtractor::extract_from_statement(statement, None, casing)?;
-        let reads = ops.reads;
+        // CRUD buckets are identity-only — drop the per-read
+        // `ResolutionKind` and keep the bare `TableReference`s.
+        let reads: Vec<TableReference> = ops.reads.into_iter().map(|r| r.reference).collect();
         let writes = ops.writes;
         let diagnostics = ops.diagnostics;
 

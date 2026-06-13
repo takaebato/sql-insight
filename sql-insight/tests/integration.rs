@@ -211,6 +211,14 @@ mod extract_table_operations {
         }
     }
 
+    /// A catalog-free read occurrence (resolution = `Inferred`).
+    fn read(name: &str) -> sql_insight::TableRead {
+        sql_insight::TableRead {
+            reference: table(name),
+            resolution: sql_insight::ResolutionKind::Inferred,
+        }
+    }
+
     #[test]
     fn select_classifies_kind_and_collects_reads() {
         let result =
@@ -218,7 +226,7 @@ mod extract_table_operations {
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.statement_kind, StatementKind::Select);
         assert_eq!(ops.reads.len(), 1);
-        assert_eq!(ops.reads[0], table("t1"));
+        assert_eq!(ops.reads[0], read("t1"));
         assert!(ops.writes.is_empty());
         assert!(ops.lineage.is_empty());
     }
@@ -229,10 +237,10 @@ mod extract_table_operations {
         let result = extract_table_operations(&GenericDialect {}, sql, None).unwrap();
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.statement_kind, StatementKind::Insert);
-        assert_eq!(ops.reads, vec![table("staging")]);
+        assert_eq!(ops.reads, vec![read("staging")]);
         assert_eq!(ops.writes, vec![table("orders")]);
         assert_eq!(ops.lineage.len(), 1);
-        assert_eq!(ops.lineage[0].source, table("staging"));
+        assert_eq!(ops.lineage[0].source, read("staging"));
         assert_eq!(ops.lineage[0].target, table("orders"));
     }
 
@@ -656,7 +664,9 @@ mod invariants {
         for sql in corpus() {
             for (idx, pair) in extract_paired(sql).into_iter().enumerate() {
                 let table_op_reads: HashSet<_> =
-                    table_set(pair.tab.reads.clone(), |r| Some(r.clone()));
+                    table_set(pair.tab.reads.clone(), |r: &sql_insight::TableRead| {
+                        Some(r.reference.clone())
+                    });
                 let table_op_writes: HashSet<_> =
                     table_set(pair.tab.writes.clone(), |w| Some(w.clone()));
                 let known: HashSet<_> = table_op_reads.union(&table_op_writes).cloned().collect();

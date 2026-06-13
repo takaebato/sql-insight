@@ -20,7 +20,7 @@ use std::collections::HashSet;
 
 use crate::diagnostic::ColumnLevelDiagnostic;
 use crate::extractor::ColumnLineageKind;
-use crate::reference::TableReference;
+use crate::reference::{TableRead, TableReference};
 
 use super::binding::binding_alias_key;
 use super::binding::BindingKey;
@@ -178,7 +178,7 @@ impl Resolution {
     ///
     /// Cycle-safe: each visited synthetic `body_scope` is recorded so
     /// recursive CTE self-references terminate after one pass.
-    pub(crate) fn collapsed_feeding_table_sources(&self) -> Vec<TableReference> {
+    pub(crate) fn collapsed_feeding_table_sources(&self) -> Vec<TableRead> {
         // Body scopes of every synthetic (CTE / true derived). The top
         // loop skips uses inside these subtrees — those uses are only
         // reachable via the synthetic's own `Synthetic` use, never
@@ -219,11 +219,14 @@ impl Resolution {
     fn collect_use(
         &self,
         captured: &CapturedTableRef,
-        out: &mut Vec<TableReference>,
+        out: &mut Vec<TableRead>,
         visited: &mut HashSet<ScopeId>,
     ) {
         match &captured.target {
-            TableRefTarget::Real(table) => out.push(table.clone()),
+            TableRefTarget::Real { table, resolution } => out.push(TableRead {
+                reference: table.clone(),
+                resolution: *resolution,
+            }),
             TableRefTarget::Synthetic { body_scope } => {
                 if !visited.insert(*body_scope) {
                     // Recursive CTE self-reference — terminate the
@@ -284,26 +287,40 @@ impl Resolution {
             .collect()
     }
 
-    /// Every table referenced as a Read source, in scope-arena order.
-    /// Includes tables inside predicate subqueries (e.g. `x` in
-    /// `WHERE id IN (SELECT id FROM x)`). Use
+    /// Every table referenced as a Read source, in scope-arena order,
+    /// each paired with its catalog-match [`crate::reference::ResolutionKind`]
+    /// (carried on the binding). Includes tables inside predicate
+    /// subqueries (e.g. `x` in `WHERE id IN (SELECT id FROM x)`). Use
     /// [`Self::collapsed_feeding_table_sources`] for the stricter
     /// "feeds the enclosing write target" filter.
-    pub(crate) fn read_tables(&self) -> Vec<TableReference> {
-        self.collect_tables_by_role(TableRole::Read)
-    }
-
-    /// Every table referenced as a Write target, in scope-arena order.
-    pub(crate) fn write_tables(&self) -> Vec<TableReference> {
-        self.collect_tables_by_role(TableRole::Write)
-    }
-
-    fn collect_tables_by_role(&self, role: TableRole) -> Vec<TableReference> {
+    pub(crate) fn read_tables(&self) -> Vec<TableRead> {
         self.scopes
             .iter()
             .flat_map(|scope| scope.iter_bindings())
             .filter_map(|binding| match binding {
-                Binding::Table { table, roles, .. } if roles.contains(&role) => {
+                Binding::Table {
+                    table,
+                    roles,
+                    resolution,
+                    ..
+                } if roles.contains(&TableRole::Read) => Some(TableRead {
+                    reference: (**table).clone(),
+                    resolution: *resolution,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every table referenced as a Write target, in scope-arena order.
+    /// Bare [`TableReference`] — write targets are trivially resolved by
+    /// construction, so they carry no resolution kind.
+    pub(crate) fn write_tables(&self) -> Vec<TableReference> {
+        self.scopes
+            .iter()
+            .flat_map(|scope| scope.iter_bindings())
+            .filter_map(|binding| match binding {
+                Binding::Table { table, roles, .. } if roles.contains(&TableRole::Write) => {
                     Some((**table).clone())
                 }
                 _ => None,

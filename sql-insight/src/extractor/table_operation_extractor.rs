@@ -22,7 +22,7 @@
 use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
-use crate::reference::TableReference;
+use crate::reference::{TableRead, TableReference};
 use crate::resolver::{IdentifierCasing, Resolver};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
@@ -46,7 +46,7 @@ use sqlparser::parser::Parser;
 /// let ops = result[0].as_ref().unwrap();
 /// assert_eq!(ops.statement_kind, StatementKind::Select);
 /// assert_eq!(ops.reads.len(), 1);
-/// assert_eq!(ops.reads[0].name.value, "users");
+/// assert_eq!(ops.reads[0].reference.name.value, "users");
 /// assert!(ops.writes.is_empty());
 /// ```
 pub fn extract_table_operations(
@@ -64,10 +64,14 @@ pub struct TableOperation {
     /// Merge / CTAS / …).
     pub statement_kind: StatementKind,
     /// Tables read by the statement, in walk order. Occurrence-based:
-    /// a table referenced more than once appears more than once.
-    pub reads: Vec<TableReference>,
+    /// a table referenced more than once appears more than once. Each
+    /// [`TableRead`] pairs the identity with the catalog-match
+    /// [`ResolutionKind`](crate::ResolutionKind); a consumer wanting the
+    /// distinct identity set dedups `reads.iter().map(|r| &r.reference)`.
+    pub reads: Vec<TableRead>,
     /// Tables written by the statement, in walk order.
-    /// Occurrence-based like `reads`.
+    /// Occurrence-based like `reads`. Bare [`TableReference`] — write
+    /// targets are trivially resolved by construction.
     pub writes: Vec<TableReference>,
     /// Lineage edges, only for statements that physically move data
     /// (`INSERT`, `UPDATE`, `MERGE` with an Insert / Update WHEN
@@ -165,7 +169,11 @@ pub enum StatementKind {
 /// the pre-bind stub without re-emitting the cycle.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableLineageEdge {
-    pub source: TableReference,
+    /// The feeding source table, paired with its catalog-match
+    /// [`ResolutionKind`](crate::ResolutionKind).
+    pub source: TableRead,
+    /// The write target. Bare [`TableReference`] — trivially resolved
+    /// by construction.
     pub target: TableReference,
 }
 
@@ -351,6 +359,7 @@ pub(super) fn classify_statement(statement: &Statement) -> StatementKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reference::ResolutionKind;
     use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
 
     fn table(name: &str) -> TableReference {
@@ -361,9 +370,18 @@ mod tests {
         }
     }
 
+    /// A read occurrence. These tests run catalog-free, so every read
+    /// resolves to [`ResolutionKind::Inferred`].
+    fn read(name: &str) -> TableRead {
+        TableRead {
+            reference: table(name),
+            resolution: ResolutionKind::Inferred,
+        }
+    }
+
     fn edge(source: &str, target: &str) -> TableLineageEdge {
         TableLineageEdge {
-            source: table(source),
+            source: read(source),
             target: table(target),
         }
     }
@@ -455,7 +473,7 @@ mod tests {
                 "SELECT id FROM users",
                 TableOperation {
                     statement_kind: StatementKind::Select,
-                    reads: vec![table("users")],
+                    reads: vec![read("users")],
                     writes: vec![],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -473,7 +491,7 @@ mod tests {
                 "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",
                 TableOperation {
                     statement_kind: StatementKind::Select,
-                    reads: vec![table("t1"), table("t2")],
+                    reads: vec![read("t1"), read("t2")],
                     writes: vec![],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -487,7 +505,7 @@ mod tests {
                 "SELECT t1.a FROM t1 WHERE id IN (SELECT id FROM t2)",
                 TableOperation {
                     statement_kind: StatementKind::Select,
-                    reads: vec![table("t1"), table("t2")],
+                    reads: vec![read("t1"), read("t2")],
                     writes: vec![],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -502,7 +520,7 @@ mod tests {
                 "WITH t2 AS (SELECT id FROM t1) SELECT t2.id FROM t2",
                 TableOperation {
                     statement_kind: StatementKind::Select,
-                    reads: vec![table("t1")],
+                    reads: vec![read("t1")],
                     writes: vec![],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -539,7 +557,7 @@ mod tests {
                 "SELECT a FROM t1 UNION SELECT b FROM t2",
                 TableOperation {
                     statement_kind: StatementKind::Select,
-                    reads: vec![table("t1"), table("t2")],
+                    reads: vec![read("t1"), read("t2")],
                     writes: vec![],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -557,7 +575,7 @@ mod tests {
                     &sql,
                     TableOperation {
                         statement_kind: StatementKind::Select,
-                        reads: vec![table("t1"), table("t2")],
+                        reads: vec![read("t1"), read("t2")],
                         writes: vec![],
                         lineage: vec![],
                         diagnostics: vec![],
@@ -574,7 +592,7 @@ mod tests {
                 "INSERT INTO dst SELECT a FROM t1 UNION SELECT b FROM t2",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("t1"), table("t2")],
+                    reads: vec![read("t1"), read("t2")],
                     writes: vec![table("dst")],
                     lineage: vec![edge("t1", "dst"), edge("t2", "dst")],
                     diagnostics: vec![],
@@ -588,7 +606,7 @@ mod tests {
                 "CREATE TABLE dst AS SELECT a FROM t1 UNION SELECT b FROM t2",
                 TableOperation {
                     statement_kind: StatementKind::CreateTable,
-                    reads: vec![table("t1"), table("t2")],
+                    reads: vec![read("t1"), read("t2")],
                     writes: vec![table("dst")],
                     lineage: vec![edge("t1", "dst"), edge("t2", "dst")],
                     diagnostics: vec![],
@@ -622,7 +640,7 @@ mod tests {
                 0,
                 TableOperation {
                     statement_kind: StatementKind::Select,
-                    reads: vec![table("t1")],
+                    reads: vec![read("t1")],
                     writes: vec![],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -633,7 +651,7 @@ mod tests {
                 1,
                 TableOperation {
                     statement_kind: StatementKind::Select,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -665,7 +683,7 @@ mod tests {
                 "INSERT INTO t1 SELECT * FROM t2",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
@@ -697,7 +715,7 @@ mod tests {
                 "UPDATE t1 SET a = 1 WHERE id IN (SELECT id FROM t2)",
                 TableOperation {
                     statement_kind: StatementKind::Update,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -716,7 +734,7 @@ mod tests {
                 &PostgreSqlDialect {},
                 TableOperation {
                     statement_kind: StatementKind::Update,
-                    reads: vec![table("t2"), table("t3"), table("t4")],
+                    reads: vec![read("t2"), read("t3"), read("t4")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1"), edge("t3", "t1")],
                     diagnostics: vec![],
@@ -748,7 +766,7 @@ mod tests {
                 "DELETE FROM t1 WHERE id IN (SELECT id FROM t2)",
                 TableOperation {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -765,7 +783,7 @@ mod tests {
                 &MySqlDialect {},
                 TableOperation {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![table("t1"), table("t2"), table("t3")],
+                    reads: vec![read("t1"), read("t2"), read("t3")],
                     writes: vec![table("t1"), table("t2")],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -779,7 +797,7 @@ mod tests {
                 "DELETE FROM t1, t2 USING t1 INNER JOIN t2 INNER JOIN t3",
                 TableOperation {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![table("t1"), table("t2"), table("t3")],
+                    reads: vec![read("t1"), read("t2"), read("t3")],
                     writes: vec![table("t1"), table("t2")],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -794,7 +812,7 @@ mod tests {
                 &MySqlDialect {},
                 TableOperation {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![table("t1"), table("t2")],
+                    reads: vec![read("t1"), read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -813,7 +831,7 @@ mod tests {
                  WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
                 TableOperation {
                     statement_kind: StatementKind::Merge,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
@@ -845,7 +863,7 @@ mod tests {
                 "CREATE TABLE t1 AS SELECT * FROM t2",
                 TableOperation {
                     statement_kind: StatementKind::CreateTable,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
@@ -859,7 +877,7 @@ mod tests {
                 "CREATE VIEW v1 AS SELECT * FROM t1",
                 TableOperation {
                     statement_kind: StatementKind::CreateView,
-                    reads: vec![table("t1")],
+                    reads: vec![read("t1")],
                     writes: vec![table("v1")],
                     lineage: vec![edge("t1", "v1")],
                     diagnostics: vec![],
@@ -890,7 +908,7 @@ mod tests {
                 "ALTER VIEW v1 AS SELECT * FROM t1",
                 TableOperation {
                     statement_kind: StatementKind::AlterView,
-                    reads: vec![table("t1")],
+                    reads: vec![read("t1")],
                     writes: vec![table("v1")],
                     lineage: vec![edge("t1", "v1")],
                     diagnostics: vec![],
@@ -980,7 +998,7 @@ mod tests {
                 "INSERT INTO t1 SELECT * FROM t2",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
@@ -994,7 +1012,7 @@ mod tests {
                 "INSERT INTO t1 SELECT * FROM t2 JOIN t3 ON t2.id = t3.id",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("t2"), table("t3")],
+                    reads: vec![read("t2"), read("t3")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1"), edge("t3", "t1")],
                     diagnostics: vec![],
@@ -1011,7 +1029,7 @@ mod tests {
                 "INSERT INTO t1 SELECT * FROM t2 WHERE id IN (SELECT id FROM t3)",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("t2"), table("t3")],
+                    reads: vec![read("t2"), read("t3")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
@@ -1029,7 +1047,7 @@ mod tests {
                  AND t2.id IN (SELECT id FROM t4)",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("t2"), table("t3"), table("t4")],
+                    reads: vec![read("t2"), read("t3"), read("t4")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1"), edge("t3", "t1")],
                     diagnostics: vec![],
@@ -1050,7 +1068,7 @@ mod tests {
              FROM s",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("s"), table("x")],
+                    reads: vec![read("s"), read("x")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("s", "t1")],
                     diagnostics: vec![],
@@ -1070,7 +1088,7 @@ mod tests {
              FROM s",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("s"), table("x")],
+                    reads: vec![read("s"), read("x")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("s", "t1")],
                     diagnostics: vec![],
@@ -1087,7 +1105,7 @@ mod tests {
                 "UPDATE t1 SET col = CASE WHEN EXISTS (SELECT 1 FROM x) THEN 1 ELSE 0 END",
                 TableOperation {
                     statement_kind: StatementKind::Update,
-                    reads: vec![table("x")],
+                    reads: vec![read("x")],
                     writes: vec![table("t1")],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -1104,7 +1122,7 @@ mod tests {
                 "INSERT INTO t1 SELECT (SELECT v FROM x LIMIT 1) FROM s",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("s"), table("x")],
+                    reads: vec![read("s"), read("x")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("s", "t1"), edge("x", "t1")],
                     diagnostics: vec![],
@@ -1125,7 +1143,7 @@ mod tests {
              FROM s",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("s"), table("x")],
+                    reads: vec![read("s"), read("x")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("s", "t1")],
                     diagnostics: vec![],
@@ -1143,7 +1161,7 @@ mod tests {
              FROM s",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("s"), table("x")],
+                    reads: vec![read("s"), read("x")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("s", "t1")],
                     diagnostics: vec![],
@@ -1157,7 +1175,7 @@ mod tests {
                 "UPDATE t1 SET col = (SELECT v FROM t2)",
                 TableOperation {
                     statement_kind: StatementKind::Update,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
@@ -1171,7 +1189,7 @@ mod tests {
                 "UPDATE t1 SET col = 1 WHERE id IN (SELECT id FROM t2)",
                 TableOperation {
                     statement_kind: StatementKind::Update,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -1185,7 +1203,7 @@ mod tests {
                 "CREATE TABLE t1 AS SELECT * FROM t2",
                 TableOperation {
                     statement_kind: StatementKind::CreateTable,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
@@ -1199,7 +1217,7 @@ mod tests {
                 "CREATE VIEW v1 AS SELECT * FROM t1",
                 TableOperation {
                     statement_kind: StatementKind::CreateView,
-                    reads: vec![table("t1")],
+                    reads: vec![read("t1")],
                     writes: vec![table("v1")],
                     lineage: vec![edge("t1", "v1")],
                     diagnostics: vec![],
@@ -1214,7 +1232,7 @@ mod tests {
                  WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
                 TableOperation {
                     statement_kind: StatementKind::Merge,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
@@ -1231,7 +1249,7 @@ mod tests {
                  WHEN NOT MATCHED THEN INSERT (a) VALUES (t2.b)",
                 TableOperation {
                     statement_kind: StatementKind::Merge,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("t2", "t1")],
                     diagnostics: vec![],
@@ -1250,7 +1268,7 @@ mod tests {
                  WHEN MATCHED THEN DELETE",
                 TableOperation {
                     statement_kind: StatementKind::Merge,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -1264,7 +1282,7 @@ mod tests {
                 "INSERT INTO t1 WITH cte AS (SELECT * FROM s) SELECT * FROM cte",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("s")],
+                    reads: vec![read("s")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("s", "t1")],
                     diagnostics: vec![],
@@ -1282,7 +1300,7 @@ mod tests {
              ) SELECT * FROM cte",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("s"), table("x")],
+                    reads: vec![read("s"), read("x")],
                     writes: vec![table("t1")],
                     lineage: vec![edge("s", "t1")],
                     diagnostics: vec![],
@@ -1311,7 +1329,7 @@ mod tests {
                 "WITH cte AS (SELECT a FROM s) INSERT INTO t1 SELECT 1",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("s")],
+                    reads: vec![read("s")],
                     writes: vec![table("t1")],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -1333,7 +1351,7 @@ mod tests {
              ) INSERT INTO t SELECT id FROM cte",
                 TableOperation {
                     statement_kind: StatementKind::Insert,
-                    reads: vec![table("x")],
+                    reads: vec![read("x")],
                     writes: vec![table("t")],
                     lineage: vec![edge("x", "t")],
                     diagnostics: vec![],
@@ -1368,7 +1386,7 @@ mod tests {
                 "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",
                 TableOperation {
                     statement_kind: StatementKind::Select,
-                    reads: vec![table("t1"), table("t2")],
+                    reads: vec![read("t1"), read("t2")],
                     writes: vec![],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -1398,7 +1416,7 @@ mod tests {
                 "DELETE FROM t1 WHERE id IN (SELECT id FROM t2)",
                 TableOperation {
                     statement_kind: StatementKind::Delete,
-                    reads: vec![table("t2")],
+                    reads: vec![read("t2")],
                     writes: vec![table("t1")],
                     lineage: vec![],
                     diagnostics: vec![],
@@ -1418,6 +1436,89 @@ mod tests {
                     diagnostics: vec![],
                 },
             );
+        }
+    }
+
+    /// Pins the table-level [`ResolutionKind`] carried on `reads` /
+    /// `lineage` sources once a catalog is supplied. Catalog-free
+    /// extraction is exercised throughout the rest of the file via the
+    /// `read()` helper (always `Inferred`); these cover the catalog-aware
+    /// arms (`Cataloged` / `Ambiguous`) the resolver can now produce.
+    mod catalog_resolution {
+        use super::*;
+        use crate::catalog::{Catalog, CatalogTable};
+
+        /// A read the catalog uniquely identified.
+        fn cataloged(name: &str) -> TableRead {
+            TableRead {
+                reference: table(name),
+                resolution: ResolutionKind::Cataloged,
+            }
+        }
+
+        /// A read whose (under-qualified) name the catalog matched to
+        /// several registered tables. The reference is still surfaced.
+        fn ambiguous(name: &str) -> TableRead {
+            TableRead {
+                reference: table(name),
+                resolution: ResolutionKind::Ambiguous,
+            }
+        }
+
+        fn ops_with_catalog(sql: &str, catalog: &Catalog) -> TableOperation {
+            extract_table_operations(&GenericDialect {}, sql, Some(catalog))
+                .unwrap()
+                .remove(0)
+                .unwrap()
+        }
+
+        #[test]
+        fn catalog_hit_marks_read_cataloged() {
+            // A unique registered hit → Cataloged at table granularity,
+            // independent of whether columns were registered.
+            let catalog = Catalog::new().table(CatalogTable::new("public", "t1"));
+            let ops = ops_with_catalog("SELECT a FROM t1", &catalog);
+            assert_eq!(ops.reads, vec![cataloged("t1")]);
+        }
+
+        #[test]
+        fn catalog_miss_marks_read_inferred() {
+            // Empty catalog → no match → Inferred, same as catalog-less.
+            let ops = ops_with_catalog("SELECT a FROM t1", &Catalog::new());
+            assert_eq!(ops.reads, vec![read("t1")]);
+        }
+
+        #[test]
+        fn lineage_source_carries_catalog_resolution() {
+            // The cataloged INSERT source `t2` surfaces Cataloged in both
+            // `reads` and the lineage source; the write target stays a
+            // bare `TableReference`.
+            let catalog = Catalog::new().table(CatalogTable::new("public", "t2"));
+            let ops = ops_with_catalog("INSERT INTO t1 SELECT * FROM t2", &catalog);
+            assert_eq!(ops.reads, vec![cataloged("t2")]);
+            assert_eq!(ops.writes, vec![table("t1")]);
+            assert_eq!(
+                ops.lineage,
+                vec![TableLineageEdge {
+                    source: cataloged("t2"),
+                    target: table("t1"),
+                }]
+            );
+        }
+
+        #[test]
+        fn ambiguous_registration_marks_read_ambiguous() {
+            // Bare `users` right-anchored-matches two registrations under
+            // different schemas (no default schema to disambiguate) →
+            // Ambiguous, with the reference still surfaced.
+            let catalog: Catalog = [
+                CatalogTable::new("s1", "users"),
+                CatalogTable::new("s2", "users"),
+            ]
+            .into_iter()
+            .collect();
+            let ops = ops_with_catalog("SELECT a FROM users", &catalog);
+            assert_eq!(ops.reads, vec![ambiguous("users")]);
         }
     }
 }
