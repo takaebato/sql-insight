@@ -10,15 +10,15 @@
 //!
 //! 1. INSERT without an explicit column list pairs source projections
 //!    with the target table's catalog-supplied columns.
-//! 2. Reads carry a `Confidence`: catalog-aware resolution surfaces
-//!    `Confirmed` placements, ambiguity surfaces as `Ambiguous`, and
+//! 2. Reads carry a `ResolutionKind`: catalog-aware resolution surfaces
+//!    `Cataloged` placements, ambiguity surfaces as `Ambiguous`, and
 //!    columns the catalog actively denies surface as `Unresolved`.
 
 use sql_insight::extractor::{extract_column_operations, ColumnTarget};
 use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::{
     catalog::{Catalog, ColumnSchema},
-    Confidence, TableReference,
+    ResolutionKind, TableReference,
 };
 use std::collections::HashMap;
 
@@ -74,10 +74,10 @@ fn main() {
 
     // 2) Ambiguous reference — both `t1` and `t2` declare `a` via the
     //    catalog, so unqualified `a` can't be pinned to a single
-    //    owner. The projection's `a` surfaces with `Confidence::Ambiguous`.
+    //    owner. The projection's `a` surfaces with `ResolutionKind::Ambiguous`.
     //    Without the catalog the same SQL also yields `Ambiguous` (two
     //    Unknown suspects with no tiebreaker) — the difference is
-    //    whether `t1.a` and `t2.a` themselves are `Confirmed` (with
+    //    whether `t1.a` and `t2.a` themselves are `Cataloged` (with
     //    catalog) or `Inferred` (without).
     {
         let sql = "SELECT a FROM t1 JOIN t2 ON t1.a = t2.a";
@@ -90,7 +90,7 @@ fn main() {
 
     // 3) Unresolved reference — `t1` catalog says columns are `[a]`;
     //    `z` is not in any in-scope Known schema. The read surfaces
-    //    with `Confidence::Unresolved`. Without the catalog the same
+    //    with `ResolutionKind::Unresolved`. Without the catalog the same
     //    SQL surfaces as `Inferred` (t1 is Unknown, so `z` could
     //    plausibly belong to t1).
     {
@@ -112,16 +112,16 @@ fn print_reads(label: &str, reads: &[sql_insight::ColumnRead]) {
             .as_ref()
             .map(|t| t.name.value.as_str())
             .unwrap_or("<unresolved>");
-        let confidence_marker = match read.confidence {
-            Confidence::Confirmed => "✓",
-            Confidence::Inferred => "~",
-            Confidence::Ambiguous => "?",
-            Confidence::Unresolved => "✗",
+        let confidence_marker = match read.resolution {
+            ResolutionKind::Cataloged => "✓",
+            ResolutionKind::Inferred => "~",
+            ResolutionKind::Ambiguous => "?",
+            ResolutionKind::Unresolved => "✗",
         };
         println!(
-            "    {confidence_marker} {table}.{name} ({confidence:?})",
+            "    {confidence_marker} {table}.{name} ({resolution:?})",
             name = read.reference.name.value,
-            confidence = read.confidence,
+            resolution = read.resolution,
         );
     }
 }

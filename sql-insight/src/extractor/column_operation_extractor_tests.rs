@@ -1,5 +1,5 @@
 use super::*;
-use crate::reference::Confidence;
+use crate::reference::ResolutionKind;
 use sqlparser::dialect::GenericDialect;
 
 fn extract(sql: &str) -> ColumnOperation {
@@ -15,39 +15,39 @@ fn table(name: &str) -> TableReference {
     }
 }
 
-// Read-side helpers return `ColumnRead` (identity + Confidence).
-// `read` and `col` both default to `Confidence::Inferred`, which is
-// the catalog-less mode's natural confidence — most tests in this
+// Read-side helpers return `ColumnRead` (identity + ResolutionKind).
+// `read` and `col` both default to `ResolutionKind::Inferred`, which is
+// the catalog-less mode's natural resolution — most tests in this
 // file run without a catalog, so the default minimises noise. Tests
 // supplying a catalog override with `read_confirmed` / `col_confirmed`.
 fn read(table_name: &str, col: &str) -> ColumnRead {
-    read_with(table_name, col, Confidence::Inferred)
+    read_with(table_name, col, ResolutionKind::Inferred)
 }
 
 fn read_confirmed(table_name: &str, col: &str) -> ColumnRead {
-    read_with(table_name, col, Confidence::Confirmed)
+    read_with(table_name, col, ResolutionKind::Cataloged)
 }
 
-fn read_with(table_name: &str, col: &str, confidence: Confidence) -> ColumnRead {
-    read_with_ref(table(table_name), col, confidence)
+fn read_with(table_name: &str, col: &str, resolution: ResolutionKind) -> ColumnRead {
+    read_with_ref(table(table_name), col, resolution)
 }
 
-fn read_with_ref(table_ref: TableReference, col: &str, confidence: Confidence) -> ColumnRead {
+fn read_with_ref(table_ref: TableReference, col: &str, resolution: ResolutionKind) -> ColumnRead {
     ColumnRead {
         reference: ColumnReference {
             table: Some(table_ref),
             name: col.into(),
         },
-        confidence,
+        resolution,
     }
 }
 
 fn col(table_name: &str, name: &str) -> ColumnRead {
-    read_with(table_name, name, Confidence::Inferred)
+    read_with(table_name, name, ResolutionKind::Inferred)
 }
 
 fn col_confirmed(table_name: &str, name: &str) -> ColumnRead {
-    read_with(table_name, name, Confidence::Confirmed)
+    read_with(table_name, name, ResolutionKind::Cataloged)
 }
 
 fn ambiguous(col: &str) -> ColumnRead {
@@ -56,7 +56,7 @@ fn ambiguous(col: &str) -> ColumnRead {
             table: None,
             name: col.into(),
         },
-        confidence: Confidence::Ambiguous,
+        resolution: ResolutionKind::Ambiguous,
     }
 }
 
@@ -66,13 +66,13 @@ fn unresolved(col: &str) -> ColumnRead {
             table: None,
             name: col.into(),
         },
-        confidence: Confidence::Unresolved,
+        resolution: ResolutionKind::Unresolved,
     }
 }
 
 // Write-side helpers stay as `ColumnReference` — write targets come
-// straight from SQL syntax and are always `Confidence::Confirmed` by
-// construction, so attaching a confidence field would be dead weight.
+// straight from SQL syntax and are always `ResolutionKind::Cataloged` by
+// construction, so attaching a resolution field would be dead weight.
 fn write(table_name: &str, col: &str) -> ColumnReference {
     ColumnReference {
         table: Some(table(table_name)),
@@ -303,10 +303,14 @@ mod reads {
             "SELECT s1.t1.a FROM s1.t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![read_with_ref(table_ref.clone(), "a", Confidence::Inferred)],
+                reads: vec![read_with_ref(
+                    table_ref.clone(),
+                    "a",
+                    ResolutionKind::Inferred,
+                )],
                 writes: vec![],
                 lineage: vec![passthrough(
-                    read_with_ref(table_ref, "a", Confidence::Inferred),
+                    read_with_ref(table_ref, "a", ResolutionKind::Inferred),
                     out("a", 0),
                 )],
                 diagnostics: vec![],
@@ -328,10 +332,14 @@ mod reads {
             "SELECT c1.s1.t1.a FROM c1.s1.t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![read_with_ref(table_ref.clone(), "a", Confidence::Inferred)],
+                reads: vec![read_with_ref(
+                    table_ref.clone(),
+                    "a",
+                    ResolutionKind::Inferred,
+                )],
                 writes: vec![],
                 lineage: vec![passthrough(
-                    read_with_ref(table_ref, "a", Confidence::Inferred),
+                    read_with_ref(table_ref, "a", ResolutionKind::Inferred),
                     out("a", 0),
                 )],
                 diagnostics: vec![],
@@ -353,10 +361,14 @@ mod reads {
             "SELECT a FROM c1.s1.t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![read_with_ref(table_ref.clone(), "a", Confidence::Inferred)],
+                reads: vec![read_with_ref(
+                    table_ref.clone(),
+                    "a",
+                    ResolutionKind::Inferred,
+                )],
                 writes: vec![],
                 lineage: vec![passthrough(
-                    read_with_ref(table_ref, "a", Confidence::Inferred),
+                    read_with_ref(table_ref, "a", ResolutionKind::Inferred),
                     out("a", 0),
                 )],
                 diagnostics: vec![],
@@ -432,7 +444,7 @@ mod reads {
     fn unqualified_with_multiple_tables_is_ambiguous() {
         // Two `Unknown`-schema tables — without a catalog the
         // resolver can't pick between them, so `a` surfaces with
-        // `table: None` and `Confidence::Ambiguous`. The lineage
+        // `table: None` and `ResolutionKind::Ambiguous`. The lineage
         // source inherits the same ambiguous read.
         assert_column_ops(
             "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id",
@@ -469,7 +481,7 @@ mod reads {
         // Reads surface only references with real Table owners or
         // unresolved column names. `unknown_col` doesn't match the
         // cte's Known schema [id], so it surfaces unresolved
-        // (table: None) with Confidence::Unresolved on the read.
+        // (table: None) with ResolutionKind::Unresolved on the read.
         assert_column_ops(
             "WITH cte AS (SELECT id FROM t1) SELECT id, unknown_col FROM cte",
             ColumnOperation {
@@ -2744,7 +2756,7 @@ mod on_conflict {
     /// `output_columns` from the INSERT source's per-operand
     /// projections; for VALUES sources (no projection captured) the
     /// binding ends up with `output_columns: None`, so refs against
-    /// it can't be `Confirmed` and surface as `Inferred`.
+    /// it can't be `Cataloged` and surface as `Inferred`.
     fn excluded(name: &str) -> ColumnRead {
         ColumnRead {
             reference: ColumnReference {
@@ -2755,7 +2767,7 @@ mod on_conflict {
                 }),
                 name: name.into(),
             },
-            confidence: Confidence::Inferred,
+            resolution: ResolutionKind::Inferred,
         }
     }
 
@@ -3253,7 +3265,7 @@ mod catalog_strict {
         // Without catalog `SELECT a FROM t1` resolves a → t1.a
         // unconditionally (single Unknown binding heuristic). With a
         // catalog that says t1's columns are [x, y], `a` cannot come
-        // from t1 — it surfaces as unresolved (table=None, confidence=
+        // from t1 — it surfaces as unresolved (table=None, resolution=
         // Unresolved on the read).
         let catalog = TestCatalog::default().with("t1", vec!["x", "y"]);
         assert_column_ops_with_catalog(
@@ -3309,7 +3321,7 @@ mod catalog_strict {
     fn catalog_does_not_match_quoted_ref_against_unquoted_column() {
         // A quoted `"ID"` matches exactly (case-sensitive), so it does
         // not match the catalog's `id`; it stays unresolved (table=None,
-        // Confidence::Unresolved). Placed in WHERE so it is a read but
+        // ResolutionKind::Unresolved). Placed in WHERE so it is a read but
         // not a lineage source.
         let catalog = TestCatalog::default().with("t1", vec!["a", "id"]);
         let unresolved_quoted_id = ColumnRead {
@@ -3317,7 +3329,7 @@ mod catalog_strict {
                 table: None,
                 name: Ident::with_quote('"', "ID"),
             },
-            confidence: Confidence::Unresolved,
+            resolution: ResolutionKind::Unresolved,
         };
         assert_column_ops_with_catalog(
             r#"SELECT a FROM t1 WHERE "ID" > 0"#,
@@ -3452,7 +3464,7 @@ mod catalog_strict {
     fn catalog_confirmed_ambiguity_surfaces_as_ambiguous_read() {
         // Both tables Known and both declare `a`. The unqualified `a`
         // can't be resolved to a single owner; the read surfaces with
-        // table=None and Confidence::Ambiguous. (Without catalog the
+        // table=None and ResolutionKind::Ambiguous. (Without catalog the
         // same query also yields Ambiguous: two Unknown suspects with
         // no Known tiebreaker.)
         let catalog = TestCatalog::default()
@@ -3479,7 +3491,7 @@ mod catalog_strict {
     fn catalog_unresolved_unqualified_surfaces_as_unresolved_read() {
         // Catalog says t1 has [x, y]; unqualified `z` belongs to
         // nothing in scope — the read surfaces with table=None and
-        // Confidence::Unresolved.
+        // ResolutionKind::Unresolved.
         let catalog = TestCatalog::default().with("t1", vec!["x", "y"]);
         assert_column_ops_with_catalog(
             "SELECT z FROM t1",
@@ -3499,9 +3511,9 @@ mod catalog_strict {
         // No catalog → all real-table schemas are Unknown. For the
         // unqualified `a`, both t1 and t2 are Unknown suspects with
         // no Known tiebreaker, so the read surfaces with table=None
-        // and Confidence::Ambiguous. No diagnostic fires:
+        // and ResolutionKind::Ambiguous. No diagnostic fires:
         // diagnostics are tool-side gaps (wildcard / unsupported),
-        // resolution outcomes live on the read's confidence.
+        // resolution outcomes live on the read's resolution.
         assert_column_ops(
             "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id",
             ColumnOperation {
@@ -3555,7 +3567,7 @@ mod expr_arm_coverage {
 
     /// A real-table column read against the single table `t`. The
     /// module runs without a catalog, so every resolved ref carries
-    /// [`Confidence::Inferred`].
+    /// [`ResolutionKind::Inferred`].
     fn c(name: &str) -> ColumnRead {
         ColumnRead {
             reference: ColumnReference {
@@ -3566,7 +3578,7 @@ mod expr_arm_coverage {
                 }),
                 name: name.into(),
             },
-            confidence: Confidence::Inferred,
+            resolution: ResolutionKind::Inferred,
         }
     }
 
@@ -4043,13 +4055,13 @@ mod relation_arm_coverage {
                 }),
                 name: name.into(),
             },
-            confidence: Confidence::Inferred,
+            resolution: ResolutionKind::Inferred,
         }
     }
 
     /// Write-side build: stays bare [`ColumnReference`] since
     /// `writes` is `Vec<ColumnReference>` (write targets come from
-    /// SQL syntax and don't carry a confidence).
+    /// SQL syntax and don't carry a resolution).
     fn w(table: &str, name: &str) -> ColumnReference {
         ColumnReference {
             table: Some(TableReference {
@@ -4831,7 +4843,7 @@ mod supported_kind_only_coverage {
     }
 }
 
-/// Pins one row per case from the [`Confidence`] rustdoc's behavior
+/// Pins one row per case from the [`ResolutionKind`] rustdoc's behavior
 /// table. Each test is the minimal SQL that exercises that arm and
 /// asserts the full expected reads vector — so this module doubles as
 /// behavior documentation: a reader can recover the catalog-less /
@@ -4899,7 +4911,7 @@ mod confidence_arm_coverage {
     fn catalog_less_cte_known_body_drops_synthetic_confirmed_ref() {
         // CTE `cte` has a `Known` body ([id]) derived from its
         // projection. The outer `cte.id` qualified ref hits the CTE
-        // binding and would be internally Confirmed, but synthetic
+        // binding and would be internally Cataloged, but synthetic
         // refs are dropped from public reads — only the inner real
         // `t1.id` (Inferred) surfaces.
         assert_eq!(
@@ -4944,7 +4956,7 @@ mod confidence_arm_coverage {
         // t1 in catalog confirms `a`; t2 is catalog-less → Unknown
         // suspect. Single Known winner adopted with Inferred (the
         // Unknown suspect could in principle also contain `a`, so we
-        // don't claim Confirmed).
+        // don't claim Cataloged).
         let catalog = TestCatalog::default().with("t1", vec!["a"]);
         assert_eq!(
             extract_reads("SELECT a FROM t1, t2", Some(&catalog)),
@@ -4958,7 +4970,7 @@ mod confidence_arm_coverage {
             .with("t1", vec!["a"])
             .with("t2", vec!["a"]);
         // Both t1 and t2 confirm `a` — genuine ambiguity. The
-        // qualified `t1.a` / `t2.a` in ON are Confirmed individually.
+        // qualified `t1.a` / `t2.a` in ON are Cataloged individually.
         assert_eq!(
             extract_reads("SELECT a FROM t1 JOIN t2 ON t1.a = t2.a", Some(&catalog)),
             vec![
@@ -4992,9 +5004,9 @@ mod confidence_arm_coverage {
 /// Pins the qualifier-matching behavior table: for a *qualified*
 /// column reference, which `FROM` binding (if any) owns it. Every row
 /// is decidable from SQL structure alone, so these run catalog-free and
-/// assert table identity + catalog-less confidence
+/// assert table identity + catalog-less resolution
 /// (`Inferred` for a resolved ref, `Ambiguous` / `Unresolved` for the
-/// failure modes). Catalog-confirmed (`Confirmed`) placement is covered
+/// failure modes). Catalog-confirmed (`Cataloged`) placement is covered
 /// separately in [`confidence_arm_coverage`].
 ///
 /// The matching rule is ANSI right-anchored: a qualifier matches a
@@ -5020,7 +5032,7 @@ mod qualified_ref_arm_coverage {
                 name: name.into(),
             },
             col,
-            Confidence::Inferred,
+            ResolutionKind::Inferred,
         )
     }
 

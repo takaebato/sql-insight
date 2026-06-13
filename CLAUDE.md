@@ -40,9 +40,9 @@ by hand.
 - The resolver takes an optional `&dyn Catalog`. With a catalog,
   Table bindings come back with `Known` schemas and column
   resolution becomes strict (typos surface as `table: None` with
-  `Confidence::Unresolved`; multi-`Known`-confirms surface as
-  `Confidence::Ambiguous`). Without a catalog the resolver is
-  best-effort and resolved reads surface as `Confidence::Inferred`.
+  `ResolutionKind::Unresolved`; multi-`Known`-confirms surface as
+  `ResolutionKind::Ambiguous`). Without a catalog the resolver is
+  best-effort and resolved reads surface as `ResolutionKind::Inferred`.
 - Identifier matching is dialect-aware (`resolver::casing`). The
   extractor derives an `IdentifierCasing` from the `&dyn Dialect`
   (`IdentifierCasing::for_dialect`) and threads it into
@@ -102,7 +102,7 @@ by hand.
   granularity:
   - `reads: Vec<ColumnRead>` — every column reference, as a plain
     occurrence list with no clause tag. Each `ColumnRead` pairs a
-    `ColumnReference` identity with a `Confidence` (Confirmed /
+    `ColumnReference` identity with a `ResolutionKind` (Cataloged /
     Inferred / Ambiguous / Unresolved). References whose walk-time
     owning binding was synthetic (CTE / derived / table function)
     are dropped — only real-storage references and unresolved names
@@ -110,7 +110,7 @@ by hand.
   - `writes: Vec<ColumnReference>` — INSERT column lists, UPDATE SET
     targets, CTAS / CREATE VIEW / ALTER VIEW columns, MERGE
     WHEN-clause writes. Write targets come straight from SQL syntax
-    so they don't carry a confidence (always Confirmed by
+    so they don't carry a resolution kind (trivially resolved by
     construction).
   - `lineage: Vec<ColumnLineageEdge>` — `source → target` edges with
     `kind: ColumnLineageKind` (`Passthrough` / `Transformation`).
@@ -137,24 +137,23 @@ by hand.
 - `ColumnReference` is identity-only too (`table: Option<TableReference>`,
   `name: Ident`). `table` is `Option` for cases where resolution
   fails (ambiguous, no candidate); the column name still surfaces.
-  Per-occurrence metadata (resolution `Confidence`, future
-  per-occurrence fields) lives on `ColumnRead { reference, confidence }`
+  Per-occurrence metadata (`ResolutionKind`, future per-occurrence
+  fields) lives on `ColumnRead { reference, resolution }`
   on the read side, so `ColumnReference` stays a pure identity for
   dedup / cross-statement comparison. Write-side surfaces stay bare
-  `ColumnReference` since writes are always Confirmed by construction.
-- `Confidence` (`Confirmed` / `Inferred` / `Ambiguous` / `Unresolved`)
-  records the resolver's confidence in a `ColumnRead`'s placement,
-  not the SQL's correctness. `Confirmed` means a `Known` schema
-  (catalog or CTE / derived body) positively confirmed the column;
-  `Inferred` means the resolver adopted a candidate without firm
-  evidence (catalog-less mode, qualifier-only resolution, or
-  Known-witness-over-Unknown-suspects tiebreaker). `Ambiguous` /
-  `Unresolved` are the two failure modes — both come with
-  `table: None`. Invariant: catalog-less mode never produces
-  `Confidence::Confirmed` on the public surface (CTE-Confirmed refs
-  are synthetic and dropped by the post-pass), so detecting
-  catalog-aware analysis is as simple as `r.confidence == Confirmed`
-  on any surviving read.
+  `ColumnReference` since writes are trivially resolved by construction.
+- `ResolutionKind` (`Cataloged` / `Inferred` / `Ambiguous` /
+  `Unresolved`) records *how* a `ColumnRead` resolved, not the SQL's
+  correctness. `Cataloged` means a `Known` schema (catalog or CTE /
+  derived body) positively confirmed the reference; `Inferred` means
+  the resolver adopted a candidate without firm evidence (catalog-less
+  mode, qualifier-only resolution, or Known-witness-over-Unknown-suspects
+  tiebreaker). `Ambiguous` / `Unresolved` are the two failure modes —
+  both come with `table: None` (`Unresolved` is columns-only). Invariant:
+  catalog-less mode never produces `ResolutionKind::Cataloged` on the
+  public surface (CTE-confirmed refs are synthetic and dropped by the
+  post-pass), so detecting catalog-aware analysis is as simple as
+  `r.resolution == Cataloged` on any surviving read.
 
 ## Design conventions
 
@@ -201,7 +200,7 @@ by hand.
   and extractors — wildcard arms silently hide newly added variants.
 - Public enums are **exhaustive (no `#[non_exhaustive]`) while pre-1.0**
   (`StatementKind` / `ColumnLineageKind` / `ColumnTarget` /
-  `Confidence` / `TableLevelDiagnosticKind` /
+  `ResolutionKind` / `TableLevelDiagnosticKind` /
   `ColumnLevelDiagnosticKind`). Adding a variant is therefore a
   breaking change on purpose — pre-1.0 that rides a `0.x` bump and
   forces consumers to re-acknowledge the new case rather than

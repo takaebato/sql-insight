@@ -279,7 +279,7 @@ mod extract_column_operations {
                 }),
                 name: name.into(),
             },
-            confidence: sql_insight::Confidence::Inferred,
+            resolution: sql_insight::ResolutionKind::Inferred,
         }
     }
 
@@ -399,8 +399,8 @@ mod catalog {
     fn ambiguous_column_surfaces_in_confidence_regardless_of_catalog() {
         // Both with and without a catalog the unqualified `a` is
         // ambiguous between t1 and t2. The catalog only changes the
-        // *qualified* refs' confidence: with catalog `t1.a` / `t2.a`
-        // are Confirmed; without they're Inferred.
+        // *qualified* refs' resolution: with catalog `t1.a` / `t2.a`
+        // are Cataloged; without they're Inferred.
         let catalog = TestCatalog::default()
             .with("t1", vec!["a"])
             .with("t2", vec!["a"]);
@@ -414,11 +414,11 @@ mod catalog {
 
         let ambiguous_with = with_reads
             .iter()
-            .filter(|r| r.confidence == sql_insight::Confidence::Ambiguous)
+            .filter(|r| r.resolution == sql_insight::ResolutionKind::Ambiguous)
             .count();
         let ambiguous_without = without_reads
             .iter()
-            .filter(|r| r.confidence == sql_insight::Confidence::Ambiguous)
+            .filter(|r| r.resolution == sql_insight::ResolutionKind::Ambiguous)
             .count();
         assert_eq!(ambiguous_with, 1, "unqualified `a` ambiguous with catalog");
         assert_eq!(
@@ -426,15 +426,15 @@ mod catalog {
             "unqualified `a` ambiguous without catalog too"
         );
 
-        // The qualified `t1.a` and `t2.a` differ in confidence:
+        // The qualified `t1.a` and `t2.a` differ in resolution:
         // catalog confirms them, no catalog leaves them inferred.
         let confirmed_with = with_reads
             .iter()
-            .filter(|r| r.confidence == sql_insight::Confidence::Confirmed)
+            .filter(|r| r.resolution == sql_insight::ResolutionKind::Cataloged)
             .count();
         let confirmed_without = without_reads
             .iter()
-            .filter(|r| r.confidence == sql_insight::Confidence::Confirmed)
+            .filter(|r| r.resolution == sql_insight::ResolutionKind::Cataloged)
             .count();
         assert_eq!(confirmed_with, 2);
         assert_eq!(confirmed_without, 0);
@@ -443,7 +443,7 @@ mod catalog {
     #[test]
     fn unresolved_column_appears_only_with_catalog() {
         // Catalog says t1 = [a, b]; `missing` cannot belong to t1.
-        // The read surfaces with Confidence::Unresolved. Without a
+        // The read surfaces with ResolutionKind::Unresolved. Without a
         // catalog, t1 is Unknown — `missing` could plausibly be in
         // t1, so it surfaces as Inferred(t1).
         let catalog = TestCatalog::default().with("t1", vec!["a", "b"]);
@@ -457,11 +457,11 @@ mod catalog {
 
         assert!(with_reads
             .iter()
-            .any(|r| r.confidence == sql_insight::Confidence::Unresolved
+            .any(|r| r.resolution == sql_insight::ResolutionKind::Unresolved
                 && r.reference.name.value == "missing"));
         assert!(without_reads
             .iter()
-            .any(|r| r.confidence == sql_insight::Confidence::Inferred
+            .any(|r| r.resolution == sql_insight::ResolutionKind::Inferred
                 && r.reference.name.value == "missing"
                 && r.reference.table.is_some()));
     }
@@ -511,7 +511,7 @@ mod diagnostics {
     #[test]
     fn unresolved_column_read_carries_precise_span_on_ident() {
         // Catalog t1 = [a, b]; `missing` cannot belong to t1, so the
-        // read surfaces with Confidence::Unresolved. The span lives
+        // read surfaces with ResolutionKind::Unresolved. The span lives
         // on the column's `Ident` (sqlparser populates it on every
         // identifier token), so consumers can locate the offending
         // text without a parallel diagnostic stream.
@@ -541,7 +541,7 @@ mod diagnostics {
             .reads
             .iter()
             .find(|r| {
-                r.confidence == sql_insight::Confidence::Unresolved
+                r.resolution == sql_insight::ResolutionKind::Unresolved
                     && r.reference.name.value == "missing"
             })
             .expect("Unresolved `missing` read not found");

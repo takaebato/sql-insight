@@ -32,10 +32,10 @@ pub struct TableReference {
 /// `table` is `Option` because some column references cannot be
 /// resolved structurally (ambiguous unqualified columns, references to
 /// derived tables we do not yet expand, etc.) — the accompanying
-/// [`ColumnRead::confidence`] surfaces *why*. Identity is name-based:
+/// [`ColumnRead::resolution`] surfaces *why*. Identity is name-based:
 /// two `ColumnReference`s with the same `table` and `name` compare
 /// equal, independent of where they appeared in the SQL or with what
-/// confidence the resolver placed them.
+/// resolution the resolver placed them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ColumnReference {
     pub table: Option<TableReference>,
@@ -43,7 +43,7 @@ pub struct ColumnReference {
 }
 
 /// One read-side occurrence of a [`ColumnReference`], pairing the
-/// identity with the resolver's [`Confidence`] in that placement.
+/// identity with how the resolver resolved it ([`ResolutionKind`]).
 ///
 /// Read-side surfaces ([`ColumnOperation::reads`] and
 /// [`ColumnLineageEdge::source`]) use this wrapper so the same column
@@ -52,8 +52,8 @@ pub struct ColumnReference {
 /// Write-side surfaces ([`ColumnOperation::writes`],
 /// [`ColumnTarget::Relation`]) stay as bare [`ColumnReference`] —
 /// targets come straight from SQL syntax and are always
-/// [`Confidence::Confirmed`] by construction, so the field would be
-/// dead weight there.
+/// [`ResolutionKind::Cataloged`]-or-trivially-resolved by construction,
+/// so the field would be dead weight there.
 ///
 /// [`ColumnOperation::reads`]: crate::extractor::ColumnOperation::reads
 /// [`ColumnOperation::writes`]: crate::extractor::ColumnOperation::writes
@@ -62,31 +62,32 @@ pub struct ColumnReference {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ColumnRead {
     pub reference: ColumnReference,
-    pub confidence: Confidence,
+    pub resolution: ResolutionKind,
 }
 
-/// The resolver's confidence in a column reference's placement —
-/// "how sure are we that this `(table, name)` is right?".
+/// How a reference was resolved — "what kind of resolution backs this
+/// `(table, name)` placement?".
 ///
 /// Catalog-less mode runs as an *inference mode*: every real-table
 /// binding's schema is `Unknown`, so a single-candidate resolution
-/// is best-effort, not confirmed. CTE and derived bodies do carry
+/// is best-effort, not catalog-backed. CTE and derived bodies do carry
 /// `Known` schemas (the resolver derives them from the body's
 /// projection), but those refs are synthetic and dropped from the
 /// public reads / lineage by the resolver's post-pass.
 ///
 /// `Ambiguous` and `Unresolved` are the two failure modes. Both come
 /// with `table: None` on the [`ColumnReference`]; the variant tells
-/// the consumer *why* the resolver gave up.
+/// the consumer *why* the resolver gave up. (`Unresolved` arises only
+/// for columns — a table reference always has a name present.)
 ///
 /// # Invariants
 ///
-/// - **Catalog-less mode → no public `Confirmed`**: every surviving
+/// - **Catalog-less mode → no public `Cataloged`**: every surviving
 ///   non-synthetic ref points at an `Unknown` real table, so the
 ///   strongest claim the resolver can make is
 ///   [`Inferred`](Self::Inferred). Catalog-aware analysis is
-///   therefore detectable by the presence of `Confirmed`.
-/// - **Catalog-aware mode does not imply `Confirmed`**: catalogs are
+///   therefore detectable by the presence of `Cataloged`.
+/// - **Catalog-aware mode does not imply `Cataloged`**: catalogs are
 ///   often partial. Refs against tables the catalog doesn't cover,
 ///   or against a real `Unknown` table that won a multi-candidate
 ///   tiebreaker over `Known` ones, both still come back as
@@ -94,36 +95,39 @@ pub struct ColumnRead {
 ///
 /// # How each variant arises
 ///
-/// | Situation | Confidence |
+/// | Situation | ResolutionKind |
 /// |---|---|
 /// | catalog-less, real `Unknown` table, sole candidate | [`Inferred`](Self::Inferred) |
 /// | catalog-less, two real `Unknown` tables in scope | [`Ambiguous`](Self::Ambiguous) |
-/// | catalog-less, CTE `Known` body confirms the column | (internal `Confirmed`; synthetic, dropped) |
+/// | catalog-less, CTE `Known` body confirms the column | (internal `Cataloged`; synthetic, dropped) |
 /// | catalog-less, CTE `Known` body denies the column (`SELECT typo FROM cte` where cte = `[id]`) | [`Unresolved`](Self::Unresolved) |
-/// | catalog-aware, `Known` binding lists the column | [`Confirmed`](Self::Confirmed) |
+/// | catalog-aware, `Known` binding lists the column | [`Cataloged`](Self::Cataloged) |
 /// | catalog-aware, `Known` binding *doesn't* list the column | [`Unresolved`](Self::Unresolved) |
 /// | catalog-aware, one `Known` confirms + one `Unknown` suspect (Known-witness-over-Unknown-suspects) | [`Inferred`](Self::Inferred) |
 /// | catalog-aware, two or more `Known` schemas confirm | [`Ambiguous`](Self::Ambiguous) |
 /// | qualified `t.col` where `t` is `Unknown` | [`Inferred`](Self::Inferred) |
-/// | qualified `t.col` where `t` is `Known` and lists `col` | [`Confirmed`](Self::Confirmed) |
+/// | qualified `t.col` where `t` is `Known` and lists `col` | [`Cataloged`](Self::Cataloged) |
 ///
 /// # Consumer guidance
 ///
 /// - **Strict mode validation**: a fully resolved, catalog-confirmed
 ///   statement satisfies
-///   `op.diagnostics.is_empty() && op.reads.iter().all(|r| r.confidence == Confidence::Confirmed)`.
+///   `op.diagnostics.is_empty() && op.reads.iter().all(|r| r.resolution == ResolutionKind::Cataloged)`.
 /// - **DFD / CRUD comprehension**: treat
-///   [`Confirmed`](Self::Confirmed) and [`Inferred`](Self::Inferred)
+///   [`Cataloged`](Self::Cataloged) and [`Inferred`](Self::Inferred)
 ///   interchangeably as "resolved" (use the `(table, name)` pair);
 ///   treat [`Ambiguous`](Self::Ambiguous) and
 ///   [`Unresolved`](Self::Unresolved) as "incomplete".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Confidence {
-    /// A `Known`-schema binding (catalog hit, or a CTE / derived body
-    /// the resolver could fully walk) positively confirmed the column
-    /// at this reference. The strongest claim the resolver makes.
-    Confirmed,
-    /// Resolution succeeded by assuming the column exists where the
+pub enum ResolutionKind {
+    /// Backed by a `Known` schema that lists the column / names the
+    /// table. On the public surface this means a catalog (or registry)
+    /// entry backed the reference. Internally a CTE / derived body's
+    /// `Known` schema also yields this variant on a synthetic ref, but
+    /// the post-pass drops those — so consumers only ever see
+    /// `Cataloged` for catalog-backed real references.
+    Cataloged,
+    /// Resolution succeeded by assuming the reference exists where the
     /// resolver placed it: an `Unknown`-schema binding adopted as the
     /// sole candidate, a qualified reference whose qualifier alone
     /// determined the table, or a `Known` witness winning over
@@ -139,7 +143,7 @@ pub enum Confidence {
     /// No in-scope binding could plausibly own the column: either
     /// every `Known` schema in scope explicitly denied it, or the
     /// scope chain held no bindings at all. `ColumnReference.table`
-    /// is `None`.
+    /// is `None`. Columns only.
     Unresolved,
 }
 

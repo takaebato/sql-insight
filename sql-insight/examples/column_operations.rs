@@ -32,7 +32,7 @@ fn main() {
             .unwrap_or("<unresolved>");
         println!(
             "  {}.{} [{:?}]",
-            table, read.reference.name.value, read.confidence
+            table, read.reference.name.value, read.resolution
         );
     }
 

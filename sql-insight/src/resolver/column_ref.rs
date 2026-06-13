@@ -1,10 +1,10 @@
 //! `CapturedColumnRef` — column references captured during the walk —
 //! plus the walk-time resolution that fills its `resolved` /
-//! `synthetic` / `confidence` fields.
+//! `synthetic` / `resolution` fields.
 
 use sqlparser::ast::Ident;
 
-use crate::reference::{Confidence, TableReference};
+use crate::reference::{ResolutionKind, TableReference};
 
 use super::binding::{
     binding_confirms_column, binding_could_contain_column, is_synthetic_binding,
@@ -20,7 +20,7 @@ use super::{Binding, CaseFold, IdentifierCasing, Resolver, ScopeId};
 /// `scope_id` is the scope in which the reference appeared (kept for
 /// diagnostics and for binding lookups at collapse time).
 ///
-/// `resolved`, `synthetic`, `is_lineage_source`, and `confidence` are
+/// `resolved`, `synthetic`, `is_lineage_source`, and `resolution` are
 /// computed at record time, when walk state still reflects what was
 /// visible to the SQL author at that point — necessary for multi-CTE
 /// chains where later CTE bindings would otherwise ambify earlier
@@ -47,23 +47,23 @@ pub(crate) struct CapturedColumnRef {
     /// with `is_lineage_source = false` are dropped from lineage
     /// edges; they still surface in `reads`.
     pub(crate) is_lineage_source: bool,
-    /// Resolver confidence in the placement: a `Known` schema
-    /// confirms the column ([`Confidence::Confirmed`]); the resolver
+    /// Resolver resolution in the placement: a `Known` schema
+    /// confirms the column ([`ResolutionKind::Cataloged`]); the resolver
     /// adopted a candidate without firm evidence
-    /// ([`Confidence::Inferred`]); multiple candidates with no
-    /// tiebreaker ([`Confidence::Ambiguous`]); no candidate at all
-    /// ([`Confidence::Unresolved`]). Synthetic refs (CTE / derived)
-    /// can be `Confirmed` here but get filtered from the public
-    /// surface, so consumers see `Confirmed` only when a catalog
+    /// ([`ResolutionKind::Inferred`]); multiple candidates with no
+    /// tiebreaker ([`ResolutionKind::Ambiguous`]); no candidate at all
+    /// ([`ResolutionKind::Unresolved`]). Synthetic refs (CTE / derived)
+    /// can be `Cataloged` here but get filtered from the public
+    /// surface, so consumers see `Cataloged` only when a catalog
     /// positively confirms the column on a real table.
-    pub(crate) confidence: Confidence,
+    pub(crate) resolution: ResolutionKind,
 }
 
 /// A binding that could plausibly own the unqualified column being
 /// resolved, captured during one scope's scan. `confirmed` is `true`
 /// only for `Known`-schema bindings that explicitly list the column —
 /// drives both the "single Known witness" tiebreaker and the
-/// `Confirmed` vs `Inferred` distinction in
+/// `Cataloged` vs `Inferred` distinction in
 /// [`Resolver::resolve_unqualified_ref`].
 struct OwnerCandidate {
     table: TableReference,
@@ -73,20 +73,20 @@ struct OwnerCandidate {
 
 impl<'a> Resolver<'a> {
     /// Record a column reference observed in the current scope.
-    /// Resolution (owning table, synthetic-vs-real, confidence) is
+    /// Resolution (owning table, synthetic-vs-real, resolution) is
     /// computed right now, while scope state is authoritative —
     /// later CTE bindings won't ambify what this reference saw.
     pub(super) fn capture_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.current_scope_id();
         let is_lineage_source = self.context.is_lineage_source;
-        let (resolved, synthetic, confidence) = self.resolve_ref(&parts, scope_id);
+        let (resolved, synthetic, resolution) = self.resolve_ref(&parts, scope_id);
         self.resolution.column_refs.push(CapturedColumnRef {
             parts,
             scope_id,
             resolved,
             synthetic,
             is_lineage_source,
-            confidence,
+            resolution,
         });
     }
 
@@ -94,9 +94,9 @@ impl<'a> Resolver<'a> {
         &self,
         parts: &[Ident],
         scope_id: ScopeId,
-    ) -> (Option<TableReference>, bool, Confidence) {
+    ) -> (Option<TableReference>, bool, ResolutionKind) {
         match parts {
-            [] => (None, false, Confidence::Unresolved),
+            [] => (None, false, ResolutionKind::Unresolved),
             [name] => self.resolve_unqualified_ref(name, scope_id),
             _ => {
                 let (qualifier, [column]) = parts.split_at(parts.len() - 1) else {
@@ -108,31 +108,31 @@ impl<'a> Resolver<'a> {
     }
 
     /// Walk the scope chain for an unqualified column reference and
-    /// return the `(table, synthetic, confidence)` triple that
+    /// return the `(table, synthetic, resolution)` triple that
     /// [`Self::capture_column_ref`] stores on the captured ref. Pure:
     /// no walker state mutated.
     ///
     /// Resolution rule (lexical shadowing, innermost-out): the first
     /// scope with at least one candidate binding wins. Within that
     /// scope:
-    /// - Exactly one candidate → owner is that binding. Confidence is
-    ///   [`Confidence::Confirmed`] if a `Known` schema confirmed the
-    ///   column, else [`Confidence::Inferred`].
+    /// - Exactly one candidate → owner is that binding. ResolutionKind is
+    ///   [`ResolutionKind::Cataloged`] if a `Known` schema confirmed the
+    ///   column, else [`ResolutionKind::Inferred`].
     /// - Multiple candidates with exactly one `Known` confirmation
     ///   (Known-witness-over-`Unknown`-suspects): the `Known` winner
-    ///   is adopted as owner with [`Confidence::Inferred`] — the
+    ///   is adopted as owner with [`ResolutionKind::Inferred`] — the
     ///   leftover `Unknown` suspects could in principle also contain
     ///   the column, so the placement is strong but not confirmed.
     /// - Multiple candidates with zero or 2+ `Known` confirmations →
-    ///   `table: None` / [`Confidence::Ambiguous`].
+    ///   `table: None` / [`ResolutionKind::Ambiguous`].
     ///
     /// No matching scope anywhere in the chain →
-    /// `table: None` / [`Confidence::Unresolved`].
+    /// `table: None` / [`ResolutionKind::Unresolved`].
     fn resolve_unqualified_ref(
         &self,
         name: &Ident,
         scope_id: ScopeId,
-    ) -> (Option<TableReference>, bool, Confidence) {
+    ) -> (Option<TableReference>, bool, ResolutionKind) {
         let column_fold = self.resolution.casing.column;
         for id in parent_chain(&self.resolution.scopes, scope_id) {
             let scope = &self.resolution.scopes[id.0];
@@ -150,33 +150,37 @@ impl<'a> Resolver<'a> {
             match candidates.as_slice() {
                 [] => continue,
                 [c] => {
-                    let confidence = if c.confirmed {
-                        Confidence::Confirmed
+                    let resolution = if c.confirmed {
+                        ResolutionKind::Cataloged
                     } else {
-                        Confidence::Inferred
+                        ResolutionKind::Inferred
                     };
-                    return (Some(c.table.clone()), c.synthetic, confidence);
+                    return (Some(c.table.clone()), c.synthetic, resolution);
                 }
                 _ => {
                     let confirmed_count = candidates.iter().filter(|c| c.confirmed).count();
                     return if confirmed_count == 1 {
                         // Known witness wins over Unknown suspects: take
                         // the single confirmed binding, but flag the
-                        // placement as Inferred rather than Confirmed
+                        // placement as Inferred rather than Cataloged
                         // since the leftover suspects could in principle
                         // also contain the column.
                         let winner = candidates
                             .into_iter()
                             .find(|c| c.confirmed)
                             .expect("confirmed_count == 1");
-                        (Some(winner.table), winner.synthetic, Confidence::Inferred)
+                        (
+                            Some(winner.table),
+                            winner.synthetic,
+                            ResolutionKind::Inferred,
+                        )
                     } else {
-                        (None, false, Confidence::Ambiguous)
+                        (None, false, ResolutionKind::Ambiguous)
                     };
                 }
             }
         }
-        (None, false, Confidence::Unresolved)
+        (None, false, ResolutionKind::Unresolved)
     }
 
     /// Resolve a qualified column reference (`t.col`, `s.t.col`,
@@ -193,16 +197,16 @@ impl<'a> Resolver<'a> {
     ///
     /// - 0 candidates → the qualifier names nothing in scope (a table
     ///   not in FROM, a contradicting schema, or an alias-hidden
-    ///   original name): `table: None` / [`Confidence::Unresolved`].
-    /// - 1 candidate → resolved. [`Confidence::Confirmed`] if a `Known`
-    ///   schema lists the column, else [`Confidence::Inferred`].
-    /// - 2+ candidates → [`Confidence::Ambiguous`] (`table: None`).
+    ///   original name): `table: None` / [`ResolutionKind::Unresolved`].
+    /// - 1 candidate → resolved. [`ResolutionKind::Cataloged`] if a `Known`
+    ///   schema lists the column, else [`ResolutionKind::Inferred`].
+    /// - 2+ candidates → [`ResolutionKind::Ambiguous`] (`table: None`).
     fn resolve_qualified_ref(
         &self,
         qualifier_parts: &[Ident],
         column_name: &Ident,
         scope_id: ScopeId,
-    ) -> (Option<TableReference>, bool, Confidence) {
+    ) -> (Option<TableReference>, bool, ResolutionKind) {
         // Decode the qualifier into a `TableReference` for right-anchored
         // matching against real-table bindings. `None` when the qualifier
         // overshoots the catalog.schema.name depth (5-part refs): no real
@@ -227,22 +231,22 @@ impl<'a> Resolver<'a> {
             match candidates.as_slice() {
                 [] => continue,
                 [c] => {
-                    let confidence = if c.confirmed {
-                        Confidence::Confirmed
+                    let resolution = if c.confirmed {
+                        ResolutionKind::Cataloged
                     } else {
-                        Confidence::Inferred
+                        ResolutionKind::Inferred
                     };
-                    return (Some(c.table.clone()), c.synthetic, confidence);
+                    return (Some(c.table.clone()), c.synthetic, resolution);
                 }
-                _ => return (None, false, Confidence::Ambiguous),
+                _ => return (None, false, ResolutionKind::Ambiguous),
             }
         }
-        (None, false, Confidence::Unresolved)
+        (None, false, ResolutionKind::Unresolved)
     }
 }
 
 /// Decide whether `binding` is a candidate owner of a qualified
-/// reference and, if so, what table / confidence it contributes.
+/// reference and, if so, what table / resolution it contributes.
 ///
 /// - Non-aliased real table: right-anchored path match via
 ///   [`qualifier_matches_table`]; resolves to the alias-free table.

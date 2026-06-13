@@ -26,7 +26,7 @@
 //!   surfaces at column granularity. `reads` is a list of
 //!   [`ColumnRead`]s (occurrence-based, each pairing a
 //!   [`ColumnReference`] identity with the resolver's
-//!   [`Confidence`]); `writes` is a plain occurrence list of
+//!   [`ResolutionKind`]); `writes` is a plain occurrence list of
 //!   [`ColumnReference`]s; `lineage` forms a source → target graph
 //!   carrying [`extractor::ColumnLineageKind`] (`Passthrough` vs
 //!   `Transformation`). The value-vs-filter distinction is
@@ -35,19 +35,19 @@
 //!   [`extractor::extract_column_operations`].
 //! - **Optional [`catalog::Catalog`]** — supply a schema provider to
 //!   make resolution strict. Catalog-confirmed placements surface as
-//!   [`Confidence::Confirmed`] reads; refs the catalog actively
-//!   denies surface as [`Confidence::Unresolved`]. INSERT without an
+//!   [`ResolutionKind::Cataloged`] reads; refs the catalog actively
+//!   denies surface as [`ResolutionKind::Unresolved`]. INSERT without an
 //!   explicit column list also uses the catalog to pair positional
 //!   values with target columns. Every extractor works catalog-free
 //!   in best-effort mode (catalog-less reads surface as
-//!   [`Confidence::Inferred`] / [`Confidence::Ambiguous`] /
-//!   [`Confidence::Unresolved`]).
+//!   [`ResolutionKind::Inferred`] / [`ResolutionKind::Ambiguous`] /
+//!   [`ResolutionKind::Unresolved`]).
 //! - **Diagnostics** ([`diagnostic::TableLevelDiagnostic`] /
 //!   [`diagnostic::ColumnLevelDiagnostic`]) — non-fatal issues surface
 //!   alongside the extraction result rather than failing the whole call.
 //!   Two kinds remain: unsupported statements and suppressed wildcards.
 //!   Per-reference resolution outcomes live on
-//!   [`ColumnRead::confidence`] instead, so the diagnostic stream is
+//!   [`ColumnRead::resolution`] instead, so the diagnostic stream is
 //!   reserved for tool-side coverage gaps.
 //!
 //! ## Quick Start
@@ -207,7 +207,7 @@ pub(crate) mod resolver;
 // are re-exported at the crate root because they thread through
 // every other module's public surface.
 mod reference;
-pub use reference::{ColumnRead, ColumnReference, Confidence, TableReference};
+pub use reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
 
 // `sqlparser` is re-exported so consumers can name `Dialect` /
 // `Ident` / etc. via `sql_insight::sqlparser::...` without taking a

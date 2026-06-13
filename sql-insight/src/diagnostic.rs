@@ -58,7 +58,7 @@ pub struct ColumnLevelDiagnostic {
 /// chose not to (or couldn't) fully analyze the construct, and a more
 /// capable analyzer could do more. Per-reference resolution outcomes
 /// (ambiguous / unresolved columns) are *not* diagnostics — they
-/// surface on each [`ColumnRead::confidence`](crate::ColumnRead) instead,
+/// surface on each [`ColumnRead::resolution`](crate::ColumnRead) instead,
 /// so the consumer reads them off the reference rather than
 /// cross-referencing a parallel diagnostic stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
