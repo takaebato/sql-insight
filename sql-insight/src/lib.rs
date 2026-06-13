@@ -23,25 +23,32 @@
 //!   `lineage` surfaces with [`extractor::StatementKind`] classification.
 //!   See [`extractor::extract_table_operations`].
 //! - **Column-level Operation Extraction** — the same three
-//!   surfaces at column granularity. `reads` / `writes` are plain
-//!   occurrence lists of [`ColumnReference`]s; `lineage` form a
-//!   source → target graph carrying [`extractor::ColumnLineageKind`]
-//!   (`Passthrough` vs `Transformation`). The value-vs-filter
-//!   distinction is structural: a value contributor is a `lineage`
-//!   source, a filter-only column is in `reads` but not `lineage`.
-//!   See [`extractor::extract_column_operations`].
+//!   surfaces at column granularity. `reads` is a list of
+//!   [`ColumnRead`]s (occurrence-based, each pairing a
+//!   [`ColumnReference`] identity with the resolver's
+//!   [`Confidence`]); `writes` is a plain occurrence list of
+//!   [`ColumnReference`]s; `lineage` forms a source → target graph
+//!   carrying [`extractor::ColumnLineageKind`] (`Passthrough` vs
+//!   `Transformation`). The value-vs-filter distinction is
+//!   structural: a value contributor is a `lineage` source, a
+//!   filter-only column is in `reads` but not `lineage`. See
+//!   [`extractor::extract_column_operations`].
 //! - **Optional [`catalog::Catalog`]** — supply a schema provider to
-//!   make resolution strict (column refs not in the catalog-provided
-//!   schema surface as
-//!   [`UnresolvedColumn`](diagnostic::ColumnLevelDiagnosticKind::UnresolvedColumn),
-//!   pair INSERT positional values with target columns, etc.).
-//!   Every extractor works catalog-free in best-effort mode.
+//!   make resolution strict. Catalog-confirmed placements surface as
+//!   [`Confidence::Confirmed`] reads; refs the catalog actively
+//!   denies surface as [`Confidence::Unresolved`]. INSERT without an
+//!   explicit column list also uses the catalog to pair positional
+//!   values with target columns. Every extractor works catalog-free
+//!   in best-effort mode (catalog-less reads surface as
+//!   [`Confidence::Inferred`] / [`Confidence::Ambiguous`] /
+//!   [`Confidence::Unresolved`]).
 //! - **Diagnostics** ([`diagnostic::TableLevelDiagnostic`] /
 //!   [`diagnostic::ColumnLevelDiagnostic`]) — non-fatal issues surface
-//!   alongside the extraction result rather than failing the whole call:
-//!   unsupported statements, suppressed wildcards, ambiguous / unresolved
-//!   columns. Split by granularity so a table-level result can't carry a
-//!   column-only condition.
+//!   alongside the extraction result rather than failing the whole call.
+//!   Two kinds remain: unsupported statements and suppressed wildcards.
+//!   Per-reference resolution outcomes live on
+//!   [`ColumnRead::confidence`] instead, so the diagnostic stream is
+//!   reserved for tool-side coverage gaps.
 //!
 //! ## Quick Start
 //!
@@ -200,7 +207,7 @@ pub(crate) mod resolver;
 // are re-exported at the crate root because they thread through
 // every other module's public surface.
 mod reference;
-pub use reference::{ColumnReference, TableReference};
+pub use reference::{ColumnRead, ColumnReference, Confidence, TableReference};
 
 // `sqlparser` is re-exported so consumers can name `Dialect` /
 // `Ident` / etc. via `sql_insight::sqlparser::...` without taking a

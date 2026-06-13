@@ -26,8 +26,8 @@ use super::binding::binding_alias_key;
 use super::binding::BindingKey;
 use super::scope::parent_chain;
 use super::{
-    Binding, CapturedColumnRef, CapturedTableRef, LineageEdge, Scope, ScopeId, TableRefTarget,
-    TableRole,
+    Binding, CapturedColumnRef, CapturedTableRef, IdentifierCasing, LineageEdge, Scope, ScopeId,
+    TableRefTarget, TableRole,
 };
 
 /// The end-of-walk result the resolver produces. Holds the scope
@@ -58,6 +58,11 @@ pub(crate) struct Resolution {
     /// physical use, occurrence-based (no dedup), matching
     /// `ColumnLineageEdge` semantics.
     pub(crate) table_refs: Vec<CapturedTableRef>,
+    /// The active dialect's identifier-folding policy, captured at
+    /// construction. Post-passes (collapse / synthetic-owner lookup)
+    /// re-fold identifiers through it to compare them consistently
+    /// with the walk.
+    pub(crate) casing: IdentifierCasing,
 }
 
 /// Recursion ceiling for `collapse_source` — guards against
@@ -132,14 +137,14 @@ impl Resolution {
         let Some(col_name) = captured.parts.last() else {
             return vec![(captured.clone(), outer_kind)];
         };
-        let key = BindingKey::from_ident(col_name);
+        let key = BindingKey::new(col_name, self.casing.column);
         let mut result = Vec::new();
         for operand in &output.set_operands {
             for column in &operand.columns {
                 let matches = column
                     .name
                     .as_ref()
-                    .is_some_and(|n| BindingKey::from_ident(n) == key);
+                    .is_some_and(|n| BindingKey::new(n, self.casing.column) == key);
                 if !matches {
                     continue;
                 }
@@ -256,11 +261,13 @@ impl Resolution {
             return None;
         }
         let table = captured.resolved.as_ref()?;
-        let key = BindingKey::from_ident(&table.name);
+        // A synthetic-owned ref names a CTE / derived / table-function
+        // relation — the table-alias class.
+        let key = BindingKey::new(&table.name, self.casing.table_alias);
         parent_chain(&self.scopes, captured.scope_id).find_map(|id| {
             self.scopes[id.0]
                 .iter_bindings()
-                .find(|b| binding_alias_key(b) == key)
+                .find(|b| binding_alias_key(b, self.casing) == key)
         })
     }
 

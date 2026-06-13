@@ -13,6 +13,7 @@ use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::extractor::{StatementKind, TableOperationExtractor};
 use crate::reference::TableReference;
+use crate::resolver::IdentifierCasing;
 use sqlparser::ast::{MergeAction, Statement};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -82,14 +83,18 @@ impl CrudTableExtractor {
         sql: &str,
     ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
+        let casing = IdentifierCasing::for_dialect(dialect);
         Ok(statements
             .iter()
-            .map(Self::extract_from_statement)
+            .map(|s| Self::extract_from_statement(s, casing))
             .collect())
     }
 
-    fn extract_from_statement(statement: &Statement) -> Result<CrudTables, Error> {
-        let ops = TableOperationExtractor::extract_from_statement(statement, None)?;
+    fn extract_from_statement(
+        statement: &Statement,
+        casing: IdentifierCasing,
+    ) -> Result<CrudTables, Error> {
+        let ops = TableOperationExtractor::extract_from_statement(statement, None, casing)?;
         let reads = ops.reads;
         let writes = ops.writes;
         let diagnostics = ops.diagnostics;

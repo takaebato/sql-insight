@@ -23,7 +23,7 @@ use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
 use crate::reference::TableReference;
-use crate::resolver::Resolver;
+use crate::resolver::{IdentifierCasing, Resolver};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -183,18 +183,20 @@ impl TableOperationExtractor {
         catalog: Option<&dyn Catalog>,
     ) -> Result<Vec<Result<TableOperation, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
+        let casing = IdentifierCasing::for_dialect(dialect);
         Ok(statements
             .iter()
-            .map(|s| Self::extract_from_statement(s, catalog))
+            .map(|s| Self::extract_from_statement(s, catalog, casing))
             .collect())
     }
 
     pub(crate) fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&dyn Catalog>,
+        casing: IdentifierCasing,
     ) -> Result<TableOperation, Error> {
         let kind = classify_statement(statement);
-        let resolution = Resolver::resolve_statement(catalog, statement)?;
+        let resolution = Resolver::resolve_statement(catalog, statement, casing)?;
 
         let mut reads = Vec::new();
         let mut writes = Vec::new();

@@ -7,9 +7,9 @@
 //! it touches walker state, not the scope arena.
 
 use indexmap::IndexMap;
-use sqlparser::ast::{Ident, ObjectName};
+use sqlparser::ast::ObjectName;
 
-use super::binding::BindingKey;
+use super::binding::{binding_alias_key, BindingKey};
 use super::{Binding, Resolver};
 
 /// Arena index for a [`Scope`]. Stable across later pushes since the
@@ -57,8 +57,11 @@ impl Scope {
         }
     }
 
-    pub(super) fn bind(&mut self, name: &Ident, binding: Binding) {
-        let key = BindingKey::from_ident(name);
+    /// Insert `binding` under its precomputed `key` (the caller folds
+    /// the exposed name through the active
+    /// [`IdentifierCasing`](super::IdentifierCasing) — table /
+    /// table-alias class as appropriate).
+    pub(super) fn bind(&mut self, key: BindingKey, binding: Binding) {
         // Re-binding the same name as a Table merges roles rather than
         // replacing — this captures the `DELETE t1 FROM t1` style case
         // where a single name plays multiple roles in one statement.
@@ -79,8 +82,8 @@ impl Scope {
         self.bindings.insert(key, binding);
     }
 
-    pub(super) fn resolve(&self, name: &Ident) -> Option<&Binding> {
-        self.bindings.get(&BindingKey::from_ident(name))
+    pub(super) fn resolve(&self, key: &BindingKey) -> Option<&Binding> {
+        self.bindings.get(key)
     }
 
     pub(super) fn iter_bindings(&self) -> impl Iterator<Item = &Binding> {
@@ -119,10 +122,13 @@ impl<'a> Resolver<'a> {
     }
 
     /// Insert a binding into the current scope, creating a root
-    /// scope on demand if nothing is open yet.
-    pub(super) fn bind_current(&mut self, name: Ident, binding: Binding) {
+    /// scope on demand if nothing is open yet. The scope key is folded
+    /// per binding kind via [`binding_alias_key`] under the active
+    /// [`IdentifierCasing`](super::IdentifierCasing).
+    pub(super) fn bind_current(&mut self, binding: Binding) {
         let id = self.current_scope_id();
-        self.resolution.scopes[id.0].bind(&name, binding);
+        let key = binding_alias_key(&binding, self.resolution.casing);
+        self.resolution.scopes[id.0].bind(key, binding);
     }
 
     /// Resolve an unqualified single-segment relation name by walking
@@ -130,14 +136,19 @@ impl<'a> Resolver<'a> {
     /// the first matching binding. Multi-segment qualified names
     /// return `None` — those route through schema/catalog resolution
     /// elsewhere.
+    ///
+    /// Used to detect CTE references (`FROM cte`), so the lookup folds
+    /// the name under the table-alias class — CTE / derived names live
+    /// there.
     pub(super) fn resolve_unqualified_relation(&self, relation: &ObjectName) -> Option<&Binding> {
         if relation.0.len() != 1 {
             return None;
         }
         let name = relation.0[0].as_ident()?;
         let from = self.context.current_scope?;
+        let key = BindingKey::new(name, self.resolution.casing.table_alias);
         parent_chain(&self.resolution.scopes, from)
-            .find_map(|id| self.resolution.scopes[id.0].resolve(name))
+            .find_map(|id| self.resolution.scopes[id.0].resolve(&key))
     }
 
     /// Push a fresh scope, run `f`, then pop it.

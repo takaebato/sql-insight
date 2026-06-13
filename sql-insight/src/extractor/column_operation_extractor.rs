@@ -71,8 +71,10 @@ use crate::catalog::Catalog;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::error::Error;
 use crate::extractor::table_operation_extractor::StatementKind;
-use crate::reference::{ColumnReference, TableReference};
-use crate::resolver::{CapturedColumnRef, LineageTargetSpec, Resolution, Resolver};
+use crate::reference::{ColumnRead, ColumnReference, TableReference};
+use crate::resolver::{
+    CapturedColumnRef, IdentifierCasing, LineageTargetSpec, Resolution, Resolver,
+};
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, Ident, OnConflictAction, OnInsert, Statement,
     TableFactor,
@@ -92,6 +94,7 @@ use sqlparser::parser::Parser;
 ///
 /// ```rust
 /// use sql_insight::sqlparser::dialect::GenericDialect;
+/// use sql_insight::Confidence;
 /// use sql_insight::extractor::{
 ///     extract_column_operations, ColumnLineageKind, ColumnTarget, StatementKind,
 /// };
@@ -106,10 +109,13 @@ use sqlparser::parser::Parser;
 /// assert!(ops.writes.is_empty());
 ///
 /// // `t1.a` surfaces as a single read, walk-time resolved to t1.
+/// // Catalog-less mode → confidence is `Inferred` (we adopted the
+/// // sole `Unknown`-schema candidate without firm evidence).
 /// assert_eq!(ops.reads.len(), 1);
 /// let read = &ops.reads[0];
-/// assert_eq!(read.name.value, "a");
-/// assert_eq!(read.table.as_ref().unwrap().name.value, "t1");
+/// assert_eq!(read.reference.name.value, "a");
+/// assert_eq!(read.reference.table.as_ref().unwrap().name.value, "t1");
+/// assert_eq!(read.confidence, Confidence::Inferred);
 ///
 /// // The projection emits one lineage edge into the SELECT's QueryOutput slot,
 /// // marked Passthrough (no expression wrapping the column).
@@ -142,21 +148,26 @@ pub struct ColumnOperation {
     pub statement_kind: StatementKind,
     /// Columns read by the statement, in walk order. Occurrence-based:
     /// a column referenced more than once appears more than once
-    /// (e.g. `SELECT a FROM t WHERE a > 0` yields `t.a` twice). A
-    /// consumer wanting the distinct set dedups via a `HashSet`.
-    pub reads: Vec<ColumnReference>,
+    /// (e.g. `SELECT a FROM t WHERE a > 0` yields `t.a` twice). Each
+    /// entry pairs the [`ColumnReference`] identity with the
+    /// resolver's [`Confidence`](crate::Confidence) in the placement.
+    /// A consumer wanting the distinct identity set dedups
+    /// `reads.iter().map(|r| &r.reference)` via a `HashSet`.
+    pub reads: Vec<ColumnRead>,
     /// Columns written by the statement, in walk order. Occurrence-based
-    /// like `reads`.
+    /// like `reads`. Write targets come straight from SQL syntax and
+    /// are always `Confidence::Confirmed` by construction, so the
+    /// confidence field is elided here.
     pub writes: Vec<ColumnReference>,
     /// Lineage edges in emission order. Statements that physically
     /// move data emit collapsed end-to-end edges (source →
     /// `ColumnTarget::Relation`); bare `SELECT` emits source →
     /// `ColumnTarget::QueryOutput` edges.
     pub lineage: Vec<ColumnLineageEdge>,
-    /// Column-level diagnostics: wildcard suppression, ambiguous /
-    /// unresolved column references, plus the
+    /// Column-level diagnostics: wildcard suppression plus the
     /// `UnsupportedStatement` projection inherited from table
-    /// granularity.
+    /// granularity. Per-reference resolution outcomes surface on
+    /// `reads[i].confidence` instead.
     pub diagnostics: Vec<ColumnLevelDiagnostic>,
 }
 
@@ -174,7 +185,12 @@ pub struct ColumnOperation {
 /// directly, with no intermediate query-output entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnLineageEdge {
-    pub source: ColumnReference,
+    /// The column the lineage edge flows from, paired with the
+    /// resolver's [`Confidence`](crate::Confidence) in that placement.
+    /// `source.reference` is the inner (post-collapse) real-table
+    /// reference; `source.confidence` follows that inner reference's
+    /// classification rather than the outer synthetic step's.
+    pub source: ColumnRead,
     pub target: ColumnTarget,
     pub kind: ColumnLineageKind,
 }
@@ -253,18 +269,20 @@ impl ColumnOperationExtractor {
         catalog: Option<&dyn Catalog>,
     ) -> Result<Vec<Result<ColumnOperation, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
+        let casing = IdentifierCasing::for_dialect(dialect);
         Ok(statements
             .iter()
-            .map(|s| Self::extract_from_statement(s, catalog))
+            .map(|s| Self::extract_from_statement(s, catalog, casing))
             .collect())
     }
 
     fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&dyn Catalog>,
+        casing: IdentifierCasing,
     ) -> Result<ColumnOperation, Error> {
         let kind = super::table_operation_extractor::classify_statement(statement);
-        let resolution = Resolver::resolve_statement(catalog, statement)?;
+        let resolution = Resolver::resolve_statement(catalog, statement, casing)?;
 
         // Start from resolver-level diagnostics; extractor adds its own
         // only when classify_statement detects an unsupported case the
@@ -338,21 +356,24 @@ fn extract_lineage(resolution: &Resolution) -> Vec<ColumnLineageEdge> {
         .collect()
 }
 
-/// Build a `ColumnReference` from a resolver-captured ref. The
-/// resolver records owning-table resolution at walk time, so this is
-/// a 1:1 read of `(resolved, parts.last())`. Refs whose owning
-/// binding was synthetic at walk time are dropped upstream by the
-/// resolver itself before they reach the extractor — see
-/// `Resolution::real_column_refs`.
-fn resolve_captured_ref(captured: &CapturedColumnRef) -> Option<ColumnReference> {
+/// Build a `ColumnRead` from a resolver-captured ref. The resolver
+/// records owning-table resolution and confidence at walk time, so
+/// this is a 1:1 read of `(resolved, parts.last(), confidence)`. Refs
+/// whose owning binding was synthetic at walk time are dropped
+/// upstream by the resolver itself before they reach the extractor —
+/// see `Resolution::real_column_refs`.
+fn resolve_captured_ref(captured: &CapturedColumnRef) -> Option<ColumnRead> {
     let name = captured.parts.last()?.clone();
-    Some(ColumnReference {
-        table: captured.resolved.clone(),
-        name,
+    Some(ColumnRead {
+        reference: ColumnReference {
+            table: captured.resolved.clone(),
+            name,
+        },
+        confidence: captured.confidence,
     })
 }
 
-fn collect_reads(resolution: &Resolution) -> Vec<ColumnReference> {
+fn collect_reads(resolution: &Resolution) -> Vec<ColumnRead> {
     resolution
         .column_refs
         .iter()

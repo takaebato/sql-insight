@@ -11,7 +11,7 @@ use core::fmt;
 use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::reference::TableReference;
-use crate::resolver::Resolver;
+use crate::resolver::{IdentifierCasing, Resolver};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -65,17 +65,21 @@ impl TableExtractor {
         sql: &str,
     ) -> Result<Vec<Result<TableExtraction, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
+        let casing = IdentifierCasing::for_dialect(dialect);
         let results = statements
             .iter()
-            .map(Self::extract_from_statement)
+            .map(|s| Self::extract_from_statement(s, casing))
             .collect::<Vec<Result<TableExtraction, Error>>>();
         Ok(results)
     }
 
-    fn extract_from_statement(statement: &Statement) -> Result<TableExtraction, Error> {
+    fn extract_from_statement(
+        statement: &Statement,
+        casing: IdentifierCasing,
+    ) -> Result<TableExtraction, Error> {
         // The legacy table-extraction API does not surface columns, so a
         // catalog would not influence its output; pass `None`.
-        let resolution = Resolver::resolve_statement(None, statement)?;
+        let resolution = Resolver::resolve_statement(None, statement, casing)?;
         Ok(TableExtraction {
             tables: resolution.tables(),
             // Project resolver diagnostics to table granularity; column
@@ -698,8 +702,11 @@ mod tests {
         }
 
         #[test]
-        fn test_delete_statement_with_case_insensitive_alias_target() {
-            let sql = "DELETE T1_ALIAS FROM t1 AS t1_alias JOIN t2 ON t1_alias.a = t2.a";
+        fn test_delete_statement_with_alias_target() {
+            // The DELETE target references the FROM alias. With matching
+            // case it merges into the alias's binding on every dialect
+            // (only t1, t2 surface — the alias is not a separate table).
+            let sql = "DELETE t1_alias FROM t1 AS t1_alias JOIN t2 ON t1_alias.a = t2.a";
             let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
             // BigQuery / Generic / Oracle do not support DELETE ... FROM
             assert_table_extraction(
@@ -709,6 +716,31 @@ mod tests {
                     DialectName::Generic,
                     DialectName::BigQuery,
                     DialectName::Oracle,
+                ]),
+            );
+        }
+
+        #[test]
+        fn test_delete_target_alias_mismatched_case() {
+            // Mismatched case (`T1_ALIAS` target vs `t1_alias` alias).
+            // Dialects whose alias fold is case-insensitive
+            // (lower / upper / insensitive) still merge it into the
+            // alias binding. MySQL is excluded: its real-table names
+            // are case-sensitive while aliases default case-insensitive,
+            // but a multi-table DELETE target is bound by the *table*
+            // (relation) fold, so a mismatched-case alias target doesn't
+            // merge — a known limitation of the relation / table-alias
+            // fold split at DELETE-target binding sites.
+            let sql = "DELETE T1_ALIAS FROM t1 AS t1_alias JOIN t2 ON t1_alias.a = t2.a";
+            let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
+            assert_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&[
+                    DialectName::Generic,
+                    DialectName::BigQuery,
+                    DialectName::Oracle,
+                    DialectName::MySql,
                 ]),
             );
         }

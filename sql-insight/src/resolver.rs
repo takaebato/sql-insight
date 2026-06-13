@@ -30,6 +30,7 @@
 //! table walkers all live here as one consolidated `impl` block).
 
 mod binding;
+mod casing;
 mod column_ref;
 mod lineage;
 mod query_body_output;
@@ -38,6 +39,7 @@ mod scope;
 mod table_ref;
 
 pub(crate) use binding::{Binding, TableRole};
+pub(crate) use casing::{CaseFold, IdentifierCasing};
 pub(crate) use column_ref::CapturedColumnRef;
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
 pub(crate) use query_body_output::{OutputColumn, QueryBodyOutput, SetOperand};
@@ -164,21 +166,30 @@ impl Default for Context {
 impl<'a> Resolver<'a> {
     /// Internal constructor. Public callers go through
     /// [`Self::resolve_statement`].
-    fn new(catalog: Option<&'a dyn Catalog>) -> Self {
+    fn new(catalog: Option<&'a dyn Catalog>, casing: IdentifierCasing) -> Self {
+        let resolution = Resolution {
+            casing,
+            ..Resolution::default()
+        };
         Self {
             catalog,
-            resolution: Resolution::default(),
+            resolution,
             context: Context::default(),
         }
     }
 
     /// Walk one [`Statement`] and return the final [`Resolution`].
-    /// The one-shot entry point used by all extractors.
+    /// The one-shot entry point used by all extractors. `casing` is
+    /// the active dialect's identifier-folding policy (typically
+    /// [`IdentifierCasing::for_dialect`]); it governs how table /
+    /// alias / column identifiers compare for equality during
+    /// resolution.
     pub(crate) fn resolve_statement(
         catalog: Option<&'a dyn Catalog>,
         statement: &Statement,
+        casing: IdentifierCasing,
     ) -> Result<Resolution, Error> {
-        let mut resolver = Self::new(catalog);
+        let mut resolver = Self::new(catalog, casing);
         resolver.visit_statement(statement)?;
         Ok(resolver.into_resolution())
     }
@@ -350,6 +361,14 @@ impl<'a> Resolver<'a> {
     /// WHERE / GROUP BY / HAVING / NAMED WINDOW / QUALIFY /
     /// CONNECT BY) and any SELECT INTO target.
     fn visit_select(&mut self, select: &Select) -> Result<(), Error> {
+        // Bind FROM relations first. DISTINCT ON / TOP appear earlier in
+        // the SELECT syntax but are logically evaluated after FROM, so
+        // their column refs (`DISTINCT ON (t.a)`, `TOP (t.a + 1)`) must
+        // resolve against the relations in scope — binding FROM up front
+        // makes those refs see their owning table.
+        for table in &select.from {
+            self.visit_table_with_joins(table, TableRole::Read)?;
+        }
         if let Some(Distinct::On(exprs)) = &select.distinct {
             // DISTINCT ON (a, b) — `a, b` decide which row of each
             // duplicate group survives; not value sources.
@@ -360,9 +379,6 @@ impl<'a> Resolver<'a> {
                 // TOP n — row-count bound.
                 self.suppress_lineage(|r| r.visit_expr(expr))?;
             }
-        }
-        for table in &select.from {
-            self.visit_table_with_joins(table, TableRole::Read)?;
         }
         let mut operand_columns = Vec::with_capacity(select.projection.len());
         for item in &select.projection {
@@ -2248,7 +2264,8 @@ mod tests {
     fn resolve(sql: &str, catalog: Option<&dyn Catalog>) -> Resolution {
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql).unwrap();
-        Resolver::resolve_statement(catalog, &statements[0]).unwrap()
+        let casing = IdentifierCasing::for_dialect(&dialect);
+        Resolver::resolve_statement(catalog, &statements[0], casing).unwrap()
     }
 
     fn first_table_columns(resolution: &Resolution) -> Option<&Option<Vec<sqlparser::ast::Ident>>> {

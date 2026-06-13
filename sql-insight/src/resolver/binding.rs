@@ -10,45 +10,27 @@ use crate::catalog::ColumnSchema;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::reference::TableReference;
 
-use super::{QueryBodyOutput, Resolver, ScopeId};
+use super::{CaseFold, IdentifierCasing, QueryBodyOutput, Resolver, ScopeId};
 
 /// A normalized identifier key for binding lookup.
 ///
 /// Two identifiers match iff their normalized forms are equal. The
-/// rule: fold an unquoted name to lowercase, keep a quoted name exact.
-/// So `"id"` and unquoted `id` are the same column, while `"ID"` and
-/// `id` are not.
-///
-/// This is one fixed rule, applied uniformly — it is *not* varied by
-/// dialect, nor by table-vs-column. Real dialects do diverge there
-/// (e.g. MySQL / BigQuery / SQLite treat quoting as mere escaping and
-/// keep quoted names case-insensitive; BigQuery columns are
-/// case-insensitive but its tables are case-sensitive; ClickHouse is
-/// fully case-sensitive). Modelling each faithfully would need a
-/// per-dialect identifier-resolution strategy, which is deferred — the
-/// fixed rule here is a deliberate common-denominator approximation:
-///
-/// - **Unquoted → lowercase** makes unquoted matching case-insensitive,
-///   which every supported dialect except ClickHouse does. (ClickHouse
-///   is over-matched — sound, just imprecise.) The fold *direction*
-///   only affects the quoted/unquoted edge; lowercase follows the
-///   popular majority (PG / MySQL / SQLite / BigQuery / Redshift / Spark)
-///   over the uppercase minority (ANSI / Oracle / Snowflake).
-/// - **Quoted → exact** follows the ANSI / PostgreSQL family, where
-///   quoting makes an identifier case-sensitive. The MySQL / BigQuery /
-///   SQLite family instead treat quoting as escaping, so this is
-///   stricter than they are for quoted names — accepted, since quoted
-///   identifiers are rare in practice.
+/// normalization is supplied by a [`CaseFold`] chosen from the active
+/// dialect's [`IdentifierCasing`] for the identifier's class (table /
+/// table-alias / column) — so e.g. an unquoted name folds to lower
+/// under PostgreSQL, to upper under Snowflake, and quoting matters
+/// under both but not under MySQL / BigQuery / DuckDB. See
+/// [`super::casing`] for the full per-dialect matrix.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct BindingKey(String);
 
 impl BindingKey {
-    pub(super) fn from_ident(ident: &Ident) -> Self {
-        Self(if ident.quote_style.is_some() {
-            ident.value.clone()
-        } else {
-            ident.value.to_ascii_lowercase()
-        })
+    /// Normalize `ident` under the given [`CaseFold`] for matching.
+    /// The fold comes from the active dialect's [`IdentifierCasing`],
+    /// picked per identifier class (table / table-alias / column) at
+    /// the call site.
+    pub(super) fn new(ident: &Ident, fold: CaseFold) -> Self {
+        Self(fold.normalize(ident))
     }
 }
 
@@ -149,14 +131,23 @@ pub(super) fn is_synthetic_binding(binding: &Binding) -> bool {
     )
 }
 
-pub(super) fn binding_alias_key(binding: &Binding) -> BindingKey {
+/// The scope-arena key for a binding's exposed name. The fold is
+/// picked per binding kind: a non-aliased real table keys by its
+/// `table` name (the [`IdentifierCasing::table`] class); an aliased
+/// table and every synthetic relation (CTE / derived / table
+/// function) key by their alias / name (the
+/// [`IdentifierCasing::table_alias`] class).
+pub(super) fn binding_alias_key(binding: &Binding, casing: IdentifierCasing) -> BindingKey {
     match binding {
-        Binding::Table { table, alias, .. } => {
-            BindingKey::from_ident(alias.as_ref().unwrap_or(&table.name))
-        }
-        Binding::Cte { name, .. } => BindingKey::from_ident(name),
+        Binding::Table {
+            table, alias: None, ..
+        } => BindingKey::new(&table.name, casing.table),
+        Binding::Table {
+            alias: Some(alias), ..
+        } => BindingKey::new(alias, casing.table_alias),
+        Binding::Cte { name, .. } => BindingKey::new(name, casing.table_alias),
         Binding::DerivedTable { alias, .. } | Binding::TableFunction { alias, .. } => {
-            BindingKey::from_ident(alias)
+            BindingKey::new(alias, casing.table_alias)
         }
     }
 }
@@ -164,12 +155,13 @@ pub(super) fn binding_alias_key(binding: &Binding) -> BindingKey {
 pub(super) fn binding_could_contain_column(
     binding: &Binding,
     name: &Ident,
+    column_fold: CaseFold,
 ) -> Option<TableReference> {
     match binding {
         // TableFunction columns are unmodeled, so any unqualified
         // column could plausibly come from one.
         Binding::TableFunction { .. } => Some(binding_table_ref(binding)),
-        _ => names_could_contain(binding_column_names(binding).as_deref(), name)
+        _ => names_could_contain(binding_column_names(binding).as_deref(), name, column_fold)
             .then(|| binding_table_ref(binding)),
     }
 }
@@ -195,21 +187,17 @@ fn binding_table_ref(binding: &Binding) -> TableReference {
 /// bindings with unknown column lists. Used by diagnostic emit to
 /// separate "definitely ambiguous" from "uncertain over unknown
 /// columns".
-pub(super) fn binding_confirms_column(binding: &Binding, name: &Ident) -> bool {
+pub(super) fn binding_confirms_column(
+    binding: &Binding,
+    name: &Ident,
+    column_fold: CaseFold,
+) -> bool {
     match binding_column_names(binding) {
         Some(cols) => cols
             .iter()
-            .any(|c| BindingKey::from_ident(c) == BindingKey::from_ident(name)),
+            .any(|c| BindingKey::new(c, column_fold) == BindingKey::new(name, column_fold)),
         None => false,
     }
-}
-
-/// `true` iff the binding has a known column list. Used to gate
-/// `UnresolvedColumn` diagnostics — without at least one binding
-/// with known columns in scope, the resolver can't claim a column is
-/// missing.
-pub(super) fn binding_has_known_columns(binding: &Binding) -> bool {
-    binding_column_names(binding).is_some()
 }
 
 /// Cross-binding column-name lookup: the single entry point that
@@ -226,12 +214,60 @@ pub(super) fn binding_column_names(binding: &Binding) -> Option<Vec<Ident>> {
     }
 }
 
-fn names_could_contain(names: Option<&[Ident]>, name: &Ident) -> bool {
+fn names_could_contain(names: Option<&[Ident]>, name: &Ident, column_fold: CaseFold) -> bool {
     match names {
         None => true, // unknown columns — anything could match
         Some(cols) => cols
             .iter()
-            .any(|c| BindingKey::from_ident(c) == BindingKey::from_ident(name)),
+            .any(|c| BindingKey::new(c, column_fold) == BindingKey::new(name, column_fold)),
+    }
+}
+
+/// Right-anchored qualifier match for a *qualified* column reference.
+///
+/// The column qualifier (decoded into a [`TableReference`] via
+/// [`TableReference::try_from_parts`]) matches a binding's underlying
+/// `table` when the `name` segments are equal and each of `schema` /
+/// `catalog` is either equal or absent on at least one side (absent =
+/// wildcard). This is the ANSI "partial qualifier" rule:
+///
+/// - `users.col` and `mydb.users.col` both name `FROM mydb.users` —
+///   the binding fills the missing schema (`users.col`), or the ref's
+///   extra schema is simply left unverified (`mydb.users.col`).
+/// - `otherdb.users.col` does *not* match `FROM mydb.users` — schema
+///   is present on both sides and differs, a contradiction a catalog
+///   can't fix.
+///
+/// Comparison folds case via [`BindingKey`] under the `table` fold
+/// (catalog / schema / table all share the [`IdentifierCasing::table`]
+/// class). Callers handle aliased and synthetic bindings separately
+/// (those expose only their single alias / name, never their
+/// underlying path).
+pub(super) fn qualifier_matches_table(
+    qualifier: &TableReference,
+    table: &TableReference,
+    table_fold: CaseFold,
+) -> bool {
+    ident_key_eq(&qualifier.name, &table.name, table_fold)
+        && opt_ident_key_eq(qualifier.schema.as_ref(), table.schema.as_ref(), table_fold)
+        && opt_ident_key_eq(
+            qualifier.catalog.as_ref(),
+            table.catalog.as_ref(),
+            table_fold,
+        )
+}
+
+fn ident_key_eq(a: &Ident, b: &Ident, fold: CaseFold) -> bool {
+    BindingKey::new(a, fold) == BindingKey::new(b, fold)
+}
+
+/// Equal, or absent on at least one side (absent = right-anchored
+/// wildcard). Only `(Some(x), Some(y))` with `x != y` fails;
+/// `(Some, None)` and `(None, Some)` both match.
+fn opt_ident_key_eq(a: Option<&Ident>, b: Option<&Ident>, fold: CaseFold) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => ident_key_eq(x, y, fold),
+        _ => true,
     }
 }
 
@@ -274,7 +310,6 @@ impl<'a> Resolver<'a> {
         alias: Option<Ident>,
         role: TableRole,
     ) {
-        let binding_name = alias.clone().unwrap_or_else(|| table.name.clone());
         let output_columns = self.lookup_catalog_columns(&table);
         if role == TableRole::Read {
             // Read-position FROM/JOIN — emit a CapturedTableRef so table-lineage
@@ -282,15 +317,12 @@ impl<'a> Resolver<'a> {
             // `write_tables` separately and don't drive collapse.
             self.capture_real_table_ref(table.clone());
         }
-        self.bind_current(
-            binding_name,
-            Binding::Table {
-                table: Box::new(table),
-                alias,
-                output_columns,
-                roles: vec![role],
-            },
-        );
+        self.bind_current(Binding::Table {
+            table: Box::new(table),
+            alias,
+            output_columns,
+            roles: vec![role],
+        });
     }
 
     /// Query the optional catalog for a table's columns.
@@ -342,14 +374,11 @@ impl<'a> Resolver<'a> {
         output_columns: Option<QueryBodyOutput>,
         body_scope: ScopeId,
     ) {
-        self.bind_current(
-            name.clone(),
-            Binding::Cte {
-                name,
-                output_columns,
-                body_scope,
-            },
-        );
+        self.bind_current(Binding::Cte {
+            name,
+            output_columns,
+            body_scope,
+        });
     }
 
     pub(super) fn bind_derived_table(
@@ -358,14 +387,11 @@ impl<'a> Resolver<'a> {
         output_columns: Option<QueryBodyOutput>,
         body_scope: Option<ScopeId>,
     ) {
-        self.bind_current(
-            alias.clone(),
-            Binding::DerivedTable {
-                alias,
-                output_columns,
-                body_scope,
-            },
-        );
+        self.bind_current(Binding::DerivedTable {
+            alias,
+            output_columns,
+            body_scope,
+        });
     }
 
     /// Look up the body scope for a CTE name. Returns `None` if the
@@ -379,7 +405,7 @@ impl<'a> Resolver<'a> {
     }
 
     pub(super) fn bind_table_function(&mut self, alias: Ident) {
-        self.bind_current(alias.clone(), Binding::TableFunction { alias });
+        self.bind_current(Binding::TableFunction { alias });
     }
 
     pub(super) fn record_diagnostic(&mut self, diagnostic: ColumnLevelDiagnostic) {

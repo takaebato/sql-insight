@@ -25,11 +25,15 @@ fn main() {
     println!("\nreads ({}):", ops.reads.len());
     for read in &ops.reads {
         let table = read
+            .reference
             .table
             .as_ref()
             .map(|t| t.name.value.as_str())
             .unwrap_or("<unresolved>");
-        println!("  {}.{}", table, read.name.value);
+        println!(
+            "  {}.{} [{:?}]",
+            table, read.reference.name.value, read.confidence
+        );
     }
 
     println!("\nlineage ({}):", ops.lineage.len());
@@ -37,11 +41,12 @@ fn main() {
         let source = format!(
             "{}.{}",
             edge.source
+                .reference
                 .table
                 .as_ref()
                 .map(|t| t.name.value.as_str())
                 .unwrap_or("?"),
-            edge.source.name.value
+            edge.source.reference.name.value
         );
         let target = match &edge.target {
             ColumnTarget::Relation(c) => format!(

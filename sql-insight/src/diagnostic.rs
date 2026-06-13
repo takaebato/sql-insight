@@ -52,40 +52,25 @@ pub struct ColumnLevelDiagnostic {
     pub span: Option<Span>,
 }
 
-/// Why a column-level extraction is incomplete. Two flavours, by *which
-/// side* the gap is on:
+/// Why a column-level extraction is incomplete.
 ///
-/// - **Tool-side coverage gap** — sql-insight didn't fully analyze this; a
-///   more capable analyzer could do more.
-///   [`UnsupportedStatement`](Self::UnsupportedStatement),
-///   [`WildcardSuppressed`](Self::WildcardSuppressed).
-/// - **Input-side resolution gap** — the SQL (+ catalog) doesn't determine
-///   it, so the reference was left `table: None`. A real engine would also
-///   reject these. [`AmbiguousColumn`](Self::AmbiguousColumn),
-///   [`UnresolvedColumn`](Self::UnresolvedColumn).
+/// Both surviving variants are *tool-side coverage gaps*: sql-insight
+/// chose not to (or couldn't) fully analyze the construct, and a more
+/// capable analyzer could do more. Per-reference resolution outcomes
+/// (ambiguous / unresolved columns) are *not* diagnostics — they
+/// surface on each [`ColumnRead::confidence`](crate::ColumnRead) instead,
+/// so the consumer reads them off the reference rather than
+/// cross-referencing a parallel diagnostic stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ColumnLevelDiagnosticKind {
-    /// (tool-side) Statement variant the resolver / extractor does not
-    /// understand well enough to extract operations from. `message` names
-    /// the statement.
+    /// Statement variant the resolver / extractor does not understand
+    /// well enough to extract operations from. `message` names the
+    /// statement.
     UnsupportedStatement,
-    /// (tool-side) `SELECT *` / `t.*` left unexpanded — the resolver does
-    /// not perform wildcard expansion (see crate docs), so column lineage
+    /// `SELECT *` / `t.*` left unexpanded — the resolver does not
+    /// perform wildcard expansion (see crate docs), so column lineage
     /// is incomplete for projections that include a wildcard.
     WildcardSuppressed,
-    /// (input-side) Unqualified column reference matched multiple in-scope
-    /// bindings whose schemas definitively contain the name. The reference
-    /// is recorded with `table: None`. Only emitted in catalog-aware mode
-    /// (i.e. when at least two `Known` schemas confirm the column); without
-    /// catalog enrichment the resolver suppresses this to avoid false
-    /// positives over `Unknown` schemas.
-    AmbiguousColumn,
-    /// (input-side) Unqualified column reference found no in-scope binding
-    /// that contains the name. Only emitted in catalog-aware mode (i.e. when
-    /// the scope has at least one `Known` schema and none of them holds the
-    /// column); without catalog enrichment, every `Unknown` schema could
-    /// contain anything and silence is the safer default.
-    UnresolvedColumn,
 }
 
 impl ColumnLevelDiagnostic {
@@ -102,9 +87,7 @@ impl ColumnLevelDiagnostic {
             ColumnLevelDiagnosticKind::UnsupportedStatement => {
                 TableLevelDiagnosticKind::UnsupportedStatement
             }
-            ColumnLevelDiagnosticKind::WildcardSuppressed
-            | ColumnLevelDiagnosticKind::AmbiguousColumn
-            | ColumnLevelDiagnosticKind::UnresolvedColumn => return None,
+            ColumnLevelDiagnosticKind::WildcardSuppressed => return None,
         };
         Some(TableLevelDiagnostic {
             kind,

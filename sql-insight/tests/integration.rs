@@ -5,9 +5,7 @@
 //! no extra wrapper module needed.
 
 use sql_insight::catalog::{Catalog, ColumnSchema};
-use sql_insight::diagnostic::{
-    ColumnLevelDiagnostic, ColumnLevelDiagnosticKind, TableLevelDiagnosticKind,
-};
+use sql_insight::diagnostic::{ColumnLevelDiagnosticKind, TableLevelDiagnosticKind};
 use sql_insight::extractor::{
     extract_column_operations, extract_crud_tables, extract_table_operations, extract_tables,
     ColumnLineageKind, ColumnTarget, CrudTables, StatementKind,
@@ -271,14 +269,17 @@ mod extract_table_operations {
 mod extract_column_operations {
     use super::*;
 
-    fn col(table: &str, name: &str) -> sql_insight::ColumnReference {
-        sql_insight::ColumnReference {
-            table: Some(TableReference {
-                catalog: None,
-                schema: None,
-                name: table.into(),
-            }),
-            name: name.into(),
+    fn col(table: &str, name: &str) -> sql_insight::ColumnRead {
+        sql_insight::ColumnRead {
+            reference: sql_insight::ColumnReference {
+                table: Some(TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: table.into(),
+                }),
+                name: name.into(),
+            },
+            confidence: sql_insight::Confidence::Inferred,
         }
     }
 
@@ -290,12 +291,16 @@ mod extract_column_operations {
         // Both the projection `a` and the filter `b` surface as reads
         // (occurrence list, no clause tag). value-vs-filter is
         // recovered structurally: `a` is also a lineage source, `b` is not.
-        let names: Vec<_> = ops.reads.iter().map(|r| r.name.value.as_str()).collect();
+        let names: Vec<_> = ops
+            .reads
+            .iter()
+            .map(|r| r.reference.name.value.as_str())
+            .collect();
         assert_eq!(names, vec!["a", "b"]);
         let lineage_sources: Vec<_> = ops
             .lineage
             .iter()
-            .map(|f| f.source.name.value.as_str())
+            .map(|f| f.source.reference.name.value.as_str())
             .collect();
         assert_eq!(lineage_sources, vec!["a"]); // `b` (filter) is not a lineage source
     }
@@ -367,10 +372,6 @@ mod catalog {
         }
     }
 
-    fn count_kind(diagnostics: &[ColumnLevelDiagnostic], kind: ColumnLevelDiagnosticKind) -> usize {
-        diagnostics.iter().filter(|d| d.kind == kind).count()
-    }
-
     #[test]
     fn insert_without_explicit_columns_pairs_via_catalog() {
         // Without explicit `(a, b)`, the resolver needs the catalog to
@@ -395,7 +396,11 @@ mod catalog {
     }
 
     #[test]
-    fn ambiguous_column_diagnostic_only_with_catalog() {
+    fn ambiguous_column_surfaces_in_confidence_regardless_of_catalog() {
+        // Both with and without a catalog the unqualified `a` is
+        // ambiguous between t1 and t2. The catalog only changes the
+        // *qualified* refs' confidence: with catalog `t1.a` / `t2.a`
+        // are Confirmed; without they're Inferred.
         let catalog = TestCatalog::default()
             .with("t1", vec!["a"])
             .with("t2", vec!["a"]);
@@ -404,39 +409,61 @@ mod catalog {
         let with = extract_column_operations(&GenericDialect {}, sql, Some(&catalog)).unwrap();
         let without = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
 
-        let with_count = count_kind(
-            &with[0].as_ref().unwrap().diagnostics,
-            ColumnLevelDiagnosticKind::AmbiguousColumn,
-        );
-        let without_count = count_kind(
-            &without[0].as_ref().unwrap().diagnostics,
-            ColumnLevelDiagnosticKind::AmbiguousColumn,
-        );
-        assert_eq!(with_count, 1, "with catalog should report AmbiguousColumn");
+        let with_reads = &with[0].as_ref().unwrap().reads;
+        let without_reads = &without[0].as_ref().unwrap().reads;
+
+        let ambiguous_with = with_reads
+            .iter()
+            .filter(|r| r.confidence == sql_insight::Confidence::Ambiguous)
+            .count();
+        let ambiguous_without = without_reads
+            .iter()
+            .filter(|r| r.confidence == sql_insight::Confidence::Ambiguous)
+            .count();
+        assert_eq!(ambiguous_with, 1, "unqualified `a` ambiguous with catalog");
         assert_eq!(
-            without_count, 0,
-            "without catalog should stay silent (Unknown schemas)"
+            ambiguous_without, 1,
+            "unqualified `a` ambiguous without catalog too"
         );
+
+        // The qualified `t1.a` and `t2.a` differ in confidence:
+        // catalog confirms them, no catalog leaves them inferred.
+        let confirmed_with = with_reads
+            .iter()
+            .filter(|r| r.confidence == sql_insight::Confidence::Confirmed)
+            .count();
+        let confirmed_without = without_reads
+            .iter()
+            .filter(|r| r.confidence == sql_insight::Confidence::Confirmed)
+            .count();
+        assert_eq!(confirmed_with, 2);
+        assert_eq!(confirmed_without, 0);
     }
 
     #[test]
-    fn unresolved_column_diagnostic_only_with_catalog() {
+    fn unresolved_column_appears_only_with_catalog() {
+        // Catalog says t1 = [a, b]; `missing` cannot belong to t1.
+        // The read surfaces with Confidence::Unresolved. Without a
+        // catalog, t1 is Unknown — `missing` could plausibly be in
+        // t1, so it surfaces as Inferred(t1).
         let catalog = TestCatalog::default().with("t1", vec!["a", "b"]);
         let sql = "SELECT missing FROM t1";
 
         let with = extract_column_operations(&GenericDialect {}, sql, Some(&catalog)).unwrap();
         let without = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
 
-        let with_count = count_kind(
-            &with[0].as_ref().unwrap().diagnostics,
-            ColumnLevelDiagnosticKind::UnresolvedColumn,
-        );
-        let without_count = count_kind(
-            &without[0].as_ref().unwrap().diagnostics,
-            ColumnLevelDiagnosticKind::UnresolvedColumn,
-        );
-        assert_eq!(with_count, 1);
-        assert_eq!(without_count, 0);
+        let with_reads = &with[0].as_ref().unwrap().reads;
+        let without_reads = &without[0].as_ref().unwrap().reads;
+
+        assert!(with_reads
+            .iter()
+            .any(|r| r.confidence == sql_insight::Confidence::Unresolved
+                && r.reference.name.value == "missing"));
+        assert!(without_reads
+            .iter()
+            .any(|r| r.confidence == sql_insight::Confidence::Inferred
+                && r.reference.name.value == "missing"
+                && r.reference.table.is_some()));
     }
 }
 
@@ -482,17 +509,14 @@ mod diagnostics {
     }
 
     #[test]
-    fn unresolved_column_diagnostic_carries_precise_span() {
-        // The catalog is needed to fire UnresolvedColumn — without it
-        // the resolver stays silent (Unknown schemas could contain
-        // anything). With the catalog, `missing` is unambiguously
-        // not a column of t1.
+    fn unresolved_column_read_carries_precise_span_on_ident() {
+        // Catalog t1 = [a, b]; `missing` cannot belong to t1, so the
+        // read surfaces with Confidence::Unresolved. The span lives
+        // on the column's `Ident` (sqlparser populates it on every
+        // identifier token), so consumers can locate the offending
+        // text without a parallel diagnostic stream.
         //
         // `missing` starts at column 8 in `SELECT missing FROM t1`.
-        // Pinning down the column here is the regression net for span
-        // plumbing through the resolver's catalog-aware path —
-        // separate from the wildcard path, which goes through
-        // projection.rs.
         #[derive(Debug, Default)]
         struct C(HashMap<String, Vec<&'static str>>);
         impl Catalog for C {
@@ -514,11 +538,14 @@ mod diagnostics {
                 .unwrap();
         let ops = result[0].as_ref().unwrap();
         let unresolved = ops
-            .diagnostics
+            .reads
             .iter()
-            .find(|d| matches!(d.kind, ColumnLevelDiagnosticKind::UnresolvedColumn))
-            .expect("UnresolvedColumn not found");
-        let span = unresolved.span.expect("ident token carries a span");
+            .find(|r| {
+                r.confidence == sql_insight::Confidence::Unresolved
+                    && r.reference.name.value == "missing"
+            })
+            .expect("Unresolved `missing` read not found");
+        let span = unresolved.reference.name.span;
         assert_eq!(span.start.line, 1);
         assert_eq!(span.start.column, 8);
     }
@@ -609,8 +636,8 @@ mod invariants {
         items.into_iter().filter_map(|i| key(&i)).collect()
     }
 
-    fn column_read_table(r: &ColumnReference) -> Option<TableReference> {
-        r.table.clone()
+    fn column_read_table(r: &sql_insight::ColumnRead) -> Option<TableReference> {
+        r.reference.table.clone()
     }
 
     fn column_write_table(w: &ColumnReference) -> Option<TableReference> {

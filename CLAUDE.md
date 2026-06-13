@@ -38,9 +38,26 @@ by hand.
   with them — pair with target columns, emit `QueryOutput` edges,
   bubble up through `SetExpr::Query`, etc.
 - The resolver takes an optional `&dyn Catalog`. With a catalog,
-  Table bindings come back with `Known` schemas and unqualified
-  column resolution becomes strict (typos surface as `table: None`).
-  Without a catalog the resolver is best-effort.
+  Table bindings come back with `Known` schemas and column
+  resolution becomes strict (typos surface as `table: None` with
+  `Confidence::Unresolved`; multi-`Known`-confirms surface as
+  `Confidence::Ambiguous`). Without a catalog the resolver is
+  best-effort and resolved reads surface as `Confidence::Inferred`.
+- Identifier matching is dialect-aware (`resolver::casing`). The
+  extractor derives an `IdentifierCasing` from the `&dyn Dialect`
+  (`IdentifierCasing::for_dialect`) and threads it into
+  `resolve_statement`; every comparison funnels through
+  `BindingKey::new(ident, fold)`. The policy splits by class —
+  `table` (catalog/schema/table), `table_alias` (aliases + CTE /
+  derived / table-function names), `column` — each a `CaseFold`
+  (`Upper` / `Lower` / `Insensitive` / `Sensitive`). Most dialects
+  are homogeneous (PG=Lower, ANSI/Snowflake=Upper, DuckDB/SQLite=
+  Insensitive); MySQL and BigQuery split (real tables `Sensitive`,
+  columns/aliases `Insensitive`). Filesystem- / collation-dependent
+  models (MySQL table names, SQL Server) resolve to a fixed safe
+  default; a per-deployment override API is a future addition. Only
+  matching folds — surfaced `TableReference` / `ColumnReference`
+  keep the original identifier text.
 - Extractors consume the resolver's output:
   - `table_extractor` — flat list of `TableReference`s (legacy API).
   - `crud_table_extractor` — CRUD-bucketed tables (legacy API).
@@ -71,21 +88,27 @@ by hand.
     `writes`.
 - `ColumnOperation` mirrors the same surfaces at column
   granularity:
-  - `reads: Vec<ColumnReference>` — every column reference, as a
-    plain occurrence list with no clause tag. References whose
-    walk-time owning binding was synthetic (CTE / derived / table
-    function) are dropped — only real-storage references and
-    unresolved names surface.
+  - `reads: Vec<ColumnRead>` — every column reference, as a plain
+    occurrence list with no clause tag. Each `ColumnRead` pairs a
+    `ColumnReference` identity with a `Confidence` (Confirmed /
+    Inferred / Ambiguous / Unresolved). References whose walk-time
+    owning binding was synthetic (CTE / derived / table function)
+    are dropped — only real-storage references and unresolved names
+    surface.
   - `writes: Vec<ColumnReference>` — INSERT column lists, UPDATE SET
     targets, CTAS / CREATE VIEW / ALTER VIEW columns, MERGE
-    WHEN-clause writes.
+    WHEN-clause writes. Write targets come straight from SQL syntax
+    so they don't carry a confidence (always Confirmed by
+    construction).
   - `lineage: Vec<ColumnLineageEdge>` — `source → target` edges with
     `kind: ColumnLineageKind` (`Passthrough` / `Transformation`).
-    Sources flowing through CTE / derived intermediates are composed
-    end-to-end; composition yields `Transformation` if any step
-    transforms. Targets: `QueryOutput { name, position }` for
-    transient SELECT outputs, `Relation(ColumnReference)` for
-    writes into a named relation (table or view).
+    `source` is a `ColumnRead` (same shape as `reads`'s entries);
+    sources flowing through CTE / derived intermediates are composed
+    end-to-end and inherit the inner real-table ref's confidence.
+    Composition yields `Transformation` if any step transforms.
+    Targets: `QueryOutput { name, position }` for transient SELECT
+    outputs, `Relation(ColumnReference)` for writes into a named
+    relation (table or view).
 - The value-vs-filter distinction is structural, not a tag: a value
   contributor is a `lineage` source; a filter-only column is in
   `reads` but not `lineage`.
@@ -102,6 +125,24 @@ by hand.
 - `ColumnReference` is identity-only too (`table: Option<TableReference>`,
   `name: Ident`). `table` is `Option` for cases where resolution
   fails (ambiguous, no candidate); the column name still surfaces.
+  Per-occurrence metadata (resolution `Confidence`, future
+  per-occurrence fields) lives on `ColumnRead { reference, confidence }`
+  on the read side, so `ColumnReference` stays a pure identity for
+  dedup / cross-statement comparison. Write-side surfaces stay bare
+  `ColumnReference` since writes are always Confirmed by construction.
+- `Confidence` (`Confirmed` / `Inferred` / `Ambiguous` / `Unresolved`)
+  records the resolver's confidence in a `ColumnRead`'s placement,
+  not the SQL's correctness. `Confirmed` means a `Known` schema
+  (catalog or CTE / derived body) positively confirmed the column;
+  `Inferred` means the resolver adopted a candidate without firm
+  evidence (catalog-less mode, qualifier-only resolution, or
+  Known-witness-over-Unknown-suspects tiebreaker). `Ambiguous` /
+  `Unresolved` are the two failure modes — both come with
+  `table: None`. Invariant: catalog-less mode never produces
+  `Confidence::Confirmed` on the public surface (CTE-Confirmed refs
+  are synthetic and dropped by the post-pass), so detecting
+  catalog-aware analysis is as simple as `r.confidence == Confirmed`
+  on any surviving read.
 
 ## Design conventions
 
@@ -148,20 +189,23 @@ by hand.
   and extractors — wildcard arms silently hide newly added variants.
 - Public enums are **exhaustive (no `#[non_exhaustive]`) while pre-1.0**
   (`StatementKind` / `ColumnLineageKind` / `ColumnTarget` /
-  `TableLevelDiagnosticKind` / `ColumnLevelDiagnosticKind`). Adding a
-  variant is therefore a breaking change on purpose — pre-1.0 that
-  rides a `0.x` bump and forces consumers to re-acknowledge the new
-  case rather than silently hitting a wildcard arm. Add
-  `#[non_exhaustive]` at the 1.0 freeze (removing it later is
-  non-breaking; adding it is breaking, so the 1.0 boundary is the
-  place). Keep internal `match`es exhaustive regardless.
-- Diagnostics are split by extraction granularity:
-  `TableLevelDiagnostic` (only `UnsupportedStatement`) vs
-  `ColumnLevelDiagnostic` (adds `WildcardSuppressed` /
-  `AmbiguousColumn` / `UnresolvedColumn`). The resolver produces the
-  column-level superset; table-level surfaces project it down via
+  `Confidence` / `TableLevelDiagnosticKind` /
+  `ColumnLevelDiagnosticKind`). Adding a variant is therefore a
+  breaking change on purpose — pre-1.0 that rides a `0.x` bump and
+  forces consumers to re-acknowledge the new case rather than
+  silently hitting a wildcard arm. Add `#[non_exhaustive]` at the
+  1.0 freeze (removing it later is non-breaking; adding it is
+  breaking, so the 1.0 boundary is the place). Keep internal
+  `match`es exhaustive regardless.
+- Diagnostics are reserved for **tool-side coverage gaps**, not
+  per-reference resolution outcomes. `TableLevelDiagnostic` carries
+  only `UnsupportedStatement`; `ColumnLevelDiagnostic` adds
+  `WildcardSuppressed`. The resolver produces the column-level
+  superset; table-level surfaces project it down via
   `ColumnLevelDiagnostic::to_table_level` (exhaustive match, so a new
-  column kind forces a table-level decision).
+  column kind forces a table-level decision). Per-occurrence
+  resolution status (ambiguous / unresolved column refs) lives on
+  `ColumnRead::confidence`, not in a parallel diagnostic stream.
 - For unsupported SQL, accumulate diagnostics instead of `?`-bailing
   mid-walk. Reserve hard errors for genuinely unrecoverable
   conditions.

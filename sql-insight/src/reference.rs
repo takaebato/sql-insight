@@ -31,14 +31,116 @@ pub struct TableReference {
 ///
 /// `table` is `Option` because some column references cannot be
 /// resolved structurally (ambiguous unqualified columns, references to
-/// derived tables we do not yet expand, etc.) — in that case a
-/// diagnostic accompanies the operation. Identity is name-based: two
-/// `ColumnReference`s with the same `table` and `name` compare equal,
-/// independent of where they appeared in the SQL.
+/// derived tables we do not yet expand, etc.) — the accompanying
+/// [`ColumnRead::confidence`] surfaces *why*. Identity is name-based:
+/// two `ColumnReference`s with the same `table` and `name` compare
+/// equal, independent of where they appeared in the SQL or with what
+/// confidence the resolver placed them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ColumnReference {
     pub table: Option<TableReference>,
     pub name: Ident,
+}
+
+/// One read-side occurrence of a [`ColumnReference`], pairing the
+/// identity with the resolver's [`Confidence`] in that placement.
+///
+/// Read-side surfaces ([`ColumnOperation::reads`] and
+/// [`ColumnLineageEdge::source`]) use this wrapper so the same column
+/// referenced twice can carry per-occurrence resolution metadata
+/// without breaking [`ColumnReference`]'s identity-only contract.
+/// Write-side surfaces ([`ColumnOperation::writes`],
+/// [`ColumnTarget::Relation`]) stay as bare [`ColumnReference`] —
+/// targets come straight from SQL syntax and are always
+/// [`Confidence::Confirmed`] by construction, so the field would be
+/// dead weight there.
+///
+/// [`ColumnOperation::reads`]: crate::extractor::ColumnOperation::reads
+/// [`ColumnOperation::writes`]: crate::extractor::ColumnOperation::writes
+/// [`ColumnLineageEdge::source`]: crate::extractor::ColumnLineageEdge::source
+/// [`ColumnTarget::Relation`]: crate::extractor::ColumnTarget::Relation
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ColumnRead {
+    pub reference: ColumnReference,
+    pub confidence: Confidence,
+}
+
+/// The resolver's confidence in a column reference's placement —
+/// "how sure are we that this `(table, name)` is right?".
+///
+/// Catalog-less mode runs as an *inference mode*: every real-table
+/// binding's schema is `Unknown`, so a single-candidate resolution
+/// is best-effort, not confirmed. CTE and derived bodies do carry
+/// `Known` schemas (the resolver derives them from the body's
+/// projection), but those refs are synthetic and dropped from the
+/// public reads / lineage by the resolver's post-pass.
+///
+/// `Ambiguous` and `Unresolved` are the two failure modes. Both come
+/// with `table: None` on the [`ColumnReference`]; the variant tells
+/// the consumer *why* the resolver gave up.
+///
+/// # Invariants
+///
+/// - **Catalog-less mode → no public `Confirmed`**: every surviving
+///   non-synthetic ref points at an `Unknown` real table, so the
+///   strongest claim the resolver can make is
+///   [`Inferred`](Self::Inferred). Catalog-aware analysis is
+///   therefore detectable by the presence of `Confirmed`.
+/// - **Catalog-aware mode does not imply `Confirmed`**: catalogs are
+///   often partial. Refs against tables the catalog doesn't cover,
+///   or against a real `Unknown` table that won a multi-candidate
+///   tiebreaker over `Known` ones, both still come back as
+///   [`Inferred`](Self::Inferred).
+///
+/// # How each variant arises
+///
+/// | Situation | Confidence |
+/// |---|---|
+/// | catalog-less, real `Unknown` table, sole candidate | [`Inferred`](Self::Inferred) |
+/// | catalog-less, two real `Unknown` tables in scope | [`Ambiguous`](Self::Ambiguous) |
+/// | catalog-less, CTE `Known` body confirms the column | (internal `Confirmed`; synthetic, dropped) |
+/// | catalog-less, CTE `Known` body denies the column (`SELECT typo FROM cte` where cte = `[id]`) | [`Unresolved`](Self::Unresolved) |
+/// | catalog-aware, `Known` binding lists the column | [`Confirmed`](Self::Confirmed) |
+/// | catalog-aware, `Known` binding *doesn't* list the column | [`Unresolved`](Self::Unresolved) |
+/// | catalog-aware, one `Known` confirms + one `Unknown` suspect (Known-witness-over-Unknown-suspects) | [`Inferred`](Self::Inferred) |
+/// | catalog-aware, two or more `Known` schemas confirm | [`Ambiguous`](Self::Ambiguous) |
+/// | qualified `t.col` where `t` is `Unknown` | [`Inferred`](Self::Inferred) |
+/// | qualified `t.col` where `t` is `Known` and lists `col` | [`Confirmed`](Self::Confirmed) |
+///
+/// # Consumer guidance
+///
+/// - **Strict mode validation**: a fully resolved, catalog-confirmed
+///   statement satisfies
+///   `op.diagnostics.is_empty() && op.reads.iter().all(|r| r.confidence == Confidence::Confirmed)`.
+/// - **DFD / CRUD comprehension**: treat
+///   [`Confirmed`](Self::Confirmed) and [`Inferred`](Self::Inferred)
+///   interchangeably as "resolved" (use the `(table, name)` pair);
+///   treat [`Ambiguous`](Self::Ambiguous) and
+///   [`Unresolved`](Self::Unresolved) as "incomplete".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Confidence {
+    /// A `Known`-schema binding (catalog hit, or a CTE / derived body
+    /// the resolver could fully walk) positively confirmed the column
+    /// at this reference. The strongest claim the resolver makes.
+    Confirmed,
+    /// Resolution succeeded by assuming the column exists where the
+    /// resolver placed it: an `Unknown`-schema binding adopted as the
+    /// sole candidate, a qualified reference whose qualifier alone
+    /// determined the table, or a `Known` witness winning over
+    /// `Unknown` suspects in a multi-candidate scope. All defensible
+    /// inferences in catalog-less or partial-catalog mode, but not
+    /// proven.
+    Inferred,
+    /// Multiple plausible candidates and the resolver couldn't pick
+    /// one: either two-or-more `Known` schemas confirmed the column
+    /// (genuine ambiguity), or every candidate was an `Unknown`
+    /// suspect with no tiebreaker. `ColumnReference.table` is `None`.
+    Ambiguous,
+    /// No in-scope binding could plausibly own the column: either
+    /// every `Known` schema in scope explicitly denied it, or the
+    /// scope chain held no bindings at all. `ColumnReference.table`
+    /// is `None`.
+    Unresolved,
 }
 
 impl TableReference {

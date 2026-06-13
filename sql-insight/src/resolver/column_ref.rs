@@ -1,18 +1,17 @@
 //! `CapturedColumnRef` — column references captured during the walk —
 //! plus the walk-time resolution that fills its `resolved` /
-//! `synthetic` fields.
+//! `synthetic` / `confidence` fields.
 
 use sqlparser::ast::Ident;
 
-use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
-use crate::reference::TableReference;
+use crate::reference::{Confidence, TableReference};
 
 use super::binding::{
-    binding_alias_key, binding_confirms_column, binding_could_contain_column,
-    binding_has_known_columns, is_synthetic_binding, normalize_span, span_suffix, BindingKey,
+    binding_confirms_column, binding_could_contain_column, is_synthetic_binding,
+    qualifier_matches_table, synthetic_table_ref, BindingKey,
 };
 use super::scope::parent_chain;
-use super::{Binding, Resolver, ScopeId};
+use super::{Binding, CaseFold, IdentifierCasing, Resolver, ScopeId};
 
 /// A column reference captured by the resolver during the AST walk.
 ///
@@ -21,10 +20,10 @@ use super::{Binding, Resolver, ScopeId};
 /// `scope_id` is the scope in which the reference appeared (kept for
 /// diagnostics and for binding lookups at collapse time).
 ///
-/// `resolved`, `synthetic`, and `is_lineage_source` are computed at
-/// record time, when walk state still reflects what was visible to
-/// the SQL author at that point — necessary for multi-CTE chains
-/// where later CTE bindings would otherwise ambify earlier
+/// `resolved`, `synthetic`, `is_lineage_source`, and `confidence` are
+/// computed at record time, when walk state still reflects what was
+/// visible to the SQL author at that point — necessary for multi-CTE
+/// chains where later CTE bindings would otherwise ambify earlier
 /// resolutions, and for recording the lexical role of the reference
 /// (value vs predicate) before the walker leaves the surrounding
 /// clause.
@@ -48,157 +47,251 @@ pub(crate) struct CapturedColumnRef {
     /// with `is_lineage_source = false` are dropped from lineage
     /// edges; they still surface in `reads`.
     pub(crate) is_lineage_source: bool,
+    /// Resolver confidence in the placement: a `Known` schema
+    /// confirms the column ([`Confidence::Confirmed`]); the resolver
+    /// adopted a candidate without firm evidence
+    /// ([`Confidence::Inferred`]); multiple candidates with no
+    /// tiebreaker ([`Confidence::Ambiguous`]); no candidate at all
+    /// ([`Confidence::Unresolved`]). Synthetic refs (CTE / derived)
+    /// can be `Confirmed` here but get filtered from the public
+    /// surface, so consumers see `Confirmed` only when a catalog
+    /// positively confirms the column on a real table.
+    pub(crate) confidence: Confidence,
+}
+
+/// A binding that could plausibly own the unqualified column being
+/// resolved, captured during one scope's scan. `confirmed` is `true`
+/// only for `Known`-schema bindings that explicitly list the column —
+/// drives both the "single Known witness" tiebreaker and the
+/// `Confirmed` vs `Inferred` distinction in
+/// [`Resolver::resolve_unqualified_ref`].
+struct OwnerCandidate {
+    table: TableReference,
+    confirmed: bool,
+    synthetic: bool,
 }
 
 impl<'a> Resolver<'a> {
     /// Record a column reference observed in the current scope.
-    /// Resolution (owning table) and synthetic-vs-real classification
-    /// are computed right now, while scope state is authoritative —
+    /// Resolution (owning table, synthetic-vs-real, confidence) is
+    /// computed right now, while scope state is authoritative —
     /// later CTE bindings won't ambify what this reference saw.
     pub(super) fn capture_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.current_scope_id();
         let is_lineage_source = self.context.is_lineage_source;
-        let (resolved, synthetic) = self.resolve_ref(&parts, scope_id);
+        let (resolved, synthetic, confidence) = self.resolve_ref(&parts, scope_id);
         self.resolution.column_refs.push(CapturedColumnRef {
             parts,
             scope_id,
             resolved,
             synthetic,
             is_lineage_source,
+            confidence,
         });
     }
 
     fn resolve_ref(
-        &mut self,
+        &self,
         parts: &[Ident],
         scope_id: ScopeId,
-    ) -> (Option<TableReference>, bool) {
-        match parts.len() {
-            0 => (None, false),
-            1 => self.resolve_unqualified_ref(&parts[0], scope_id),
-            n => self.resolve_qualified_ref(&parts[..n - 1], scope_id),
+    ) -> (Option<TableReference>, bool, Confidence) {
+        match parts {
+            [] => (None, false, Confidence::Unresolved),
+            [name] => self.resolve_unqualified_ref(name, scope_id),
+            _ => {
+                let (qualifier, [column]) = parts.split_at(parts.len() - 1) else {
+                    unreachable!("len >= 2 splits cleanly into qualifier + 1-element column tail")
+                };
+                self.resolve_qualified_ref(qualifier, column, scope_id)
+            }
         }
     }
 
-    /// Walk the scope chain for an unqualified column reference. Emits
-    /// `AmbiguousColumn` when two or more bindings with `Known` schemas
-    /// confirm the column, and `UnresolvedColumn` when no in-scope
-    /// binding contains it but at least one scope had a `Known` schema
-    /// (catalog-aware mode). Both diagnostics are suppressed when every
-    /// candidate / scope is `Unknown`, since `Unknown` schemas could
-    /// hold anything and silence is the safer default without catalog
-    /// enrichment.
+    /// Walk the scope chain for an unqualified column reference and
+    /// return the `(table, synthetic, confidence)` triple that
+    /// [`Self::capture_column_ref`] stores on the captured ref. Pure:
+    /// no walker state mutated.
+    ///
+    /// Resolution rule (lexical shadowing, innermost-out): the first
+    /// scope with at least one candidate binding wins. Within that
+    /// scope:
+    /// - Exactly one candidate → owner is that binding. Confidence is
+    ///   [`Confidence::Confirmed`] if a `Known` schema confirmed the
+    ///   column, else [`Confidence::Inferred`].
+    /// - Multiple candidates with exactly one `Known` confirmation
+    ///   (Known-witness-over-`Unknown`-suspects): the `Known` winner
+    ///   is adopted as owner with [`Confidence::Inferred`] — the
+    ///   leftover `Unknown` suspects could in principle also contain
+    ///   the column, so the placement is strong but not confirmed.
+    /// - Multiple candidates with zero or 2+ `Known` confirmations →
+    ///   `table: None` / [`Confidence::Ambiguous`].
+    ///
+    /// No matching scope anywhere in the chain →
+    /// `table: None` / [`Confidence::Unresolved`].
     fn resolve_unqualified_ref(
-        &mut self,
+        &self,
         name: &Ident,
         scope_id: ScopeId,
-    ) -> (Option<TableReference>, bool) {
-        let mut had_known_schemas_anywhere = false;
-        let mut resolved: Option<(TableReference, bool)> = None;
-        // (candidate tables, confirmed-by-Known count)
-        let mut ambiguity: Option<(Vec<TableReference>, usize)> = None;
-
+    ) -> (Option<TableReference>, bool, Confidence) {
+        let column_fold = self.resolution.casing.column;
         for id in parent_chain(&self.resolution.scopes, scope_id) {
             let scope = &self.resolution.scopes[id.0];
-            if scope.iter_bindings().any(binding_has_known_columns) {
-                had_known_schemas_anywhere = true;
-            }
-            let matches: Vec<(TableReference, bool, bool)> = scope
+            let candidates: Vec<OwnerCandidate> = scope
                 .iter_bindings()
                 .filter_map(|b| {
-                    let tbl = binding_could_contain_column(b, name)?;
-                    Some((
-                        tbl,
-                        binding_confirms_column(b, name),
-                        is_synthetic_binding(b),
-                    ))
+                    let table = binding_could_contain_column(b, name, column_fold)?;
+                    Some(OwnerCandidate {
+                        table,
+                        confirmed: binding_confirms_column(b, name, column_fold),
+                        synthetic: is_synthetic_binding(b),
+                    })
                 })
                 .collect();
-            if !matches.is_empty() {
-                if matches.len() == 1 {
-                    let (tbl, _, syn) = matches.into_iter().next().unwrap();
-                    resolved = Some((tbl, syn));
-                } else {
-                    let confirmed = matches.iter().filter(|(_, c, _)| *c).count();
-                    let candidates: Vec<TableReference> =
-                        matches.into_iter().map(|(t, _, _)| t).collect();
-                    ambiguity = Some((candidates, confirmed));
+            match candidates.as_slice() {
+                [] => continue,
+                [c] => {
+                    let confidence = if c.confirmed {
+                        Confidence::Confirmed
+                    } else {
+                        Confidence::Inferred
+                    };
+                    return (Some(c.table.clone()), c.synthetic, confidence);
                 }
-                break;
+                _ => {
+                    let confirmed_count = candidates.iter().filter(|c| c.confirmed).count();
+                    return if confirmed_count == 1 {
+                        // Known witness wins over Unknown suspects: take
+                        // the single confirmed binding, but flag the
+                        // placement as Inferred rather than Confirmed
+                        // since the leftover suspects could in principle
+                        // also contain the column.
+                        let winner = candidates
+                            .into_iter()
+                            .find(|c| c.confirmed)
+                            .expect("confirmed_count == 1");
+                        (Some(winner.table), winner.synthetic, Confidence::Inferred)
+                    } else {
+                        (None, false, Confidence::Ambiguous)
+                    };
+                }
             }
         }
-
-        if let Some((tbl, syn)) = resolved {
-            return (Some(tbl), syn);
-        }
-        if let Some((candidates, confirmed_count)) = ambiguity {
-            if confirmed_count >= 2 {
-                let span = normalize_span(name.span);
-                let names: Vec<String> = candidates.iter().map(|t| t.name.value.clone()).collect();
-                self.record_diagnostic(ColumnLevelDiagnostic {
-                    kind: ColumnLevelDiagnosticKind::AmbiguousColumn,
-                    message: format!(
-                        "ambiguous column `{}`{} — matches in: [{}]",
-                        name.value,
-                        span_suffix(span),
-                        names.join(", ")
-                    ),
-                    span,
-                });
-            }
-            return (None, false);
-        }
-        if had_known_schemas_anywhere {
-            let span = normalize_span(name.span);
-            self.record_diagnostic(ColumnLevelDiagnostic {
-                kind: ColumnLevelDiagnosticKind::UnresolvedColumn,
-                message: format!(
-                    "unresolved column `{}`{} — no in-scope relation with a known schema contains it",
-                    name.value,
-                    span_suffix(span),
-                ),
-                span,
-            });
-        }
-        (None, false)
+        (None, false, Confidence::Unresolved)
     }
 
+    /// Resolve a qualified column reference (`t.col`, `s.t.col`,
+    /// `c.s.t.col`) against the scope chain. Mirrors
+    /// [`Self::resolve_unqualified_ref`]: walk innermost-out, the first
+    /// scope with at least one matching binding wins, branch on the
+    /// candidate count.
+    ///
+    /// A binding matches per ANSI qualifier rules (see
+    /// [`qualified_candidate`]): non-aliased real tables match by
+    /// right-anchored path ([`qualifier_matches_table`]); aliased and
+    /// synthetic bindings expose only their single name and so match
+    /// only a single-segment qualifier equal to it.
+    ///
+    /// - 0 candidates → the qualifier names nothing in scope (a table
+    ///   not in FROM, a contradicting schema, or an alias-hidden
+    ///   original name): `table: None` / [`Confidence::Unresolved`].
+    /// - 1 candidate → resolved. [`Confidence::Confirmed`] if a `Known`
+    ///   schema lists the column, else [`Confidence::Inferred`].
+    /// - 2+ candidates → [`Confidence::Ambiguous`] (`table: None`).
     fn resolve_qualified_ref(
         &self,
         qualifier_parts: &[Ident],
+        column_name: &Ident,
         scope_id: ScopeId,
-    ) -> (Option<TableReference>, bool) {
-        // Look up the binding for the qualifier head in the scope chain.
-        // Multi-segment qualifiers (s.t.col) match only on the head —
-        // schema/catalog-qualified bound names are rare and we don't
-        // currently bind their full path anyway.
-        let binding = qualifier_parts
-            .first()
-            .and_then(|head| self.binding_for_qualifier(head, scope_id));
-        let synthetic = binding.map(is_synthetic_binding).unwrap_or(false);
-        // Canonicalize a single-segment qualifier bound to a real table
-        // to that binding's alias-free underlying `TableReference`, so an
-        // aliased ref (`u.a` over `FROM t1 AS u`) surfaces the real table
-        // `t1` — matching how unqualified refs resolve. Synthetic bindings
-        // (CTE / derived / table function) keep the qualifier verbatim so
-        // lineage collapse can re-find the owning binding by name;
-        // multi-segment qualifiers are already real identities and pass
-        // through untouched.
-        let table = match binding {
-            Some(Binding::Table { table, .. }) if qualifier_parts.len() == 1 => {
-                Some((**table).clone())
-            }
-            _ => TableReference::try_from_parts(qualifier_parts),
-        };
-        (table, synthetic)
-    }
-
-    fn binding_for_qualifier(&self, head: &Ident, scope_id: ScopeId) -> Option<&Binding> {
-        let key = BindingKey::from_ident(head);
-        parent_chain(&self.resolution.scopes, scope_id).find_map(|id| {
-            self.resolution.scopes[id.0]
+    ) -> (Option<TableReference>, bool, Confidence) {
+        // Decode the qualifier into a `TableReference` for right-anchored
+        // matching against real-table bindings. `None` when the qualifier
+        // overshoots the catalog.schema.name depth (5-part refs): no real
+        // table can match, leaving only single-segment alias / synthetic
+        // bindings matchable.
+        let qualifier_ref = TableReference::try_from_parts(qualifier_parts);
+        let casing = self.resolution.casing;
+        for id in parent_chain(&self.resolution.scopes, scope_id) {
+            let scope = &self.resolution.scopes[id.0];
+            let candidates: Vec<OwnerCandidate> = scope
                 .iter_bindings()
-                .find(|b| binding_alias_key(b) == key)
-        })
+                .filter_map(|b| {
+                    qualified_candidate(
+                        b,
+                        qualifier_parts,
+                        qualifier_ref.as_ref(),
+                        column_name,
+                        casing,
+                    )
+                })
+                .collect();
+            match candidates.as_slice() {
+                [] => continue,
+                [c] => {
+                    let confidence = if c.confirmed {
+                        Confidence::Confirmed
+                    } else {
+                        Confidence::Inferred
+                    };
+                    return (Some(c.table.clone()), c.synthetic, confidence);
+                }
+                _ => return (None, false, Confidence::Ambiguous),
+            }
+        }
+        (None, false, Confidence::Unresolved)
     }
+}
+
+/// Decide whether `binding` is a candidate owner of a qualified
+/// reference and, if so, what table / confidence it contributes.
+///
+/// - Non-aliased real table: right-anchored path match via
+///   [`qualifier_matches_table`]; resolves to the alias-free table.
+/// - Aliased real table: the alias hides the original name
+///   (ANSI / Postgres / MySQL), so it matches only a single-segment
+///   qualifier equal to the alias; resolves to the alias-free table.
+/// - Synthetic (CTE / derived / table function): exposes only its
+///   single name; resolves to a name-only synthetic ref so lineage
+///   collapse can re-find the owning binding by name.
+fn qualified_candidate(
+    binding: &Binding,
+    qualifier_parts: &[Ident],
+    qualifier_ref: Option<&TableReference>,
+    column_name: &Ident,
+    casing: IdentifierCasing,
+) -> Option<OwnerCandidate> {
+    let (table, synthetic) = match binding {
+        Binding::Table {
+            table, alias: None, ..
+        } => {
+            let q = qualifier_ref?;
+            qualifier_matches_table(q, table, casing.table).then(|| ((**table).clone(), false))?
+        }
+        Binding::Table {
+            table,
+            alias: Some(alias),
+            ..
+        } => qualifier_is_single(qualifier_parts, alias, casing.table_alias)
+            .then(|| ((**table).clone(), false))?,
+        Binding::Cte { name, .. } => qualifier_is_single(qualifier_parts, name, casing.table_alias)
+            .then(|| (synthetic_table_ref(name), true))?,
+        Binding::DerivedTable { alias, .. } | Binding::TableFunction { alias, .. } => {
+            qualifier_is_single(qualifier_parts, alias, casing.table_alias)
+                .then(|| (synthetic_table_ref(alias), true))?
+        }
+    };
+    Some(OwnerCandidate {
+        table,
+        confirmed: binding_confirms_column(binding, column_name, casing.column),
+        synthetic,
+    })
+}
+
+/// `true` iff `qualifier_parts` is a single segment whose
+/// [`BindingKey`] (under the table-alias `fold`) equals `name`'s — the
+/// only shape an alias / synthetic (single exposed name) can match.
+fn qualifier_is_single(qualifier_parts: &[Ident], name: &Ident, fold: CaseFold) -> bool {
+    matches!(
+        qualifier_parts,
+        [only] if BindingKey::new(only, fold) == BindingKey::new(name, fold)
+    )
 }

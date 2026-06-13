@@ -1,4 +1,5 @@
 use super::*;
+use crate::reference::Confidence;
 use sqlparser::dialect::GenericDialect;
 
 fn extract(sql: &str) -> ColumnOperation {
@@ -14,28 +15,67 @@ fn table(name: &str) -> TableReference {
     }
 }
 
-// reads / writes are now plain `Vec<ColumnReference>` (occurrence
-// based, no clause kind), so all the read/write builders return a
-// `ColumnReference`. `read` and `col` are interchangeable; both are
-// kept for callsite readability (`read` in reads lists, `col` as a
-// lineage source / target inner).
-fn read(table_name: &str, col: &str) -> ColumnReference {
-    ColumnReference {
-        table: Some(table(table_name)),
-        name: col.into(),
+// Read-side helpers return `ColumnRead` (identity + Confidence).
+// `read` and `col` both default to `Confidence::Inferred`, which is
+// the catalog-less mode's natural confidence — most tests in this
+// file run without a catalog, so the default minimises noise. Tests
+// supplying a catalog override with `read_confirmed` / `col_confirmed`.
+fn read(table_name: &str, col: &str) -> ColumnRead {
+    read_with(table_name, col, Confidence::Inferred)
+}
+
+fn read_confirmed(table_name: &str, col: &str) -> ColumnRead {
+    read_with(table_name, col, Confidence::Confirmed)
+}
+
+fn read_with(table_name: &str, col: &str, confidence: Confidence) -> ColumnRead {
+    read_with_ref(table(table_name), col, confidence)
+}
+
+fn read_with_ref(table_ref: TableReference, col: &str, confidence: Confidence) -> ColumnRead {
+    ColumnRead {
+        reference: ColumnReference {
+            table: Some(table_ref),
+            name: col.into(),
+        },
+        confidence,
     }
 }
 
+fn col(table_name: &str, name: &str) -> ColumnRead {
+    read_with(table_name, name, Confidence::Inferred)
+}
+
+fn col_confirmed(table_name: &str, name: &str) -> ColumnRead {
+    read_with(table_name, name, Confidence::Confirmed)
+}
+
+fn ambiguous(col: &str) -> ColumnRead {
+    ColumnRead {
+        reference: ColumnReference {
+            table: None,
+            name: col.into(),
+        },
+        confidence: Confidence::Ambiguous,
+    }
+}
+
+fn unresolved(col: &str) -> ColumnRead {
+    ColumnRead {
+        reference: ColumnReference {
+            table: None,
+            name: col.into(),
+        },
+        confidence: Confidence::Unresolved,
+    }
+}
+
+// Write-side helpers stay as `ColumnReference` — write targets come
+// straight from SQL syntax and are always `Confidence::Confirmed` by
+// construction, so attaching a confidence field would be dead weight.
 fn write(table_name: &str, col: &str) -> ColumnReference {
     ColumnReference {
         table: Some(table(table_name)),
-        name: col.into(),
-    }
-}
-
-fn unresolved(col: &str) -> ColumnReference {
-    ColumnReference {
-        table: None,
         name: col.into(),
     }
 }
@@ -61,14 +101,7 @@ fn relation(table_name: &str, col: &str) -> ColumnTarget {
     })
 }
 
-fn col(table_name: &str, name: &str) -> ColumnReference {
-    ColumnReference {
-        table: Some(table(table_name)),
-        name: name.into(),
-    }
-}
-
-fn passthrough(source: ColumnReference, target: ColumnTarget) -> ColumnLineageEdge {
+fn passthrough(source: ColumnRead, target: ColumnTarget) -> ColumnLineageEdge {
     ColumnLineageEdge {
         source,
         target,
@@ -76,7 +109,7 @@ fn passthrough(source: ColumnReference, target: ColumnTarget) -> ColumnLineageEd
     }
 }
 
-fn transformation(source: ColumnReference, target: ColumnTarget) -> ColumnLineageEdge {
+fn transformation(source: ColumnRead, target: ColumnTarget) -> ColumnLineageEdge {
     ColumnLineageEdge {
         source,
         target,
@@ -270,16 +303,10 @@ mod reads {
             "SELECT s1.t1.a FROM s1.t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![ColumnReference {
-                    table: Some(table_ref.clone()),
-                    name: "a".into(),
-                }],
+                reads: vec![read_with_ref(table_ref.clone(), "a", Confidence::Inferred)],
                 writes: vec![],
                 lineage: vec![passthrough(
-                    ColumnReference {
-                        table: Some(table_ref),
-                        name: "a".into(),
-                    },
+                    read_with_ref(table_ref, "a", Confidence::Inferred),
                     out("a", 0),
                 )],
                 diagnostics: vec![],
@@ -301,16 +328,10 @@ mod reads {
             "SELECT c1.s1.t1.a FROM c1.s1.t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![ColumnReference {
-                    table: Some(table_ref.clone()),
-                    name: "a".into(),
-                }],
+                reads: vec![read_with_ref(table_ref.clone(), "a", Confidence::Inferred)],
                 writes: vec![],
                 lineage: vec![passthrough(
-                    ColumnReference {
-                        table: Some(table_ref),
-                        name: "a".into(),
-                    },
+                    read_with_ref(table_ref, "a", Confidence::Inferred),
                     out("a", 0),
                 )],
                 diagnostics: vec![],
@@ -332,16 +353,10 @@ mod reads {
             "SELECT a FROM c1.s1.t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![ColumnReference {
-                    table: Some(table_ref.clone()),
-                    name: "a".into(),
-                }],
+                reads: vec![read_with_ref(table_ref.clone(), "a", Confidence::Inferred)],
                 writes: vec![],
                 lineage: vec![passthrough(
-                    ColumnReference {
-                        table: Some(table_ref),
-                        name: "a".into(),
-                    },
+                    read_with_ref(table_ref, "a", Confidence::Inferred),
                     out("a", 0),
                 )],
                 diagnostics: vec![],
@@ -362,14 +377,7 @@ mod reads {
                 statement_kind: StatementKind::Select,
                 reads: vec![unresolved("a")],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: None,
-                        name: "a".into(),
-                    },
-                    target: out("a", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
+                lineage: vec![passthrough(unresolved("a"), out("a", 0))],
                 diagnostics: vec![],
             },
         );
@@ -421,24 +429,18 @@ mod reads {
     }
 
     #[test]
-    fn unqualified_with_multiple_tables_stays_unresolved() {
-        // Two `Unknown`-schema tables — without a catalog the resolver
-        // cannot tell which `a` belongs to, so the ref surfaces with
-        // `table: None`. The lineage source also stays unresolved.
+    fn unqualified_with_multiple_tables_is_ambiguous() {
+        // Two `Unknown`-schema tables — without a catalog the
+        // resolver can't pick between them, so `a` surfaces with
+        // `table: None` and `Confidence::Ambiguous`. The lineage
+        // source inherits the same ambiguous read.
         assert_column_ops(
             "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![read("t1", "id"), read("t2", "id"), unresolved("a")],
+                reads: vec![read("t1", "id"), read("t2", "id"), ambiguous("a")],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: None,
-                        name: "a".into(),
-                    },
-                    target: out("a", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
+                lineage: vec![passthrough(ambiguous("a"), out("a", 0))],
                 diagnostics: vec![],
             },
         );
@@ -467,7 +469,7 @@ mod reads {
         // Reads surface only references with real Table owners or
         // unresolved column names. `unknown_col` doesn't match the
         // cte's Known schema [id], so it surfaces unresolved
-        // (table: None) AND fires an UnresolvedColumn diagnostic.
+        // (table: None) with Confidence::Unresolved on the read.
         assert_column_ops(
             "WITH cte AS (SELECT id FROM t1) SELECT id, unknown_col FROM cte",
             ColumnOperation {
@@ -476,16 +478,9 @@ mod reads {
                 writes: vec![],
                 lineage: vec![
                     passthrough(col("t1", "id"), out("id", 0)),
-                    ColumnLineageEdge {
-                        source: ColumnReference {
-                            table: None,
-                            name: "unknown_col".into(),
-                        },
-                        target: out("unknown_col", 1),
-                        kind: ColumnLineageKind::Passthrough,
-                    },
+                    passthrough(unresolved("unknown_col"), out("unknown_col", 1)),
                 ],
-                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnresolvedColumn)],
+                diagnostics: vec![],
             },
         );
     }
@@ -2250,18 +2245,7 @@ mod collapse {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t1", "id")],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: Some(TableReference {
-                            catalog: None,
-                            schema: None,
-                            name: "r".into(),
-                        }),
-                        name: "id".into(),
-                    },
-                    target: out("id", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
+                lineage: vec![passthrough(read("r", "id"), out("id", 0))],
                 diagnostics: vec![],
             },
         );
@@ -2571,16 +2555,9 @@ mod join_using_and_natural {
             "SELECT id FROM t1 JOIN t2 USING (id)",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![unresolved("id")],
+                reads: vec![ambiguous("id")],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: None,
-                        name: "id".into(),
-                    },
-                    target: out("id", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
+                lineage: vec![passthrough(ambiguous("id"), out("id", 0))],
                 diagnostics: vec![],
             },
         );
@@ -2597,16 +2574,9 @@ mod join_using_and_natural {
             "SELECT id FROM t1 JOIN t2 USING (id) WHERE id > 0",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![unresolved("id"), unresolved("id")],
+                reads: vec![ambiguous("id"), ambiguous("id")],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: None,
-                        name: "id".into(),
-                    },
-                    target: out("id", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
+                lineage: vec![passthrough(ambiguous("id"), out("id", 0))],
                 diagnostics: vec![],
             },
         );
@@ -2640,16 +2610,9 @@ mod join_using_and_natural {
             "SELECT id FROM t1 NATURAL JOIN t2",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![unresolved("id")],
+                reads: vec![ambiguous("id")],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: None,
-                        name: "id".into(),
-                    },
-                    target: out("id", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
+                lineage: vec![passthrough(ambiguous("id"), out("id", 0))],
                 diagnostics: vec![],
             },
         );
@@ -2775,17 +2738,24 @@ mod on_conflict {
         assert_column_ops_inner(sql, 0, actual, expected);
     }
 
-    /// Construct a `ColumnReference` for the synthetic EXCLUDED
+    /// Construct a `ColumnRead` for the synthetic EXCLUDED
     /// pseudo-table — used only as a Source in lineage edges, not
-    /// as a real table.
-    fn excluded(name: &str) -> ColumnReference {
-        ColumnReference {
-            table: Some(TableReference {
-                catalog: None,
-                schema: None,
-                name: "EXCLUDED".into(),
-            }),
-            name: name.into(),
+    /// as a real table. The EXCLUDED binding inherits its
+    /// `output_columns` from the INSERT source's per-operand
+    /// projections; for VALUES sources (no projection captured) the
+    /// binding ends up with `output_columns: None`, so refs against
+    /// it can't be `Confirmed` and surface as `Inferred`.
+    fn excluded(name: &str) -> ColumnRead {
+        ColumnRead {
+            reference: ColumnReference {
+                table: Some(TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "EXCLUDED".into(),
+                }),
+                name: name.into(),
+            },
+            confidence: Confidence::Inferred,
         }
     }
 
@@ -2967,30 +2937,8 @@ mod values_as_relation {
                 reads: vec![],
                 writes: vec![],
                 lineage: vec![
-                    ColumnLineageEdge {
-                        source: ColumnReference {
-                            table: Some(TableReference {
-                                catalog: None,
-                                schema: None,
-                                name: "t".into(),
-                            }),
-                            name: "x".into(),
-                        },
-                        target: out("x", 0),
-                        kind: ColumnLineageKind::Passthrough,
-                    },
-                    ColumnLineageEdge {
-                        source: ColumnReference {
-                            table: Some(TableReference {
-                                catalog: None,
-                                schema: None,
-                                name: "t".into(),
-                            }),
-                            name: "y".into(),
-                        },
-                        target: out("y", 1),
-                        kind: ColumnLineageKind::Passthrough,
-                    },
+                    passthrough(read("t", "x"), out("x", 0)),
+                    passthrough(read("t", "y"), out("y", 1)),
                 ],
                 diagnostics: vec![],
             },
@@ -3005,18 +2953,7 @@ mod values_as_relation {
                 statement_kind: StatementKind::Select,
                 reads: vec![],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: Some(TableReference {
-                            catalog: None,
-                            schema: None,
-                            name: "cte".into(),
-                        }),
-                        name: "id".into(),
-                    },
-                    target: out("id", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
+                lineage: vec![passthrough(read("cte", "id"), out("id", 0))],
                 diagnostics: vec![],
             },
         );
@@ -3034,18 +2971,7 @@ mod values_as_relation {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t1", "a")],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: Some(TableReference {
-                            catalog: None,
-                            schema: None,
-                            name: "v".into(),
-                        }),
-                        name: "x".into(),
-                    },
-                    target: out("x", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
+                lineage: vec![passthrough(read("v", "x"), out("x", 0))],
                 diagnostics: vec![],
             },
         );
@@ -3325,10 +3251,10 @@ mod catalog_strict {
     #[test]
     fn catalog_known_schema_rejects_columns_not_in_table() {
         // Without catalog `SELECT a FROM t1` resolves a → t1.a
-        // unconditionally (single Unknown binding heuristic). With
-        // a catalog that says t1's columns are [x, y], `a` cannot
-        // come from t1 — it surfaces as unresolved and fires
-        // UnresolvedColumn.
+        // unconditionally (single Unknown binding heuristic). With a
+        // catalog that says t1's columns are [x, y], `a` cannot come
+        // from t1 — it surfaces as unresolved (table=None, confidence=
+        // Unresolved on the read).
         let catalog = TestCatalog::default().with("t1", vec!["x", "y"]);
         assert_column_ops_with_catalog(
             "SELECT a FROM t1",
@@ -3337,15 +3263,8 @@ mod catalog_strict {
                 statement_kind: StatementKind::Select,
                 reads: vec![unresolved("a")],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: None,
-                        name: "a".into(),
-                    },
-                    target: out("a", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
-                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnresolvedColumn)],
+                lineage: vec![passthrough(unresolved("a"), out("a", 0))],
+                diagnostics: vec![],
             },
         );
     }
@@ -3358,9 +3277,9 @@ mod catalog_strict {
             &catalog,
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![read("t1", "a")],
+                reads: vec![read_confirmed("t1", "a")],
                 writes: vec![],
-                lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
+                lineage: vec![passthrough(col_confirmed("t1", "a"), out("a", 0))],
                 diagnostics: vec![],
             },
         );
@@ -3378,9 +3297,9 @@ mod catalog_strict {
             &catalog,
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![read("t1", "ID")],
+                reads: vec![read_confirmed("t1", "ID")],
                 writes: vec![],
-                lineage: vec![passthrough(col("t1", "ID"), out("ID", 0))],
+                lineage: vec![passthrough(col_confirmed("t1", "ID"), out("ID", 0))],
                 diagnostics: vec![],
             },
         );
@@ -3389,25 +3308,26 @@ mod catalog_strict {
     #[test]
     fn catalog_does_not_match_quoted_ref_against_unquoted_column() {
         // A quoted `"ID"` matches exactly (case-sensitive), so it does
-        // not match the catalog's `id`; it stays unresolved and fires
-        // UnresolvedColumn. Placed in WHERE so it is a read but not a
-        // lineage source.
+        // not match the catalog's `id`; it stays unresolved (table=None,
+        // Confidence::Unresolved). Placed in WHERE so it is a read but
+        // not a lineage source.
         let catalog = TestCatalog::default().with("t1", vec!["a", "id"]);
+        let unresolved_quoted_id = ColumnRead {
+            reference: ColumnReference {
+                table: None,
+                name: Ident::with_quote('"', "ID"),
+            },
+            confidence: Confidence::Unresolved,
+        };
         assert_column_ops_with_catalog(
             r#"SELECT a FROM t1 WHERE "ID" > 0"#,
             &catalog,
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![
-                    read("t1", "a"),
-                    ColumnReference {
-                        table: None,
-                        name: Ident::with_quote('"', "ID"),
-                    },
-                ],
+                reads: vec![read_confirmed("t1", "a"), unresolved_quoted_id],
                 writes: vec![],
-                lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
-                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnresolvedColumn)],
+                lineage: vec![passthrough(col_confirmed("t1", "a"), out("a", 0))],
+                diagnostics: vec![],
             },
         );
     }
@@ -3488,7 +3408,7 @@ mod catalog_strict {
             ColumnOperation {
                 statement_kind: StatementKind::Merge,
                 reads: vec![
-                    read("t", "id"),
+                    read_confirmed("t", "id"),
                     read("s", "id"),
                     read("s", "id"),
                     read("s", "a"),
@@ -3516,22 +3436,25 @@ mod catalog_strict {
             &catalog,
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![read("t1", "id"), read("t2", "id"), read("t2", "a")],
+                reads: vec![
+                    read_confirmed("t1", "id"),
+                    read_confirmed("t2", "id"),
+                    read_confirmed("t2", "a"),
+                ],
                 writes: vec![],
-                lineage: vec![passthrough(col("t2", "a"), out("a", 0))],
+                lineage: vec![passthrough(col_confirmed("t2", "a"), out("a", 0))],
                 diagnostics: vec![],
             },
         );
     }
 
     #[test]
-    fn catalog_confirmed_ambiguity_reports_diagnostic() {
-        // Both tables Known and both declare `a`. ColumnLevelDiagnostic must
-        // fire — without catalog the same query is silently
-        // ambiguous (no diagnostic) since Unknown schemas could
-        // contain anything. assert_column_ops compares diagnostics
-        // by kind only; the message-content checks are kept inline
-        // since they're this test's specific purpose.
+    fn catalog_confirmed_ambiguity_surfaces_as_ambiguous_read() {
+        // Both tables Known and both declare `a`. The unqualified `a`
+        // can't be resolved to a single owner; the read surfaces with
+        // table=None and Confidence::Ambiguous. (Without catalog the
+        // same query also yields Ambiguous: two Unknown suspects with
+        // no Known tiebreaker.)
         let catalog = TestCatalog::default()
             .with("t1", vec!["a"])
             .with("t2", vec!["a"]);
@@ -3540,41 +3463,23 @@ mod catalog_strict {
             &catalog,
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![read("t1", "a"), read("t2", "a"), unresolved("a")],
+                reads: vec![
+                    read_confirmed("t1", "a"),
+                    read_confirmed("t2", "a"),
+                    ambiguous("a"),
+                ],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: None,
-                        name: "a".into(),
-                    },
-                    target: out("a", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
-                diagnostics: vec![diag(ColumnLevelDiagnosticKind::AmbiguousColumn)],
+                lineage: vec![passthrough(ambiguous("a"), out("a", 0))],
+                diagnostics: vec![],
             },
         );
-        // Specific message-content checks for this test's purpose.
-        let ops = extract_column_operations(
-            &GenericDialect {},
-            "SELECT a FROM t1 JOIN t2 ON t1.a = t2.a",
-            Some(&catalog),
-        )
-        .unwrap();
-        let ops = ops.into_iter().next().unwrap().unwrap();
-        let amb = ops
-            .diagnostics
-            .iter()
-            .find(|d| matches!(d.kind, ColumnLevelDiagnosticKind::AmbiguousColumn))
-            .expect("AmbiguousColumn must fire");
-        assert!(amb.message.contains("ambiguous column `a`"));
-        assert!(amb.message.contains("t1"));
-        assert!(amb.message.contains("t2"));
     }
 
     #[test]
-    fn catalog_unresolved_unqualified_reports_diagnostic() {
+    fn catalog_unresolved_unqualified_surfaces_as_unresolved_read() {
         // Catalog says t1 has [x, y]; unqualified `z` belongs to
-        // nothing in scope — UnresolvedColumn fires.
+        // nothing in scope — the read surfaces with table=None and
+        // Confidence::Unresolved.
         let catalog = TestCatalog::default().with("t1", vec!["x", "y"]);
         assert_column_ops_with_catalog(
             "SELECT z FROM t1",
@@ -3583,52 +3488,27 @@ mod catalog_strict {
                 statement_kind: StatementKind::Select,
                 reads: vec![unresolved("z")],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: None,
-                        name: "z".into(),
-                    },
-                    target: out("z", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
-                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnresolvedColumn)],
+                lineage: vec![passthrough(unresolved("z"), out("z", 0))],
+                diagnostics: vec![],
             },
         );
-        // Message-content check for this test's purpose.
-        let ops = extract_column_operations(&GenericDialect {}, "SELECT z FROM t1", Some(&catalog))
-            .unwrap();
-        let ops = ops.into_iter().next().unwrap().unwrap();
-        let unr = ops
-            .diagnostics
-            .iter()
-            .find(|d| matches!(d.kind, ColumnLevelDiagnosticKind::UnresolvedColumn))
-            .expect("UnresolvedColumn must fire");
-        assert!(unr.message.contains("unresolved column `z`"));
     }
 
     #[test]
-    fn no_catalog_unqualified_is_silent_even_when_ambiguous_shape() {
-        // No catalog → all schemas are Unknown → resolver can't
-        // tell whether `a` is genuinely in both t1 and t2, only one,
-        // or neither. Two diagnostic kinds are intentionally
-        // suppressed in this mode: AmbiguousColumn (no confirmed
-        // matches) and UnresolvedColumn (no Known schemas in scope).
-        // The resolution itself still returns None for the column,
-        // and the lineage source is also unresolved.
+    fn no_catalog_unqualified_is_ambiguous_under_unknown_suspects() {
+        // No catalog → all real-table schemas are Unknown. For the
+        // unqualified `a`, both t1 and t2 are Unknown suspects with
+        // no Known tiebreaker, so the read surfaces with table=None
+        // and Confidence::Ambiguous. No diagnostic fires:
+        // diagnostics are tool-side gaps (wildcard / unsupported),
+        // resolution outcomes live on the read's confidence.
         assert_column_ops(
             "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![read("t1", "id"), read("t2", "id"), unresolved("a")],
+                reads: vec![read("t1", "id"), read("t2", "id"), ambiguous("a")],
                 writes: vec![],
-                lineage: vec![ColumnLineageEdge {
-                    source: ColumnReference {
-                        table: None,
-                        name: "a".into(),
-                    },
-                    target: out("a", 0),
-                    kind: ColumnLineageKind::Passthrough,
-                }],
+                lineage: vec![passthrough(ambiguous("a"), out("a", 0))],
                 diagnostics: vec![],
             },
         );
@@ -3654,7 +3534,7 @@ mod expr_arm_coverage {
     use sqlparser::dialect::GenericDialect;
 
     /// `reads` of the first statement, resolved without a catalog.
-    fn reads(sql: &str) -> Vec<ColumnReference> {
+    fn reads(sql: &str) -> Vec<ColumnRead> {
         extract_column_operations(&GenericDialect {}, sql, None)
             .unwrap()
             .remove(0)
@@ -3664,7 +3544,7 @@ mod expr_arm_coverage {
 
     /// Like [`reads`], but parses under PostgreSQL — a few arms
     /// (e.g. `ARRAY[...]` literals) are syntax `GenericDialect` rejects.
-    fn reads_pg(sql: &str) -> Vec<ColumnReference> {
+    fn reads_pg(sql: &str) -> Vec<ColumnRead> {
         use sqlparser::dialect::PostgreSqlDialect;
         extract_column_operations(&PostgreSqlDialect {}, sql, None)
             .unwrap()
@@ -3673,15 +3553,20 @@ mod expr_arm_coverage {
             .reads
     }
 
-    /// A real-table column reference on the single table `t`.
-    fn c(name: &str) -> ColumnReference {
-        ColumnReference {
-            table: Some(TableReference {
-                catalog: None,
-                schema: None,
-                name: "t".into(),
-            }),
-            name: name.into(),
+    /// A real-table column read against the single table `t`. The
+    /// module runs without a catalog, so every resolved ref carries
+    /// [`Confidence::Inferred`].
+    fn c(name: &str) -> ColumnRead {
+        ColumnRead {
+            reference: ColumnReference {
+                table: Some(TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: "t".into(),
+                }),
+                name: name.into(),
+            },
+            confidence: Confidence::Inferred,
         }
     }
 
@@ -4144,11 +4029,28 @@ mod relation_arm_coverage {
             .unwrap()
     }
 
-    fn reads(sql: &str) -> Vec<ColumnReference> {
+    fn reads(sql: &str) -> Vec<ColumnRead> {
         op(sql).reads
     }
 
-    fn c(table: &str, name: &str) -> ColumnReference {
+    fn c(table: &str, name: &str) -> ColumnRead {
+        ColumnRead {
+            reference: ColumnReference {
+                table: Some(TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: table.into(),
+                }),
+                name: name.into(),
+            },
+            confidence: Confidence::Inferred,
+        }
+    }
+
+    /// Write-side build: stays bare [`ColumnReference`] since
+    /// `writes` is `Vec<ColumnReference>` (write targets come from
+    /// SQL syntax and don't carry a confidence).
+    fn w(table: &str, name: &str) -> ColumnReference {
         ColumnReference {
             table: Some(TableReference {
                 catalog: None,
@@ -4231,17 +4133,23 @@ mod relation_arm_coverage {
 
     #[test]
     fn table_function() {
+        // The function arg `t.a` is walked, but `t` is not in FROM (the
+        // sole relation is the table function `g`), so the qualified ref
+        // resolves to nothing → unresolved. Coverage point preserved:
+        // the column `a` still surfaces, proving the arg was walked.
         assert_eq!(
             reads("SELECT g.v FROM TABLE(gen(t.a)) g"),
-            vec![c("t", "a")]
+            vec![unresolved("a")]
         );
     }
 
     #[test]
     fn unnest() {
+        // `t` is not in FROM (only the UNNEST relation `u`), so `t.arr`
+        // is unresolved; the column still surfaces (arg walked).
         assert_eq!(
             reads("SELECT u.x FROM UNNEST(t.arr) u"),
-            vec![c("t", "arr")]
+            vec![unresolved("arr")]
         );
     }
 
@@ -4284,39 +4192,46 @@ mod relation_arm_coverage {
 
     #[test]
     fn json_table() {
-        // TableFactor::JsonTable — only the `json_expr` is a column
-        // read; the `COLUMNS (...)` schema declares synthetic outputs,
-        // and the `j.x` projection rides through them so it is dropped.
+        // TableFactor::JsonTable — the `json_expr` (`t.doc`) is walked;
+        // `t` is not in FROM (only the JSON_TABLE relation `j`), so it
+        // surfaces unresolved. The `COLUMNS (...)` schema declares
+        // synthetic outputs, and the `j.x` projection rides through them
+        // so it is dropped.
         assert_eq!(
             reads("SELECT j.x FROM JSON_TABLE(t.doc, '$' COLUMNS (x INT PATH '$.x')) AS j"),
-            vec![c("t", "doc")]
+            vec![unresolved("doc")]
         );
     }
 
     #[test]
     fn open_json_table() {
         // TableFactor::OpenJsonTable — same visit shape as JsonTable;
-        // only `t.doc` surfaces, the WITH-declared columns are synthetic.
+        // `t.doc` is walked but `t` is not in FROM → unresolved. The
+        // WITH-declared columns are synthetic.
         assert_eq!(
             reads("SELECT o.x FROM OPENJSON(t.doc) WITH (x INT '$.x') AS o"),
-            vec![c("t", "doc")]
+            vec![unresolved("doc")]
         );
     }
 
     #[test]
     fn xml_table() {
         // TableFactor::XmlTable — visits `row_expression` (here a string
-        // literal — no read) then each PASSING argument expression.
+        // literal — no read) then each PASSING argument expression
+        // (`t.doc`). `t` is not in FROM (only the XMLTABLE relation `x`),
+        // so it surfaces unresolved.
         assert_eq!(
             reads("SELECT x.v FROM XMLTABLE('/r' PASSING t.doc COLUMNS v INT PATH '@v') AS x"),
-            vec![c("t", "doc")]
+            vec![unresolved("doc")]
         );
     }
 
     #[test]
     fn semantic_view() {
         // TableFactor::SemanticView — Snowflake-only syntax. Visit order
-        // is dimensions → metrics → facts → where_clause.
+        // is dimensions → metrics → facts → where_clause. `t` is not in
+        // FROM (the relation is the semantic view itself), so the
+        // `t.a` / `t.b` refs surface unresolved.
         use sqlparser::dialect::SnowflakeDialect;
         assert_eq!(
             op_with(
@@ -4324,7 +4239,7 @@ mod relation_arm_coverage {
                 &SnowflakeDialect {},
             )
             .reads,
-            vec![c("t", "a"), c("t", "b")]
+            vec![unresolved("a"), unresolved("b")]
         );
     }
 
@@ -4351,14 +4266,14 @@ mod relation_arm_coverage {
             result.reads,
             vec![c("t1", "id"), c("t2", "id"), c("t2", "b"), c("t2", "b")]
         );
-        assert_eq!(result.writes, vec![c("t1", "a"), c("t1", "a")]);
+        assert_eq!(result.writes, vec![w("t1", "a"), w("t1", "a")]);
     }
 
     #[test]
     fn insert_on_conflict() {
         assert_eq!(
             op("INSERT INTO t1 (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = EXCLUDED.a").writes,
-            vec![c("t1", "a"), c("t1", "a")]
+            vec![w("t1", "a"), w("t1", "a")]
         );
     }
 
@@ -4366,21 +4281,21 @@ mod relation_arm_coverage {
     fn create_table_as_select() {
         let result = op("CREATE TABLE t2 AS SELECT t1.a FROM t1");
         assert_eq!(result.reads, vec![c("t1", "a")]);
-        assert_eq!(result.writes, vec![c("t2", "a")]);
+        assert_eq!(result.writes, vec![w("t2", "a")]);
     }
 
     #[test]
     fn create_view() {
         let result = op("CREATE VIEW v AS SELECT t1.a FROM t1");
         assert_eq!(result.reads, vec![c("t1", "a")]);
-        assert_eq!(result.writes, vec![c("v", "a")]);
+        assert_eq!(result.writes, vec![w("v", "a")]);
     }
 
     #[test]
     fn alter_table_add_column() {
         assert_eq!(
             op("ALTER TABLE t1 ADD COLUMN c INT").writes,
-            vec![c("t1", "c")]
+            vec![w("t1", "c")]
         );
     }
 
@@ -4393,21 +4308,21 @@ mod relation_arm_coverage {
     fn update() {
         let result = op("UPDATE t1 SET a = t1.b WHERE t1.c = 1");
         assert_eq!(result.reads, vec![c("t1", "b"), c("t1", "c")]);
-        assert_eq!(result.writes, vec![c("t1", "a")]);
+        assert_eq!(result.writes, vec![w("t1", "a")]);
     }
 
     #[test]
     fn insert_returning() {
         let result = op("INSERT INTO t1 (a) VALUES (1) RETURNING t1.a");
         assert_eq!(result.reads, vec![c("t1", "a")]);
-        assert_eq!(result.writes, vec![c("t1", "a")]);
+        assert_eq!(result.writes, vec![w("t1", "a")]);
     }
 
     #[test]
     fn insert_from_select() {
         let result = op("INSERT INTO t1 (a) SELECT t2.b FROM t2");
         assert_eq!(result.reads, vec![c("t2", "b")]);
-        assert_eq!(result.writes, vec![c("t1", "a")]);
+        assert_eq!(result.writes, vec![w("t1", "a")]);
     }
 
     // ---- query.rs: set operations / clauses ----
@@ -4671,7 +4586,7 @@ mod relation_arm_coverage {
         // column list, not the `TO` target.
         let result = op("CREATE VIEW v TO dst AS SELECT t.a FROM t");
         assert_eq!(result.reads, vec![c("t", "a")]);
-        assert_eq!(result.writes, vec![c("v", "a")]);
+        assert_eq!(result.writes, vec![w("v", "a")]);
     }
 
     #[test]
@@ -4691,7 +4606,7 @@ mod relation_arm_coverage {
         // `AlterTableOperation::ChangeColumn` with `old != new` mirrors
         // RenameColumn — both ends of the rename surface as writes.
         let result = op("ALTER TABLE t CHANGE COLUMN old new INT");
-        assert_eq!(result.writes, vec![c("t", "old"), c("t", "new")]);
+        assert_eq!(result.writes, vec![w("t", "old"), w("t", "new")]);
     }
 
     #[test]
@@ -4699,14 +4614,14 @@ mod relation_arm_coverage {
         // When `old == new`, ChangeColumn is a type / nullability change
         // rather than a rename — emit only the single column name.
         let result = op("ALTER TABLE t CHANGE COLUMN col col VARCHAR(255)");
-        assert_eq!(result.writes, vec![c("t", "col")]);
+        assert_eq!(result.writes, vec![w("t", "col")]);
     }
 
     #[test]
     fn alter_table_modify_column() {
         // MySQL `MODIFY COLUMN` — type change on a single column.
         let result = op("ALTER TABLE t MODIFY COLUMN col VARCHAR(255)");
-        assert_eq!(result.writes, vec![c("t", "col")]);
+        assert_eq!(result.writes, vec![w("t", "col")]);
     }
 
     #[test]
@@ -4717,7 +4632,7 @@ mod relation_arm_coverage {
         let result = op("WITH src AS (SELECT a, b FROM t2) \
              MERGE INTO t1 USING src ON t1.id = src.a \
              WHEN MATCHED THEN UPDATE SET col = src.b");
-        assert_eq!(result.writes, vec![c("t1", "col")]);
+        assert_eq!(result.writes, vec![w("t1", "col")]);
     }
 
     #[test]
@@ -4913,5 +4828,430 @@ mod supported_kind_only_coverage {
             assert!(op.lineage.is_empty(), "lineage for SQL: {sql}");
             assert!(op.diagnostics.is_empty(), "diagnostics for SQL: {sql}");
         }
+    }
+}
+
+/// Pins one row per case from the [`Confidence`] rustdoc's behavior
+/// table. Each test is the minimal SQL that exercises that arm and
+/// asserts the full expected reads vector — so this module doubles as
+/// behavior documentation: a reader can recover the catalog-less /
+/// catalog-aware semantics by reading the test bodies.
+#[cfg(test)]
+mod confidence_arm_coverage {
+    use super::*;
+    use crate::catalog::{Catalog, ColumnSchema};
+    use sqlparser::dialect::GenericDialect;
+    use std::collections::HashMap;
+
+    #[derive(Debug, Default)]
+    struct TestCatalog {
+        tables: HashMap<String, Vec<&'static str>>,
+    }
+
+    impl TestCatalog {
+        fn with(mut self, name: &str, cols: Vec<&'static str>) -> Self {
+            self.tables.insert(name.to_string(), cols);
+            self
+        }
+    }
+
+    impl Catalog for TestCatalog {
+        fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
+            self.tables.get(table.name.value.as_str()).map(|cols| {
+                cols.iter()
+                    .map(|c| ColumnSchema {
+                        name: c.to_string(),
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    fn extract_reads(sql: &str, catalog: Option<&dyn Catalog>) -> Vec<ColumnRead> {
+        extract_column_operations(&GenericDialect {}, sql, catalog)
+            .unwrap()
+            .remove(0)
+            .unwrap()
+            .reads
+    }
+
+    #[test]
+    fn catalog_less_sole_unknown_candidate_is_inferred() {
+        // Real `Unknown` table is the sole candidate → Inferred.
+        assert_eq!(
+            extract_reads("SELECT id FROM t1", None),
+            vec![read("t1", "id")]
+        );
+    }
+
+    #[test]
+    fn catalog_less_two_unknown_candidates_is_ambiguous() {
+        // Both candidates Unknown, no Known tiebreaker → Ambiguous.
+        // The `t1.id` / `t2.id` qualified refs in the ON predicate
+        // remain Inferred (qualifier-bound but Unknown schema).
+        assert_eq!(
+            extract_reads("SELECT id FROM t1 JOIN t2 ON t1.id = t2.id", None),
+            vec![read("t1", "id"), read("t2", "id"), ambiguous("id")]
+        );
+    }
+
+    #[test]
+    fn catalog_less_cte_known_body_drops_synthetic_confirmed_ref() {
+        // CTE `cte` has a `Known` body ([id]) derived from its
+        // projection. The outer `cte.id` qualified ref hits the CTE
+        // binding and would be internally Confirmed, but synthetic
+        // refs are dropped from public reads — only the inner real
+        // `t1.id` (Inferred) surfaces.
+        assert_eq!(
+            extract_reads("WITH cte AS (SELECT id FROM t1) SELECT id FROM cte", None),
+            vec![read("t1", "id")]
+        );
+    }
+
+    #[test]
+    fn catalog_less_cte_known_denies_column_is_unresolved() {
+        // CTE body = [id]; `unknown_col` cannot belong to the CTE.
+        // The outer ref surfaces with table=None / Unresolved.
+        assert_eq!(
+            extract_reads(
+                "WITH cte AS (SELECT id FROM t1) SELECT id, unknown_col FROM cte",
+                None
+            ),
+            vec![read("t1", "id"), unresolved("unknown_col")]
+        );
+    }
+
+    #[test]
+    fn catalog_aware_known_binding_lists_column_is_confirmed() {
+        let catalog = TestCatalog::default().with("t1", vec!["a"]);
+        assert_eq!(
+            extract_reads("SELECT a FROM t1", Some(&catalog)),
+            vec![read_confirmed("t1", "a")]
+        );
+    }
+
+    #[test]
+    fn catalog_aware_known_binding_missing_column_is_unresolved() {
+        let catalog = TestCatalog::default().with("t1", vec!["x", "y"]);
+        assert_eq!(
+            extract_reads("SELECT a FROM t1", Some(&catalog)),
+            vec![unresolved("a")]
+        );
+    }
+
+    #[test]
+    fn catalog_aware_known_witness_over_unknown_suspect_is_inferred() {
+        // t1 in catalog confirms `a`; t2 is catalog-less → Unknown
+        // suspect. Single Known winner adopted with Inferred (the
+        // Unknown suspect could in principle also contain `a`, so we
+        // don't claim Confirmed).
+        let catalog = TestCatalog::default().with("t1", vec!["a"]);
+        assert_eq!(
+            extract_reads("SELECT a FROM t1, t2", Some(&catalog)),
+            vec![read("t1", "a")]
+        );
+    }
+
+    #[test]
+    fn catalog_aware_two_known_confirms_is_ambiguous() {
+        let catalog = TestCatalog::default()
+            .with("t1", vec!["a"])
+            .with("t2", vec!["a"]);
+        // Both t1 and t2 confirm `a` — genuine ambiguity. The
+        // qualified `t1.a` / `t2.a` in ON are Confirmed individually.
+        assert_eq!(
+            extract_reads("SELECT a FROM t1 JOIN t2 ON t1.a = t2.a", Some(&catalog)),
+            vec![
+                read_confirmed("t1", "a"),
+                read_confirmed("t2", "a"),
+                ambiguous("a"),
+            ]
+        );
+    }
+
+    #[test]
+    fn qualified_ref_to_unknown_table_is_inferred() {
+        // `t.col` where t is `Unknown` (no catalog). The qualifier
+        // binds, but the column existence is assumed → Inferred.
+        assert_eq!(
+            extract_reads("SELECT t.id FROM t", None),
+            vec![read("t", "id")]
+        );
+    }
+
+    #[test]
+    fn qualified_ref_to_known_table_listing_column_is_confirmed() {
+        let catalog = TestCatalog::default().with("t", vec!["id"]);
+        assert_eq!(
+            extract_reads("SELECT t.id FROM t", Some(&catalog)),
+            vec![read_confirmed("t", "id")]
+        );
+    }
+}
+
+/// Pins the qualifier-matching behavior table: for a *qualified*
+/// column reference, which `FROM` binding (if any) owns it. Every row
+/// is decidable from SQL structure alone, so these run catalog-free and
+/// assert table identity + catalog-less confidence
+/// (`Inferred` for a resolved ref, `Ambiguous` / `Unresolved` for the
+/// failure modes). Catalog-confirmed (`Confirmed`) placement is covered
+/// separately in [`confidence_arm_coverage`].
+///
+/// The matching rule is ANSI right-anchored: a qualifier matches a
+/// non-aliased table when name segments are equal and each of
+/// schema / catalog is equal-or-either-absent; an alias hides the
+/// original name and matches only a single-segment qualifier equal to
+/// the alias.
+#[cfg(test)]
+mod qualified_ref_arm_coverage {
+    use super::*;
+
+    fn reads(sql: &str) -> Vec<ColumnRead> {
+        extract(sql).reads
+    }
+
+    /// A schema-qualified read (`schema.name.col`), catalog-less →
+    /// `Inferred`.
+    fn read2(schema: &str, name: &str, col: &str) -> ColumnRead {
+        read_with_ref(
+            TableReference {
+                catalog: None,
+                schema: Some(schema.into()),
+                name: name.into(),
+            },
+            col,
+            Confidence::Inferred,
+        )
+    }
+
+    #[test]
+    fn row1_bare_qualifier_matches_schema_qualified_binding() {
+        // `users` (no schema) matches `FROM mydb.users` — the binding
+        // fills the omitted schema. Surfaces the binding's full identity.
+        assert_eq!(
+            reads("SELECT users.id FROM mydb.users"),
+            vec![read2("mydb", "users", "id")]
+        );
+    }
+
+    #[test]
+    fn row2_full_qualifier_matches_exactly() {
+        assert_eq!(
+            reads("SELECT mydb.users.id FROM mydb.users"),
+            vec![read2("mydb", "users", "id")]
+        );
+    }
+
+    #[test]
+    fn row3_contradicting_schema_is_unresolved() {
+        // `otherdb.users` vs binding `mydb.users` — schema present on
+        // both and differs. Contradiction a catalog can't fix.
+        assert_eq!(
+            reads("SELECT otherdb.users.id FROM mydb.users"),
+            vec![unresolved("id")]
+        );
+    }
+
+    #[test]
+    fn row4_bare_qualifier_matches_bare_binding() {
+        assert_eq!(
+            reads("SELECT users.id FROM users"),
+            vec![read("users", "id")]
+        );
+    }
+
+    #[test]
+    fn row5_over_qualified_ref_resolves_to_binding_identity() {
+        // `mydb.users` vs bare binding `users` — the binding leaves the
+        // schema unspecified, so the ref's extra `mydb` matches as a
+        // wildcard. We surface the *binding's* identity (`users`), not
+        // the ref's unverified `mydb` qualifier — binding wins, for
+        // consistency with row 1 (always surface what FROM declared).
+        assert_eq!(
+            reads("SELECT mydb.users.id FROM users"),
+            vec![read("users", "id")]
+        );
+    }
+
+    #[test]
+    fn row6_alias_matches_alias() {
+        assert_eq!(
+            reads("SELECT u.id FROM mydb.users AS u"),
+            vec![read2("mydb", "users", "id")]
+        );
+    }
+
+    #[test]
+    fn row7_alias_hides_original_bare_name() {
+        // `users.id` against `FROM mydb.users AS u` — the alias hides
+        // the original name, so `users` matches nothing.
+        assert_eq!(
+            reads("SELECT users.id FROM mydb.users AS u"),
+            vec![unresolved("id")]
+        );
+    }
+
+    #[test]
+    fn row8_alias_hides_original_full_name() {
+        assert_eq!(
+            reads("SELECT mydb.users.id FROM mydb.users AS u"),
+            vec![unresolved("id")]
+        );
+    }
+
+    #[test]
+    fn row9_two_unaliased_same_name_tables_collide_in_scope() {
+        // IDEAL (real engine): `users` matches both `s1.users` and
+        // `s2.users` → AMBIGUOUS. KNOWN LIMITATION: the scope arena
+        // keys bindings by exposed name, and both tables expose
+        // `users`, so binding the second merges it into the first
+        // (role-merge) and drops `s2.users`. Only `s1.users` survives,
+        // so the ref resolves to it (Inferred) and the ambiguity is
+        // not detected. Aliasing the tables (row 13) sidesteps the
+        // collision. Pre-existing — independent of qualifier matching.
+        assert_eq!(
+            reads("SELECT users.id FROM s1.users, s2.users"),
+            vec![read2("s1", "users", "id")]
+        );
+    }
+
+    #[test]
+    fn row10_explicit_schema_disambiguates() {
+        assert_eq!(
+            reads("SELECT s1.users.id FROM s1.users, s2.users"),
+            vec![read2("s1", "users", "id")]
+        );
+    }
+
+    #[test]
+    fn row11_schema_matching_no_candidate_is_unresolved() {
+        assert_eq!(
+            reads("SELECT s3.users.id FROM s1.users, s2.users"),
+            vec![unresolved("id")]
+        );
+    }
+
+    #[test]
+    fn row12_alias_disambiguates_two_aliased_bindings() {
+        assert_eq!(
+            reads("SELECT u1.id FROM s1.users u1, s2.users u2"),
+            vec![read2("s1", "users", "id")]
+        );
+    }
+
+    #[test]
+    fn row13_bare_name_hidden_by_both_aliases_is_unresolved() {
+        assert_eq!(
+            reads("SELECT users.id FROM s1.users u1, s2.users u2"),
+            vec![unresolved("id")]
+        );
+    }
+
+    #[test]
+    fn row14_last_segment_uniquely_matches_one_binding() {
+        // `users` matches `mydb.users` but not `mydb.orders` (name
+        // differs). Unique → resolve.
+        assert_eq!(
+            reads("SELECT users.id FROM mydb.users, mydb.orders"),
+            vec![read2("mydb", "users", "id")]
+        );
+    }
+}
+
+/// Pins the dialect-aware identifier case-folding policy
+/// ([`crate::resolver`]'s `IdentifierCasing`) as observed through
+/// column resolution. The distinguishing cases are table-name
+/// case-sensitivity (BigQuery / MySQL real tables are case-sensitive;
+/// most dialects fold) and alias case-insensitivity (BigQuery aliases
+/// fold even though its tables don't). Column case-insensitivity is
+/// shown via a catalog.
+#[cfg(test)]
+mod dialect_casing_coverage {
+    use super::*;
+    use crate::catalog::{Catalog, ColumnSchema};
+    use sqlparser::dialect::{BigQueryDialect, GenericDialect, MySqlDialect};
+    use std::collections::HashMap;
+
+    #[derive(Debug, Default)]
+    struct TestCatalog {
+        tables: HashMap<String, Vec<&'static str>>,
+    }
+
+    impl TestCatalog {
+        fn with(mut self, name: &str, cols: Vec<&'static str>) -> Self {
+            self.tables.insert(name.to_string(), cols);
+            self
+        }
+    }
+
+    impl Catalog for TestCatalog {
+        fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
+            self.tables.get(table.name.value.as_str()).map(|cols| {
+                cols.iter()
+                    .map(|c| ColumnSchema {
+                        name: c.to_string(),
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    fn reads(sql: &str, dialect: &dyn Dialect, catalog: Option<&dyn Catalog>) -> Vec<ColumnRead> {
+        extract_column_operations(dialect, sql, catalog)
+            .unwrap()
+            .remove(0)
+            .unwrap()
+            .reads
+    }
+
+    #[test]
+    fn bigquery_qualified_table_ref_is_case_sensitive() {
+        // BigQuery tables are case-sensitive: qualifier `T1` does not
+        // match the binding `t1`, so the ref is unresolved.
+        assert_eq!(
+            reads("SELECT T1.id FROM t1", &BigQueryDialect {}, None),
+            vec![unresolved("id")]
+        );
+    }
+
+    #[test]
+    fn mysql_qualified_table_ref_is_case_sensitive() {
+        // MySQL real-table names default case-sensitive (filesystem
+        // fallback), same as BigQuery here.
+        assert_eq!(
+            reads("SELECT T1.id FROM t1", &MySqlDialect {}, None),
+            vec![unresolved("id")]
+        );
+    }
+
+    #[test]
+    fn generic_qualified_table_ref_is_case_insensitive() {
+        // The generic dialect folds lower-case, so `T1` matches `t1`
+        // and the ref resolves (Inferred — no catalog).
+        assert_eq!(
+            reads("SELECT T1.id FROM t1", &GenericDialect {}, None),
+            vec![read("t1", "id")]
+        );
+    }
+
+    #[test]
+    fn bigquery_alias_ref_is_case_insensitive() {
+        // BigQuery aliases fold case-insensitively even though its
+        // tables don't: `A` matches the alias `a`, resolving to t1.
+        assert_eq!(
+            reads("SELECT A.id FROM t1 AS a", &BigQueryDialect {}, None),
+            vec![read("t1", "id")]
+        );
+    }
+
+    #[test]
+    fn bigquery_column_is_case_insensitive() {
+        // BigQuery columns fold case-insensitively: `Id` matches the
+        // catalog's `id`, confirming the resolution on t1.
+        let catalog = TestCatalog::default().with("t1", vec!["id"]);
+        assert_eq!(
+            reads("SELECT Id FROM t1", &BigQueryDialect {}, Some(&catalog)),
+            vec![read_confirmed("t1", "Id")]
+        );
     }
 }
