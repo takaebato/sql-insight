@@ -1448,10 +1448,23 @@ mod tests {
         use super::*;
         use crate::catalog::{Catalog, CatalogTable};
 
-        /// A read the catalog uniquely identified.
+        /// The canonical `public.<name>` identity a registered table
+        /// surfaces with on the write / lineage-target side (bare
+        /// `TableReference`).
+        fn pub_table(name: &str) -> TableReference {
+            TableReference {
+                catalog: None,
+                schema: Some("public".into()),
+                name: name.into(),
+            }
+        }
+
+        /// A read the catalog uniquely identified. The tables here are
+        /// registered under `public`, so a unique match canonicalizes
+        /// the surfaced identity to `public.<name>`.
         fn cataloged(name: &str) -> TableRead {
             TableRead {
-                reference: table(name),
+                reference: pub_table(name),
                 resolution: ResolutionKind::Cataloged,
             }
         }
@@ -1519,6 +1532,30 @@ mod tests {
             .collect();
             let ops = ops_with_catalog("SELECT a FROM users", &catalog);
             assert_eq!(ops.reads, vec![ambiguous("users")]);
+        }
+
+        #[test]
+        fn canonicalizes_both_source_and_target_to_registered_path() {
+            // Both tables are written bare but registered under
+            // `public`; a unique match canonicalizes the surfaced
+            // identity everywhere — the read, the write target, and both
+            // ends of the lineage edge carry `public.<name>`.
+            let catalog: Catalog = [
+                CatalogTable::new("public", "orders"),
+                CatalogTable::new("public", "staging"),
+            ]
+            .into_iter()
+            .collect();
+            let ops = ops_with_catalog("INSERT INTO orders SELECT id FROM staging", &catalog);
+            assert_eq!(ops.reads, vec![cataloged("staging")]);
+            assert_eq!(ops.writes, vec![pub_table("orders")]);
+            assert_eq!(
+                ops.lineage,
+                vec![TableLineageEdge {
+                    source: cataloged("staging"),
+                    target: pub_table("orders"),
+                }]
+            );
         }
     }
 }

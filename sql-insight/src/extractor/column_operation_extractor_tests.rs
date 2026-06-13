@@ -15,17 +15,32 @@ fn table(name: &str) -> TableReference {
     }
 }
 
+/// The canonical identity a catalog-matched table surfaces with. The
+/// catalog-aware test modules all register tables under a `public`
+/// schema, and a unique match canonicalizes the reference to that full
+/// path — so `Cataloged` reads / writes / lineage carry `public.<name>`,
+/// not the bare name written in the SQL. Used by `read_confirmed` /
+/// `col_confirmed` and the catalog modules' write / relation helpers.
+fn cataloged_table(name: &str) -> TableReference {
+    TableReference {
+        catalog: None,
+        schema: Some("public".into()),
+        name: name.into(),
+    }
+}
+
 // Read-side helpers return `ColumnRead` (identity + ResolutionKind).
 // `read` and `col` both default to `ResolutionKind::Inferred`, which is
 // the catalog-less mode's natural resolution — most tests in this
 // file run without a catalog, so the default minimises noise. Tests
-// supplying a catalog override with `read_confirmed` / `col_confirmed`.
+// supplying a catalog override with `read_confirmed` / `col_confirmed`
+// (which carry the canonicalized `public.<name>` identity).
 fn read(table_name: &str, col: &str) -> ColumnRead {
     read_with(table_name, col, ResolutionKind::Inferred)
 }
 
 fn read_confirmed(table_name: &str, col: &str) -> ColumnRead {
-    read_with(table_name, col, ResolutionKind::Cataloged)
+    read_with_ref(cataloged_table(table_name), col, ResolutionKind::Cataloged)
 }
 
 fn read_with(table_name: &str, col: &str, resolution: ResolutionKind) -> ColumnRead {
@@ -47,7 +62,7 @@ fn col(table_name: &str, name: &str) -> ColumnRead {
 }
 
 fn col_confirmed(table_name: &str, name: &str) -> ColumnRead {
-    read_with(table_name, name, ResolutionKind::Cataloged)
+    read_with_ref(cataloged_table(table_name), name, ResolutionKind::Cataloged)
 }
 
 fn ambiguous(col: &str) -> ColumnRead {
@@ -3252,6 +3267,45 @@ mod catalog_strict {
         assert_column_ops_inner(sql, 0, actual, expected);
     }
 
+    // Every write target in this module is a registered (`public`) table,
+    // so the resolver canonicalizes it. Override the bare top-level
+    // `write` / `relation` helpers to carry the `public.<name>` identity.
+    // (Sources like `s` are unregistered and stay bare via `read` / `col`.)
+    fn write(table_name: &str, col: &str) -> ColumnReference {
+        ColumnReference {
+            table: Some(cataloged_table(table_name)),
+            name: col.into(),
+        }
+    }
+
+    fn relation(table_name: &str, col: &str) -> ColumnTarget {
+        ColumnTarget::Relation(ColumnReference {
+            table: Some(cataloged_table(table_name)),
+            name: col.into(),
+        })
+    }
+
+    #[test]
+    fn catalog_canonicalizes_bare_ref_to_registered_full_path() {
+        // `users` is written bare, but the catalog registers it under
+        // `public`; a unique match canonicalizes the surfaced owning
+        // table to `public.users` on both the read and the lineage
+        // source. (`read_confirmed` / `col_confirmed` carry that
+        // canonical identity.)
+        let catalog = TestCatalog::default().with("users", vec!["a"]);
+        assert_column_ops_with_catalog(
+            "SELECT a FROM users",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read_confirmed("users", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col_confirmed("users", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
     #[test]
     fn catalog_known_schema_rejects_columns_not_in_table() {
         // Without catalog `SELECT a FROM t1` resolves a → t1.a
@@ -4938,9 +4992,15 @@ mod confidence_arm_coverage {
         // Unknown suspect could in principle also contain `a`, so we
         // don't claim Cataloged).
         let catalog = TestCatalog::default().with("t1", vec!["a"]);
+        // t1 is cataloged → its identity canonicalizes to public.t1, but
+        // the placement is still Inferred (t2 is an Unknown suspect).
         assert_eq!(
             extract_reads("SELECT a FROM t1, t2", Some(&catalog)),
-            vec![read("t1", "a")]
+            vec![read_with_ref(
+                cataloged_table("t1"),
+                "a",
+                ResolutionKind::Inferred
+            )]
         );
     }
 

@@ -61,11 +61,18 @@ by hand.
 - The scope arena keys bindings by **merge-identity**
   (`binding_alias_key`): a non-aliased real table by its full
   `catalog.schema.name` path (`BindingKey::from_table`), an aliased
-  table / CTE / derived / table function by its single name. So
-  `mydb.users` and `otherdb.users` are distinct bindings (coexist),
-  and a bare `users` does not merge into a qualified `mydb.users`
-  (no default-schema assumption — catalog-driven canonicalization is
-  a future layer). The key drives the two **exact-identity**
+  table / CTE / derived / table function by its single name. The path
+  is the **catalog-canonicalized** identity: `bind_real_table` rewrites
+  a uniquely-matched reference to its registered full path *before*
+  keying (`catalog_canonical_ref`), so a bare `users` and an explicit
+  `public.users` collapse to one binding when the catalog confirms them
+  as the same table. Without a catalog — or on a miss / ambiguous match
+  — the reference keys as written, so `mydb.users` and `otherdb.users`
+  stay distinct and a bare `users` does not merge into `mydb.users`.
+  Write targets canonicalize too: the extractor routes column-write /
+  `Relation`-target identity through the resolver's canonicalized
+  binding (`canonical_write_target` / `Resolver::canonicalize`) so all
+  surfaces agree. The key drives the two **exact-identity**
   operations — merge-on-bind and CTE-name lookup
   (`resolve_unqualified_relation`); **right-anchored** column
   resolution scans `iter_bindings` instead (a partial qualifier like

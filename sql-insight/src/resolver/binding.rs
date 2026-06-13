@@ -313,12 +313,19 @@ pub(super) fn synthetic_table_ref(name: &Ident) -> TableReference {
 }
 
 /// Outcome of matching a query [`TableReference`] against the catalog.
-/// Drives both the table-level [`ResolutionKind`] and the column list.
+/// Drives the surfaced identity, the table-level [`ResolutionKind`],
+/// and the column list.
 enum CatalogMatch {
-    /// Exactly one registered table matched. Carries its column names
-    /// (possibly empty = schema known, columns unknown). →
-    /// [`ResolutionKind::Cataloged`].
-    Unique(Vec<String>),
+    /// Exactly one registered table matched. Carries the registered
+    /// table's `canonical` identity (the surfaced reference is rewritten
+    /// to it) and its column names (possibly empty = schema known,
+    /// columns unknown). → [`ResolutionKind::Cataloged`]. `canonical` is
+    /// boxed so this large variant doesn't bloat the unit `Ambiguous` /
+    /// `Miss` arms (`TableReference` is ~300B).
+    Unique {
+        canonical: Box<TableReference>,
+        columns: Vec<String>,
+    },
     /// Two or more registered tables matched the (under-qualified)
     /// reference — can't pick one. → [`ResolutionKind::Ambiguous`].
     Ambiguous,
@@ -344,6 +351,22 @@ fn catalog_match_ref(table: &CatalogTable) -> TableReference {
         catalog: table.catalog_segment().map(quoted_ident),
         schema: Some(quoted_ident(table.schema_segment())),
         name: quoted_ident(table.name_segment()),
+    }
+}
+
+/// Build the *surfaced* canonical identity of a matched table: plain
+/// (unquoted) `Ident`s built from the registered path, so the resulting
+/// reads / writes / lineage compare naturally and later
+/// column-qualifier matching folds the segments like any other bound
+/// table. A bare query `users` matching a registered `public.users`
+/// surfaces as `public.users` — this is what makes references to the
+/// same physical table from differently-qualified SQL collapse to one
+/// identity.
+fn catalog_canonical_ref(table: &CatalogTable) -> TableReference {
+    TableReference {
+        catalog: table.catalog_segment().map(Ident::new),
+        schema: Some(Ident::new(table.schema_segment())),
+        name: Ident::new(table.name_segment()),
     }
 }
 
@@ -399,14 +422,13 @@ impl<'a> Resolver<'a> {
         alias: Option<Ident>,
         role: TableRole,
     ) {
-        // The catalog match drives both the table-level resolution (how
-        // the catalog identified the table) and the column list (for
-        // strict column resolution). The surfaced identity is left
-        // exactly as written — catalog-driven canonicalization (filling
-        // the schema of a bare `users` from a matched `public.users`) is
-        // a separate layer (see CLAUDE.md).
-        let (resolution, output_columns) = match self.catalog_match(&table) {
-            CatalogMatch::Unique(columns) => {
+        // The catalog match drives the surfaced identity, the
+        // table-level resolution (how the catalog identified the table),
+        // and the column list (for strict column resolution). A unique
+        // hit canonicalizes the reference to the registered full path; a
+        // miss / ambiguous leaves it exactly as written.
+        let (table, resolution, output_columns) = match self.catalog_match(&table) {
+            CatalogMatch::Unique { canonical, columns } => {
                 // An empty registered column list means "schema known,
                 // columns unknown" (see `CatalogTable` docs) → leave
                 // `None` so any column could plausibly belong here,
@@ -417,10 +439,10 @@ impl<'a> Resolver<'a> {
                         .map(|c| Ident::with_quote('"', c))
                         .collect()
                 });
-                (ResolutionKind::Cataloged, output_columns)
+                (*canonical, ResolutionKind::Cataloged, output_columns)
             }
-            CatalogMatch::Ambiguous => (ResolutionKind::Ambiguous, None),
-            CatalogMatch::Miss => (ResolutionKind::Inferred, None),
+            CatalogMatch::Ambiguous => (table, ResolutionKind::Ambiguous, None),
+            CatalogMatch::Miss => (table, ResolutionKind::Inferred, None),
         };
         if role == TableRole::Read {
             // Read-position FROM/JOIN — emit a CapturedTableRef so table-lineage
@@ -459,7 +481,24 @@ impl<'a> Resolver<'a> {
             // than arbitrarily pick one.
             return CatalogMatch::Ambiguous;
         }
-        CatalogMatch::Unique(first.column_names().to_vec())
+        CatalogMatch::Unique {
+            canonical: Box::new(catalog_canonical_ref(first)),
+            columns: first.column_names().to_vec(),
+        }
+    }
+
+    /// Rewrite a write-target reference to its catalog-canonical
+    /// identity (the registered full path) when the catalog uniquely
+    /// matches it, so write / lineage-target surfaces use the same
+    /// identity as the canonicalized read binding (`bind_real_table`
+    /// canonicalizes that side independently). A miss / ambiguous match
+    /// leaves the reference exactly as written. Idempotent — a reference
+    /// that is already the canonical path matches itself.
+    pub(super) fn canonicalize(&self, table: TableReference) -> TableReference {
+        match self.catalog_match(&table) {
+            CatalogMatch::Unique { canonical, .. } => *canonical,
+            CatalogMatch::Ambiguous | CatalogMatch::Miss => table,
+        }
     }
 
     /// Resolve the effective target column list for INSERT-style
@@ -478,7 +517,7 @@ impl<'a> Resolver<'a> {
             return explicit.to_vec();
         }
         match self.catalog_match(target) {
-            CatalogMatch::Unique(columns) => columns.into_iter().map(Ident::new).collect(),
+            CatalogMatch::Unique { columns, .. } => columns.into_iter().map(Ident::new).collect(),
             CatalogMatch::Ambiguous | CatalogMatch::Miss => Vec::new(),
         }
     }

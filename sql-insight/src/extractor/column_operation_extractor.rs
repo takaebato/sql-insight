@@ -403,6 +403,23 @@ fn column_ref_from_parts(parts: &[Ident]) -> Option<ColumnReference> {
     })
 }
 
+/// The statement's canonical write target as the resolver bound it.
+/// Each verb handled by [`collect_writes`] has exactly one write
+/// target, so this reads the resolution's single write table — which
+/// the resolver has already catalog-canonicalized — and falls back to
+/// the AST-derived `ast_target` only when the resolution surfaced none
+/// (keeps the function total). Without a catalog the bound table equals
+/// the AST one, so this is a no-op there. Routing the target identity
+/// through the resolver keeps column writes consistent with the
+/// canonicalized reads / `Relation` lineage targets.
+fn canonical_write_target(resolution: &Resolution, ast_target: TableReference) -> TableReference {
+    resolution
+        .write_tables()
+        .into_iter()
+        .next()
+        .unwrap_or(ast_target)
+}
+
 /// Statement-specific write extraction. Covered:
 /// - INSERT explicit column list → writes scoped to the INSERT target.
 /// - UPDATE SET targets → writes scoped to the UPDATE target table
@@ -439,7 +456,7 @@ fn collect_writes(
     let mut writes = Vec::new();
     match statement {
         Statement::Insert(insert) => {
-            let target = TableReference::try_from(insert)?;
+            let target = canonical_write_target(resolution, TableReference::try_from(insert)?);
             if !insert.columns.is_empty() {
                 for col in &insert.columns {
                     writes.push(ColumnReference {
@@ -462,9 +479,10 @@ fn collect_writes(
         }
         Statement::Update(update) => {
             let default_table = match &update.table.relation {
-                TableFactor::Table { .. } => {
-                    Some(TableReference::try_from(&update.table.relation)?)
-                }
+                TableFactor::Table { .. } => Some(canonical_write_target(
+                    resolution,
+                    TableReference::try_from(&update.table.relation)?,
+                )),
                 _ => None,
             };
             for assignment in &update.assignments {
@@ -479,21 +497,21 @@ fn collect_writes(
         // `CREATE TABLE t (a INT, ...)` is pure DDL and falls through to
         // the no-op arm below.
         Statement::CreateTable(ct) if ct.query.is_some() => {
-            let target = TableReference::try_from(&ct.name)?;
+            let target = canonical_write_target(resolution, TableReference::try_from(&ct.name)?);
             let explicit: Vec<Ident> = ct.columns.iter().map(|c| c.name.clone()).collect();
             writes.extend(created_writes(&target, &explicit, resolution));
         }
         Statement::CreateView(cv) => {
-            let target = TableReference::try_from(&cv.name)?;
+            let target = canonical_write_target(resolution, TableReference::try_from(&cv.name)?);
             let explicit: Vec<Ident> = cv.columns.iter().map(|c| c.name.clone()).collect();
             writes.extend(created_writes(&target, &explicit, resolution));
         }
         Statement::AlterView { name, columns, .. } => {
-            let target = TableReference::try_from(name)?;
+            let target = canonical_write_target(resolution, TableReference::try_from(name)?);
             writes.extend(created_writes(&target, columns, resolution));
         }
         Statement::AlterTable(alter) => {
-            let target = TableReference::try_from(&alter.name)?;
+            let target = canonical_write_target(resolution, TableReference::try_from(&alter.name)?);
             for op in &alter.operations {
                 for col_name in alter_table_op_target_columns(op) {
                     writes.push(ColumnReference {
@@ -506,7 +524,9 @@ fn collect_writes(
         Statement::Merge(merge) => {
             use sqlparser::ast::MergeAction;
             let target = match &merge.table {
-                TableFactor::Table { .. } => TableReference::try_from(&merge.table).ok(),
+                TableFactor::Table { .. } => TableReference::try_from(&merge.table)
+                    .ok()
+                    .map(|t| canonical_write_target(resolution, t)),
                 _ => None,
             };
             for clause in &merge.clauses {

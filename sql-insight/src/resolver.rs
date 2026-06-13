@@ -558,7 +558,7 @@ impl<'a> Resolver<'a> {
             Statement::Delete(delete) => self.visit_delete(delete),
             Statement::Merge(merge) => self.visit_merge(merge),
             Statement::CreateTable(create_table) => {
-                let target = TableReference::try_from(&create_table.name)?;
+                let target = self.canonicalize(TableReference::try_from(&create_table.name)?);
                 self.bind_real_table(target.clone(), None, TableRole::Write);
                 if let Some(query) = &create_table.query {
                     // CTAS: source projections pair with the new
@@ -575,7 +575,7 @@ impl<'a> Resolver<'a> {
                 Ok(())
             }
             Statement::CreateView(create_view) => {
-                let target = TableReference::try_from(&create_view.name)?;
+                let target = self.canonicalize(TableReference::try_from(&create_view.name)?);
                 self.bind_real_table(target.clone(), None, TableRole::Write);
                 let explicit: Vec<sqlparser::ast::Ident> =
                     create_view.columns.iter().map(|c| c.name.clone()).collect();
@@ -592,7 +592,7 @@ impl<'a> Resolver<'a> {
                 columns,
                 ..
             } => {
-                let target = TableReference::try_from(name)?;
+                let target = self.canonicalize(TableReference::try_from(name)?);
                 self.bind_real_table(target.clone(), None, TableRole::Write);
                 let resolved = self.resolve_query(query)?;
                 self.emit_relation_to_created(&target, columns, &resolved);
@@ -770,7 +770,10 @@ impl<'a> Resolver<'a> {
     /// and dispatch the ON CONFLICT / ON DUPLICATE KEY clause.
     fn visit_insert(&mut self, insert: &sqlparser::ast::Insert) -> Result<(), Error> {
         let (table, alias) = TableReference::from_insert_with_alias(insert)?;
-        let target_table = table.clone();
+        // Canonicalize the target so the write / Relation-lineage
+        // surfaces match the canonicalized read binding bind_real_table
+        // produces.
+        let target_table = self.canonicalize(table.clone());
         self.bind_real_table(table, alias, TableRole::Write);
         // Explicit column list wins; otherwise fall back to the
         // catalog-provided schema (when present) for positional
@@ -966,7 +969,8 @@ impl<'a> Resolver<'a> {
                 self.visit_table_with_joins(table, TableRole::Read)?;
             }
         }
-        let target_table = try_target_table_from_factor(&update.table.relation);
+        let target_table =
+            try_target_table_from_factor(&update.table.relation).map(|t| self.canonicalize(t));
         self.emit_assignment_lineage(&update.assignments, target_table.as_ref())?;
         if let Some(selection) = &update.selection {
             self.suppress_lineage(|r| r.visit_expr(selection))?;
@@ -999,8 +1003,13 @@ impl<'a> Resolver<'a> {
             else {
                 continue;
             };
+            // Canonicalize the per-assignment target: the bare-target
+            // fallback already inherits the canonical `default_table`,
+            // but a qualified `SET schema.t.col` builds its table from
+            // the qualifier parts, so fold it to the registered identity
+            // here too.
             let target = LineageTargetSpec::Relation {
-                table: target_table_ref,
+                table: self.canonicalize(target_table_ref),
                 column: target_parts.last().cloned().unwrap(),
             };
             self.push_edges_from_refs_since(refs_before, target, kind);
@@ -1059,7 +1068,7 @@ impl<'a> Resolver<'a> {
         self.visit_table_factor(&merge.table, TableRole::Write)?;
         self.visit_table_factor(&merge.source, TableRole::Read)?;
         self.suppress_lineage(|r| r.visit_expr(&merge.on))?;
-        let target_table = try_target_table_from_factor(&merge.table);
+        let target_table = try_target_table_from_factor(&merge.table).map(|t| self.canonicalize(t));
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
                 self.suppress_lineage(|r| r.visit_expr(predicate))?;
