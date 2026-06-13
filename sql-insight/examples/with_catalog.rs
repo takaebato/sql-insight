@@ -14,46 +14,24 @@
 //!    `Cataloged` placements, ambiguity surfaces as `Ambiguous`, and
 //!    columns the catalog actively denies surface as `Unresolved`.
 
+use sql_insight::catalog::{Catalog, CatalogTable};
 use sql_insight::extractor::{extract_column_operations, ColumnTarget};
 use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::{
-    catalog::{Catalog, ColumnSchema},
-    ResolutionKind, TableReference,
-};
-use std::collections::HashMap;
-
-#[derive(Debug, Default)]
-struct InMemoryCatalog {
-    tables: HashMap<String, Vec<String>>,
-}
-
-impl InMemoryCatalog {
-    fn with(mut self, name: &str, columns: &[&str]) -> Self {
-        self.tables.insert(
-            name.to_string(),
-            columns.iter().map(|c| c.to_string()).collect(),
-        );
-        self
-    }
-}
-
-impl Catalog for InMemoryCatalog {
-    fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
-        self.tables.get(table.name.value.as_str()).map(|cols| {
-            cols.iter()
-                .map(|c| ColumnSchema { name: c.clone() })
-                .collect()
-        })
-    }
-}
+use sql_insight::ResolutionKind;
 
 fn main() {
     let dialect = GenericDialect {};
-    let catalog = InMemoryCatalog::default()
-        .with("orders", &["id", "total"])
-        .with("staging", &["order_id", "amount"])
-        .with("t1", &["a"])
-        .with("t2", &["a"]);
+    // A concrete, eager registry: every table registered under a
+    // `public` schema. The bare query references below resolve against
+    // it by right-anchored matching.
+    let catalog: Catalog = [
+        CatalogTable::new("public", "orders").columns(["id", "total"]),
+        CatalogTable::new("public", "staging").columns(["order_id", "amount"]),
+        CatalogTable::new("public", "t1").columns(["a"]),
+        CatalogTable::new("public", "t2").columns(["a"]),
+    ]
+    .into_iter()
+    .collect();
 
     // 1) INSERT without explicit columns — the catalog supplies the
     //    target column list so source projections pair positionally.

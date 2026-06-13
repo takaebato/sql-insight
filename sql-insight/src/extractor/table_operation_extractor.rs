@@ -52,7 +52,7 @@ use sqlparser::parser::Parser;
 pub fn extract_table_operations(
     dialect: &dyn Dialect,
     sql: &str,
-    catalog: Option<&dyn Catalog>,
+    catalog: Option<&Catalog>,
 ) -> Result<Vec<Result<TableOperation, Error>>, Error> {
     TableOperationExtractor::extract(dialect, sql, catalog)
 }
@@ -180,7 +180,7 @@ impl TableOperationExtractor {
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,
-        catalog: Option<&dyn Catalog>,
+        catalog: Option<&Catalog>,
     ) -> Result<Vec<Result<TableOperation, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         let casing = IdentifierCasing::for_dialect(dialect);
@@ -192,7 +192,7 @@ impl TableOperationExtractor {
 
     pub(crate) fn extract_from_statement(
         statement: &Statement,
-        catalog: Option<&dyn Catalog>,
+        catalog: Option<&Catalog>,
         casing: IdentifierCasing,
     ) -> Result<TableOperation, Error> {
         let kind = classify_statement(statement);

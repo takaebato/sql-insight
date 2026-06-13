@@ -84,11 +84,17 @@ use sqlparser::parser::Parser;
 
 /// Convenience function to extract column-level operations from SQL.
 ///
-/// `catalog` is consulted for relation-level enrichment as well as
-/// future column-level needs (`SELECT *` expansion, ambiguous
-/// unqualified column resolution). Pass `None` for the lightest path —
-/// the MVP does not consult the catalog yet, but the signature is fixed
-/// so callers don't have to migrate when it does.
+/// `catalog` is an optional schema registry (see [`Catalog`]). When
+/// supplied, table references are matched against it (right-anchored,
+/// dialect-cased): a
+/// unique hit canonicalizes the surfaced identity to the registered
+/// path and supplies the column list, turning column resolution strict
+/// (a column the schema doesn't list surfaces as
+/// [`Unresolved`](crate::ResolutionKind::Unresolved), and an unqualified
+/// name two known schemas both declare as
+/// [`Ambiguous`](crate::ResolutionKind::Ambiguous)). Pass `None` for
+/// best-effort, catalog-free resolution (every resolved read is
+/// [`Inferred`](crate::ResolutionKind::Inferred)).
 ///
 /// ## Example
 ///
@@ -133,7 +139,7 @@ use sqlparser::parser::Parser;
 pub fn extract_column_operations(
     dialect: &dyn Dialect,
     sql: &str,
-    catalog: Option<&dyn Catalog>,
+    catalog: Option<&Catalog>,
 ) -> Result<Vec<Result<ColumnOperation, Error>>, Error> {
     ColumnOperationExtractor::extract(dialect, sql, catalog)
 }
@@ -266,7 +272,7 @@ impl ColumnOperationExtractor {
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,
-        catalog: Option<&dyn Catalog>,
+        catalog: Option<&Catalog>,
     ) -> Result<Vec<Result<ColumnOperation, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
         let casing = IdentifierCasing::for_dialect(dialect);
@@ -278,7 +284,7 @@ impl ColumnOperationExtractor {
 
     fn extract_from_statement(
         statement: &Statement,
-        catalog: Option<&dyn Catalog>,
+        catalog: Option<&Catalog>,
         casing: IdentifierCasing,
     ) -> Result<ColumnOperation, Error> {
         let kind = super::table_operation_extractor::classify_statement(statement);

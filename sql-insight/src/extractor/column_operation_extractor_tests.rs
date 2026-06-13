@@ -3222,36 +3222,28 @@ mod returning {
 
 mod catalog_strict {
     use super::*;
-    use crate::catalog::{Catalog, ColumnSchema};
+    use crate::catalog::{Catalog, CatalogTable};
     use sqlparser::ast::Ident;
-    use std::collections::HashMap;
 
+    /// Builder over a real [`Catalog`], registering every table under a
+    /// `public` schema (bare query refs resolve against it by
+    /// right-anchored matching). Keeps the terse `.with(name, cols)`
+    /// shape the tests were written against.
     #[derive(Debug, Default)]
     struct TestCatalog {
-        tables: HashMap<String, Vec<&'static str>>,
+        catalog: Catalog,
     }
 
     impl TestCatalog {
         fn with(mut self, name: &str, cols: Vec<&'static str>) -> Self {
-            self.tables.insert(name.to_string(), cols);
+            self.catalog = std::mem::take(&mut self.catalog)
+                .table(CatalogTable::new("public", name).columns(cols));
             self
         }
     }
 
-    impl Catalog for TestCatalog {
-        fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
-            self.tables.get(table.name.value.as_str()).map(|cols| {
-                cols.iter()
-                    .map(|c| ColumnSchema {
-                        name: c.to_string(),
-                    })
-                    .collect()
-            })
-        }
-    }
-
-    fn assert_column_ops_with_catalog(sql: &str, catalog: &dyn Catalog, expected: ColumnOperation) {
-        let actual = extract_column_operations(&GenericDialect {}, sql, Some(catalog))
+    fn assert_column_ops_with_catalog(sql: &str, catalog: &TestCatalog, expected: ColumnOperation) {
+        let actual = extract_column_operations(&GenericDialect {}, sql, Some(&catalog.catalog))
             .unwrap()
             .into_iter()
             .next()
@@ -4851,36 +4843,24 @@ mod supported_kind_only_coverage {
 #[cfg(test)]
 mod confidence_arm_coverage {
     use super::*;
-    use crate::catalog::{Catalog, ColumnSchema};
+    use crate::catalog::{Catalog, CatalogTable};
     use sqlparser::dialect::GenericDialect;
-    use std::collections::HashMap;
 
     #[derive(Debug, Default)]
     struct TestCatalog {
-        tables: HashMap<String, Vec<&'static str>>,
+        catalog: Catalog,
     }
 
     impl TestCatalog {
         fn with(mut self, name: &str, cols: Vec<&'static str>) -> Self {
-            self.tables.insert(name.to_string(), cols);
+            self.catalog = std::mem::take(&mut self.catalog)
+                .table(CatalogTable::new("public", name).columns(cols));
             self
         }
     }
 
-    impl Catalog for TestCatalog {
-        fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
-            self.tables.get(table.name.value.as_str()).map(|cols| {
-                cols.iter()
-                    .map(|c| ColumnSchema {
-                        name: c.to_string(),
-                    })
-                    .collect()
-            })
-        }
-    }
-
-    fn extract_reads(sql: &str, catalog: Option<&dyn Catalog>) -> Vec<ColumnRead> {
-        extract_column_operations(&GenericDialect {}, sql, catalog)
+    fn extract_reads(sql: &str, catalog: Option<&TestCatalog>) -> Vec<ColumnRead> {
+        extract_column_operations(&GenericDialect {}, sql, catalog.map(|c| &c.catalog))
             .unwrap()
             .remove(0)
             .unwrap()
@@ -5178,36 +5158,24 @@ mod qualified_ref_arm_coverage {
 #[cfg(test)]
 mod dialect_casing_coverage {
     use super::*;
-    use crate::catalog::{Catalog, ColumnSchema};
+    use crate::catalog::{Catalog, CatalogTable};
     use sqlparser::dialect::{BigQueryDialect, GenericDialect, MySqlDialect};
-    use std::collections::HashMap;
 
     #[derive(Debug, Default)]
     struct TestCatalog {
-        tables: HashMap<String, Vec<&'static str>>,
+        catalog: Catalog,
     }
 
     impl TestCatalog {
         fn with(mut self, name: &str, cols: Vec<&'static str>) -> Self {
-            self.tables.insert(name.to_string(), cols);
+            self.catalog = std::mem::take(&mut self.catalog)
+                .table(CatalogTable::new("public", name).columns(cols));
             self
         }
     }
 
-    impl Catalog for TestCatalog {
-        fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
-            self.tables.get(table.name.value.as_str()).map(|cols| {
-                cols.iter()
-                    .map(|c| ColumnSchema {
-                        name: c.to_string(),
-                    })
-                    .collect()
-            })
-        }
-    }
-
-    fn reads(sql: &str, dialect: &dyn Dialect, catalog: Option<&dyn Catalog>) -> Vec<ColumnRead> {
-        extract_column_operations(dialect, sql, catalog)
+    fn reads(sql: &str, dialect: &dyn Dialect, catalog: Option<&TestCatalog>) -> Vec<ColumnRead> {
+        extract_column_operations(dialect, sql, catalog.map(|c| &c.catalog))
             .unwrap()
             .remove(0)
             .unwrap()

@@ -105,7 +105,7 @@ pub(crate) struct ResolvedQuery {
 pub(crate) struct Resolver<'a> {
     /// `None` means the resolver runs without external schema
     /// enrichment; tables bound here carry `output_columns: None`.
-    catalog: Option<&'a dyn Catalog>,
+    catalog: Option<&'a Catalog>,
     /// The [`Resolution`] under construction. Walk-time methods push
     /// directly into its `diagnostics` / `column_refs` /
     /// `lineage_edges` / `table_refs` buffers and the `scopes` arena;
@@ -166,7 +166,7 @@ impl Default for Context {
 impl<'a> Resolver<'a> {
     /// Internal constructor. Public callers go through
     /// [`Self::resolve_statement`].
-    fn new(catalog: Option<&'a dyn Catalog>, casing: IdentifierCasing) -> Self {
+    fn new(catalog: Option<&'a Catalog>, casing: IdentifierCasing) -> Self {
         let resolution = Resolution {
             casing,
             ..Resolution::default()
@@ -185,7 +185,7 @@ impl<'a> Resolver<'a> {
     /// alias / column identifiers compare for equality during
     /// resolution.
     pub(crate) fn resolve_statement(
-        catalog: Option<&'a dyn Catalog>,
+        catalog: Option<&'a Catalog>,
         statement: &Statement,
         casing: IdentifierCasing,
     ) -> Result<Resolution, Error> {
@@ -2231,37 +2231,22 @@ fn assignment_target_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::ColumnSchema;
-    use crate::reference::TableReference;
+    use crate::catalog::CatalogTable;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
-    use std::collections::HashMap;
 
-    #[derive(Debug, Default)]
-    struct TestCatalog {
-        tables: HashMap<String, Vec<&'static str>>,
+    /// Build a catalog from `(table_name, columns)` pairs, all under a
+    /// `public` schema. Query references in these tests are bare, so
+    /// right-anchored matching resolves them against the schema-qualified
+    /// registration.
+    fn catalog(tables: &[(&str, &[&str])]) -> Catalog {
+        tables
+            .iter()
+            .map(|(name, cols)| CatalogTable::new("public", *name).columns(cols.iter().copied()))
+            .collect()
     }
 
-    impl TestCatalog {
-        fn with(mut self, name: &str, cols: Vec<&'static str>) -> Self {
-            self.tables.insert(name.to_string(), cols);
-            self
-        }
-    }
-
-    impl Catalog for TestCatalog {
-        fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
-            self.tables.get(table.name.value.as_str()).map(|cols| {
-                cols.iter()
-                    .map(|c| ColumnSchema {
-                        name: c.to_string(),
-                    })
-                    .collect()
-            })
-        }
-    }
-
-    fn resolve(sql: &str, catalog: Option<&dyn Catalog>) -> Resolution {
+    fn resolve(sql: &str, catalog: Option<&Catalog>) -> Resolution {
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql).unwrap();
         let casing = IdentifierCasing::for_dialect(&dialect);
@@ -2281,7 +2266,7 @@ mod tests {
 
     #[test]
     fn catalog_hit_populates_table_columns() {
-        let catalog = TestCatalog::default().with("users", vec!["id", "email"]);
+        let catalog = catalog(&[("users", &["id", "email"])]);
         let resolution = resolve("SELECT * FROM users", Some(&catalog));
         match first_table_columns(&resolution) {
             Some(Some(cols)) => {
@@ -2295,7 +2280,7 @@ mod tests {
 
     #[test]
     fn catalog_miss_leaves_columns_unknown() {
-        let catalog = TestCatalog::default();
+        let catalog = catalog(&[]);
         let resolution = resolve("SELECT * FROM users", Some(&catalog));
         assert!(matches!(first_table_columns(&resolution), Some(None)));
     }
@@ -2308,7 +2293,7 @@ mod tests {
 
     #[test]
     fn catalog_lookup_ignores_alias() {
-        let catalog = TestCatalog::default().with("users", vec!["id"]);
+        let catalog = catalog(&[("users", &["id"])]);
         let resolution = resolve("SELECT * FROM users AS u", Some(&catalog));
         assert!(matches!(first_table_columns(&resolution), Some(Some(_))));
     }

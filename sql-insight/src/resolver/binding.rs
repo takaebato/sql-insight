@@ -6,7 +6,7 @@
 use sqlparser::ast::{Ident, ObjectName, Statement};
 use sqlparser::tokenizer::Span;
 
-use crate::catalog::ColumnSchema;
+use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::reference::TableReference;
 
@@ -303,6 +303,47 @@ pub(super) fn synthetic_table_ref(name: &Ident) -> TableReference {
     }
 }
 
+/// A quoted `Ident` over a catalog-side string. Quoting makes the
+/// segment fold with *exact* semantics (preserved under `Upper` /
+/// `Lower`, case-folded only under `Insensitive`, preserved under
+/// `Sensitive`) — i.e. registered names behave like quoted identifiers,
+/// per the [`crate::catalog`] module docs.
+fn quoted_ident(s: &str) -> Ident {
+    Ident::with_quote('"', s)
+}
+
+/// Build a [`TableReference`] for *matching* a registered table: each
+/// segment is a quoted `Ident` so the comparison treats catalog names
+/// as exact (see [`quoted_ident`]).
+fn catalog_match_ref(table: &CatalogTable) -> TableReference {
+    TableReference {
+        catalog: table.catalog_segment().map(quoted_ident),
+        schema: Some(quoted_ident(table.schema_segment())),
+        name: quoted_ident(table.name_segment()),
+    }
+}
+
+/// Fill a query reference's missing prefix segments from the catalog's
+/// configured defaults before matching: a bare name picks up the
+/// default schema (then catalog), a `schema.name` picks up the default
+/// catalog. The catalog segment is only filled once a schema is present
+/// so we never synthesize a `catalog.<gap>.name` path. Filled segments
+/// are quoted (exact) like registered names.
+fn fill_query_defaults(table: &TableReference, catalog: &Catalog) -> TableReference {
+    let mut filled = table.clone();
+    if filled.schema.is_none() {
+        if let Some(schema) = catalog.default_schema_segment() {
+            filled.schema = Some(quoted_ident(schema));
+        }
+    }
+    if filled.catalog.is_none() && filled.schema.is_some() {
+        if let Some(catalog_segment) = catalog.default_catalog_segment() {
+            filled.catalog = Some(quoted_ident(catalog_segment));
+        }
+    }
+    filled
+}
+
 /// Convert a raw sqlparser `Span` to the `Option<Span>` shape stored on
 /// `ColumnLevelDiagnostic`: an empty span (sqlparser convention: `line == 0`) is
 /// flattened to `None` so consumers can distinguish "no source location"
@@ -334,7 +375,24 @@ impl<'a> Resolver<'a> {
         alias: Option<Ident>,
         role: TableRole,
     ) {
-        let output_columns = self.lookup_catalog_columns(&table);
+        // A catalog hit supplies the table's column list; a miss (or no
+        // catalog) leaves columns unknown. The surfaced identity is left
+        // exactly as written — catalog-driven canonicalization (filling
+        // the schema of a bare `users` from a matched `public.users`) is
+        // a separate layer landed with the table-level resolution
+        // surface (see CLAUDE.md).
+        let output_columns = self.catalog_match(&table).and_then(|columns| {
+            // An empty registered column list means "schema known,
+            // columns unknown" (see `CatalogTable` docs) → leave `None`
+            // so any column could plausibly belong here, rather than
+            // `Some([])` which would reject every ref.
+            (!columns.is_empty()).then(|| {
+                columns
+                    .into_iter()
+                    .map(|c| Ident::with_quote('"', c))
+                    .collect()
+            })
+        });
         if role == TableRole::Read {
             // Read-position FROM/JOIN — emit a CapturedTableRef so table-lineage
             // collapse sees this as a real source. Write targets feed
@@ -349,18 +407,28 @@ impl<'a> Resolver<'a> {
         });
     }
 
-    /// Query the optional catalog for a table's columns.
-    /// `TableReference` is already alias-free, so it is a valid
-    /// catalog key as-is. Returns `None` when no catalog is supplied
-    /// or the catalog has no entry for the table.
-    fn lookup_catalog_columns(&self, table: &TableReference) -> Option<Vec<Ident>> {
+    /// Match a query [`TableReference`] against the catalog by
+    /// right-anchored, dialect-cased comparison (after default-fill). On
+    /// a *unique* match returns the registered table's column names;
+    /// multiple matches (ambiguous registration) or none yield `None`,
+    /// leaving the reference best-effort with unknown columns. See the
+    /// [`crate::catalog`] module docs for the matching contract.
+    fn catalog_match(&self, table: &TableReference) -> Option<Vec<String>> {
         let catalog = self.catalog?;
-        let cols = catalog.columns(table)?;
-        Some(
-            cols.into_iter()
-                .map(|ColumnSchema { name }| Ident::new(name))
-                .collect(),
-        )
+        let filled = fill_query_defaults(table, catalog);
+        let table_fold = self.resolution.casing.table;
+        let mut hits = catalog
+            .tables()
+            .iter()
+            .filter(|t| qualifier_matches_table(&filled, &catalog_match_ref(t), table_fold));
+        let first = hits.next()?;
+        if hits.next().is_some() {
+            // Ambiguous registration (e.g. a bare `users` matching two
+            // distinct `*.users` entries) — stay best-effort rather
+            // than arbitrarily pick one.
+            return None;
+        }
+        Some(first.column_names().to_vec())
     }
 
     /// Resolve the effective target column list for INSERT-style
@@ -368,7 +436,8 @@ impl<'a> Resolver<'a> {
     /// otherwise the catalog-provided schema if known. Returns an
     /// empty `Vec` when neither path yields names — the caller then
     /// emits no Relation edges (matches the no-catalog
-    /// column-list-less INSERT behavior).
+    /// column-list-less INSERT behavior). Catalog columns surface as
+    /// plain (unquoted) `Ident`s here since they become write targets.
     pub(super) fn effective_target_columns(
         &self,
         explicit: &[Ident],
@@ -377,7 +446,9 @@ impl<'a> Resolver<'a> {
         if !explicit.is_empty() {
             return explicit.to_vec();
         }
-        self.lookup_catalog_columns(target).unwrap_or_default()
+        self.catalog_match(target)
+            .map(|columns| columns.into_iter().map(Ident::new).collect())
+            .unwrap_or_default()
     }
 
     /// Look up an in-scope CTE's `output_columns`, for re-binding

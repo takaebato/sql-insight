@@ -4,7 +4,7 @@
 //! top-level items are equivalent to a `mod tests` in the library —
 //! no extra wrapper module needed.
 
-use sql_insight::catalog::{Catalog, ColumnSchema};
+use sql_insight::catalog::{Catalog, CatalogTable};
 use sql_insight::diagnostic::{ColumnLevelDiagnosticKind, TableLevelDiagnosticKind};
 use sql_insight::extractor::{
     extract_column_operations, extract_crud_tables, extract_table_operations, extract_tables,
@@ -14,7 +14,6 @@ use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::test_utils::all_dialects;
 use sql_insight::TableReference;
-use std::collections::HashMap;
 
 mod format {
     use super::*;
@@ -348,27 +347,18 @@ mod extract_column_operations {
 mod catalog {
     use super::*;
 
+    /// Builder over a real [`Catalog`], registering every table under a
+    /// `public` schema; bare query refs resolve by right-anchored match.
     #[derive(Debug, Default)]
     struct TestCatalog {
-        tables: HashMap<String, Vec<&'static str>>,
+        catalog: Catalog,
     }
 
     impl TestCatalog {
         fn with(mut self, name: &str, cols: Vec<&'static str>) -> Self {
-            self.tables.insert(name.to_string(), cols);
+            self.catalog = std::mem::take(&mut self.catalog)
+                .table(CatalogTable::new("public", name).columns(cols));
             self
-        }
-    }
-
-    impl Catalog for TestCatalog {
-        fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
-            self.tables.get(table.name.value.as_str()).map(|cols| {
-                cols.iter()
-                    .map(|c| ColumnSchema {
-                        name: c.to_string(),
-                    })
-                    .collect()
-            })
         }
     }
 
@@ -380,7 +370,8 @@ mod catalog {
             .with("orders", vec!["id", "total"])
             .with("staging", vec!["id", "amount"]);
         let sql = "INSERT INTO orders SELECT id, amount FROM staging";
-        let result = extract_column_operations(&GenericDialect {}, sql, Some(&catalog)).unwrap();
+        let result =
+            extract_column_operations(&GenericDialect {}, sql, Some(&catalog.catalog)).unwrap();
         let ops = result[0].as_ref().unwrap();
         // Two lineage edges into Relation targets orders.id / orders.total.
         let relation_targets: Vec<_> = ops
@@ -406,7 +397,8 @@ mod catalog {
             .with("t2", vec!["a"]);
         let sql = "SELECT a FROM t1 JOIN t2 ON t1.a = t2.a";
 
-        let with = extract_column_operations(&GenericDialect {}, sql, Some(&catalog)).unwrap();
+        let with =
+            extract_column_operations(&GenericDialect {}, sql, Some(&catalog.catalog)).unwrap();
         let without = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
 
         let with_reads = &with[0].as_ref().unwrap().reads;
@@ -449,7 +441,8 @@ mod catalog {
         let catalog = TestCatalog::default().with("t1", vec!["a", "b"]);
         let sql = "SELECT missing FROM t1";
 
-        let with = extract_column_operations(&GenericDialect {}, sql, Some(&catalog)).unwrap();
+        let with =
+            extract_column_operations(&GenericDialect {}, sql, Some(&catalog.catalog)).unwrap();
         let without = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
 
         let with_reads = &with[0].as_ref().unwrap().reads;
@@ -517,21 +510,7 @@ mod diagnostics {
         // text without a parallel diagnostic stream.
         //
         // `missing` starts at column 8 in `SELECT missing FROM t1`.
-        #[derive(Debug, Default)]
-        struct C(HashMap<String, Vec<&'static str>>);
-        impl Catalog for C {
-            fn columns(&self, table: &TableReference) -> Option<Vec<ColumnSchema>> {
-                self.0.get(table.name.value.as_str()).map(|cols| {
-                    cols.iter()
-                        .map(|c| ColumnSchema {
-                            name: c.to_string(),
-                        })
-                        .collect()
-                })
-            }
-        }
-        let mut catalog = C::default();
-        catalog.0.insert("t1".to_string(), vec!["a", "b"]);
+        let catalog = Catalog::new().table(CatalogTable::new("public", "t1").columns(["a", "b"]));
 
         let result =
             extract_column_operations(&GenericDialect {}, "SELECT missing FROM t1", Some(&catalog))
