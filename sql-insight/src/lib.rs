@@ -193,6 +193,10 @@
 //!   `#[non_exhaustive]` at the 1.0 freeze, once the variant sets
 //!   stabilize.
 
+// Incubating "bound plan" (design "B") — a materialized full-stack
+// operator tree built alongside the current `resolver` (strangler).
+// Not yet wired into any extractor; kept private while it grows.
+mod bind;
 pub mod catalog;
 pub mod diagnostic;
 pub mod error;
