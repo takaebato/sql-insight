@@ -42,6 +42,36 @@ fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
     }
 }
 
+/// The reads of a plan *below* its top output columns — a nested
+/// subquery's filter-only reads. Its output provenance is taken
+/// separately (as the enclosing value's lineage sources), so skipping it
+/// here keeps the subquery's output from being counted twice.
+pub(crate) fn input_reads(plan: &Plan) -> Vec<ColumnRead> {
+    let mut reads = Vec::new();
+    collect_input_reads(plan, &mut reads);
+    reads
+}
+
+fn collect_input_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
+    match plan {
+        // Skip the top producer's output columns; walk everything beneath.
+        Plan::Project(project) => collect_reads(&project.input, out),
+        Plan::SetOp(set) => {
+            for operand in &set.operands {
+                collect_input_reads(operand, out);
+            }
+        }
+        Plan::PassThrough(pt) => {
+            out.extend(pt.reads.iter().cloned());
+            for input in &pt.inputs {
+                collect_input_reads(input, out);
+            }
+        }
+        // No output columns to skip — every read is a filter read.
+        Plan::Scan(_) | Plan::OpaqueLeaf(_) | Plan::Write(_) => collect_reads(plan, out),
+    }
+}
+
 /// Every column the statement writes: a [`Write`]'s target columns
 /// qualified by its target relation. A bare query writes nothing.
 pub(crate) fn extract_writes(plan: &Plan) -> Vec<ColumnReference> {
@@ -120,7 +150,7 @@ fn emit_edges(column: &BoundColumn, target: &ColumnTarget, out: &mut Vec<ColumnL
 /// The output-column operands of a plan: one list per set-operation
 /// branch (a plain `Project` has a single operand). Filter `PassThrough`
 /// wrappers (clause reads / ORDER BY) are peeled to the producer beneath.
-fn output_operands(plan: &Plan) -> Vec<&[BoundColumn]> {
+pub(crate) fn output_operands(plan: &Plan) -> Vec<&[BoundColumn]> {
     match plan {
         Plan::Project(project) => vec![&project.outputs],
         Plan::SetOp(set) => set.operands.iter().flat_map(output_operands).collect(),
@@ -279,6 +309,11 @@ mod differential {
             // relation falls through the correlation stack to it.
             "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a)",
             "SELECT a FROM t WHERE b > (SELECT avg(c) FROM u WHERE u.k = t.a)",
+            // Scalar subquery in a projection (value position): only its
+            // output is a lineage source of the column; its internal
+            // predicate reads surface as reads, not lineage.
+            "SELECT (SELECT max(x) FROM u) AS m FROM t",
+            "SELECT (SELECT max(x) FROM u WHERE u.t_id = t.id) AS m FROM t",
             // Set operations (UNION / INTERSECT / EXCEPT): reads fan in
             // from every branch; a derived/CTE over a UNION traces each.
             "SELECT a FROM t UNION SELECT b FROM u",
@@ -302,25 +337,13 @@ mod differential {
     }
 
     /// Statements whose `reads` / `writes` match the resolver but whose
-    /// `lineage` intentionally differs, so the harness checks only the
-    /// first two surfaces. Two reasons:
-    ///
-    /// - **Deferred** (B incomplete): a scalar subquery in a *projection*
-    ///   with its own internal filter — only the subquery's output is a
-    ///   lineage source, but its filter reads currently share the
-    ///   projection column's provenance and would surface as spurious
-    ///   sources. The value-vs-filter split inside a value-position
-    ///   subquery is a later refinement.
-    /// - **Improvement** (B better): a recursive CTE — B collapses the
-    ///   body's output through to the real base table, while the resolver
-    ///   stops at the CTE binding as the lineage source (its documented
-    ///   deferred recursive-body collapse).
+    /// `lineage` is a deliberate **improvement**, so the harness checks
+    /// only the first two surfaces: a recursive CTE — B collapses the
+    /// body's output through to the real base table, while the resolver
+    /// stops at the CTE binding as the lineage source (its documented
+    /// deferred recursive-body collapse).
     fn reads_writes_only_corpus() -> &'static [&'static str] {
         &[
-            // Deferred — projection subquery filter reads vs lineage.
-            "SELECT (SELECT max(x) FROM u) AS m FROM t",
-            "SELECT (SELECT max(x) FROM u WHERE u.t_id = t.id) AS m FROM t",
-            // Improvement — recursive CTE collapses to the real table.
             "WITH RECURSIVE c AS (SELECT id FROM t UNION ALL SELECT id FROM c) SELECT id FROM c",
             "WITH RECURSIVE c(n) AS (SELECT 1 FROM t UNION ALL SELECT n + 1 FROM c WHERE n < 10) SELECT n FROM c",
         ]
@@ -358,6 +381,30 @@ mod differential {
             })
             .collect();
         assert_eq!(source_tables, set(&[Some("t".to_string())]));
+    }
+
+    #[test]
+    fn projection_subquery_lineage_excludes_internal_filter() {
+        // A scalar subquery in a projection: only its output (u.x) is a
+        // lineage source of `m`; its internal predicate (u.t_id = t.id)
+        // reads columns but is not lineage.
+        let plan = bind_one(
+            "SELECT (SELECT max(x) FROM u WHERE u.t_id = t.id) AS m FROM t",
+            None,
+        );
+        let lineage_sources: Vec<(String, String)> = extract_lineage(&plan)
+            .iter()
+            .map(|edge| {
+                let r = &edge.source.reference;
+                (
+                    r.table.as_ref().unwrap().name.value.clone(),
+                    r.name.value.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(lineage_sources, vec![("u".to_string(), "x".to_string())]);
+        // The filter columns still surface as reads (u.x, u.t_id, t.id).
+        assert_eq!(set(&extract_reads(&plan)).len(), 3);
     }
 
     #[test]

@@ -237,21 +237,19 @@ impl Binder<'_> {
                 scope = scope.merge(from_scope);
             }
         }
-        let where_reads = update
+        let mut reads = update
             .selection
             .as_ref()
             .map(|s| self.expr_reads(s, &scope))
             .unwrap_or_default();
-        let source = wrap_inputs(inputs, where_reads);
         let mut outputs = Vec::new();
         let mut target_columns = Vec::new();
         for assignment in &update.assignments {
             for column in assignment_target_columns(&assignment.target) {
-                outputs.push(self.bind_value_column(
-                    Some(column.clone()),
-                    &assignment.value,
-                    &scope,
-                ));
+                let (output, filters) =
+                    self.bind_value_column(Some(column.clone()), &assignment.value, &scope);
+                outputs.push(output);
+                reads.extend(filters);
                 target_columns.push(column);
             }
         }
@@ -260,7 +258,7 @@ impl Binder<'_> {
             target,
             target_columns,
             input: Box::new(Plan::Project(Project {
-                input: Box::new(source),
+                input: Box::new(wrap_inputs(inputs, reads)),
                 outputs,
             })),
         }))
@@ -336,11 +334,10 @@ impl Binder<'_> {
                             .collect();
                         for row in &values.rows {
                             for (column, expr) in columns.iter().zip(row) {
-                                outputs.push(self.bind_value_column(
-                                    Some(column.clone()),
-                                    expr,
-                                    &scope,
-                                ));
+                                let (output, filters) =
+                                    self.bind_value_column(Some(column.clone()), expr, &scope);
+                                outputs.push(output);
+                                reads.extend(filters);
                                 target_columns.push(column.clone());
                             }
                         }
@@ -349,11 +346,13 @@ impl Binder<'_> {
                 MergeAction::Update(update) => {
                     for assignment in &update.assignments {
                         for column in assignment_target_columns(&assignment.target) {
-                            outputs.push(self.bind_value_column(
+                            let (output, filters) = self.bind_value_column(
                                 Some(column.clone()),
                                 &assignment.value,
                                 &scope,
-                            ));
+                            );
+                            outputs.push(output);
+                            reads.extend(filters);
                             target_columns.push(column);
                         }
                     }
@@ -571,14 +570,19 @@ impl Binder<'_> {
             None => from,
         };
         // PassThrough is identity, so the projection resolves against the
-        // FROM scope either way.
-        let outputs: Vec<BoundColumn> = select
-            .projection
-            .iter()
-            .filter_map(|item| self.bind_output_column(item, &from_scope))
-            .collect();
+        // FROM scope either way. A projection subquery's internal-predicate
+        // reads (filter-only) wrap the input below the Project, so they
+        // surface as reads but not as lineage sources.
+        let mut outputs = Vec::new();
+        let mut projection_filters = Vec::new();
+        for item in &select.projection {
+            if let Some((column, filters)) = self.bind_output_column(item, &from_scope) {
+                outputs.push(column);
+                projection_filters.extend(filters);
+            }
+        }
         let project = Plan::Project(Project {
-            input: Box::new(input),
+            input: Box::new(wrap_reads(input, projection_filters)),
             outputs: outputs.clone(),
         });
         // GROUP BY / HAVING / SORT BY see the output aliases (clause
@@ -746,9 +750,15 @@ impl Binder<'_> {
             .find(|c| self.ident_eq(&c.name, name))
     }
 
-    /// Resolve one SELECT-list item against `scope`. Wildcards are
-    /// skipped for now (`None`).
-    fn bind_output_column(&self, item: &SelectItem, scope: &Scope) -> Option<BoundColumn> {
+    /// Resolve one SELECT-list item against `scope` into a bound output
+    /// column plus the filter-only reads it contributes (a projection
+    /// subquery's internal predicates — reads but not lineage sources).
+    /// Wildcards are skipped (`None`).
+    fn bind_output_column(
+        &self,
+        item: &SelectItem,
+        scope: &Scope,
+    ) -> Option<(BoundColumn, Vec<ColumnRead>)> {
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.clone())),
@@ -759,84 +769,105 @@ impl Binder<'_> {
     }
 
     /// Bind a value-producing expression (a projection item or a SET /
-    /// VALUES assignment RHS) into a named output column. Each source's
-    /// composed kind folds in this expression's own kind: a bare column
-    /// ref is `Passthrough`, anything else `Transformation` — so a
-    /// transforming step anywhere along the chain wins.
-    fn bind_value_column(&self, name: Option<Ident>, expr: &Expr, scope: &Scope) -> BoundColumn {
+    /// VALUES assignment RHS) into a named output column, returning it with
+    /// its filter-only reads. The column's provenance is the value's
+    /// lineage sources (direct refs + any nested subquery's *output*);
+    /// each source's composed kind folds in this expression's own kind (a
+    /// bare column ref is `Passthrough`, anything else `Transformation`).
+    /// The filter-only reads are a nested subquery's internal predicates —
+    /// they read columns but don't feed this value, so they're surfaced
+    /// separately rather than as lineage sources.
+    fn bind_value_column(
+        &self,
+        name: Option<Ident>,
+        expr: &Expr,
+        scope: &Scope,
+    ) -> (BoundColumn, Vec<ColumnRead>) {
         let outer = expr_kind(expr);
-        let provenance = self
-            .expr_provenance(expr, scope)
+        let mut sources = Vec::new();
+        let mut filters = Vec::new();
+        self.collect_expr(expr, scope, &mut sources, &mut filters);
+        let provenance = sources
             .into_iter()
             .map(|source| ProvenanceSource {
                 kind: combine_kind(source.kind, outer),
                 read: source.read,
             })
             .collect();
-        BoundColumn { name, provenance }
-    }
-
-    /// Every lineage source an expression contributes against `scope`:
-    /// its direct column references (resolved to their pre-collapsed
-    /// provenance) plus any nested subquery's reads. Used for value
-    /// positions (a column's provenance); the filter-only callers strip
-    /// the kind via [`Self::expr_reads`].
-    fn expr_provenance(&self, expr: &Expr, scope: &Scope) -> Vec<ProvenanceSource> {
-        let mut out = Vec::new();
-        self.collect_expr_provenance(expr, scope, &mut out);
-        out
+        (BoundColumn { name, provenance }, filters)
     }
 
     /// The plain column reads of an expression (filter position — WHERE /
-    /// ON / clause predicates): the provenance with its lineage kind
-    /// dropped.
+    /// ON / clause predicates / DML predicates): every column it touches,
+    /// with the value/filter distinction collapsed (both its value sources
+    /// and nested-subquery filters are just reads here).
     fn expr_reads(&self, expr: &Expr, scope: &Scope) -> Vec<ColumnRead> {
-        self.expr_provenance(expr, scope)
+        let mut sources = Vec::new();
+        let mut filters = Vec::new();
+        self.collect_expr(expr, scope, &mut sources, &mut filters);
+        sources
             .into_iter()
             .map(|source| source.read)
+            .chain(filters)
             .collect()
     }
 
-    fn collect_expr_provenance(&self, expr: &Expr, scope: &Scope, out: &mut Vec<ProvenanceSource>) {
+    /// Walk an expression splitting its reads into two channels: `sources`
+    /// — the value's lineage sources (direct column refs + a nested
+    /// subquery's output columns); and `filters` — reads that don't feed
+    /// the value (a nested subquery's internal predicates). A filter-
+    /// position caller merges both; a value-position caller keeps only
+    /// `sources` as provenance and surfaces `filters` as plain reads.
+    fn collect_expr(
+        &self,
+        expr: &Expr,
+        scope: &Scope,
+        sources: &mut Vec<ProvenanceSource>,
+        filters: &mut Vec<ColumnRead>,
+    ) {
         match expr {
-            Expr::Identifier(id) => out.extend(self.resolve_ref(std::slice::from_ref(id), scope)),
-            Expr::CompoundIdentifier(ids) => out.extend(self.resolve_ref(ids, scope)),
+            Expr::Identifier(id) => {
+                sources.extend(self.resolve_ref(std::slice::from_ref(id), scope))
+            }
+            Expr::CompoundIdentifier(ids) => sources.extend(self.resolve_ref(ids, scope)),
             Expr::BinaryOp { left, right, .. } => {
-                self.collect_expr_provenance(left, scope, out);
-                self.collect_expr_provenance(right, scope, out);
+                self.collect_expr(left, scope, sources, filters);
+                self.collect_expr(right, scope, sources, filters);
             }
             Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
-                self.collect_expr_provenance(expr, scope, out)
+                self.collect_expr(expr, scope, sources, filters)
             }
-            Expr::Function(function) => self.collect_function_provenance(function, scope, out),
+            Expr::Function(function) => self.collect_function(function, scope, sources, filters),
             // GROUP BY ROLLUP / CUBE / GROUPING SETS — each grouping set is
             // a list of expressions.
             Expr::Rollup(sets) | Expr::Cube(sets) | Expr::GroupingSets(sets) => {
                 for set in sets {
                     for expr in set {
-                        self.collect_expr_provenance(expr, scope, out);
+                        self.collect_expr(expr, scope, sources, filters);
                     }
                 }
             }
-            // Subqueries: bind against the enclosing scope (correlation)
-            // and fold in their reads as transformation sources.
+            // Subqueries: bind against the enclosing scope (correlation).
+            // Their *output* columns are the value's lineage sources; the
+            // rest of their reads (internal predicates) are filter-only.
             Expr::Subquery(query)
             | Expr::Exists {
                 subquery: query, ..
-            } => out.extend(self.subquery_sources(query, scope)),
+            } => self.collect_subquery(query, scope, sources, filters),
             Expr::InSubquery { expr, subquery, .. } => {
-                self.collect_expr_provenance(expr, scope, out);
-                out.extend(self.subquery_sources(subquery, scope));
+                self.collect_expr(expr, scope, sources, filters);
+                self.collect_subquery(subquery, scope, sources, filters);
             }
             _ => {}
         }
     }
 
-    fn collect_function_provenance(
+    fn collect_function(
         &self,
         function: &Function,
         scope: &Scope,
-        out: &mut Vec<ProvenanceSource>,
+        sources: &mut Vec<ProvenanceSource>,
+        filters: &mut Vec<ColumnRead>,
     ) {
         if let FunctionArguments::List(list) = &function.args {
             for arg in &list.args {
@@ -853,27 +884,28 @@ impl Binder<'_> {
                     _ => None,
                 };
                 if let Some(expr) = inner {
-                    self.collect_expr_provenance(expr, scope, out);
+                    self.collect_expr(expr, scope, sources, filters);
                 }
             }
         }
     }
 
-    /// The lineage sources of a subquery nested in an expression: bind it
-    /// as its own plan (with the containing `scope`'s relations pushed
-    /// onto the correlation stack, so a correlated reference resolves
-    /// outward) and walk it. A subquery derives its value, so its sources
-    /// are tagged `Transformation`.
-    fn subquery_sources(&self, query: &Query, scope: &Scope) -> Vec<ProvenanceSource> {
+    /// Bind a subquery nested in an expression (with the containing
+    /// `scope`'s relations pushed onto the correlation stack, so a
+    /// correlated reference resolves outward). Its output columns are the
+    /// enclosing value's lineage sources; its full read set (including
+    /// internal predicates) surfaces as filter-only reads.
+    fn collect_subquery(
+        &self,
+        query: &Query,
+        scope: &Scope,
+        sources: &mut Vec<ProvenanceSource>,
+        filters: &mut Vec<ColumnRead>,
+    ) {
         let binder = self.with_outer_scope(scope.relations.clone());
         let (plan, _) = binder.bind_query(query);
-        super::extract::extract_reads(&plan)
-            .into_iter()
-            .map(|read| ProvenanceSource {
-                read,
-                kind: ColumnLineageKind::Transformation,
-            })
-            .collect()
+        sources.extend(output_sources(&plan));
+        filters.extend(super::extract::input_reads(&plan));
     }
 
     /// Resolve a single column reference to its pre-collapsed provenance.
@@ -1265,6 +1297,18 @@ fn apply_column_aliases(outputs: &mut [BoundColumn], alias: &TableAlias) {
 /// are given. Anonymous (un-nameable) outputs are dropped.
 fn output_names(outputs: &[BoundColumn]) -> Vec<Ident> {
     outputs.iter().filter_map(|c| c.name.clone()).collect()
+}
+
+/// The lineage sources a bound plan exposes through its output columns —
+/// a nested subquery's output provenance, used as the lineage sources of
+/// the enclosing value (its internal filter reads are collected
+/// separately).
+fn output_sources(plan: &Plan) -> Vec<ProvenanceSource> {
+    super::extract::output_operands(plan)
+        .iter()
+        .flat_map(|operand| operand.iter())
+        .flat_map(|column| column.provenance.iter().cloned())
+        .collect()
 }
 
 /// The last (rightmost) identifier of a possibly-qualified name — a
