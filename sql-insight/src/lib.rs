@@ -193,16 +193,18 @@
 //!   `#[non_exhaustive]` at the 1.0 freeze, once the variant sets
 //!   stabilize.
 
-// Incubating "bound plan" (design "B") — a materialized full-stack
-// operator tree built alongside the current `resolver` (strangler).
-// Not yet wired into any extractor; kept private while it grows.
-mod bind;
+// Incubating bound logical-plan (design "B") — the resolver
+// reimplemented as a materialized full-stack operator tree, built
+// alongside the current `resolver` (strangler). Not yet wired into any
+// extractor; kept private while it grows, and will take over the
+// `resolver` name at parity.
 pub mod catalog;
 pub mod diagnostic;
 pub mod error;
 pub mod extractor;
 pub mod formatter;
 pub mod normalizer;
+mod plan;
 pub(crate) mod resolver;
 
 // `reference` is intentionally private: the module name itself is not
