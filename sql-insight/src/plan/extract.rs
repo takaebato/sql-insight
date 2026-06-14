@@ -60,36 +60,6 @@ fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
     }
 }
 
-/// The reads of a plan *below* its top output columns — a nested
-/// subquery's filter-only reads. Its output provenance is taken
-/// separately (as the enclosing value's lineage sources), so skipping it
-/// here keeps the subquery's output from being counted twice.
-pub(crate) fn input_reads(plan: &Plan) -> Vec<ColumnRead> {
-    let mut reads = Vec::new();
-    collect_input_reads(plan, &mut reads);
-    reads
-}
-
-fn collect_input_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
-    match plan {
-        // Skip the top producer's output columns; walk everything beneath.
-        Plan::Project(project) => collect_reads(&project.input, out),
-        Plan::SetOp(set) => {
-            for operand in &set.operands {
-                collect_input_reads(operand, out);
-            }
-        }
-        Plan::PassThrough(pt) => {
-            out.extend(pt.reads.iter().cloned());
-            for input in &pt.inputs {
-                collect_input_reads(input, out);
-            }
-        }
-        // No output columns to skip — every read is a filter read.
-        Plan::Scan(_) | Plan::OpaqueLeaf | Plan::Write(_) => collect_reads(plan, out),
-    }
-}
-
 /// Every column the statement writes: a [`Write`]'s target columns
 /// qualified by its target relation. A bare query writes nothing.
 pub(crate) fn extract_writes(plan: &Plan) -> Vec<ColumnReference> {

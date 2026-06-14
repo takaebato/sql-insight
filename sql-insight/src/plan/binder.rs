@@ -256,7 +256,7 @@ impl Binder<'_> {
                 scope = scope.merge(from_scope);
             }
         }
-        let mut reads = update
+        let (reads, mut subqueries) = update
             .selection
             .as_ref()
             .map(|s| self.expr_reads(s, &scope))
@@ -265,10 +265,10 @@ impl Binder<'_> {
         let mut target_columns = Vec::new();
         for assignment in &update.assignments {
             for column in assignment_target_columns(&assignment.target) {
-                let (output, filters) =
+                let (output, value_subqueries) =
                     self.bind_value_column(Some(column.clone()), &assignment.value, &scope);
                 outputs.push(output);
-                reads.extend(filters);
+                subqueries.extend(value_subqueries);
                 target_columns.push(column);
             }
         }
@@ -277,9 +277,9 @@ impl Binder<'_> {
             target,
             target_columns,
             input: Box::new(Plan::Project(Project {
-                input: Box::new(wrap_inputs(inputs, reads)),
+                input: Box::new(wrap_inputs(inputs, reads, Vec::new())),
                 outputs,
-                subqueries: Vec::new(),
+                subqueries,
             })),
         }))
     }
@@ -299,12 +299,12 @@ impl Binder<'_> {
             inputs.push(plan);
             scope = scope.merge(twj_scope);
         }
-        let reads = delete
+        let (reads, subqueries) = delete
             .selection
             .as_ref()
             .map(|s| self.expr_reads(s, &scope))
             .unwrap_or_default();
-        let input = wrap_inputs(inputs, reads);
+        let input = wrap_inputs(inputs, reads, subqueries);
         // The deleted relation is the explicit `DELETE t` list when
         // present, else the FROM target.
         let target = if let Some(name) = delete.tables.first() {
@@ -334,17 +334,21 @@ impl Binder<'_> {
         let (target_plan, target_scope) = self.bind_table_factor(&merge.table);
         let (source_plan, source_scope) = self.bind_table_factor(&merge.source);
         let scope = target_scope.merge(source_scope);
-        let mut reads = self.expr_reads(&merge.on, &scope);
+        let (mut reads, mut subqueries) = self.expr_reads(&merge.on, &scope);
         let mut outputs = Vec::new();
         let mut target_columns = Vec::new();
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
-                reads.extend(self.expr_reads(predicate, &scope));
+                let (r, s) = self.expr_reads(predicate, &scope);
+                reads.extend(r);
+                subqueries.extend(s);
             }
             match &clause.action {
                 MergeAction::Insert(insert) => {
                     if let Some(predicate) = &insert.insert_predicate {
-                        reads.extend(self.expr_reads(predicate, &scope));
+                        let (r, s) = self.expr_reads(predicate, &scope);
+                        reads.extend(r);
+                        subqueries.extend(s);
                     }
                     if let MergeInsertKind::Values(values) = &insert.kind {
                         let columns: Vec<Ident> = insert
@@ -354,10 +358,10 @@ impl Binder<'_> {
                             .collect();
                         for row in &values.rows {
                             for (column, expr) in columns.iter().zip(row) {
-                                let (output, filters) =
+                                let (output, value_subqueries) =
                                     self.bind_value_column(Some(column.clone()), expr, &scope);
                                 outputs.push(output);
-                                reads.extend(filters);
+                                subqueries.extend(value_subqueries);
                                 target_columns.push(column.clone());
                             }
                         }
@@ -366,13 +370,13 @@ impl Binder<'_> {
                 MergeAction::Update(update) => {
                     for assignment in &update.assignments {
                         for column in assignment_target_columns(&assignment.target) {
-                            let (output, filters) = self.bind_value_column(
+                            let (output, value_subqueries) = self.bind_value_column(
                                 Some(column.clone()),
                                 &assignment.value,
                                 &scope,
                             );
                             outputs.push(output);
-                            reads.extend(filters);
+                            subqueries.extend(value_subqueries);
                             target_columns.push(column);
                         }
                     }
@@ -380,7 +384,9 @@ impl Binder<'_> {
                         .into_iter()
                         .flatten()
                     {
-                        reads.extend(self.expr_reads(predicate, &scope));
+                        let (r, s) = self.expr_reads(predicate, &scope);
+                        reads.extend(r);
+                        subqueries.extend(s);
                     }
                 }
                 // DELETE moves no column values.
@@ -388,14 +394,14 @@ impl Binder<'_> {
             }
         }
         let target = TableReference::try_from(&merge.table).ok()?;
-        let source = wrap_inputs(vec![target_plan, source_plan], reads);
+        let source = wrap_inputs(vec![target_plan, source_plan], reads, Vec::new());
         Some(Plan::Write(Write {
             target,
             target_columns,
             input: Box::new(Plan::Project(Project {
                 input: Box::new(source),
                 outputs,
-                subqueries: Vec::new(),
+                subqueries,
             })),
         }))
     }
@@ -539,8 +545,8 @@ impl Binder<'_> {
         // aliases (resolved against the body's output scope).
         let plan = match &query.order_by {
             Some(order_by) => {
-                let reads = self.order_by_reads(order_by, &scope);
-                wrap_reads(body, reads)
+                let (reads, subqueries) = self.order_by_reads(order_by, &scope);
+                wrap_reads(body, reads, subqueries)
             }
             None => body,
         };
@@ -585,29 +591,32 @@ impl Binder<'_> {
         // against the FROM scope only (Project is above, so no aliases
         // are visible — the clause-phase rule, structurally).
         let input = match &select.selection {
-            Some(predicate) => Plan::PassThrough(PassThrough {
-                inputs: vec![from],
-                reads: self.expr_reads(predicate, &from_scope),
-                subqueries: Vec::new(),
-            }),
+            Some(predicate) => {
+                let (reads, subqueries) = self.expr_reads(predicate, &from_scope);
+                Plan::PassThrough(PassThrough {
+                    inputs: vec![from],
+                    reads,
+                    subqueries,
+                })
+            }
             None => from,
         };
         // PassThrough is identity, so the projection resolves against the
-        // FROM scope either way. A projection subquery's internal-predicate
-        // reads (filter-only) wrap the input below the Project, so they
-        // surface as reads but not as lineage sources.
+        // FROM scope either way. A projection scalar subquery's sub-plan is
+        // kept on the Project (walked for its tables / reads); its output
+        // already folded into the owning column's provenance.
         let mut outputs = Vec::new();
-        let mut projection_filters = Vec::new();
+        let mut projection_subqueries = Vec::new();
         for item in &select.projection {
-            if let Some((column, filters)) = self.bind_output_column(item, &from_scope) {
+            if let Some((column, subqueries)) = self.bind_output_column(item, &from_scope) {
                 outputs.push(column);
-                projection_filters.extend(filters);
+                projection_subqueries.extend(subqueries);
             }
         }
         let project = Plan::Project(Project {
-            input: Box::new(wrap_reads(input, projection_filters)),
+            input: Box::new(input),
             outputs: outputs.clone(),
-            subqueries: Vec::new(),
+            subqueries: projection_subqueries,
         });
         // GROUP BY / HAVING / SORT BY see the output aliases (clause
         // phase): resolve against the FROM relations *plus* the outputs,
@@ -617,16 +626,24 @@ impl Binder<'_> {
             outputs,
             merge_columns: from_scope.merge_columns,
         };
-        let mut clause_reads = self.group_by_reads(&select.group_by, &clause_scope);
+        let (mut clause_reads, mut clause_subqueries) =
+            self.group_by_reads(&select.group_by, &clause_scope);
         if let Some(having) = &select.having {
-            clause_reads.extend(self.expr_reads(having, &clause_scope));
+            let (reads, subqueries) = self.expr_reads(having, &clause_scope);
+            clause_reads.extend(reads);
+            clause_subqueries.extend(subqueries);
         }
         for sort in &select.sort_by {
-            clause_reads.extend(self.expr_reads(&sort.expr, &clause_scope));
+            let (reads, subqueries) = self.expr_reads(&sort.expr, &clause_scope);
+            clause_reads.extend(reads);
+            clause_subqueries.extend(subqueries);
         }
         // A trailing top-level ORDER BY also resolves against this scope,
         // so hand it back to `bind_query`.
-        (wrap_reads(project, clause_reads), clause_scope)
+        (
+            wrap_reads(project, clause_reads, clause_subqueries),
+            clause_scope,
+        )
     }
 
     fn bind_from(&self, items: &[TableWithJoins]) -> (Plan, Scope) {
@@ -665,7 +682,7 @@ impl Binder<'_> {
             // The ON predicate sees both sides; resolve its reads against
             // the combined scope, which is also this PassThrough's output.
             let mut combined = scope.merge(right_scope);
-            let reads = match join_constraint(join) {
+            let (reads, subqueries) = match join_constraint(join) {
                 Some(JoinConstraint::On(expr)) => self.expr_reads(expr, &combined),
                 // USING (col, …) records merge columns: a later unqualified
                 // reference fans in to every side that could own one. The
@@ -675,14 +692,14 @@ impl Binder<'_> {
                     combined
                         .merge_columns
                         .extend(columns.iter().filter_map(object_name_last_ident));
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 }
-                _ => Vec::new(),
+                _ => (Vec::new(), Vec::new()),
             };
             node = Plan::PassThrough(PassThrough {
                 inputs: vec![node, right],
                 reads,
-                subqueries: Vec::new(),
+                subqueries,
             });
             scope = combined;
         }
@@ -773,7 +790,7 @@ impl Binder<'_> {
         &self,
         item: &SelectItem,
         scope: &Scope,
-    ) -> Option<(BoundColumn, Vec<ColumnRead>)> {
+    ) -> Option<(BoundColumn, Vec<Plan>)> {
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.clone())),
@@ -814,11 +831,11 @@ impl Binder<'_> {
         name: Option<Ident>,
         expr: &Expr,
         scope: &Scope,
-    ) -> (BoundColumn, Vec<ColumnRead>) {
+    ) -> (BoundColumn, Vec<Plan>) {
         let outer = expr_kind(expr);
         let mut sources = Vec::new();
-        let mut filters = Vec::new();
-        self.collect_expr(expr, scope, &mut sources, &mut filters);
+        let mut subplans = Vec::new();
+        self.collect_expr(expr, scope, &mut sources, &mut subplans);
         let provenance = sources
             .into_iter()
             .map(|source| ProvenanceSource {
@@ -827,40 +844,39 @@ impl Binder<'_> {
                 synthetic_origin: source.synthetic_origin,
             })
             .collect();
-        (BoundColumn { name, provenance }, filters)
+        (BoundColumn { name, provenance }, subplans)
     }
 
     /// The plain column reads of an expression (filter position — WHERE /
-    /// ON / clause predicates / DML predicates): every column it touches,
-    /// with the value/filter distinction collapsed (both its value sources
-    /// and nested-subquery filters are just reads here). Synthetic-origin
-    /// sources (a reference through a derived / CTE relation or to an
-    /// output alias) are dropped — their physical read is counted at the
-    /// inner producer, not at this reference.
-    fn expr_reads(&self, expr: &Expr, scope: &Scope) -> Vec<ColumnRead> {
+    /// ON / clause predicates / DML predicates) plus the sub-plans of any
+    /// subqueries it contains. Direct references become reads;
+    /// synthetic-origin sources (through a derived / CTE relation, an
+    /// output alias, or a nested subquery's output) are dropped — their
+    /// physical reads are counted by walking the returned sub-plans.
+    fn expr_reads(&self, expr: &Expr, scope: &Scope) -> (Vec<ColumnRead>, Vec<Plan>) {
         let mut sources = Vec::new();
-        let mut filters = Vec::new();
-        self.collect_expr(expr, scope, &mut sources, &mut filters);
-        sources
+        let mut subplans = Vec::new();
+        self.collect_expr(expr, scope, &mut sources, &mut subplans);
+        let reads = sources
             .into_iter()
             .filter(|source| !source.synthetic_origin)
             .map(|source| source.read)
-            .chain(filters)
-            .collect()
+            .collect();
+        (reads, subplans)
     }
 
-    /// Walk an expression splitting its reads into two channels: `sources`
-    /// — the value's lineage sources (direct column refs + a nested
-    /// subquery's output columns); and `filters` — reads that don't feed
-    /// the value (a nested subquery's internal predicates). A filter-
-    /// position caller merges both; a value-position caller keeps only
-    /// `sources` as provenance and surfaces `filters` as plain reads.
+    /// Walk an expression collecting its lineage `sources` (direct column
+    /// refs + a nested subquery's *output* columns, the latter marked
+    /// synthetic-origin) and the `subplans` of any nested subqueries (kept
+    /// whole so their tables / reads surface by walking). A value-position
+    /// caller keeps `sources` as provenance; a filter-position caller keeps
+    /// the non-synthetic reads. Both attach `subplans` to their node.
     fn collect_expr(
         &self,
         expr: &Expr,
         scope: &Scope,
         sources: &mut Vec<ProvenanceSource>,
-        filters: &mut Vec<ColumnRead>,
+        subplans: &mut Vec<Plan>,
     ) {
         match expr {
             Expr::Identifier(id) => {
@@ -868,32 +884,33 @@ impl Binder<'_> {
             }
             Expr::CompoundIdentifier(ids) => sources.extend(self.resolve_ref(ids, scope)),
             Expr::BinaryOp { left, right, .. } => {
-                self.collect_expr(left, scope, sources, filters);
-                self.collect_expr(right, scope, sources, filters);
+                self.collect_expr(left, scope, sources, subplans);
+                self.collect_expr(right, scope, sources, subplans);
             }
             Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
-                self.collect_expr(expr, scope, sources, filters)
+                self.collect_expr(expr, scope, sources, subplans)
             }
-            Expr::Function(function) => self.collect_function(function, scope, sources, filters),
+            Expr::Function(function) => self.collect_function(function, scope, sources, subplans),
             // GROUP BY ROLLUP / CUBE / GROUPING SETS — each grouping set is
             // a list of expressions.
             Expr::Rollup(sets) | Expr::Cube(sets) | Expr::GroupingSets(sets) => {
                 for set in sets {
                     for expr in set {
-                        self.collect_expr(expr, scope, sources, filters);
+                        self.collect_expr(expr, scope, sources, subplans);
                     }
                 }
             }
             // Subqueries: bind against the enclosing scope (correlation).
-            // Their *output* columns are the value's lineage sources; the
-            // rest of their reads (internal predicates) are filter-only.
+            // The sub-plan is kept whole (walked for its tables / reads);
+            // its output columns fold in as synthetic-origin lineage
+            // sources of the enclosing value.
             Expr::Subquery(query)
             | Expr::Exists {
                 subquery: query, ..
-            } => self.collect_subquery(query, scope, sources, filters),
+            } => self.collect_subquery(query, scope, sources, subplans),
             Expr::InSubquery { expr, subquery, .. } => {
-                self.collect_expr(expr, scope, sources, filters);
-                self.collect_subquery(subquery, scope, sources, filters);
+                self.collect_expr(expr, scope, sources, subplans);
+                self.collect_subquery(subquery, scope, sources, subplans);
             }
             _ => {}
         }
@@ -904,7 +921,7 @@ impl Binder<'_> {
         function: &Function,
         scope: &Scope,
         sources: &mut Vec<ProvenanceSource>,
-        filters: &mut Vec<ColumnRead>,
+        subplans: &mut Vec<Plan>,
     ) {
         if let FunctionArguments::List(list) = &function.args {
             for arg in &list.args {
@@ -921,7 +938,7 @@ impl Binder<'_> {
                     _ => None,
                 };
                 if let Some(expr) = inner {
-                    self.collect_expr(expr, scope, sources, filters);
+                    self.collect_expr(expr, scope, sources, subplans);
                 }
             }
         }
@@ -929,20 +946,29 @@ impl Binder<'_> {
 
     /// Bind a subquery nested in an expression (with the containing
     /// `scope`'s relations pushed onto the correlation stack, so a
-    /// correlated reference resolves outward). Its output columns are the
-    /// enclosing value's lineage sources; its full read set (including
-    /// internal predicates) surfaces as filter-only reads.
+    /// correlated reference resolves outward). The bound sub-plan is kept
+    /// whole in `subplans` (so its tables / reads surface by walking it);
+    /// its output columns fold into `sources` as synthetic-origin lineage
+    /// sources of the enclosing value (their physical reads are counted by
+    /// walking the sub-plan, so they're excluded from `reads`).
     fn collect_subquery(
         &self,
         query: &Query,
         scope: &Scope,
         sources: &mut Vec<ProvenanceSource>,
-        filters: &mut Vec<ColumnRead>,
+        subplans: &mut Vec<Plan>,
     ) {
         let binder = self.with_outer_scope(scope.relations.clone());
         let (plan, _) = binder.bind_query(query);
-        sources.extend(output_sources(&plan));
-        filters.extend(super::extract::input_reads(&plan));
+        sources.extend(
+            output_sources(&plan)
+                .into_iter()
+                .map(|source| ProvenanceSource {
+                    synthetic_origin: true,
+                    ..source
+                }),
+        );
+        subplans.push(plan);
     }
 
     /// Resolve a single column reference to its pre-collapsed provenance.
@@ -1057,34 +1083,48 @@ impl Binder<'_> {
         (!candidates.is_empty()).then(|| self.pick(candidates, column))
     }
 
-    /// Reads contributed by GROUP BY (plain keys + ROLLUP / CUBE /
-    /// GROUPING SETS members + a `GROUPING SETS` modifier), resolved
-    /// against `scope` (which carries the output aliases).
-    fn group_by_reads(&self, group_by: &GroupByExpr, scope: &Scope) -> Vec<ColumnRead> {
+    /// Reads (and any subquery sub-plans) contributed by GROUP BY (plain
+    /// keys + ROLLUP / CUBE / GROUPING SETS members + a `GROUPING SETS`
+    /// modifier), resolved against `scope` (which carries the output
+    /// aliases).
+    fn group_by_reads(
+        &self,
+        group_by: &GroupByExpr,
+        scope: &Scope,
+    ) -> (Vec<ColumnRead>, Vec<Plan>) {
         let mut reads = Vec::new();
+        let mut subqueries = Vec::new();
         if let GroupByExpr::Expressions(exprs, modifiers) = group_by {
-            for expr in exprs {
-                reads.extend(self.expr_reads(expr, scope));
-            }
-            for modifier in modifiers {
-                if let GroupByWithModifier::GroupingSets(expr) = modifier {
-                    reads.extend(self.expr_reads(expr, scope));
-                }
+            let members =
+                exprs
+                    .iter()
+                    .chain(modifiers.iter().filter_map(|modifier| match modifier {
+                        GroupByWithModifier::GroupingSets(expr) => Some(expr),
+                        _ => None,
+                    }));
+            for expr in members {
+                let (r, s) = self.expr_reads(expr, scope);
+                reads.extend(r);
+                subqueries.extend(s);
             }
         }
-        reads
+        (reads, subqueries)
     }
 
-    /// Reads contributed by an ORDER BY, resolved against `scope`.
-    fn order_by_reads(&self, order_by: &OrderBy, scope: &Scope) -> Vec<ColumnRead> {
+    /// Reads (and any subquery sub-plans) contributed by an ORDER BY,
+    /// resolved against `scope`.
+    fn order_by_reads(&self, order_by: &OrderBy, scope: &Scope) -> (Vec<ColumnRead>, Vec<Plan>) {
         let OrderByKind::Expressions(exprs) = &order_by.kind else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let mut reads = Vec::new();
+        let mut subqueries = Vec::new();
         for expr in exprs {
-            reads.extend(self.expr_reads(&expr.expr, scope));
+            let (r, s) = self.expr_reads(&expr.expr, scope);
+            reads.extend(r);
+            subqueries.extend(s);
         }
-        reads
+        (reads, subqueries)
     }
 
     fn name_matches(&self, name: Option<&Ident>, other: &Ident) -> bool {
@@ -1320,28 +1360,29 @@ fn join_constraint(join: &Join) -> Option<&JoinConstraint> {
 /// reads passes through unwrapped; otherwise a `PassThrough` joins the
 /// inputs and carries the filter `reads`. Used to build a DML statement's
 /// scanned-and-filtered source below its SET / VALUES `Project`.
-fn wrap_inputs(mut inputs: Vec<Plan>, reads: Vec<ColumnRead>) -> Plan {
-    if reads.is_empty() && inputs.len() == 1 {
+fn wrap_inputs(mut inputs: Vec<Plan>, reads: Vec<ColumnRead>, subqueries: Vec<Plan>) -> Plan {
+    if reads.is_empty() && subqueries.is_empty() && inputs.len() == 1 {
         inputs.pop().unwrap()
     } else {
         Plan::PassThrough(PassThrough {
             inputs,
             reads,
-            subqueries: Vec::new(),
+            subqueries,
         })
     }
 }
 
-/// Wrap `plan` in a filter `PassThrough` carrying `reads`, or return it
-/// unchanged when there are none.
-fn wrap_reads(plan: Plan, reads: Vec<ColumnRead>) -> Plan {
-    if reads.is_empty() {
+/// Wrap `plan` in a filter `PassThrough` carrying `reads` and the
+/// `subqueries` of those predicates, or return it unchanged when there's
+/// nothing to carry.
+fn wrap_reads(plan: Plan, reads: Vec<ColumnRead>, subqueries: Vec<Plan>) -> Plan {
+    if reads.is_empty() && subqueries.is_empty() {
         plan
     } else {
         Plan::PassThrough(PassThrough {
             inputs: vec![plan],
             reads,
-            subqueries: Vec::new(),
+            subqueries,
         })
     }
 }
@@ -1672,26 +1713,31 @@ mod tests {
     }
 
     #[test]
-    fn subquery_in_where_folds_in_its_reads() {
-        // `b IN (SELECT id FROM u)` contributes both the outer `b` and the
-        // subquery's `u.id` as filter reads on the WHERE PassThrough.
-        let Plan::Project(project) = bind_one("SELECT a FROM t WHERE b IN (SELECT id FROM u)")
-        else {
+    fn subquery_in_where_is_kept_as_a_sub_plan() {
+        // `b IN (SELECT id FROM u)`: the outer `b` is a direct filter read;
+        // the subquery is kept whole as a sub-plan on the WHERE PassThrough
+        // (walked for its `u.id`), not folded into the reads.
+        let Plan::Project(outer) = bind_one("SELECT a FROM t WHERE b IN (SELECT id FROM u)") else {
             panic!("expected Project");
         };
-        let Plan::PassThrough(where_pt) = project.input.as_ref() else {
+        let Plan::PassThrough(where_pt) = outer.input.as_ref() else {
             panic!("expected WHERE PassThrough");
         };
+        assert_eq!(where_pt.reads, vec![inferred("t", "b")]);
         assert_eq!(
-            where_pt.reads,
-            vec![inferred("t", "b"), inferred("u", "id")]
+            where_pt.subqueries,
+            vec![project(
+                scan("u"),
+                vec![passthrough_col("id", vec![inferred("u", "id")])]
+            )]
         );
     }
 
     #[test]
     fn correlated_subquery_resolves_outward() {
-        // The inner `t.a` finds no `t` in the subquery's own scope `[u]`,
-        // so it falls through the correlation stack to the outer `t`.
+        // The EXISTS subquery is a sub-plan on the WHERE PassThrough; inside
+        // it, `t.a` finds no `t` in the subquery's own scope `[u]`, so it
+        // falls through the correlation stack to the outer `t`.
         let Plan::Project(project) =
             bind_one("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a)")
         else {
@@ -1700,7 +1746,17 @@ mod tests {
         let Plan::PassThrough(where_pt) = project.input.as_ref() else {
             panic!("expected WHERE PassThrough");
         };
-        assert_eq!(where_pt.reads, vec![inferred("u", "x"), inferred("t", "a")]);
+        // The subquery's own WHERE resolves `u.x` locally and `t.a` outward.
+        let [Plan::Project(subquery)] = where_pt.subqueries.as_slice() else {
+            panic!("expected one subquery sub-plan");
+        };
+        let Plan::PassThrough(sub_where) = subquery.input.as_ref() else {
+            panic!("expected the subquery's WHERE PassThrough");
+        };
+        assert_eq!(
+            sub_where.reads,
+            vec![inferred("u", "x"), inferred("t", "a")]
+        );
     }
 
     #[test]
