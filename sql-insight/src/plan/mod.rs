@@ -34,5 +34,5 @@
 mod binder;
 mod extract;
 mod ir;
-mod operation;
-mod table_operation;
+pub(crate) mod operation;
+pub(crate) mod table_operation;

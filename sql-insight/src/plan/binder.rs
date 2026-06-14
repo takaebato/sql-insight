@@ -12,11 +12,13 @@
 //! coexist; the differential harness pins them together).
 
 use sqlparser::ast::{
-    AssignmentTarget, CreateTable, CreateView, Cte, Delete, Expr, FromTable, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident, Insert, Join,
-    JoinConstraint, JoinOperator, Merge, MergeAction, MergeInsertKind, ObjectName, OrderBy,
-    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
-    TableWithJoins, Update, UpdateTableFromKind,
+    AccessExpr, Array, AssignmentTarget, CreateTable, CreateView, Cte, Delete, DictionaryField,
+    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
+    FunctionArgumentList, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident, Insert, Join,
+    JoinConstraint, JoinOperator, ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind,
+    ObjectName, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
+    Subscript, TableAlias, TableFactor, TableWithJoins, Update, UpdateTableFromKind,
+    WindowFrameBound, WindowSpec, WindowType,
 };
 
 use std::cell::RefCell;
@@ -201,6 +203,47 @@ struct Binder<'a> {
     diagnostics: &'a RefCell<Vec<ColumnLevelDiagnostic>>,
 }
 
+/// Accumulator for walking one expression. References split by position:
+/// `sources` are value references (they flow to the output → lineage),
+/// `filter_reads` are predicate references (they only influence which rows
+/// / values are produced → reads but not lineage), and `subplans` are the
+/// whole bound plans of nested subqueries. `is_suppressed` marks the
+/// current position as a filter, mirroring the resolver's `suppress_lineage`.
+#[derive(Default)]
+struct ExprCollector {
+    sources: Vec<ProvenanceSource>,
+    filter_reads: Vec<ColumnRead>,
+    subplans: Vec<Plan>,
+    is_suppressed: bool,
+}
+
+impl ExprCollector {
+    /// A value position (a projection item / SET / VALUES RHS): references
+    /// flow as lineage sources unless a sub-expression suppresses them.
+    fn value() -> Self {
+        Self::default()
+    }
+
+    /// A filter position (WHERE / ON / clause predicate / DML predicate):
+    /// the whole expression is a predicate, so every reference is a read.
+    fn filter() -> Self {
+        Self {
+            is_suppressed: true,
+            ..Self::default()
+        }
+    }
+
+    /// Run `f` with the position forced to a filter (a predicate
+    /// sub-expression — a `CASE` condition, an `EXISTS` test, a sort /
+    /// partition key), restoring the prior position afterward.
+    fn suppressed(&mut self, f: impl FnOnce(&mut Self)) {
+        let prev = self.is_suppressed;
+        self.is_suppressed = true;
+        f(self);
+        self.is_suppressed = prev;
+    }
+}
+
 impl Binder<'_> {
     /// Bind a statement into a [`Plan`], or `None` for kinds not modelled
     /// yet. A query is bound directly; the data-moving statements
@@ -263,7 +306,7 @@ impl Binder<'_> {
                 scope = scope.merge(from_scope);
             }
         }
-        let (reads, mut subqueries) = update
+        let (mut reads, mut subqueries) = update
             .selection
             .as_ref()
             .map(|s| self.expr_reads(s, &scope))
@@ -272,10 +315,11 @@ impl Binder<'_> {
         let mut target_columns = Vec::new();
         for assignment in &update.assignments {
             for column in assignment_target_columns(&assignment.target) {
-                let (output, value_subqueries) =
+                let (output, value_subqueries, value_filter_reads) =
                     self.bind_value_column(Some(column.clone()), &assignment.value, &scope);
                 outputs.push(output);
                 subqueries.extend(value_subqueries);
+                reads.extend(value_filter_reads);
                 target_columns.push(column);
             }
         }
@@ -380,10 +424,11 @@ impl Binder<'_> {
                             .collect();
                         for row in &values.rows {
                             for (column, expr) in columns.iter().zip(row) {
-                                let (output, value_subqueries) =
+                                let (output, value_subqueries, value_filter_reads) =
                                     self.bind_value_column(Some(column.clone()), expr, &scope);
                                 outputs.push(output);
                                 subqueries.extend(value_subqueries);
+                                reads.extend(value_filter_reads);
                                 target_columns.push(column.clone());
                             }
                         }
@@ -392,13 +437,11 @@ impl Binder<'_> {
                 MergeAction::Update(update) => {
                     for assignment in &update.assignments {
                         for column in assignment_target_columns(&assignment.target) {
-                            let (output, value_subqueries) = self.bind_value_column(
-                                Some(column.clone()),
-                                &assignment.value,
-                                &scope,
-                            );
+                            let (output, value_subqueries, value_filter_reads) = self
+                                .bind_value_column(Some(column.clone()), &assignment.value, &scope);
                             outputs.push(output);
                             subqueries.extend(value_subqueries);
+                            reads.extend(value_filter_reads);
                             target_columns.push(column);
                         }
                     }
@@ -652,14 +695,21 @@ impl Binder<'_> {
         // already folded into the owning column's provenance.
         let mut outputs = Vec::new();
         let mut projection_subqueries = Vec::new();
+        // Predicate references inside a projection expression (a `CASE`
+        // condition, an `EXISTS` test) are reads, not value sources — carry
+        // them as filter reads on a PassThrough below the Project.
+        let mut projection_filter_reads = Vec::new();
         for item in &select.projection {
-            if let Some((column, subqueries)) = self.bind_output_column(item, &from_scope) {
+            if let Some((column, subqueries, filter_reads)) =
+                self.bind_output_column(item, &from_scope)
+            {
                 outputs.push(column);
                 projection_subqueries.extend(subqueries);
+                projection_filter_reads.extend(filter_reads);
             }
         }
         let project = Plan::Project(Project {
-            input: Box::new(input),
+            input: Box::new(wrap_reads(input, projection_filter_reads, Vec::new())),
             outputs: outputs.clone(),
             subqueries: projection_subqueries,
         });
@@ -850,7 +900,7 @@ impl Binder<'_> {
         &self,
         item: &SelectItem,
         scope: &Scope,
-    ) -> Option<(BoundColumn, Vec<Plan>)> {
+    ) -> Option<(BoundColumn, Vec<Plan>, Vec<ColumnRead>)> {
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.clone())),
@@ -891,12 +941,12 @@ impl Binder<'_> {
         name: Option<Ident>,
         expr: &Expr,
         scope: &Scope,
-    ) -> (BoundColumn, Vec<Plan>) {
+    ) -> (BoundColumn, Vec<Plan>, Vec<ColumnRead>) {
         let outer = expr_kind(expr);
-        let mut sources = Vec::new();
-        let mut subplans = Vec::new();
-        self.collect_expr(expr, scope, &mut sources, &mut subplans);
-        let provenance = sources
+        let mut collector = ExprCollector::value();
+        self.collect_expr(expr, scope, &mut collector);
+        let provenance = collector
+            .sources
             .into_iter()
             .map(|source| ProvenanceSource {
                 kind: combine_kind(source.kind, outer),
@@ -904,101 +954,403 @@ impl Binder<'_> {
                 synthetic_origin: source.synthetic_origin,
             })
             .collect();
-        (BoundColumn { name, provenance }, subplans)
+        (
+            BoundColumn { name, provenance },
+            collector.subplans,
+            collector.filter_reads,
+        )
     }
 
     /// The plain column reads of an expression (filter position — WHERE /
     /// ON / clause predicates / DML predicates) plus the sub-plans of any
-    /// subqueries it contains. Direct references become reads;
-    /// synthetic-origin sources (through a derived / CTE relation, an
-    /// output alias, or a nested subquery's output) are dropped — their
-    /// physical reads are counted by walking the returned sub-plans.
+    /// subqueries it contains. The whole expression is a predicate, so it
+    /// collects in suppressed mode: every direct reference is a read, never
+    /// a lineage source. Synthetic-origin references (through a derived /
+    /// CTE relation, an output alias, or a nested subquery's output) are
+    /// dropped — their physical reads are counted by walking the sub-plans.
     fn expr_reads(&self, expr: &Expr, scope: &Scope) -> (Vec<ColumnRead>, Vec<Plan>) {
-        let mut sources = Vec::new();
-        let mut subplans = Vec::new();
-        self.collect_expr(expr, scope, &mut sources, &mut subplans);
-        let reads = sources
-            .into_iter()
-            .filter(|source| !source.synthetic_origin)
-            .map(|source| source.read)
-            .collect();
-        (reads, subplans)
+        let mut collector = ExprCollector::filter();
+        self.collect_expr(expr, scope, &mut collector);
+        (collector.filter_reads, collector.subplans)
     }
 
-    /// Walk an expression collecting its lineage `sources` (direct column
-    /// refs + a nested subquery's *output* columns, the latter marked
-    /// synthetic-origin) and the `subplans` of any nested subqueries (kept
-    /// whole so their tables / reads surface by walking). A value-position
-    /// caller keeps `sources` as provenance; a filter-position caller keeps
-    /// the non-synthetic reads. Both attach `subplans` to their node.
-    fn collect_expr(
-        &self,
-        expr: &Expr,
-        scope: &Scope,
-        sources: &mut Vec<ProvenanceSource>,
-        subplans: &mut Vec<Plan>,
-    ) {
+    /// Walk an expression, routing each column reference to the collector by
+    /// position: a **value** reference (one whose value flows to the output)
+    /// becomes a lineage `source`; a **filter** reference (a predicate that
+    /// only influences *which* rows / values are produced — a `CASE`
+    /// condition, an `EXISTS` / `IN` / `ANY` / `ALL` test, a window
+    /// PARTITION / ORDER key, an aggregate `FILTER`) becomes a `filter_read`
+    /// instead. The split mirrors the resolver's `suppress_lineage`. Nested
+    /// subqueries are kept whole as `subplans` (walked for their own tables
+    /// / reads); a scalar subquery's *output* additionally folds in as a
+    /// synthetic-origin value source (unless it sits in a filter position).
+    /// The match is exhaustive so new `Expr` variants are reviewed here.
+    fn collect_expr(&self, expr: &Expr, scope: &Scope, c: &mut ExprCollector) {
         match expr {
-            Expr::Identifier(id) => {
-                sources.extend(self.resolve_ref(std::slice::from_ref(id), scope))
+            Expr::Identifier(id) => self.emit_ref(std::slice::from_ref(id), scope, c),
+            Expr::CompoundIdentifier(ids) => self.emit_ref(ids, scope, c),
+            // Both operands flow / filter with the surrounding position.
+            Expr::BinaryOp { left, right, .. }
+            | Expr::IsDistinctFrom(left, right)
+            | Expr::IsNotDistinctFrom(left, right) => {
+                self.collect_expr(left, scope, c);
+                self.collect_expr(right, scope, c);
             }
-            Expr::CompoundIdentifier(ids) => sources.extend(self.resolve_ref(ids, scope)),
-            Expr::BinaryOp { left, right, .. } => {
-                self.collect_expr(left, scope, sources, subplans);
-                self.collect_expr(right, scope, sources, subplans);
+            // ANY / ALL: the LHS keeps the surrounding position; the RHS is
+            // a shape test (its rows don't flow as values) → suppressed.
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                self.collect_expr(left, scope, c);
+                c.suppressed(|c| self.collect_expr(right, scope, c));
             }
-            Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
-                self.collect_expr(expr, scope, sources, subplans)
+            Expr::UnaryOp { expr, .. }
+            | Expr::Nested(expr)
+            | Expr::OuterJoin(expr)
+            | Expr::Prior(expr)
+            | Expr::IsFalse(expr)
+            | Expr::IsNotFalse(expr)
+            | Expr::IsTrue(expr)
+            | Expr::IsNotTrue(expr)
+            | Expr::IsNull(expr)
+            | Expr::IsNotNull(expr)
+            | Expr::IsUnknown(expr)
+            | Expr::IsNotUnknown(expr)
+            | Expr::Cast { expr, .. }
+            | Expr::IsNormalized { expr, .. }
+            | Expr::Extract { expr, .. }
+            | Expr::Ceil { expr, .. }
+            | Expr::Floor { expr, .. }
+            | Expr::Collate { expr, .. }
+            | Expr::Prefixed { value: expr, .. }
+            | Expr::Named { expr, .. } => self.collect_expr(expr, scope, c),
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                self.collect_expr(root, scope, c);
+                for access in access_chain {
+                    self.collect_access(access, scope, c);
+                }
             }
-            Expr::Function(function) => self.collect_function(function, scope, sources, subplans),
-            // GROUP BY ROLLUP / CUBE / GROUPING SETS — each grouping set is
-            // a list of expressions.
-            Expr::Rollup(sets) | Expr::Cube(sets) | Expr::GroupingSets(sets) => {
-                for set in sets {
-                    for expr in set {
-                        self.collect_expr(expr, scope, sources, subplans);
+            Expr::JsonAccess { value, .. } => self.collect_expr(value, scope, c),
+            Expr::InList { expr, list, .. } => {
+                self.collect_expr(expr, scope, c);
+                for item in list {
+                    self.collect_expr(item, scope, c);
+                }
+            }
+            Expr::InUnnest {
+                expr, array_expr, ..
+            } => {
+                self.collect_expr(expr, scope, c);
+                self.collect_expr(array_expr, scope, c);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.collect_expr(expr, scope, c);
+                self.collect_expr(low, scope, c);
+                self.collect_expr(high, scope, c);
+            }
+            Expr::Like { expr, pattern, .. }
+            | Expr::ILike { expr, pattern, .. }
+            | Expr::SimilarTo { expr, pattern, .. }
+            | Expr::RLike { expr, pattern, .. } => {
+                self.collect_expr(expr, scope, c);
+                self.collect_expr(pattern, scope, c);
+            }
+            Expr::Convert { expr, styles, .. } => {
+                self.collect_expr(expr, scope, c);
+                for style in styles {
+                    self.collect_expr(style, scope, c);
+                }
+            }
+            Expr::AtTimeZone {
+                timestamp,
+                time_zone,
+            } => {
+                self.collect_expr(timestamp, scope, c);
+                self.collect_expr(time_zone, scope, c);
+            }
+            Expr::Position { expr, r#in } => {
+                self.collect_expr(expr, scope, c);
+                self.collect_expr(r#in, scope, c);
+            }
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                self.collect_expr(expr, scope, c);
+                for sub in [substring_from, substring_for].into_iter().flatten() {
+                    self.collect_expr(sub, scope, c);
+                }
+            }
+            Expr::Trim {
+                expr,
+                trim_what,
+                trim_characters,
+                ..
+            } => {
+                self.collect_expr(expr, scope, c);
+                if let Some(trim_what) = trim_what {
+                    self.collect_expr(trim_what, scope, c);
+                }
+                if let Some(exprs) = trim_characters {
+                    for sub in exprs {
+                        self.collect_expr(sub, scope, c);
                     }
                 }
             }
-            // Subqueries: bind against the enclosing scope (correlation).
-            // The sub-plan is kept whole (walked for its tables / reads);
-            // its output columns fold in as synthetic-origin lineage
-            // sources of the enclosing value.
-            Expr::Subquery(query)
-            | Expr::Exists {
-                subquery: query, ..
-            } => self.collect_subquery(query, scope, sources, subplans),
-            Expr::InSubquery { expr, subquery, .. } => {
-                self.collect_expr(expr, scope, sources, subplans);
-                self.collect_subquery(subquery, scope, sources, subplans);
+            Expr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => {
+                self.collect_expr(expr, scope, c);
+                self.collect_expr(overlay_what, scope, c);
+                self.collect_expr(overlay_from, scope, c);
+                if let Some(overlay_for) = overlay_for {
+                    self.collect_expr(overlay_for, scope, c);
+                }
             }
-            _ => {}
+            // CASE: the operand and the WHEN conditions are predicates (they
+            // select which result is produced) → suppressed; the THEN / ELSE
+            // results are the values that flow → keep the surrounding position.
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    c.suppressed(|c| self.collect_expr(operand, scope, c));
+                }
+                for condition in conditions {
+                    c.suppressed(|c| self.collect_expr(&condition.condition, scope, c));
+                    self.collect_expr(&condition.result, scope, c);
+                }
+                if let Some(else_result) = else_result {
+                    self.collect_expr(else_result, scope, c);
+                }
+            }
+            Expr::Rollup(sets) | Expr::Cube(sets) | Expr::GroupingSets(sets) => {
+                for set in sets {
+                    for expr in set {
+                        self.collect_expr(expr, scope, c);
+                    }
+                }
+            }
+            Expr::Tuple(exprs) | Expr::Struct { values: exprs, .. } => {
+                for expr in exprs {
+                    self.collect_expr(expr, scope, c);
+                }
+            }
+            Expr::Function(function) => self.collect_function(function, scope, c),
+            Expr::Dictionary(fields) => {
+                for field in fields {
+                    self.collect_dictionary_field(field, scope, c);
+                }
+            }
+            Expr::Map(map) => self.collect_map(map, scope, c),
+            Expr::Array(array) => self.collect_array(array, scope, c),
+            Expr::Interval(interval) => self.collect_expr(&interval.value, scope, c),
+            Expr::Lambda(lambda) => self.collect_expr(&lambda.body, scope, c),
+            Expr::MemberOf(member_of) => {
+                self.collect_expr(&member_of.value, scope, c);
+                self.collect_expr(&member_of.array, scope, c);
+            }
+            // A scalar subquery's value flows out → keep the surrounding
+            // position; EXISTS is a boolean test → suppressed.
+            Expr::Subquery(query) => self.collect_subquery(query, scope, c),
+            Expr::Exists {
+                subquery: query, ..
+            } => c.suppressed(|c| self.collect_subquery(query, scope, c)),
+            Expr::InSubquery { expr, subquery, .. } => {
+                self.collect_expr(expr, scope, c);
+                c.suppressed(|c| self.collect_subquery(subquery, scope, c));
+            }
+            Expr::Value(_)
+            | Expr::TypedString(_)
+            | Expr::MatchAgainst { .. }
+            | Expr::Wildcard(_)
+            | Expr::QualifiedWildcard(_, _) => {}
         }
     }
 
-    fn collect_function(
+    /// Emit one column reference into the collector: a value position adds
+    /// the resolved lineage sources; a filter position keeps only the
+    /// non-synthetic reads (synthetic-origin references are counted at the
+    /// inner producer by walking its sub-plan).
+    fn emit_ref(&self, parts: &[Ident], scope: &Scope, c: &mut ExprCollector) {
+        let resolved = self.resolve_ref(parts, scope);
+        if c.is_suppressed {
+            c.filter_reads.extend(
+                resolved
+                    .into_iter()
+                    .filter(|source| !source.synthetic_origin)
+                    .map(|source| source.read),
+            );
+        } else {
+            c.sources.extend(resolved);
+        }
+    }
+
+    fn collect_function(&self, function: &Function, scope: &Scope, c: &mut ExprCollector) {
+        self.collect_function_arguments(&function.parameters, scope, c);
+        self.collect_function_arguments(&function.args, scope, c);
+        // Aggregate `FILTER (WHERE …)` is a row-selection predicate — its
+        // refs don't flow as values.
+        if let Some(filter) = &function.filter {
+            c.suppressed(|c| self.collect_expr(filter, scope, c));
+        }
+        for order_by in &function.within_group {
+            self.collect_order_by_expr(order_by, scope, c);
+        }
+        if let Some(WindowType::WindowSpec(spec)) = &function.over {
+            self.collect_window_spec(spec, scope, c);
+        }
+    }
+
+    fn collect_function_arguments(
         &self,
-        function: &Function,
+        arguments: &FunctionArguments,
         scope: &Scope,
-        sources: &mut Vec<ProvenanceSource>,
-        subplans: &mut Vec<Plan>,
+        c: &mut ExprCollector,
     ) {
-        if let FunctionArguments::List(list) = &function.args {
-            for arg in &list.args {
-                let inner = match arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-                    | FunctionArg::Named {
-                        arg: FunctionArgExpr::Expr(expr),
-                        ..
+        match arguments {
+            FunctionArguments::None => {}
+            FunctionArguments::Subquery(query) => self.collect_subquery(query, scope, c),
+            FunctionArguments::List(list) => self.collect_function_argument_list(list, scope, c),
+        }
+    }
+
+    fn collect_function_argument_list(
+        &self,
+        list: &FunctionArgumentList,
+        scope: &Scope,
+        c: &mut ExprCollector,
+    ) {
+        for arg in &list.args {
+            self.collect_function_arg(arg, scope, c);
+        }
+        for clause in &list.clauses {
+            match clause {
+                FunctionArgumentClause::OrderBy(order_by) => {
+                    for order_by in order_by {
+                        self.collect_order_by_expr(order_by, scope, c);
                     }
-                    | FunctionArg::ExprNamed {
-                        arg: FunctionArgExpr::Expr(expr),
-                        ..
-                    } => Some(expr),
-                    _ => None,
-                };
-                if let Some(expr) = inner {
-                    self.collect_expr(expr, scope, sources, subplans);
+                }
+                // Row-count / predicate bounds inside aggregate args.
+                FunctionArgumentClause::Limit(expr) => {
+                    c.suppressed(|c| self.collect_expr(expr, scope, c))
+                }
+                FunctionArgumentClause::Having(bound) => {
+                    c.suppressed(|c| self.collect_expr(&bound.1, scope, c))
+                }
+                FunctionArgumentClause::OnOverflow(ListAggOnOverflow::Truncate {
+                    filler: Some(filler),
+                    ..
+                }) => self.collect_expr(filler, scope, c),
+                FunctionArgumentClause::OnOverflow(_)
+                | FunctionArgumentClause::IgnoreOrRespectNulls(_)
+                | FunctionArgumentClause::Separator(_)
+                | FunctionArgumentClause::JsonNullClause(_)
+                | FunctionArgumentClause::JsonReturningClause(_) => {}
+            }
+        }
+    }
+
+    fn collect_function_arg(&self, arg: &FunctionArg, scope: &Scope, c: &mut ExprCollector) {
+        match arg {
+            FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => {
+                if let FunctionArgExpr::Expr(expr) = arg {
+                    self.collect_expr(expr, scope, c);
+                }
+            }
+            FunctionArg::ExprNamed { name, arg, .. } => {
+                self.collect_expr(name, scope, c);
+                if let FunctionArgExpr::Expr(expr) = arg {
+                    self.collect_expr(expr, scope, c);
+                }
+            }
+        }
+    }
+
+    fn collect_access(&self, access: &AccessExpr, scope: &Scope, c: &mut ExprCollector) {
+        match access {
+            AccessExpr::Dot(expr) => self.collect_expr(expr, scope, c),
+            AccessExpr::Subscript(subscript) => match subscript {
+                Subscript::Index { index } => self.collect_expr(index, scope, c),
+                Subscript::Slice {
+                    lower_bound,
+                    upper_bound,
+                    stride,
+                } => {
+                    for expr in [lower_bound, upper_bound, stride].into_iter().flatten() {
+                        self.collect_expr(expr, scope, c);
+                    }
+                }
+            },
+        }
+    }
+
+    fn collect_dictionary_field(
+        &self,
+        field: &DictionaryField,
+        scope: &Scope,
+        c: &mut ExprCollector,
+    ) {
+        self.collect_expr(&field.value, scope, c);
+    }
+
+    fn collect_map(&self, map: &Map, scope: &Scope, c: &mut ExprCollector) {
+        for entry in &map.entries {
+            self.collect_expr(&entry.key, scope, c);
+            self.collect_expr(&entry.value, scope, c);
+        }
+    }
+
+    fn collect_array(&self, array: &Array, scope: &Scope, c: &mut ExprCollector) {
+        for expr in &array.elem {
+            self.collect_expr(expr, scope, c);
+        }
+    }
+
+    /// An ORDER BY expression in value-bearing position (window / WITHIN
+    /// GROUP / aggregate ORDER BY): sort keys never flow as values, so the
+    /// key and any WITH FILL bounds are suppressed.
+    fn collect_order_by_expr(&self, order_by: &OrderByExpr, scope: &Scope, c: &mut ExprCollector) {
+        c.suppressed(|c| {
+            self.collect_expr(&order_by.expr, scope, c);
+            if let Some(with_fill) = &order_by.with_fill {
+                for expr in [&with_fill.from, &with_fill.to, &with_fill.step]
+                    .into_iter()
+                    .flatten()
+                {
+                    self.collect_expr(expr, scope, c);
+                }
+            }
+        });
+    }
+
+    /// A window `OVER (…)` spec: PARTITION BY keys, ORDER BY keys, and frame
+    /// bounds are all row-positioning, not value sources → suppressed.
+    fn collect_window_spec(&self, spec: &WindowSpec, scope: &Scope, c: &mut ExprCollector) {
+        c.suppressed(|c| {
+            for expr in &spec.partition_by {
+                self.collect_expr(expr, scope, c);
+            }
+        });
+        for order_by in &spec.order_by {
+            self.collect_order_by_expr(order_by, scope, c);
+        }
+        if let Some(frame) = &spec.window_frame {
+            let mut bounds = vec![&frame.start_bound];
+            bounds.extend(frame.end_bound.as_ref());
+            for bound in bounds {
+                if let WindowFrameBound::Preceding(Some(expr))
+                | WindowFrameBound::Following(Some(expr)) = bound
+                {
+                    c.suppressed(|c| self.collect_expr(expr, scope, c));
                 }
             }
         }
@@ -1007,28 +1359,25 @@ impl Binder<'_> {
     /// Bind a subquery nested in an expression (with the containing
     /// `scope`'s relations pushed onto the correlation stack, so a
     /// correlated reference resolves outward). The bound sub-plan is kept
-    /// whole in `subplans` (so its tables / reads surface by walking it);
-    /// its output columns fold into `sources` as synthetic-origin lineage
-    /// sources of the enclosing value (their physical reads are counted by
-    /// walking the sub-plan, so they're excluded from `reads`).
-    fn collect_subquery(
-        &self,
-        query: &Query,
-        scope: &Scope,
-        sources: &mut Vec<ProvenanceSource>,
-        subplans: &mut Vec<Plan>,
-    ) {
+    /// whole in `subplans` (so its tables / reads surface by walking it). In
+    /// value position its output columns fold into `sources` as
+    /// synthetic-origin lineage sources of the enclosing value; in a filter
+    /// position (`EXISTS`, `IN`, an aggregate `FILTER`) the output is a test
+    /// result, not a value, so only the sub-plan is kept.
+    fn collect_subquery(&self, query: &Query, scope: &Scope, c: &mut ExprCollector) {
         let binder = self.with_outer_scope(scope.relations.clone());
         let (plan, _) = binder.bind_query(query);
-        sources.extend(
-            output_sources(&plan)
-                .into_iter()
-                .map(|source| ProvenanceSource {
-                    synthetic_origin: true,
-                    ..source
-                }),
-        );
-        subplans.push(plan);
+        if !c.is_suppressed {
+            c.sources.extend(
+                output_sources(&plan)
+                    .into_iter()
+                    .map(|source| ProvenanceSource {
+                        synthetic_origin: true,
+                        ..source
+                    }),
+            );
+        }
+        c.subplans.push(plan);
     }
 
     /// Resolve a single column reference to its pre-collapsed provenance.

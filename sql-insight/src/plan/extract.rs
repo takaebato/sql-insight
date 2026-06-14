@@ -490,6 +490,20 @@ mod differential {
             "SELECT a FROM x JOIN y ON x.id = y.id",
             "SELECT a FROM x JOIN y ON x.id = y.id WHERE x.c > 0",
             "SELECT p.a FROM p, q WHERE p.id = q.id",
+            // Expression-arm coverage: every sub-expression's column refs
+            // surface as reads; the value / filter split (CASE conditions,
+            // window PARTITION / ORDER keys, aggregate FILTER) keeps
+            // predicate refs out of lineage while values flow.
+            "SELECT a FROM t WHERE c BETWEEN lo AND hi",
+            "SELECT CASE WHEN a > 0 THEN b ELSE c END AS m FROM t",
+            "SELECT CASE d WHEN 1 THEN b ELSE c END AS m FROM t",
+            "SELECT a FROM t WHERE x LIKE y",
+            "SELECT a FROM t WHERE b IN (1, c)",
+            "SELECT a FROM t WHERE b IS NOT NULL AND NOT (c > 0)",
+            "SELECT COALESCE(a, b) AS m FROM t",
+            "SELECT substring(a FROM 1 FOR b) AS m FROM t",
+            "SELECT sum(a) OVER (PARTITION BY b ORDER BY c) AS m FROM t",
+            "SELECT sum(a) FILTER (WHERE b > 0) AS m FROM t GROUP BY c",
             // GROUP BY / HAVING / ORDER BY (clause-phase, alias visibility).
             "SELECT a, COUNT(*) FROM t GROUP BY a",
             "SELECT a FROM t GROUP BY a HAVING SUM(b) > 0",
