@@ -28,3 +28,7 @@ pub use column_operation_extractor::*;
 pub use crud_table_extractor::*;
 pub use table_extractor::*;
 pub use table_operation_extractor::*;
+
+// The statement classifier is resolver-independent; the incubating `plan`
+// module reuses it for statement-kind classification.
+pub(crate) use table_operation_extractor::classify_statement;

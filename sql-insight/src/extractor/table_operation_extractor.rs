@@ -317,7 +317,7 @@ fn merge_moves_data(statement: &Statement) -> bool {
     })
 }
 
-pub(super) fn classify_statement(statement: &Statement) -> StatementKind {
+pub(crate) fn classify_statement(statement: &Statement) -> StatementKind {
     use sqlparser::ast::{ObjectType, SetExpr};
     match statement {
         // `WITH cte AS (...) INSERT/UPDATE/DELETE/MERGE ...` is parsed

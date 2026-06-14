@@ -203,8 +203,28 @@ mod differential {
             .unwrap()
     }
 
+    /// The plan-based column operation (the extractor switch's surface).
+    fn plan_op(sql: &str, catalog: Option<&Catalog>) -> ColumnOperation {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        let casing = IdentifierCasing::for_dialect(&dialect);
+        crate::plan::operation::column_operation(&statements[0], catalog, casing)
+    }
+
     fn set<T: Clone + Eq + Hash>(items: &[T]) -> HashSet<T> {
         items.iter().cloned().collect()
+    }
+
+    /// Diagnostic *kinds* as a sorted multiset (messages are human-readable
+    /// detail, not part of the compared contract).
+    fn diag_kinds(op: &ColumnOperation) -> Vec<String> {
+        let mut kinds: Vec<String> = op
+            .diagnostics
+            .iter()
+            .map(|d| format!("{:?}", d.kind))
+            .collect();
+        kinds.sort();
+        kinds
     }
 
     /// A span-free key for a read, so occurrences sort / compare by
@@ -244,28 +264,37 @@ mod differential {
         keys
     }
 
-    /// The binder's `reads` / `writes` / `lineage` **sets** must each
-    /// match the resolver's for every covered statement, under the same
-    /// catalog. Sets (not order / multiplicity) so pre-collapse occurrence
-    /// differences don't register as regressions.
+    /// The plan-based column operation must match the resolver's for every
+    /// covered statement: `statement_kind`, diagnostic kinds, the `reads`
+    /// **span-tagged multiset** (occurrence + source span, order excepted),
+    /// and the `writes` / `lineage` sets.
     fn assert_parity(sql: &str, catalog: Option<&Catalog>) {
-        let plan = bind_one(sql, catalog);
+        let plan = plan_op(sql, catalog);
         let old = resolver_op(sql, catalog);
         assert_eq!(
-            read_span_bag(&extract_reads(&plan)),
+            plan.statement_kind, old.statement_kind,
+            "statement-kind mismatch for: {sql}"
+        );
+        assert_eq!(
+            diag_kinds(&plan),
+            diag_kinds(&old),
+            "diagnostic-kind mismatch for: {sql}"
+        );
+        assert_eq!(
+            read_span_bag(&plan.reads),
             read_span_bag(&old.reads),
             "read-multiset mismatch for: {sql}"
         );
         assert_eq!(
-            set(&extract_writes(&plan)),
+            set(&plan.writes),
             set(&old.writes),
             "write-set mismatch for: {sql}"
         );
         assert_eq!(
-            set(&extract_lineage(&plan)),
+            set(&plan.lineage),
             set(&old.lineage),
             "lineage-set mismatch for: {sql}\n  plan: {:?}\n  old:  {:?}",
-            extract_lineage(&plan),
+            plan.lineage,
             old.lineage
         );
     }
@@ -274,15 +303,15 @@ mod differential {
     /// lineage is a deferred refinement or a deliberate improvement (see
     /// [`reads_writes_only_corpus`]).
     fn assert_reads_writes_parity(sql: &str, catalog: Option<&Catalog>) {
-        let plan = bind_one(sql, catalog);
+        let plan = plan_op(sql, catalog);
         let old = resolver_op(sql, catalog);
         assert_eq!(
-            read_span_bag(&extract_reads(&plan)),
+            read_span_bag(&plan.reads),
             read_span_bag(&old.reads),
             "read-multiset mismatch for: {sql}"
         );
         assert_eq!(
-            set(&extract_writes(&plan)),
+            set(&plan.writes),
             set(&old.writes),
             "write-set mismatch for: {sql}"
         );
@@ -292,7 +321,7 @@ mod differential {
     /// deliberately differ (see [`reads_only_corpus`]).
     fn assert_reads_parity(sql: &str, catalog: Option<&Catalog>) {
         assert_eq!(
-            read_span_bag(&extract_reads(&bind_one(sql, catalog))),
+            read_span_bag(&plan_op(sql, catalog).reads),
             read_span_bag(&resolver_op(sql, catalog).reads),
             "read-multiset mismatch for: {sql}"
         );
@@ -383,6 +412,9 @@ mod differential {
             // pair to the (canonical) target columns.
             "MERGE INTO target t USING source s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+            // Unsupported statement: empty surfaces + an UnsupportedStatement
+            // diagnostic, matching the resolver-based extractor.
+            "CREATE INDEX idx ON t (a)",
         ]
     }
 
