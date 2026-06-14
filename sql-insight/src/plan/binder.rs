@@ -284,10 +284,14 @@ impl Binder<'_> {
             Some(source) => self.bind_query(source).0,
             None => Plan::OpaqueLeaf,
         };
+        // RETURNING references resolve against the target alone (the source
+        // query's scope is already popped).
+        let returning = self.bind_returning(&insert.returning, &self.target_scope(&target));
         Some(Plan::Write(Write {
             target,
             target_columns,
             input: Box::new(input),
+            returning,
         }))
     }
 
@@ -332,6 +336,8 @@ impl Binder<'_> {
             }
         }
         let target = self.canonical_target(TableReference::try_from(&update.table.relation).ok()?);
+        // RETURNING resolves against the statement scope (target + FROM).
+        let returning = self.bind_returning(&update.returning, &scope);
         Some(Plan::Write(Write {
             target,
             target_columns,
@@ -340,6 +346,7 @@ impl Binder<'_> {
                 outputs,
                 subqueries,
             })),
+            returning,
         }))
     }
 
@@ -377,6 +384,9 @@ impl Binder<'_> {
             .as_ref()
             .map(|s| self.expr_reads(s, &scope))
             .unwrap_or_default();
+        // RETURNING resolves against the FROM / USING scope (which holds
+        // the target).
+        let returning = self.bind_returning(&delete.returning, &scope);
         let input = wrap_inputs(inputs, reads, subqueries);
         // The deleted relation is the explicit `DELETE t` list when
         // present, else the FROM target.
@@ -393,6 +403,7 @@ impl Binder<'_> {
                 target,
                 target_columns: Vec::new(),
                 input: Box::new(input),
+                returning,
             }),
             None => input,
         })
@@ -483,6 +494,7 @@ impl Binder<'_> {
                 outputs,
                 subqueries,
             })),
+            returning: Vec::new(),
         }))
     }
 
@@ -503,6 +515,7 @@ impl Binder<'_> {
             target,
             target_columns,
             input: Box::new(input),
+            returning: Vec::new(),
         }))
     }
 
@@ -520,6 +533,7 @@ impl Binder<'_> {
             target,
             target_columns,
             input: Box::new(input),
+            returning: Vec::new(),
         }))
     }
 
@@ -1130,6 +1144,45 @@ impl Binder<'_> {
                 .to_string(),
             span: None,
         });
+    }
+
+    /// Bind a `RETURNING` clause's projected columns against `scope`. Each
+    /// is a value-position projection (like a SELECT list) over the written
+    /// relation, so it contributes target reads and a `QueryOutput` lineage
+    /// edge. A wildcard records `WildcardSuppressed` and is skipped.
+    fn bind_returning(
+        &self,
+        returning: &Option<Vec<SelectItem>>,
+        scope: &Scope,
+    ) -> Vec<BoundColumn> {
+        let Some(items) = returning else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            // Sub-plans / filter reads of a RETURNING expression (rare —
+            // a subquery or CASE in RETURNING) aren't modelled yet.
+            .filter_map(|item| {
+                self.bind_output_column(item, scope)
+                    .map(|(column, _, _)| column)
+            })
+            .collect()
+    }
+
+    /// A resolution scope holding just the write target (for `INSERT …
+    /// RETURNING`, whose references resolve against the target alone — the
+    /// source query's scope has already been popped).
+    fn target_scope(&self, target: &TableReference) -> Scope {
+        let TableMatch { table, columns, .. } = self.table_match(target);
+        let columns = if columns.is_empty() {
+            RelationColumns::Open
+        } else {
+            RelationColumns::Known(columns)
+        };
+        Scope::of(Relation {
+            alias: None,
+            source: RelationSource::Table { table, columns },
+        })
     }
 
     /// Bind a value-producing expression (a projection item or a SET /
@@ -2601,6 +2654,7 @@ mod tests {
                         passthrough_col("y", vec![inferred("source", "y")]),
                     ],
                 )),
+                returning: vec![],
             })
         );
     }
@@ -2622,6 +2676,7 @@ mod tests {
                         vec![inferred("t", "a"), inferred("t", "b")]
                     )],
                 )),
+                returning: vec![],
             })
         );
     }
@@ -2636,6 +2691,7 @@ mod tests {
                 target: tref("t"),
                 target_columns: vec![],
                 input: Box::new(pass(vec![write_scan("t")], vec![inferred("t", "d")])),
+                returning: vec![],
             })
         );
     }

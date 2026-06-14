@@ -58,7 +58,20 @@ fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
                 collect_reads(operand, out);
             }
         }
-        Plan::Write(write) => collect_reads(&write.input, out),
+        Plan::Write(write) => {
+            collect_reads(&write.input, out);
+            // RETURNING reads the target's columns (value-position
+            // provenance), like a projection over the written relation.
+            for column in &write.returning {
+                out.extend(
+                    column
+                        .provenance
+                        .iter()
+                        .filter(|source| !source.synthetic_origin)
+                        .map(|source| source.read.clone()),
+                );
+            }
+        }
         // Each declared CTE body is walked once here regardless of how many
         // references consume it (or whether any do) — its reads count once.
         Plan::With(with) => {
@@ -251,7 +264,18 @@ pub(crate) fn extract_lineage(plan: &Plan) -> Vec<ColumnLineageEdge> {
     }
     let mut edges = Vec::new();
     match plan {
-        Plan::Write(write) => write_lineage(write, &mut edges),
+        Plan::Write(write) => {
+            write_lineage(write, &mut edges);
+            // RETURNING projects the written relation: each column emits a
+            // `QueryOutput` edge, so the statement both writes and returns.
+            for (position, column) in write.returning.iter().enumerate() {
+                let target = ColumnTarget::QueryOutput {
+                    name: column.name.clone(),
+                    position,
+                };
+                emit_edges(column, &target, &mut edges);
+            }
+        }
         _ => query_output_lineage(plan, &mut edges),
     }
     edges
@@ -592,6 +616,15 @@ mod differential {
             // Statement-level WITH over DML: sqlparser nests the INSERT as
             // the WITH-query's body, so writes / lineage must peel the With.
             "WITH c AS (SELECT a FROM s) INSERT INTO t (col) SELECT a FROM c",
+            // RETURNING: a projection over the written relation — reads the
+            // target's columns and emits QueryOutput lineage, alongside the
+            // statement's write / write-lineage.
+            "INSERT INTO t (a, b) VALUES (1, 2) RETURNING id",
+            "INSERT INTO t (a) SELECT x FROM s RETURNING id AS pk",
+            "UPDATE t SET a = b + 1 WHERE id = 5 RETURNING id, a",
+            "DELETE FROM t WHERE id = 5 RETURNING id, val",
+            "INSERT INTO t (a) VALUES (1) RETURNING id + 1 AS bumped",
+            "INSERT INTO t (a) VALUES (1) RETURNING *",
             // MERGE with an unqualified INSERT clause: writes / lineage
             // pair to the (canonical) target columns.
             "MERGE INTO target t USING source s ON t.id = s.id \

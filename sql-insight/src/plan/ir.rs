@@ -111,6 +111,12 @@ pub(crate) struct Write {
     pub(crate) target: TableReference,
     pub(crate) target_columns: Vec<Ident>,
     pub(crate) input: Box<Plan>,
+    /// A `RETURNING` clause's projected columns, resolved against the
+    /// target (for `INSERT`) or the statement scope (`UPDATE` / `DELETE`).
+    /// Each contributes target-column reads and a `QueryOutput` lineage
+    /// edge — the statement both writes the relation and returns a row set.
+    /// Empty when there is no `RETURNING`.
+    pub(crate) returning: Vec<BoundColumn>,
 }
 
 /// A `WITH` clause: the CTEs it declares, kept as named sub-plans, plus
