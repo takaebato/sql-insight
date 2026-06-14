@@ -12,13 +12,14 @@
 //! coexist; the differential harness pins them together).
 
 use sqlparser::ast::{
-    AccessExpr, Array, AssignmentTarget, CreateTable, CreateView, Cte, Delete, DictionaryField,
-    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
-    FunctionArgumentList, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident, Insert, Join,
-    JoinConstraint, JoinOperator, ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind,
-    ObjectName, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, Query, Select,
-    SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor, TableWithJoins, Update,
-    UpdateTableFromKind, WindowFrameBound, WindowSpec, WindowType,
+    AccessExpr, AlterTable, AlterTableOperation, Array, AssignmentTarget, CreateTable, CreateView,
+    Cte, Delete, DictionaryField, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
+    GroupByWithModifier, Ident, Insert, Join, JoinConstraint, JoinOperator, ListAggOnOverflow, Map,
+    Merge, MergeAction, MergeInsertKind, ObjectName, OnConflictAction, OnInsert, OrderBy,
+    OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Subscript, TableAlias,
+    TableFactor, TableWithJoins, Update, UpdateTableFromKind, WindowFrameBound, WindowSpec,
+    WindowType,
 };
 
 use std::cell::RefCell;
@@ -267,6 +268,7 @@ impl Binder<'_> {
             Statement::Merge(merge) => self.bind_merge(merge),
             Statement::CreateTable(create) => self.bind_create_table(create),
             Statement::CreateView(create) => self.bind_create_view(create),
+            Statement::AlterTable(alter) => self.bind_alter_table(alter),
             // Other DDL / session statements aren't data operations — not
             // bound (the wildcard mirrors `build`'s "unsupported → None").
             _ => None,
@@ -546,6 +548,27 @@ impl Binder<'_> {
             target,
             target_columns,
             input: Box::new(input),
+            returning: Vec::new(),
+            conflict_updates: Vec::new(),
+        }))
+    }
+
+    /// `ALTER TABLE t <ops>`: the altered table is a write target; each
+    /// column-naming operation contributes its column(s) as writes (RENAME
+    /// / CHANGE surface both the old and new names). Schema-level ops
+    /// (constraints, partitions, RENAME TABLE) name no columns. No reads or
+    /// lineage — ALTER restructures, it doesn't move row data.
+    fn bind_alter_table(&self, alter: &AlterTable) -> Option<Plan> {
+        let target = self.canonical_target(TableReference::try_from(&alter.name).ok()?);
+        let target_columns = alter
+            .operations
+            .iter()
+            .flat_map(alter_table_op_target_columns)
+            .collect();
+        Some(Plan::Write(Write {
+            target,
+            target_columns,
+            input: Box::new(Plan::OpaqueLeaf),
             returning: Vec::new(),
             conflict_updates: Vec::new(),
         }))
@@ -2202,6 +2225,29 @@ fn wrap_inputs(mut inputs: Vec<Plan>, reads: Vec<ColumnRead>, subqueries: Vec<Pl
             reads,
             subqueries,
         })
+    }
+}
+
+/// The column names an `ALTER TABLE` operation writes to. Column-naming
+/// ops (ADD / DROP / MODIFY / ALTER COLUMN) name one column; RENAME /
+/// CHANGE name both the old and new (both ends of the rename are useful
+/// to a lineage consumer). Schema-level ops (constraints, partitions,
+/// RENAME TABLE, …) name no columns.
+fn alter_table_op_target_columns(op: &AlterTableOperation) -> Vec<Ident> {
+    match op {
+        AlterTableOperation::AddColumn { column_def, .. } => vec![column_def.name.clone()],
+        AlterTableOperation::DropColumn { column_names, .. } => column_names.clone(),
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => vec![old_column_name.clone(), new_column_name.clone()],
+        AlterTableOperation::ChangeColumn {
+            old_name, new_name, ..
+        } if old_name != new_name => vec![old_name.clone(), new_name.clone()],
+        AlterTableOperation::ChangeColumn { old_name, .. } => vec![old_name.clone()],
+        AlterTableOperation::ModifyColumn { col_name, .. } => vec![col_name.clone()],
+        AlterTableOperation::AlterColumn { column_name, .. } => vec![column_name.clone()],
+        _ => Vec::new(),
     }
 }
 

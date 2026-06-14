@@ -674,6 +674,15 @@ mod differential {
             // pair to the (canonical) target columns.
             "MERGE INTO target t USING source s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+            // ALTER TABLE: column-naming ops are writes on the altered
+            // table (RENAME / CHANGE surface both names); schema-level ops
+            // name no columns. No reads / lineage.
+            "ALTER TABLE t ADD COLUMN c INT",
+            "ALTER TABLE t DROP COLUMN c",
+            "ALTER TABLE t RENAME COLUMN a TO b",
+            "ALTER TABLE t ALTER COLUMN a SET NOT NULL",
+            "ALTER TABLE t ADD COLUMN c INT, DROP COLUMN d",
+            "ALTER TABLE t ADD CONSTRAINT uq UNIQUE (a)",
             // Unsupported statement: empty surfaces + an UnsupportedStatement
             // diagnostic, matching the resolver-based extractor.
             "CREATE INDEX idx ON t (a)",
