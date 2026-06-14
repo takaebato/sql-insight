@@ -22,8 +22,8 @@ use sqlparser::ast::{
 use std::cell::RefCell;
 
 use super::ir::{
-    BoundColumn, CtePlan, CteRef, PassThrough, Plan, Project, ProvenanceSource, Scan, SetOp, With,
-    Write,
+    BoundColumn, CtePlan, CteRef, PassThrough, Plan, Project, ProvenanceSource, Scan, ScanRole,
+    SetOp, With, Write,
 };
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
@@ -227,6 +227,7 @@ impl Binder<'_> {
     /// A `VALUES` source binds to an opaque leaf (no column reads).
     fn bind_insert(&self, insert: &Insert) -> Option<Plan> {
         let (target, _alias) = TableReference::from_insert_with_alias(insert).ok()?;
+        let target = self.canonical_target(target);
         let target_columns = insert.columns.clone();
         let input = match &insert.source {
             Some(source) => self.bind_query(source).0,
@@ -247,7 +248,9 @@ impl Binder<'_> {
     /// predicate is a filter `PassThrough` below it.
     fn bind_update(&self, update: &Update) -> Option<Plan> {
         let (target_plan, mut scope) = self.bind_table_with_joins(&update.table);
-        let mut inputs = vec![target_plan];
+        // The UPDATE target is in scope for resolving SET / WHERE, but it's
+        // a write (reported via `Write.target`), not a table read.
+        let mut inputs = vec![into_write_target(target_plan)];
         if let Some(from) = &update.from {
             let tables = match from {
                 UpdateTableFromKind::BeforeSet(tables) | UpdateTableFromKind::AfterSet(tables) => {
@@ -276,7 +279,7 @@ impl Binder<'_> {
                 target_columns.push(column);
             }
         }
-        let target = TableReference::try_from(&update.table.relation).ok()?;
+        let target = self.canonical_target(TableReference::try_from(&update.table.relation).ok()?);
         Some(Plan::Write(Write {
             target,
             target_columns,
@@ -296,10 +299,24 @@ impl Binder<'_> {
         let from_tables = match &delete.from {
             FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
         };
+        // An implicit `DELETE FROM t` (no explicit `DELETE t1, …` list)
+        // deletes its single FROM target — that relation is the write, not
+        // a read. With an explicit list the FROM relations are all reads
+        // (the named target also surfaces as a write via `Write.target`).
+        let implicit_target = delete.tables.is_empty();
         let mut inputs = Vec::new();
         let mut scope = Scope::empty();
-        for twj in from_tables.iter().chain(delete.using.iter().flatten()) {
+        for (i, twj) in from_tables
+            .iter()
+            .chain(delete.using.iter().flatten())
+            .enumerate()
+        {
             let (plan, twj_scope) = self.bind_table_with_joins(twj);
+            let plan = if implicit_target && i == 0 {
+                into_write_target(plan)
+            } else {
+                plan
+            };
             inputs.push(plan);
             scope = scope.merge(twj_scope);
         }
@@ -317,7 +334,8 @@ impl Binder<'_> {
             from_tables
                 .first()
                 .and_then(|twj| TableReference::try_from(&twj.relation).ok())
-        };
+        }
+        .map(|target| self.canonical_target(target));
         Some(match target {
             Some(target) => Plan::Write(Write {
                 target,
@@ -397,8 +415,14 @@ impl Binder<'_> {
                 MergeAction::Delete { .. } => {}
             }
         }
-        let target = TableReference::try_from(&merge.table).ok()?;
-        let source = wrap_inputs(vec![target_plan, source_plan], reads, Vec::new());
+        let target = self.canonical_target(TableReference::try_from(&merge.table).ok()?);
+        // The MERGE target is in scope for ON / WHEN resolution but is a
+        // write, not a read; the source relation is a read.
+        let source = wrap_inputs(
+            vec![into_write_target(target_plan), source_plan],
+            reads,
+            Vec::new(),
+        );
         Some(Plan::Write(Write {
             target,
             target_columns,
@@ -417,7 +441,7 @@ impl Binder<'_> {
     fn bind_create_table(&self, create: &CreateTable) -> Option<Plan> {
         let query = create.query.as_ref()?;
         let (input, scope) = self.bind_query(query);
-        let target = TableReference::try_from(&create.name).ok()?;
+        let target = self.canonical_target(TableReference::try_from(&create.name).ok()?);
         let target_columns = if create.columns.is_empty() {
             output_names(&scope.outputs)
         } else {
@@ -434,7 +458,7 @@ impl Binder<'_> {
     /// with the view's columns (explicit list wins, else source names).
     fn bind_create_view(&self, create: &CreateView) -> Option<Plan> {
         let (input, scope) = self.bind_query(&create.query);
-        let target = TableReference::try_from(&create.name).ok()?;
+        let target = self.canonical_target(TableReference::try_from(&create.name).ok()?);
         let target_columns = if create.columns.is_empty() {
             output_names(&scope.outputs)
         } else {
@@ -566,17 +590,26 @@ impl Binder<'_> {
     }
 
     /// Bind a query body's set expression: a leaf `SELECT`, a
-    /// parenthesized inner query, or a set operation (`UNION` /
-    /// `INTERSECT` / `EXCEPT`). A set operation fans its operands into a
+    /// parenthesized inner query, a set operation (`UNION` / `INTERSECT` /
+    /// `EXCEPT`), or a DML body. A set operation fans its operands into a
     /// [`SetOp`] and merges their outputs positionally — each result
     /// column unions the branches' provenance (so a derived / CTE over a
     /// `UNION` traces to every branch's base columns), taking its name
     /// from the left branch. The set-operation kind itself doesn't change
-    /// lineage, so it's dropped.
+    /// lineage, so it's dropped. A leading statement-level `WITH` parses as
+    /// a `Query` whose body is the DML (`WITH … INSERT/UPDATE …`), so those
+    /// bodies bind through here to their `Write`-rooted tree.
     fn bind_set_expr(&self, set_expr: &SetExpr) -> (Plan, Scope) {
         match set_expr {
             SetExpr::Select(select) => self.bind_select(select),
             SetExpr::Query(inner) => self.bind_query(inner),
+            // `WITH … INSERT/UPDATE …`: the DML statement is the query
+            // body. Bind it to its `Write` tree; it exposes no output scope
+            // to an enclosing query.
+            SetExpr::Insert(statement) | SetExpr::Update(statement) => (
+                self.bind_statement(statement).unwrap_or(Plan::OpaqueLeaf),
+                Scope::empty(),
+            ),
             SetExpr::SetOperation { left, right, .. } => {
                 let (left_plan, left_scope) = self.bind_set_expr(left);
                 let (right_plan, right_scope) = self.bind_set_expr(right);
@@ -744,15 +777,19 @@ impl Binder<'_> {
                         return (Plan::CteRef(CteRef { name }), Scope::of(relation));
                     }
                 }
-                // A unique catalog hit canonicalizes the identity and
-                // supplies the columns; a miss / ambiguous / no-catalog
-                // leaves it as written with an open column set.
-                let (table, columns) = match self.catalog_match(&written) {
-                    Some((canonical, cols)) if !cols.is_empty() => {
-                        (canonical, RelationColumns::Known(cols))
-                    }
-                    Some((canonical, _)) => (canonical, RelationColumns::Open),
-                    None => (written, RelationColumns::Open),
+                // A unique catalog hit canonicalizes the identity, supplies
+                // the columns, and is `Cataloged`; ambiguous stays as
+                // written and `Ambiguous`; a miss / no-catalog stays as
+                // written, open, and `Inferred`.
+                let TableMatch {
+                    table,
+                    resolution,
+                    columns,
+                } = self.table_match(&written);
+                let columns = if columns.is_empty() {
+                    RelationColumns::Open
+                } else {
+                    RelationColumns::Known(columns)
                 };
                 let relation = Relation {
                     alias,
@@ -761,7 +798,14 @@ impl Binder<'_> {
                         columns,
                     },
                 };
-                (Plan::Scan(Scan { table }), Scope::of(relation))
+                (
+                    Plan::Scan(Scan {
+                        table,
+                        resolution,
+                        role: ScanRole::Read,
+                    }),
+                    Scope::of(relation),
+                )
             }
             // A derived table `(<subquery>) AS d`: bind the subquery and
             // expose its output columns as a synthetic relation. Those
@@ -1271,30 +1315,70 @@ impl Binder<'_> {
         self.casing.table_alias.normalize(a) == self.casing.table_alias.normalize(b)
     }
 
-    /// Match a query table reference against the catalog: a unique
-    /// right-anchored, dialect-cased hit returns the registered table's
-    /// canonical identity and column names. Mirrors the resolver's
-    /// `catalog_match` (ambiguous / miss → `None`, best-effort open).
-    fn catalog_match(&self, written: &TableReference) -> Option<(TableReference, Vec<Ident>)> {
-        let catalog = self.catalog?;
+    /// Canonicalize a write target to its registered full path when the
+    /// catalog uniquely identifies it, so write surfaces agree with the
+    /// (canonicalized) read side. An ambiguous / missing / catalog-free
+    /// target — including a freshly created CTAS / view name — stays as
+    /// written (`table_match` returns the written ref in those cases).
+    fn canonical_target(&self, target: TableReference) -> TableReference {
+        self.table_match(&target).table
+    }
+
+    /// Match a query table reference against the catalog by right-anchored,
+    /// dialect-cased comparison (after default-fill). A unique hit yields
+    /// the registered table's canonical identity, its column names, and
+    /// `Cataloged`; several hits yield the written ref and `Ambiguous`; no
+    /// catalog or no hit yields the written ref and `Inferred`. Mirrors the
+    /// resolver's `catalog_match` but keeps the resolution kind so the
+    /// `Scan`'s table-level resolution survives (the resolver collapsed
+    /// ambiguous / miss to "open").
+    fn table_match(&self, written: &TableReference) -> TableMatch {
+        let no_hit = |resolution| TableMatch {
+            table: written.clone(),
+            resolution,
+            columns: Vec::new(),
+        };
+        let Some(catalog) = self.catalog else {
+            return no_hit(ResolutionKind::Inferred);
+        };
         let filled = fill_query_defaults(written, catalog);
         let fold = self.casing.table;
         let mut hits = catalog
             .tables()
             .iter()
             .filter(|t| catalog_table_matches(&filled, t, fold));
-        let first = hits.next()?;
+        let Some(first) = hits.next() else {
+            return no_hit(ResolutionKind::Inferred);
+        };
         if hits.next().is_some() {
-            // Ambiguous registration — stay best-effort (open).
-            return None;
+            return no_hit(ResolutionKind::Ambiguous);
         }
         let columns = first
             .column_names()
             .iter()
             .map(|c| Ident::with_quote('"', c))
             .collect();
-        Some((canonical_ref(first), columns))
+        TableMatch {
+            table: canonical_ref(first),
+            resolution: ResolutionKind::Cataloged,
+            columns,
+        }
     }
+}
+
+/// The outcome of matching a written table reference against the catalog —
+/// one shape for every case, so a `Scan` gets its identity, table-level
+/// [`ResolutionKind`], and (when known) column list from a single match.
+struct TableMatch {
+    /// Canonical identity for a unique hit; the written reference for an
+    /// ambiguous / missing / catalog-free match.
+    table: TableReference,
+    /// `Cataloged` (unique hit), `Ambiguous` (several), or `Inferred`
+    /// (no hit / no catalog).
+    resolution: ResolutionKind,
+    /// The registered column names for a unique hit that declared them;
+    /// empty otherwise (schema-known-columns-unknown, or no hit).
+    columns: Vec<Ident>,
 }
 
 /// Fill a query reference's missing prefix segments from the catalog's
@@ -1385,6 +1469,22 @@ fn wrap_inputs(mut inputs: Vec<Plan>, reads: Vec<ColumnRead>, subqueries: Vec<Pl
             reads,
             subqueries,
         })
+    }
+}
+
+/// Re-tag a write target's leaf `Scan` as [`ScanRole::Write`] so
+/// table-level read extraction skips it (it is reported via
+/// `Write.target`). The target is still kept in the tree so its columns
+/// stay in scope for resolving SET / WHERE / ON. A non-`Scan` target
+/// (e.g. a joined UPDATE target) is left unchanged — that shape is a
+/// later brick.
+fn into_write_target(plan: Plan) -> Plan {
+    match plan {
+        Plan::Scan(scan) => Plan::Scan(Scan {
+            role: ScanRole::Write,
+            ..scan
+        }),
+        other => other,
     }
 }
 
@@ -1575,7 +1675,21 @@ mod tests {
     }
 
     fn scan(name: &str) -> Plan {
-        Plan::Scan(Scan { table: tref(name) })
+        Plan::Scan(Scan {
+            table: tref(name),
+            resolution: ResolutionKind::Inferred,
+            role: ScanRole::Read,
+        })
+    }
+
+    /// A write-target leaf `Scan` (role = Write): kept in the tree for
+    /// resolution scope but skipped by table-level read extraction.
+    fn write_scan(name: &str) -> Plan {
+        Plan::Scan(Scan {
+            table: tref(name),
+            resolution: ResolutionKind::Inferred,
+            role: ScanRole::Write,
+        })
     }
 
     fn project(input: Plan, outputs: Vec<BoundColumn>) -> Plan {
@@ -1925,7 +2039,7 @@ mod tests {
                 target: tref("t"),
                 target_columns: vec![Ident::new("c")],
                 input: Box::new(project(
-                    pass(vec![scan("t")], vec![inferred("t", "d")]),
+                    pass(vec![write_scan("t")], vec![inferred("t", "d")]),
                     vec![transform_col(
                         "c",
                         vec![inferred("t", "a"), inferred("t", "b")]
@@ -1944,7 +2058,7 @@ mod tests {
             Plan::Write(Write {
                 target: tref("t"),
                 target_columns: vec![],
-                input: Box::new(pass(vec![scan("t")], vec![inferred("t", "d")])),
+                input: Box::new(pass(vec![write_scan("t")], vec![inferred("t", "d")])),
             })
         );
     }

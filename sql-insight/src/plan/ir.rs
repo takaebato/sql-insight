@@ -9,7 +9,7 @@
 use sqlparser::ast::Ident;
 
 use crate::extractor::ColumnLineageKind;
-use crate::reference::{ColumnRead, TableReference};
+use crate::reference::{ColumnRead, ResolutionKind, TableReference};
 
 /// One node in the bound operator tree.
 ///
@@ -38,12 +38,32 @@ pub(crate) enum Plan {
 }
 
 /// A real stored table (leaf), identified by its (catalog-canonicalized)
-/// reference. The use-site alias and catalog resolution live on the
-/// bind-time scope, not here; column reads already carry their own
-/// resolution, so the persisted node needs only the table identity.
+/// reference. The use-site alias lives on the bind-time scope, not here.
+/// `resolution` is how the catalog identified the table — needed because
+/// a table read with no referenced column (`SELECT 1 FROM t`,
+/// `DELETE FROM t`) surfaces *only* through this node, so its
+/// table-level [`ResolutionKind`] can't be recovered from column reads.
+/// `role` distinguishes a read source from a write target's resolution
+/// scan (see [`ScanRole`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Scan {
     pub(crate) table: TableReference,
+    pub(crate) resolution: ResolutionKind,
+    pub(crate) role: ScanRole,
+}
+
+/// Whether a [`Scan`] is a read source or a write target.
+///
+/// A write target (the relation of `UPDATE` / `DELETE` / `MERGE`) is
+/// still bound to a `Scan` so its columns are in scope for resolving the
+/// SET / WHERE / ON expressions, but it is reported through
+/// `Write.target`, not as a table read — so table-level read extraction
+/// skips it. (A table that is *both*, e.g. multi-table `DELETE t1 FROM t1
+/// JOIN t2`, is a later brick.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanRole {
+    Read,
+    Write,
 }
 
 /// Join (N inputs) **and** every filter (WHERE / HAVING / JOIN ON):

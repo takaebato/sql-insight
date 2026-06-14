@@ -3,9 +3,9 @@
 //! differential harness below is the strangler safety net — every
 //! covered statement's surfaces must match the current resolver.
 
-use super::ir::{BoundColumn, Plan, Write};
+use super::ir::{BoundColumn, Plan, ScanRole, Write};
 use crate::extractor::{ColumnLineageEdge, ColumnTarget};
-use crate::reference::{ColumnRead, ColumnReference};
+use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference};
 
 /// Every physical column read the bound plan expresses: each `Project`
 /// output column's non-synthetic provenance plus every `PassThrough`'s
@@ -82,6 +82,75 @@ pub(crate) fn extract_writes(plan: &Plan) -> Vec<ColumnReference> {
                 name: column.clone(),
             })
             .collect(),
+        // A statement-level `WITH … INSERT/UPDATE …` wraps the DML `Write`.
+        Plan::With(with) => extract_writes(&with.body),
+        _ => Vec::new(),
+    }
+}
+
+/// Every table the statement reads from, occurrence-based: one
+/// [`TableRead`] per read-role `Scan` in the tree (a table scanned more
+/// than once appears more than once), carrying the scan's table-level
+/// [`ResolutionKind`](crate::reference::ResolutionKind). Write-target
+/// scans are skipped — they surface through [`extract_table_writes`]. CTE
+/// bodies and predicate / scalar subqueries are walked, so the real
+/// tables they read surface too. Order is the tree walk's, incidental
+/// like the column-level reads.
+pub(crate) fn extract_table_reads(plan: &Plan) -> Vec<TableRead> {
+    let mut reads = Vec::new();
+    collect_table_reads(plan, &mut reads);
+    reads
+}
+
+fn collect_table_reads(plan: &Plan, out: &mut Vec<TableRead>) {
+    match plan {
+        // A read-role scan is a table read; a write-target scan is in the
+        // tree only for resolution scope and surfaces via `Write.target`.
+        Plan::Scan(scan) => {
+            if scan.role == ScanRole::Read {
+                out.push(TableRead {
+                    reference: scan.table.clone(),
+                    resolution: scan.resolution,
+                });
+            }
+        }
+        Plan::OpaqueLeaf | Plan::CteRef(_) => {}
+        Plan::PassThrough(pt) => {
+            for input in &pt.inputs {
+                collect_table_reads(input, out);
+            }
+            for subquery in &pt.subqueries {
+                collect_table_reads(subquery, out);
+            }
+        }
+        Plan::Project(project) => {
+            collect_table_reads(&project.input, out);
+            for subquery in &project.subqueries {
+                collect_table_reads(subquery, out);
+            }
+        }
+        Plan::SetOp(set) => {
+            for operand in &set.operands {
+                collect_table_reads(operand, out);
+            }
+        }
+        Plan::Write(write) => collect_table_reads(&write.input, out),
+        Plan::With(with) => {
+            collect_table_reads(&with.body, out);
+            for cte in &with.ctes {
+                collect_table_reads(&cte.plan, out);
+            }
+        }
+    }
+}
+
+/// The table the statement writes to: a [`Write`]'s target, else nothing.
+/// Occurrence-based like [`extract_table_reads`]; one target per `Write`.
+pub(crate) fn extract_table_writes(plan: &Plan) -> Vec<TableReference> {
+    match plan {
+        Plan::Write(write) => vec![write.target.clone()],
+        // A statement-level `WITH … INSERT/UPDATE …` wraps the DML `Write`.
+        Plan::With(with) => extract_table_writes(&with.body),
         _ => Vec::new(),
     }
 }
@@ -92,6 +161,12 @@ pub(crate) fn extract_writes(plan: &Plan) -> Vec<ColumnReference> {
 /// Sources come straight from each output column's pre-collapsed
 /// provenance (already real base columns carrying composed kind).
 pub(crate) fn extract_lineage(plan: &Plan) -> Vec<ColumnLineageEdge> {
+    // A leading statement-level `WITH` wraps the real root (a query or a
+    // DML `Write`); peel it — the CTE bodies feed that root through
+    // collapsed provenance, they are not lineage roots themselves.
+    if let Plan::With(with) = plan {
+        return extract_lineage(&with.body);
+    }
     let mut edges = Vec::new();
     match plan {
         Plan::Write(write) => write_lineage(write, &mut edges),
@@ -171,7 +246,9 @@ pub(crate) fn output_operands(plan: &Plan) -> Vec<&[BoundColumn]> {
 mod differential {
     use super::*;
     use crate::catalog::{Catalog, CatalogTable};
-    use crate::extractor::{extract_column_operations, ColumnOperation};
+    use crate::extractor::{
+        extract_column_operations, extract_table_operations, ColumnOperation, TableOperation,
+    };
     use crate::resolver::IdentifierCasing;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -404,6 +481,9 @@ mod differential {
             "DELETE FROM t WHERE d > 0",
             "CREATE TABLE dst AS SELECT a, b FROM src",
             "CREATE VIEW v AS SELECT a, b FROM src WHERE c > 0",
+            // Statement-level WITH over DML: sqlparser nests the INSERT as
+            // the WITH-query's body, so writes / lineage must peel the With.
+            "WITH c AS (SELECT a FROM s) INSERT INTO t (col) SELECT a FROM c",
             // MERGE with an unqualified INSERT clause: writes / lineage
             // pair to the (canonical) target columns.
             "MERGE INTO target t USING source s ON t.id = s.id \
@@ -537,6 +617,136 @@ mod differential {
             "SELECT a FROM x JOIN y USING (a)",      // USING fan-in narrows to x (y lacks a)
         ] {
             assert_parity(sql, Some(&catalog));
+        }
+    }
+
+    // ---- Table-level differential (reads + writes; lineage deferred) ----
+
+    fn table_plan_op(sql: &str, catalog: Option<&Catalog>) -> TableOperation {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        let casing = IdentifierCasing::for_dialect(&dialect);
+        crate::plan::table_operation::table_operation(&statements[0], catalog, casing)
+    }
+
+    fn table_resolver_op(sql: &str, catalog: Option<&Catalog>) -> TableOperation {
+        let dialect = GenericDialect {};
+        extract_table_operations(&dialect, sql, catalog)
+            .unwrap()
+            .remove(0)
+            .unwrap()
+    }
+
+    /// A table read as a `path|resolution` key. Table references carry no
+    /// span, so occurrence is the only multiplicity signal — the bag is a
+    /// sorted multiset (order non-contractual, like column reads).
+    fn table_read_bag(reads: &[TableRead]) -> Vec<String> {
+        let mut keys: Vec<String> = reads
+            .iter()
+            .map(|r| format!("{}|{:?}", table_path(&r.reference), r.resolution))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn table_ref_bag(refs: &[TableReference]) -> Vec<String> {
+        let mut keys: Vec<String> = refs.iter().map(table_path).collect();
+        keys.sort();
+        keys
+    }
+
+    fn table_path(t: &TableReference) -> String {
+        format!(
+            "{}.{}.{}",
+            t.catalog.as_ref().map(|c| c.value.as_str()).unwrap_or(""),
+            t.schema.as_ref().map(|s| s.value.as_str()).unwrap_or(""),
+            t.name.value,
+        )
+    }
+
+    fn table_diag_kinds(op: &TableOperation) -> Vec<String> {
+        let mut kinds: Vec<String> = op
+            .diagnostics
+            .iter()
+            .map(|d| format!("{:?}", d.kind))
+            .collect();
+        kinds.sort();
+        kinds
+    }
+
+    /// Table-level `statement_kind` + diagnostic kinds + `reads`
+    /// (path|resolution multiset) + `writes` (path multiset) must match the
+    /// resolver. `lineage` is excluded — it is a follow-up brick.
+    fn assert_table_reads_writes_parity(sql: &str, catalog: Option<&Catalog>) {
+        let plan = table_plan_op(sql, catalog);
+        let old = table_resolver_op(sql, catalog);
+        assert_eq!(
+            plan.statement_kind, old.statement_kind,
+            "table statement-kind mismatch for: {sql}"
+        );
+        assert_eq!(
+            table_diag_kinds(&plan),
+            table_diag_kinds(&old),
+            "table diagnostic-kind mismatch for: {sql}"
+        );
+        assert_eq!(
+            table_read_bag(&plan.reads),
+            table_read_bag(&old.reads),
+            "table read-multiset mismatch for: {sql}"
+        );
+        assert_eq!(
+            table_ref_bag(&plan.writes),
+            table_ref_bag(&old.writes),
+            "table write-multiset mismatch for: {sql}"
+        );
+    }
+
+    /// Table-level cases not already in the column corpus: the
+    /// write-target role split (USING source is a read, the target isn't;
+    /// a no-FROM UPDATE has no reads), a no-column read (`SELECT 1 FROM t`),
+    /// and CTE transitivity feeding a write.
+    fn table_only_corpus() -> &'static [&'static str] {
+        &[
+            "DELETE FROM t USING s WHERE t.id = s.id",
+            "UPDATE t SET c = 1",
+            "SELECT 1 FROM t",
+            "WITH c AS (SELECT a FROM s) INSERT INTO t SELECT a FROM c",
+        ]
+    }
+
+    #[test]
+    fn catalog_free_table_reads_writes_match_resolver() {
+        for sql in covered_corpus()
+            .iter()
+            .chain(reads_writes_only_corpus())
+            .chain(reads_only_corpus())
+            .chain(table_only_corpus())
+        {
+            assert_table_reads_writes_parity(sql, None);
+        }
+    }
+
+    #[test]
+    fn catalog_aware_table_reads_match_resolver() {
+        // `public.x` / `public.y` are registered; `dup` is registered in
+        // two schemas (→ Ambiguous); `missing` is unregistered (→ Inferred).
+        let catalog: Catalog = [
+            CatalogTable::new("public", "x").columns(["id", "a"]),
+            CatalogTable::new("public", "y").columns(["id", "b"]),
+            CatalogTable::new("public", "dup").columns(["a"]),
+            CatalogTable::new("other", "dup").columns(["a"]),
+        ]
+        .into_iter()
+        .collect();
+        for sql in [
+            "SELECT a FROM x",                       // x Cataloged
+            "SELECT a FROM x JOIN y ON x.id = y.id", // both Cataloged
+            "SELECT a FROM missing",                 // Inferred (no hit)
+            "SELECT a FROM dup",                     // Ambiguous (two hits)
+            "INSERT INTO x SELECT a FROM y",         // read y Cataloged, write x
+            "SELECT 1 FROM x",                       // no-column read, Cataloged
+        ] {
+            assert_table_reads_writes_parity(sql, Some(&catalog));
         }
     }
 }

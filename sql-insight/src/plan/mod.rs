@@ -17,17 +17,22 @@
 //! - [`extract`] — walk a `Plan` for the operation surfaces, plus the
 //!   differential harness that pins the binder's output against the
 //!   current resolver.
+//! - [`operation`] — assemble the public `ColumnOperation` from a `Plan`.
+//! - [`table_operation`] — assemble the public `TableOperation` (reads /
+//!   writes; lineage is a follow-up brick) from a `Plan`.
 //!
-//! ## Current brick
+//! ## Coverage
 //!
-//! `SELECT` over `FROM` (single table, comma joins, `JOIN … ON`) with a
-//! `WHERE` filter and a projection of column references / simple
-//! expressions, resolved catalog-free. Catalog / open-schema resolution,
-//! GROUP BY / HAVING / ORDER BY, set operations, CTE / derived /
-//! subquery, DML, and `USING` fan-in are later bricks.
+//! Column-level extraction is at full differential parity with the
+//! resolver across the covered corpus (SELECT / FROM / joins / WHERE /
+//! GROUP BY / HAVING / ORDER BY / USING fan-in / derived tables / CTEs /
+//! subqueries / set operations / DML / DDL / wildcards). Table-level
+//! extraction covers `reads` / `writes`; table-level `lineage` and the
+//! legacy table / CRUD extractors are later bricks.
 #![allow(dead_code)] // incubating: exercised by tests only until wired
 
 mod binder;
 mod extract;
 mod ir;
 mod operation;
+mod table_operation;
