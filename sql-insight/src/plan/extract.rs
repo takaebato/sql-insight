@@ -504,6 +504,18 @@ mod differential {
             "SELECT substring(a FROM 1 FOR b) AS m FROM t",
             "SELECT sum(a) OVER (PARTITION BY b ORDER BY c) AS m FROM t",
             "SELECT sum(a) FILTER (WHERE b > 0) AS m FROM t GROUP BY c",
+            // Relation-arm coverage: table functions / UNNEST / PIVOT /
+            // nested join / LATERAL. A table-function output is opaque (a
+            // qualified ref to its alias yields nothing), but its argument
+            // expressions read against the surrounding (LATERAL-visible)
+            // scope; PIVOT / UNPIVOT read the inner table's columns; a
+            // nested join exposes its inner tables directly.
+            "SELECT g.v FROM TABLE(gen(t.a)) g",
+            "SELECT u.x FROM UNNEST(t.arr) u",
+            "SELECT * FROM t PIVOT(SUM(t.amt) FOR t.mon IN ('a', 'b'))",
+            "SELECT * FROM t UNPIVOT(v FOR n IN (t.a, t.b))",
+            "SELECT t1.a FROM (t1 JOIN t2 ON t1.id = t2.id)",
+            "SELECT f.value FROM t, LATERAL FLATTEN(input => t.arr) AS f",
             // GROUP BY / HAVING / ORDER BY (clause-phase, alias visibility).
             "SELECT a, COUNT(*) FROM t GROUP BY a",
             "SELECT a FROM t GROUP BY a HAVING SUM(b) > 0",

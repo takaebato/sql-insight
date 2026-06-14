@@ -69,6 +69,7 @@ pub(crate) fn build_with_diagnostics(
 /// Bind-time resolution scope: the relations visible at a point in the
 /// bind, plus (for the output-alias-visible clauses) the enclosing
 /// SELECT's output columns. Scratch — never stored on the [`Plan`].
+#[derive(Clone, Default)]
 pub(crate) struct Scope {
     relations: Vec<Relation>,
     /// The enclosing SELECT's output columns, visible to its own
@@ -124,7 +125,7 @@ impl Relation {
     fn exposed_name(&self) -> Option<&Ident> {
         self.alias.as_ref().or(match &self.source {
             RelationSource::Table { table, .. } => Some(&table.name),
-            RelationSource::Derived { .. } => None,
+            RelationSource::Derived { .. } | RelationSource::TableFunction => None,
         })
     }
 }
@@ -143,6 +144,13 @@ enum RelationSource {
     /// *Synthetic* — it has no table identity, so a reference through it
     /// surfaces the inner real columns, never the derived name itself.
     Derived { columns: Vec<BoundColumn> },
+    /// A table function / `UNNEST` / `PIVOT` / `JSON_TABLE` output: a
+    /// synthetic relation whose columns are opaque (dynamically produced).
+    /// A reference qualified by its alias resolves *to it* but contributes
+    /// nothing (the produced columns aren't stored), so it neither surfaces
+    /// as a read nor as a lineage source — its inputs are read separately
+    /// from the function's argument expressions.
+    TableFunction,
 }
 
 /// What a real table exposes for resolution.
@@ -290,7 +298,7 @@ impl Binder<'_> {
     /// the same output-column machinery as INSERT / CTAS); the WHERE
     /// predicate is a filter `PassThrough` below it.
     fn bind_update(&self, update: &Update) -> Option<Plan> {
-        let (target_plan, mut scope) = self.bind_table_with_joins(&update.table);
+        let (target_plan, mut scope) = self.bind_table_with_joins(&update.table, &Scope::empty());
         // The UPDATE target is in scope for resolving SET / WHERE, but it's
         // a write (reported via `Write.target`), not a table read.
         let mut inputs = vec![into_write_target(target_plan)];
@@ -301,7 +309,7 @@ impl Binder<'_> {
                 }
             };
             for twj in tables {
-                let (plan, from_scope) = self.bind_table_with_joins(twj);
+                let (plan, from_scope) = self.bind_table_with_joins(twj, &scope);
                 inputs.push(plan);
                 scope = scope.merge(from_scope);
             }
@@ -355,7 +363,7 @@ impl Binder<'_> {
             .chain(delete.using.iter().flatten())
             .enumerate()
         {
-            let (plan, twj_scope) = self.bind_table_with_joins(twj);
+            let (plan, twj_scope) = self.bind_table_with_joins(twj, &scope);
             let plan = if implicit_target && i == 0 {
                 into_write_target(plan)
             } else {
@@ -397,8 +405,9 @@ impl Binder<'_> {
     /// target / INSERT column), so the `value → target` lineage pairing
     /// reuses the output-column machinery.
     fn bind_merge(&self, merge: &Merge) -> Option<Plan> {
-        let (target_plan, target_scope) = self.bind_table_factor(&merge.table);
-        let (source_plan, source_scope) = self.bind_table_factor(&merge.source);
+        let (target_plan, target_scope) = self.bind_table_factor(&merge.table, &Scope::empty());
+        let (source_plan, source_scope) =
+            self.bind_table_factor(&merge.source, &target_scope.clone());
         let scope = target_scope.merge(source_scope);
         let (mut reads, mut subqueries) = self.expr_reads(&merge.on, &scope);
         let mut outputs = Vec::new();
@@ -742,38 +751,39 @@ impl Binder<'_> {
     }
 
     fn bind_from(&self, items: &[TableWithJoins]) -> (Plan, Scope) {
-        let mut bound: Vec<(Plan, Scope)> = items
-            .iter()
-            .map(|twj| self.bind_table_with_joins(twj))
-            .collect();
-        match bound.len() {
+        // Bind each comma-separated FROM item in order, accumulating the
+        // scope so a later item (a LATERAL table function / derived table)
+        // can resolve references to an earlier sibling.
+        let mut scope = Scope::empty();
+        let mut inputs = Vec::with_capacity(items.len());
+        for twj in items {
+            let (node, node_scope) = self.bind_table_with_joins(twj, &scope);
+            inputs.push(node);
+            scope = scope.merge(node_scope);
+        }
+        match inputs.len() {
             // `SELECT 1` (no FROM) — an empty opaque source.
             0 => (Plan::OpaqueLeaf, Scope::empty()),
-            1 => bound.pop().unwrap(),
+            1 => (inputs.pop().unwrap(), scope),
             // Comma join: a PassThrough with no predicate.
-            _ => {
-                let mut scope = Scope::empty();
-                let mut inputs = Vec::with_capacity(bound.len());
-                for (node, node_scope) in bound {
-                    inputs.push(node);
-                    scope = scope.merge(node_scope);
-                }
-                (
-                    Plan::PassThrough(PassThrough {
-                        inputs,
-                        reads: Vec::new(),
-                        subqueries: Vec::new(),
-                    }),
-                    scope,
-                )
-            }
+            _ => (
+                Plan::PassThrough(PassThrough {
+                    inputs,
+                    reads: Vec::new(),
+                    subqueries: Vec::new(),
+                }),
+                scope,
+            ),
         }
     }
 
-    fn bind_table_with_joins(&self, twj: &TableWithJoins) -> (Plan, Scope) {
-        let (mut node, mut scope) = self.bind_table_factor(&twj.relation);
+    fn bind_table_with_joins(&self, twj: &TableWithJoins, siblings: &Scope) -> (Plan, Scope) {
+        let (mut node, mut scope) = self.bind_table_factor(&twj.relation, siblings);
         for join in &twj.joins {
-            let (right, right_scope) = self.bind_table_factor(&join.relation);
+            // A joined relation sees the preceding FROM siblings plus the
+            // relations bound so far in this join chain (LATERAL).
+            let joined_siblings = siblings.clone().merge(scope.clone());
+            let (right, right_scope) = self.bind_table_factor(&join.relation, &joined_siblings);
             // The ON predicate sees both sides; resolve its reads against
             // the combined scope, which is also this PassThrough's output.
             let mut combined = scope.merge(right_scope);
@@ -801,12 +811,23 @@ impl Binder<'_> {
         (node, scope)
     }
 
-    fn bind_table_factor(&self, factor: &TableFactor) -> (Plan, Scope) {
+    fn bind_table_factor(&self, factor: &TableFactor, siblings: &Scope) -> (Plan, Scope) {
         match factor {
-            TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
                 let Ok(written) = TableReference::try_from_name(name) else {
                     return (Plan::OpaqueLeaf, Scope::empty());
                 };
+                // A parameterised table reference `foo(args)` carries
+                // argument expressions (read against the surrounding scope).
+                let arg_reads = args.as_ref().map(|args| {
+                    let mut c = ExprCollector::filter();
+                    for arg in &args.args {
+                        self.collect_function_arg(arg, siblings, &mut c);
+                    }
+                    c
+                });
                 let alias = alias.as_ref().map(|a| a.name.clone());
                 // A bare name matching an in-scope CTE resolves to that
                 // CTE's synthetic relation — its pre-collapsed outputs,
@@ -848,25 +869,33 @@ impl Binder<'_> {
                         columns,
                     },
                 };
-                (
-                    Plan::Scan(Scan {
-                        table,
-                        resolution,
-                        role: ScanRole::Read,
-                    }),
-                    Scope::of(relation),
-                )
+                let scan = Plan::Scan(Scan {
+                    table,
+                    resolution,
+                    role: ScanRole::Read,
+                });
+                // Table-function args (rare on a named table) read against
+                // the surrounding scope; embed them so they surface.
+                let plan = match arg_reads {
+                    Some(c) => wrap_reads(scan, c.filter_reads, c.subplans),
+                    None => scan,
+                };
+                (plan, Scope::of(relation))
             }
             // A derived table `(<subquery>) AS d`: bind the subquery and
             // expose its output columns as a synthetic relation. Those
             // outputs already carry collapsed provenance, so an outer
             // reference through `d` surfaces the inner real columns —
             // collapse falls out of construction. The subquery's plan is
-            // this factor's plan (an input to the enclosing operators).
+            // this factor's plan (an input to the enclosing operators). The
+            // preceding FROM siblings are visible to a LATERAL subquery (the
+            // `lateral` flag is not enforced, matching the resolver).
             TableFactor::Derived {
                 subquery, alias, ..
             } => {
-                let (plan, sub_scope) = self.bind_query(subquery);
+                let (plan, sub_scope) = self
+                    .with_outer_scope(siblings.relations.clone())
+                    .bind_query(subquery);
                 let mut columns = sub_scope.outputs;
                 if let Some(alias) = alias {
                     apply_column_aliases(&mut columns, alias);
@@ -877,9 +906,185 @@ impl Binder<'_> {
                 };
                 (plan, Scope::of(relation))
             }
-            // Table functions / pivots / VALUES etc. are later bricks;
-            // they expose no inspectable columns yet.
-            _ => (Plan::OpaqueLeaf, Scope::empty()),
+            // A parenthesized join `(a JOIN b ...)`: the inner tables bind
+            // directly into the current scope (so refs to them resolve and
+            // their ON reads surface); the wrapper alias exposes nothing.
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => self.bind_table_with_joins(table_with_joins, siblings),
+            // PIVOT / UNPIVOT / MATCH_RECOGNIZE wrap an inner table whose
+            // columns the clause expressions read; the produced relation is
+            // opaque (dynamic columns).
+            TableFactor::Pivot {
+                table,
+                aggregate_functions,
+                value_column,
+                value_source,
+                default_on_null,
+                alias,
+                ..
+            } => {
+                let (inner, inner_scope) = self.bind_table_factor(table, siblings);
+                let mut c = ExprCollector::filter();
+                for agg in aggregate_functions {
+                    self.collect_expr(&agg.expr, &inner_scope, &mut c);
+                }
+                for expr in value_column {
+                    self.collect_expr(expr, &inner_scope, &mut c);
+                }
+                self.collect_pivot_value_source(value_source, &inner_scope, &mut c);
+                if let Some(expr) = default_on_null {
+                    self.collect_expr(expr, &inner_scope, &mut c);
+                }
+                self.opaque_relation(inner, alias.as_ref(), c)
+            }
+            TableFactor::Unpivot {
+                table,
+                value,
+                columns,
+                alias,
+                ..
+            } => {
+                let (inner, inner_scope) = self.bind_table_factor(table, siblings);
+                let mut c = ExprCollector::filter();
+                self.collect_expr(value, &inner_scope, &mut c);
+                for col in columns {
+                    self.collect_expr(&col.expr, &inner_scope, &mut c);
+                }
+                self.opaque_relation(inner, alias.as_ref(), c)
+            }
+            TableFactor::MatchRecognize {
+                table,
+                partition_by,
+                order_by,
+                measures,
+                symbols,
+                alias,
+                ..
+            } => {
+                let (inner, inner_scope) = self.bind_table_factor(table, siblings);
+                let mut c = ExprCollector::filter();
+                for expr in partition_by {
+                    self.collect_expr(expr, &inner_scope, &mut c);
+                }
+                for ob in order_by {
+                    self.collect_order_by_expr(ob, &inner_scope, &mut c);
+                }
+                for measure in measures {
+                    self.collect_expr(&measure.expr, &inner_scope, &mut c);
+                }
+                for symbol in symbols {
+                    self.collect_expr(&symbol.definition, &inner_scope, &mut c);
+                }
+                self.opaque_relation(inner, alias.as_ref(), c)
+            }
+            // Table functions / UNNEST / JSON_TABLE / XML / semantic views:
+            // an opaque relation whose argument expressions read against the
+            // surrounding (LATERAL-visible) scope.
+            TableFactor::TableFunction { expr, alias } => {
+                let mut c = ExprCollector::filter();
+                self.collect_expr(expr, siblings, &mut c);
+                self.opaque_relation(Plan::OpaqueLeaf, alias.as_ref(), c)
+            }
+            TableFactor::Function { args, alias, .. } => {
+                let mut c = ExprCollector::filter();
+                for arg in args {
+                    self.collect_function_arg(arg, siblings, &mut c);
+                }
+                self.opaque_relation(Plan::OpaqueLeaf, alias.as_ref(), c)
+            }
+            TableFactor::UNNEST {
+                array_exprs, alias, ..
+            } => {
+                let mut c = ExprCollector::filter();
+                for expr in array_exprs {
+                    self.collect_expr(expr, siblings, &mut c);
+                }
+                self.opaque_relation(Plan::OpaqueLeaf, alias.as_ref(), c)
+            }
+            TableFactor::JsonTable {
+                json_expr, alias, ..
+            }
+            | TableFactor::OpenJsonTable {
+                json_expr, alias, ..
+            } => {
+                let mut c = ExprCollector::filter();
+                self.collect_expr(json_expr, siblings, &mut c);
+                self.opaque_relation(Plan::OpaqueLeaf, alias.as_ref(), c)
+            }
+            TableFactor::XmlTable {
+                row_expression,
+                passing,
+                alias,
+                ..
+            } => {
+                let mut c = ExprCollector::filter();
+                self.collect_expr(row_expression, siblings, &mut c);
+                for argument in &passing.arguments {
+                    self.collect_expr(&argument.expr, siblings, &mut c);
+                }
+                self.opaque_relation(Plan::OpaqueLeaf, alias.as_ref(), c)
+            }
+            TableFactor::SemanticView {
+                dimensions,
+                metrics,
+                facts,
+                where_clause,
+                alias,
+                ..
+            } => {
+                let mut c = ExprCollector::filter();
+                for expr in dimensions.iter().chain(metrics).chain(facts) {
+                    self.collect_expr(expr, siblings, &mut c);
+                }
+                if let Some(expr) = where_clause {
+                    self.collect_expr(expr, siblings, &mut c);
+                }
+                self.opaque_relation(Plan::OpaqueLeaf, alias.as_ref(), c)
+            }
+        }
+    }
+
+    /// Wrap an opaque relation's `base` plan with the reads collected from
+    /// its argument expressions, exposing the result as a synthetic
+    /// [`TableFunction`](RelationSource::TableFunction) relation (its
+    /// produced columns are dynamic, so a reference through its alias yields
+    /// nothing).
+    fn opaque_relation(
+        &self,
+        base: Plan,
+        alias: Option<&TableAlias>,
+        collector: ExprCollector,
+    ) -> (Plan, Scope) {
+        let plan = wrap_reads(base, collector.filter_reads, collector.subplans);
+        let scope = alias.map_or_else(Scope::empty, |alias| {
+            Scope::of(Relation {
+                alias: Some(alias.name.clone()),
+                source: RelationSource::TableFunction,
+            })
+        });
+        (plan, scope)
+    }
+
+    fn collect_pivot_value_source(
+        &self,
+        value_source: &sqlparser::ast::PivotValueSource,
+        scope: &Scope,
+        c: &mut ExprCollector,
+    ) {
+        use sqlparser::ast::PivotValueSource;
+        match value_source {
+            PivotValueSource::List(values) => {
+                for value in values {
+                    self.collect_expr(&value.expr, scope, c);
+                }
+            }
+            PivotValueSource::Any(order_by) => {
+                for ob in order_by {
+                    self.collect_order_by_expr(ob, scope, c);
+                }
+            }
+            PivotValueSource::Subquery(query) => self.collect_subquery(query, scope, c),
         }
     }
 
@@ -1562,6 +1767,9 @@ impl Binder<'_> {
                 synthetic: false,
             }),
             RelationSource::Derived { columns } => self.derived_candidate(columns, column),
+            // A table function's columns are opaque; a bare name is not
+            // claimed by it (so it stays resolvable against real tables).
+            RelationSource::TableFunction => None,
         }
     }
 
@@ -1600,6 +1808,26 @@ impl Binder<'_> {
                 synthetic: false,
             }),
             RelationSource::Derived { columns } => self.derived_candidate(columns, column),
+            // A reference qualified by a table function's alias resolves to
+            // it: the produced column isn't stored, so it's marked
+            // synthetic-origin — excluded from `reads`, but still a lineage
+            // source (the value flows out of the function), exactly as the
+            // resolver surfaces a synthetic table-function reference.
+            RelationSource::TableFunction => rel.exposed_name().map(|name| {
+                let table = TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: name.clone(),
+                };
+                Candidate {
+                    provenance: vec![ProvenanceSource {
+                        synthetic_origin: true,
+                        ..passthrough(read(&table, column, ResolutionKind::Inferred))
+                    }],
+                    confirmed: true,
+                    synthetic: true,
+                }
+            }),
         }
     }
 
