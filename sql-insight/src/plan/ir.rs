@@ -117,6 +117,14 @@ pub(crate) struct Write {
     /// edge — the statement both writes the relation and returns a row set.
     /// Empty when there is no `RETURNING`.
     pub(crate) returning: Vec<BoundColumn>,
+    /// An `INSERT … ON CONFLICT DO UPDATE SET` / `ON DUPLICATE KEY UPDATE`
+    /// conflict action: a mini-UPDATE on the same target. Each column is
+    /// named by its SET target and carries the right-hand side's
+    /// provenance, so it contributes an extra target-column write and a
+    /// `Relation`-target lineage edge. Empty when there is no conflict
+    /// update. (The `EXCLUDED` pseudo-table's references are folded in here
+    /// as synthetic-origin sources, like a derived relation.)
+    pub(crate) conflict_updates: Vec<BoundColumn>,
 }
 
 /// A `WITH` clause: the CTEs it declares, kept as named sub-plans, plus

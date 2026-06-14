@@ -61,8 +61,9 @@ fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
         Plan::Write(write) => {
             collect_reads(&write.input, out);
             // RETURNING reads the target's columns (value-position
-            // provenance), like a projection over the written relation.
-            for column in &write.returning {
+            // provenance); a conflict-action SET reads its RHS columns.
+            // Both drop synthetic-origin sources (EXCLUDED / derived).
+            for column in write.returning.iter().chain(&write.conflict_updates) {
                 out.extend(
                     column
                         .provenance
@@ -90,6 +91,14 @@ pub(crate) fn extract_writes(plan: &Plan) -> Vec<ColumnReference> {
         Plan::Write(write) => write
             .target_columns
             .iter()
+            // ON CONFLICT DO UPDATE SET targets are extra writes on the
+            // same relation, after the INSERT columns.
+            .chain(
+                write
+                    .conflict_updates
+                    .iter()
+                    .filter_map(|c| c.name.as_ref()),
+            )
             .map(|column| ColumnReference {
                 table: Some(write.target.clone()),
                 name: column.clone(),
@@ -266,6 +275,17 @@ pub(crate) fn extract_lineage(plan: &Plan) -> Vec<ColumnLineageEdge> {
     match plan {
         Plan::Write(write) => {
             write_lineage(write, &mut edges);
+            // A conflict-action SET assignment feeds a `Relation` edge into
+            // its target column, like a standalone UPDATE.
+            for column in &write.conflict_updates {
+                if let Some(name) = &column.name {
+                    let target = ColumnTarget::Relation(ColumnReference {
+                        table: Some(write.target.clone()),
+                        name: name.clone(),
+                    });
+                    emit_edges(column, &target, &mut edges);
+                }
+            }
             // RETURNING projects the written relation: each column emits a
             // `QueryOutput` edge, so the statement both writes and returns.
             for (position, column) in write.returning.iter().enumerate() {
@@ -369,8 +389,15 @@ mod differential {
     }
 
     fn resolver_op(sql: &str, catalog: Option<&Catalog>) -> ColumnOperation {
-        let dialect = GenericDialect {};
-        extract_column_operations(&dialect, sql, catalog)
+        resolver_op_d(sql, &GenericDialect {}, catalog)
+    }
+
+    fn resolver_op_d(
+        sql: &str,
+        dialect: &dyn sqlparser::dialect::Dialect,
+        catalog: Option<&Catalog>,
+    ) -> ColumnOperation {
+        extract_column_operations(dialect, sql, catalog)
             .unwrap()
             .remove(0)
             .unwrap()
@@ -378,9 +405,16 @@ mod differential {
 
     /// The plan-based column operation (the extractor switch's surface).
     fn plan_op(sql: &str, catalog: Option<&Catalog>) -> ColumnOperation {
-        let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(&dialect, sql).unwrap();
-        let casing = IdentifierCasing::for_dialect(&dialect);
+        plan_op_d(sql, &GenericDialect {}, catalog)
+    }
+
+    fn plan_op_d(
+        sql: &str,
+        dialect: &dyn sqlparser::dialect::Dialect,
+        catalog: Option<&Catalog>,
+    ) -> ColumnOperation {
+        let statements = Parser::parse_sql(dialect, sql).unwrap();
+        let casing = IdentifierCasing::for_dialect(dialect);
         crate::plan::operation::column_operation(&statements[0], catalog, casing)
     }
 
@@ -442,8 +476,19 @@ mod differential {
     /// **span-tagged multiset** (occurrence + source span, order excepted),
     /// and the `writes` / `lineage` sets.
     fn assert_parity(sql: &str, catalog: Option<&Catalog>) {
-        let plan = plan_op(sql, catalog);
-        let old = resolver_op(sql, catalog);
+        assert_parity_d(sql, &GenericDialect {}, catalog);
+    }
+
+    /// [`assert_parity`] for SQL that needs a specific dialect to parse
+    /// (`ON CONFLICT` = Postgres, `ON DUPLICATE KEY` = MySQL). Both the
+    /// plan and the resolver run under the same dialect.
+    fn assert_parity_d(
+        sql: &str,
+        dialect: &dyn sqlparser::dialect::Dialect,
+        catalog: Option<&Catalog>,
+    ) {
+        let plan = plan_op_d(sql, dialect, catalog);
+        let old = resolver_op_d(sql, dialect, catalog);
         assert_eq!(
             plan.statement_kind, old.statement_kind,
             "statement-kind mismatch for: {sql}"
@@ -791,6 +836,34 @@ mod differential {
         ] {
             assert_parity(sql, Some(&catalog));
         }
+    }
+
+    #[test]
+    fn on_conflict_matches_resolver() {
+        use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
+        let pg = PostgreSqlDialect {};
+        for sql in [
+            // EXCLUDED is synthetic: DO UPDATE SET feeds a Relation edge,
+            // dropped from reads; for INSERT SELECT it collapses to the
+            // source, for VALUES it stays a synthetic self-reference.
+            "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
+            "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO NOTHING",
+            "INSERT INTO t (a, b) SELECT x, y FROM s ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
+            "INSERT INTO t (a) SELECT x FROM s1 UNION SELECT y FROM s2 \
+             ON CONFLICT (a) DO UPDATE SET a = EXCLUDED.a",
+            "INSERT INTO t (total) SELECT SUM(x) FROM s \
+             ON CONFLICT (id) DO UPDATE SET total = EXCLUDED.total",
+            "INSERT INTO t (a, b) VALUES (1, 2) \
+             ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b WHERE t.a > 0",
+        ] {
+            assert_parity_d(sql, &pg, None);
+        }
+        // MySQL `VALUES(col)` self-references the target (no EXCLUDED).
+        assert_parity_d(
+            "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b)",
+            &MySqlDialect {},
+            None,
+        );
     }
 
     // ---- Table-level differential ----

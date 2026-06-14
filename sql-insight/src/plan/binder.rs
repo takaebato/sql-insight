@@ -16,9 +16,9 @@ use sqlparser::ast::{
     Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
     FunctionArgumentList, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident, Insert, Join,
     JoinConstraint, JoinOperator, ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind,
-    ObjectName, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
-    Subscript, TableAlias, TableFactor, TableWithJoins, Update, UpdateTableFromKind,
-    WindowFrameBound, WindowSpec, WindowType,
+    ObjectName, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, Query, Select,
+    SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor, TableWithJoins, Update,
+    UpdateTableFromKind, WindowFrameBound, WindowSpec, WindowType,
 };
 
 use std::cell::RefCell;
@@ -280,10 +280,18 @@ impl Binder<'_> {
         let (target, _alias) = TableReference::from_insert_with_alias(insert).ok()?;
         let target = self.canonical_target(target);
         let target_columns = insert.columns.clone();
-        let input = match &insert.source {
-            Some(source) => self.bind_query(source).0,
-            None => Plan::OpaqueLeaf,
+        let (input, source_scope) = match &insert.source {
+            Some(source) => self.bind_query(source),
+            None => (Plan::OpaqueLeaf, Scope::empty()),
         };
+        // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: a conflict-time
+        // mini-UPDATE on the target. Its reads / sub-plans fold onto the
+        // input; its assignments drive extra writes + lineage.
+        let (conflict_updates, conflict_reads, conflict_subplans) = match &insert.on {
+            Some(on) => self.bind_conflict(on, &target, &target_columns, &source_scope),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        let input = wrap_reads(input, conflict_reads, conflict_subplans);
         // RETURNING references resolve against the target alone (the source
         // query's scope is already popped).
         let returning = self.bind_returning(&insert.returning, &self.target_scope(&target));
@@ -292,6 +300,7 @@ impl Binder<'_> {
             target_columns,
             input: Box::new(input),
             returning,
+            conflict_updates,
         }))
     }
 
@@ -347,6 +356,7 @@ impl Binder<'_> {
                 subqueries,
             })),
             returning,
+            conflict_updates: Vec::new(),
         }))
     }
 
@@ -404,6 +414,7 @@ impl Binder<'_> {
                 target_columns: Vec::new(),
                 input: Box::new(input),
                 returning,
+                conflict_updates: Vec::new(),
             }),
             None => input,
         })
@@ -495,6 +506,7 @@ impl Binder<'_> {
                 subqueries,
             })),
             returning: Vec::new(),
+            conflict_updates: Vec::new(),
         }))
     }
 
@@ -516,6 +528,7 @@ impl Binder<'_> {
             target_columns,
             input: Box::new(input),
             returning: Vec::new(),
+            conflict_updates: Vec::new(),
         }))
     }
 
@@ -534,6 +547,7 @@ impl Binder<'_> {
             target_columns,
             input: Box::new(input),
             returning: Vec::new(),
+            conflict_updates: Vec::new(),
         }))
     }
 
@@ -1167,6 +1181,95 @@ impl Binder<'_> {
                     .map(|(column, _, _)| column)
             })
             .collect()
+    }
+
+    /// Bind an `INSERT`'s conflict action (`ON CONFLICT DO UPDATE SET …`
+    /// or MySQL `ON DUPLICATE KEY UPDATE …`) into a mini-UPDATE on the
+    /// target: the SET assignments become bound columns (named by their
+    /// target column, carrying the RHS provenance) for extra writes +
+    /// `Relation` lineage, and the optional `DO UPDATE … WHERE` is a filter
+    /// read. Returns the assignments plus the conflict's reads / sub-plans
+    /// (to fold onto the write's input). For Postgres / SQLite the
+    /// `EXCLUDED` pseudo-table is in scope (its columns are the INSERT
+    /// source's outputs renamed to the target columns, so `EXCLUDED.col`
+    /// collapses back to the source); MySQL's `VALUES(col)` self-references
+    /// the target instead, so no `EXCLUDED` is bound.
+    fn bind_conflict(
+        &self,
+        on: &OnInsert,
+        target: &TableReference,
+        target_columns: &[Ident],
+        source_scope: &Scope,
+    ) -> (Vec<BoundColumn>, Vec<ColumnRead>, Vec<Plan>) {
+        let mut updates = Vec::new();
+        let mut reads = Vec::new();
+        let mut subplans = Vec::new();
+        let (assignments, scope, selection) = match on {
+            OnInsert::DuplicateKeyUpdate(assignments) => {
+                (assignments.as_slice(), self.target_scope(target), None)
+            }
+            OnInsert::OnConflict(on_conflict) => match &on_conflict.action {
+                OnConflictAction::DoUpdate(do_update) => {
+                    let scope = self
+                        .target_scope(target)
+                        .merge(self.excluded_scope(target_columns, source_scope));
+                    (
+                        do_update.assignments.as_slice(),
+                        scope,
+                        do_update.selection.as_ref(),
+                    )
+                }
+                // DO NOTHING moves no data.
+                OnConflictAction::DoNothing => return (updates, reads, subplans),
+            },
+            // `OnInsert` is non-exhaustive; an unmodelled action is a no-op.
+            _ => return (updates, reads, subplans),
+        };
+        for assignment in assignments {
+            for column in assignment_target_columns(&assignment.target) {
+                let (output, value_subqueries, value_filter_reads) =
+                    self.bind_value_column(Some(column), &assignment.value, &scope);
+                updates.push(output);
+                subplans.extend(value_subqueries);
+                reads.extend(value_filter_reads);
+            }
+        }
+        if let Some(selection) = selection {
+            let (r, s) = self.expr_reads(selection, &scope);
+            reads.extend(r);
+            subplans.extend(s);
+        }
+        (updates, reads, subplans)
+    }
+
+    /// The `EXCLUDED` pseudo-table's resolution scope: a synthetic relation
+    /// whose columns are the INSERT source's output columns renamed
+    /// positionally to the target columns (so `EXCLUDED.col` collapses to
+    /// whatever feeds that position of the source). A source with no
+    /// inspectable outputs (`VALUES`) yields an opaque table-function-like
+    /// relation, so `EXCLUDED.col` stays a synthetic self-reference.
+    fn excluded_scope(&self, target_columns: &[Ident], source_scope: &Scope) -> Scope {
+        let columns: Vec<BoundColumn> = source_scope
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(i, column)| BoundColumn {
+                name: target_columns
+                    .get(i)
+                    .cloned()
+                    .or_else(|| column.name.clone()),
+                provenance: column.provenance.clone(),
+            })
+            .collect();
+        let source = if columns.is_empty() {
+            RelationSource::TableFunction
+        } else {
+            RelationSource::Derived { columns }
+        };
+        Scope::of(Relation {
+            alias: Some(Ident::new("EXCLUDED")),
+            source,
+        })
     }
 
     /// A resolution scope holding just the write target (for `INSERT …
@@ -2655,6 +2758,7 @@ mod tests {
                     ],
                 )),
                 returning: vec![],
+                conflict_updates: vec![],
             })
         );
     }
@@ -2677,6 +2781,7 @@ mod tests {
                     )],
                 )),
                 returning: vec![],
+                conflict_updates: vec![],
             })
         );
     }
@@ -2692,6 +2797,7 @@ mod tests {
                 target_columns: vec![],
                 input: Box::new(pass(vec![write_scan("t")], vec![inferred("t", "d")])),
                 returning: vec![],
+                conflict_updates: vec![],
             })
         );
     }
