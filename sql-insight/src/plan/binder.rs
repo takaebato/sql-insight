@@ -54,6 +54,10 @@ pub(crate) struct Scope {
     /// GROUP BY / HAVING / ORDER BY (SQL alias visibility). Empty at
     /// FROM-level resolution (WHERE / projection / JOIN ON).
     outputs: Vec<BoundColumn>,
+    /// `JOIN … USING (col)` merge columns in scope: an unqualified
+    /// reference to one fans in to every relation that could own it
+    /// (one source per side) instead of resolving ambiguously.
+    merge_columns: Vec<Ident>,
 }
 
 impl Scope {
@@ -61,6 +65,7 @@ impl Scope {
         Self {
             relations: Vec::new(),
             outputs: Vec::new(),
+            merge_columns: Vec::new(),
         }
     }
 
@@ -68,13 +73,16 @@ impl Scope {
         Self {
             relations: vec![relation],
             outputs: Vec::new(),
+            merge_columns: Vec::new(),
         }
     }
 
-    /// Concatenate the relations of two scopes (a join / comma). Output
-    /// columns aren't merged — they belong to a single SELECT.
+    /// Concatenate the relations (and USING merge columns) of two scopes
+    /// (a join / comma). Output columns aren't merged — they belong to a
+    /// single SELECT.
     fn merge(mut self, mut other: Scope) -> Scope {
         self.relations.append(&mut other.relations);
+        self.merge_columns.append(&mut other.merge_columns);
         self
     }
 }
@@ -541,6 +549,7 @@ impl Binder<'_> {
                     Scope {
                         relations: Vec::new(),
                         outputs,
+                        merge_columns: Vec::new(),
                     },
                 )
             }
@@ -573,10 +582,12 @@ impl Binder<'_> {
             outputs: outputs.clone(),
         });
         // GROUP BY / HAVING / SORT BY see the output aliases (clause
-        // phase): resolve against the FROM relations *plus* the outputs.
+        // phase): resolve against the FROM relations *plus* the outputs,
+        // keeping the USING merge columns so they fan in there too.
         let clause_scope = Scope {
             relations: from_scope.relations,
             outputs,
+            merge_columns: from_scope.merge_columns,
         };
         let mut clause_reads = self.group_by_reads(&select.group_by, &clause_scope);
         if let Some(having) = &select.having {
@@ -624,10 +635,19 @@ impl Binder<'_> {
             let (right, right_scope) = self.bind_table_factor(&join.relation);
             // The ON predicate sees both sides; resolve its reads against
             // the combined scope, which is also this PassThrough's output.
-            let combined = scope.merge(right_scope);
+            let mut combined = scope.merge(right_scope);
             let reads = match join_constraint(join) {
                 Some(JoinConstraint::On(expr)) => self.expr_reads(expr, &combined),
-                // USING fan-in / NATURAL are later bricks.
+                // USING (col, …) records merge columns: a later unqualified
+                // reference fans in to every side that could own one. The
+                // join itself contributes no reads (only references do).
+                // NATURAL is not expanded (needs both schemas).
+                Some(JoinConstraint::Using(columns)) => {
+                    combined
+                        .merge_columns
+                        .extend(columns.iter().filter_map(object_name_last_ident));
+                    Vec::new()
+                }
                 _ => Vec::new(),
             };
             node = Plan::PassThrough(PassThrough {
@@ -880,6 +900,22 @@ impl Binder<'_> {
                 .find(|c| self.name_matches(c.name.as_ref(), column))
             {
                 return output.provenance.clone();
+            }
+            // USING merge column: fan in to every relation that could own
+            // it — one source per side — instead of resolving to one /
+            // ambiguous. A catalog narrows the fan-in to declaring
+            // relations (Cataloged); catalog-free it reaches every joined
+            // relation (Inferred).
+            if self.list_has(&scope.merge_columns, column) {
+                let sources: Vec<ProvenanceSource> = scope
+                    .relations
+                    .iter()
+                    .filter_map(|rel| self.unqualified_candidate(rel, column))
+                    .flat_map(|candidate| candidate.provenance)
+                    .collect();
+                if !sources.is_empty() {
+                    return sources;
+                }
             }
         }
         if let Some(sources) = self.resolve_in_relations(parts, &scope.relations, column) {
@@ -1604,6 +1640,23 @@ mod tests {
                     reads: vec![inferred("t", "d")],
                 })),
             })
+        );
+    }
+
+    #[test]
+    fn using_merge_column_fans_in() {
+        // `JOIN y USING (a)` makes the unqualified `a` fan in to both
+        // sides (one Inferred source each), not resolve to an ambiguous
+        // single column.
+        let Plan::Project(project) = bind_one("SELECT a FROM x JOIN y USING (a)") else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            project.outputs,
+            vec![passthrough_col(
+                "a",
+                vec![inferred("x", "a"), inferred("y", "a")]
+            )]
         );
     }
 

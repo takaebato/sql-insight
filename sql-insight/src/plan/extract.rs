@@ -241,6 +241,14 @@ mod differential {
             "SELECT a, b FROM t GROUP BY ROLLUP(a, b)",
             "SELECT a, b FROM t GROUP BY GROUPING SETS ((a, b), (a))",
             "SELECT x.a FROM x JOIN y ON x.id = y.id GROUP BY x.a ORDER BY x.a",
+            // JOIN … USING (col): an unqualified merge-column ref fans in
+            // to every joined side; a qualified one keeps its single owner;
+            // a non-merge unqualified ref stays ambiguous.
+            "SELECT a FROM x JOIN y USING (a)",
+            "SELECT a, b FROM x JOIN y USING (a)",
+            "SELECT x.a FROM x JOIN y USING (a)",
+            "SELECT a FROM x JOIN y USING (a) WHERE a > 0",
+            "SELECT a FROM x JOIN y USING (a) JOIN z USING (a)",
             // Derived tables (subquery in FROM): the outer ref resolves to
             // the subquery's output column, whose provenance is the inner
             // real column — collapse falls out of construction.
@@ -388,6 +396,8 @@ mod differential {
             "SELECT a FROM x WHERE id IN (SELECT id FROM y)", // subquery Cataloged
             "SELECT a FROM x WHERE EXISTS (SELECT 1 FROM y WHERE y.id = x.id)", // correlated Cataloged
             "SELECT a FROM x UNION SELECT b FROM y", // UNION Cataloged both branches
+            "SELECT id FROM x JOIN y USING (id)",    // USING fan-in, both declare → Cataloged
+            "SELECT a FROM x JOIN y USING (a)",      // USING fan-in narrows to x (y lacks a)
         ] {
             assert_parity(sql, Some(&catalog));
         }
