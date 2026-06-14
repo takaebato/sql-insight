@@ -119,6 +119,24 @@ mod differential {
             "SELECT x FROM (SELECT a + b AS x FROM t) d",
             "SELECT x FROM (SELECT a AS x FROM t) d JOIN u ON d.x = u.id",
             "SELECT d.x FROM (SELECT a AS x FROM t WHERE b > 0) d WHERE d.x > 0",
+            // CTEs (WITH): a reference resolves to the CTE's synthetic
+            // relation, same as a derived table.
+            "WITH c AS (SELECT id FROM t) SELECT id FROM c",
+            "WITH c AS (SELECT a, b FROM t) SELECT a FROM c WHERE b > 0",
+            "WITH c AS (SELECT id FROM t) SELECT c.id FROM c",
+            "WITH c AS (SELECT id FROM t) SELECT d.id FROM c AS d",
+            // NB: a chained `WITH a …, b AS (… FROM a) … FROM b` is an
+            // intentional *improvement* (B resolves the body ref through
+            // the chain to the real table; the resolver yields Ambiguous
+            // because its flat scope leaks both CTEs), so it lives as a
+            // binder unit test, not here in the strict-parity corpus.
+            // Subqueries in expressions (uncorrelated): the subquery's
+            // reads fold into the containing expression's position —
+            // filter for WHERE / IN / EXISTS, value for a SELECT scalar.
+            "SELECT a FROM t WHERE b IN (SELECT id FROM u)",
+            "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x > 0)",
+            "SELECT a FROM t WHERE a > (SELECT avg(b) FROM u)",
+            "SELECT (SELECT max(x) FROM u) AS m FROM t",
         ]
     }
 
@@ -140,14 +158,16 @@ mod differential {
         .into_iter()
         .collect();
         for sql in [
-            "SELECT a FROM x",                              // Cataloged
-            "SELECT z FROM x",                              // Unresolved (catalog denies)
-            "SELECT a, b FROM t WHERE a > 0",               // all Cataloged
-            "SELECT x.a, y.b FROM x JOIN y ON x.id = y.id", // qualified Cataloged
-            "SELECT a FROM x JOIN y ON x.id = y.id",        // a only in x → Known witness
-            "SELECT id FROM x JOIN y ON x.id = y.id",       // id in both → Ambiguous
-            "SELECT d.a FROM (SELECT a FROM x) d",          // Cataloged through a derived table
+            "SELECT a FROM x",                                // Cataloged
+            "SELECT z FROM x",                                // Unresolved (catalog denies)
+            "SELECT a, b FROM t WHERE a > 0",                 // all Cataloged
+            "SELECT x.a, y.b FROM x JOIN y ON x.id = y.id",   // qualified Cataloged
+            "SELECT a FROM x JOIN y ON x.id = y.id",          // a only in x → Known witness
+            "SELECT id FROM x JOIN y ON x.id = y.id",         // id in both → Ambiguous
+            "SELECT d.a FROM (SELECT a FROM x) d",            // Cataloged through a derived table
             "SELECT a FROM (SELECT a FROM x) d", // unqualified, Cataloged through derived
+            "WITH c AS (SELECT a FROM x) SELECT a FROM c", // Cataloged through a CTE
+            "SELECT a FROM x WHERE id IN (SELECT id FROM y)", // subquery Cataloged
         ] {
             assert_parity(sql, Some(&catalog));
         }
