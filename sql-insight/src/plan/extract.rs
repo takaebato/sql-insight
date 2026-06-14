@@ -151,6 +151,19 @@ mod differential {
             // recursive branch's self-reference (shallow collapse).
             "WITH RECURSIVE c AS (SELECT id FROM t UNION ALL SELECT id FROM c) SELECT id FROM c",
             "WITH RECURSIVE c(n) AS (SELECT 1 FROM t UNION ALL SELECT n + 1 FROM c WHERE n < 10) SELECT n FROM c",
+            // DML / DDL: reads come from the source query, SET / predicate
+            // expressions, and VALUES — the write targets aren't reads.
+            "INSERT INTO target (a, b) SELECT x, y FROM source",
+            "INSERT INTO target SELECT x, y FROM source",
+            "INSERT INTO target (a, b) VALUES (1, 2)",
+            "UPDATE t SET c = a + b WHERE d > 0",
+            "UPDATE t SET c = a + b FROM s WHERE t.id = s.id",
+            "DELETE FROM t WHERE d > 0",
+            "CREATE TABLE dst AS SELECT a, b FROM src",
+            "CREATE VIEW v AS SELECT a, b FROM src WHERE c > 0",
+            "MERGE INTO target t USING source s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.v = s.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
         ]
     }
 

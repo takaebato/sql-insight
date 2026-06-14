@@ -12,21 +12,23 @@
 //! coexist; the differential harness pins them together).
 
 use sqlparser::ast::{
-    Cte, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    GroupByWithModifier, Ident, Join, JoinConstraint, JoinOperator, OrderBy, OrderByKind, Query,
-    Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
+    AssignmentTarget, CreateTable, CreateView, Cte, Delete, Expr, FromTable, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident, Insert, Join,
+    JoinConstraint, JoinOperator, Merge, MergeAction, MergeInsertKind, ObjectName, OrderBy,
+    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
+    TableWithJoins, Update, UpdateTableFromKind,
 };
 
-use super::ir::{BoundColumn, OpaqueLeaf, PassThrough, Plan, Project, Scan, SetOp};
+use super::ir::{BoundColumn, OpaqueLeaf, PassThrough, Plan, Project, Scan, SetOp, Write};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::extractor::ColumnLineageKind;
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
 use crate::resolver::{CaseFold, IdentifierCasing};
 
-/// Bind one statement into a [`Plan`], or `None` for statement kinds
-/// this brick doesn't model yet (everything except `SELECT`-shaped
-/// queries). The top-level scope is discarded — callers consume the
-/// resolved tree, not the scope.
+/// Bind one statement into a [`Plan`], or `None` for statement kinds not
+/// modelled (queries and the data-moving DML / DDL are; other DDL and
+/// session statements aren't). The top-level scope is discarded —
+/// callers consume the resolved tree, not the scope.
 pub(crate) fn build(
     statement: &Statement,
     catalog: Option<&Catalog>,
@@ -38,11 +40,7 @@ pub(crate) fn build(
         ctes: Vec::new(),
         outer_scopes: Vec::new(),
     };
-    match statement {
-        Statement::Query(query) => Some(binder.bind_query(query).0),
-        // DML / DDL are later bricks.
-        _ => None,
-    }
+    binder.bind_statement(statement)
 }
 
 /// Bind-time resolution scope: the relations visible at a point in the
@@ -171,6 +169,214 @@ struct Binder<'a> {
 }
 
 impl Binder<'_> {
+    /// Bind a statement into a [`Plan`], or `None` for kinds not modelled
+    /// yet. A query is bound directly; the data-moving statements
+    /// (INSERT / UPDATE / DELETE / MERGE / CTAS / CREATE VIEW) produce a
+    /// [`Write`]-rooted tree whose `input` carries every read (the source
+    /// query plus any SET / predicate / VALUES reads).
+    fn bind_statement(&self, statement: &Statement) -> Option<Plan> {
+        match statement {
+            Statement::Query(query) => Some(self.bind_query(query).0),
+            Statement::Insert(insert) => self.bind_insert(insert),
+            Statement::Update(update) => self.bind_update(update),
+            Statement::Delete(delete) => self.bind_delete(delete),
+            Statement::Merge(merge) => self.bind_merge(merge),
+            Statement::CreateTable(create) => self.bind_create_table(create),
+            Statement::CreateView(create) => self.bind_create_view(create),
+            // Other DDL / session statements aren't data operations — not
+            // bound (the wildcard mirrors `build`'s "unsupported → None").
+            _ => None,
+        }
+    }
+
+    /// `INSERT INTO target (cols) <source>`: the source query's plan is
+    /// the read-carrying input; the target columns are the write targets.
+    /// A `VALUES` source binds to an opaque leaf (no column reads).
+    fn bind_insert(&self, insert: &Insert) -> Option<Plan> {
+        let (target, _alias) = TableReference::from_insert_with_alias(insert).ok()?;
+        let target_columns = insert.columns.clone();
+        let input = match &insert.source {
+            Some(source) => self.bind_query(source).0,
+            None => Plan::OpaqueLeaf(OpaqueLeaf { alias: None }),
+        };
+        Some(Plan::Write(Write {
+            target,
+            target_columns,
+            input: Box::new(input),
+        }))
+    }
+
+    /// `UPDATE target SET col = expr [FROM src] WHERE pred`: the target
+    /// (write) plus any FROM relations (read) form the scope; the SET RHS
+    /// expressions and WHERE predicate are the reads; the SET LHS columns
+    /// are the writes.
+    fn bind_update(&self, update: &Update) -> Option<Plan> {
+        let (target_plan, mut scope) = self.bind_table_with_joins(&update.table);
+        let mut inputs = vec![target_plan];
+        if let Some(from) = &update.from {
+            let tables = match from {
+                UpdateTableFromKind::BeforeSet(tables) | UpdateTableFromKind::AfterSet(tables) => {
+                    tables
+                }
+            };
+            for twj in tables {
+                let (plan, from_scope) = self.bind_table_with_joins(twj);
+                inputs.push(plan);
+                scope = scope.merge(from_scope);
+            }
+        }
+        let mut reads = Vec::new();
+        for assignment in &update.assignments {
+            self.collect_expr_reads(&assignment.value, &scope, &mut reads);
+        }
+        if let Some(selection) = &update.selection {
+            self.collect_expr_reads(selection, &scope, &mut reads);
+        }
+        let target = TableReference::try_from(&update.table.relation).ok()?;
+        let target_columns = update
+            .assignments
+            .iter()
+            .flat_map(|a| assignment_target_columns(&a.target))
+            .collect();
+        Some(Plan::Write(Write {
+            target,
+            target_columns,
+            input: Box::new(Plan::PassThrough(PassThrough { inputs, reads })),
+        }))
+    }
+
+    /// `DELETE FROM target [USING src] WHERE pred`: the predicate's reads
+    /// against the FROM (and USING) relations; no column writes (the rows
+    /// are removed wholesale), so the [`Write`]'s `target_columns` is
+    /// empty — the target still surfaces for table-level analysis.
+    fn bind_delete(&self, delete: &Delete) -> Option<Plan> {
+        let from_tables = match &delete.from {
+            FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+        };
+        let mut inputs = Vec::new();
+        let mut scope = Scope::empty();
+        for twj in from_tables.iter().chain(delete.using.iter().flatten()) {
+            let (plan, twj_scope) = self.bind_table_with_joins(twj);
+            inputs.push(plan);
+            scope = scope.merge(twj_scope);
+        }
+        let mut reads = Vec::new();
+        if let Some(selection) = &delete.selection {
+            self.collect_expr_reads(selection, &scope, &mut reads);
+        }
+        let input = Plan::PassThrough(PassThrough { inputs, reads });
+        // The deleted relation is the explicit `DELETE t` list when
+        // present, else the FROM target.
+        let target = if let Some(name) = delete.tables.first() {
+            TableReference::try_from_name(name).ok()
+        } else {
+            from_tables
+                .first()
+                .and_then(|twj| TableReference::try_from(&twj.relation).ok())
+        };
+        Some(match target {
+            Some(target) => Plan::Write(Write {
+                target,
+                target_columns: Vec::new(),
+                input: Box::new(input),
+            }),
+            None => input,
+        })
+    }
+
+    /// `MERGE INTO target USING source ON pred WHEN … THEN …`: target
+    /// (write) and source (read) form the scope; reads come from ON, each
+    /// clause predicate, the UPDATE assignment RHS, and INSERT VALUES;
+    /// writes are the UPDATE SET targets and INSERT columns.
+    fn bind_merge(&self, merge: &Merge) -> Option<Plan> {
+        let (target_plan, target_scope) = self.bind_table_factor(&merge.table);
+        let (source_plan, source_scope) = self.bind_table_factor(&merge.source);
+        let scope = target_scope.merge(source_scope);
+        let mut reads = Vec::new();
+        let mut target_columns = Vec::new();
+        self.collect_expr_reads(&merge.on, &scope, &mut reads);
+        for clause in &merge.clauses {
+            if let Some(predicate) = &clause.predicate {
+                self.collect_expr_reads(predicate, &scope, &mut reads);
+            }
+            match &clause.action {
+                MergeAction::Insert(insert) => {
+                    if let Some(predicate) = &insert.insert_predicate {
+                        self.collect_expr_reads(predicate, &scope, &mut reads);
+                    }
+                    if let MergeInsertKind::Values(values) = &insert.kind {
+                        for row in &values.rows {
+                            for expr in row {
+                                self.collect_expr_reads(expr, &scope, &mut reads);
+                            }
+                        }
+                    }
+                    target_columns.extend(insert.columns.iter().filter_map(object_name_last_ident));
+                }
+                MergeAction::Update(update) => {
+                    for assignment in &update.assignments {
+                        self.collect_expr_reads(&assignment.value, &scope, &mut reads);
+                        target_columns.extend(assignment_target_columns(&assignment.target));
+                    }
+                    for predicate in [&update.update_predicate, &update.delete_predicate]
+                        .into_iter()
+                        .flatten()
+                    {
+                        self.collect_expr_reads(predicate, &scope, &mut reads);
+                    }
+                }
+                // DELETE moves no column values.
+                MergeAction::Delete { .. } => {}
+            }
+        }
+        let target = TableReference::try_from(&merge.table).ok()?;
+        Some(Plan::Write(Write {
+            target,
+            target_columns,
+            input: Box::new(Plan::PassThrough(PassThrough {
+                inputs: vec![target_plan, source_plan],
+                reads,
+            })),
+        }))
+    }
+
+    /// `CREATE TABLE dst AS <query>` (CTAS): the source query's reads,
+    /// paired with the new table's columns (explicit defs win, else the
+    /// source output names). A non-CTAS `CREATE TABLE` (no query) isn't a
+    /// data operation — not bound.
+    fn bind_create_table(&self, create: &CreateTable) -> Option<Plan> {
+        let query = create.query.as_ref()?;
+        let (input, scope) = self.bind_query(query);
+        let target = TableReference::try_from(&create.name).ok()?;
+        let target_columns = if create.columns.is_empty() {
+            output_names(&scope.outputs)
+        } else {
+            create.columns.iter().map(|c| c.name.clone()).collect()
+        };
+        Some(Plan::Write(Write {
+            target,
+            target_columns,
+            input: Box::new(input),
+        }))
+    }
+
+    /// `CREATE VIEW v AS <query>`: like CTAS — the query's reads paired
+    /// with the view's columns (explicit list wins, else source names).
+    fn bind_create_view(&self, create: &CreateView) -> Option<Plan> {
+        let (input, scope) = self.bind_query(&create.query);
+        let target = TableReference::try_from(&create.name).ok()?;
+        let target_columns = if create.columns.is_empty() {
+            output_names(&scope.outputs)
+        } else {
+            create.columns.iter().map(|c| c.name.clone()).collect()
+        };
+        Some(Plan::Write(Write {
+            target,
+            target_columns,
+            input: Box::new(input),
+        }))
+    }
+
     /// Bind a query, returning the plan node and its output scope. A
     /// leading `WITH` is peeled first: each CTE binds in declaration order
     /// into an environment the later CTEs and the body resolve against. A
@@ -963,6 +1169,28 @@ fn apply_column_aliases(outputs: &mut [BoundColumn], alias: &TableAlias) {
     }
 }
 
+/// The named output columns of a bound body — the target column list a
+/// CTAS / CREATE VIEW pairs its source against when no explicit columns
+/// are given. Anonymous (un-nameable) outputs are dropped.
+fn output_names(outputs: &[BoundColumn]) -> Vec<Ident> {
+    outputs.iter().filter_map(|c| c.name.clone()).collect()
+}
+
+/// The last (rightmost) identifier of a possibly-qualified name — a
+/// write-target column's bare name.
+fn object_name_last_ident(name: &ObjectName) -> Option<Ident> {
+    name.0.last().and_then(|part| part.as_ident().cloned())
+}
+
+/// The column(s) an assignment writes: a single `col = …` or a tuple
+/// `(a, b) = …`, each reduced to its bare name.
+fn assignment_target_columns(target: &AssignmentTarget) -> Vec<Ident> {
+    match target {
+        AssignmentTarget::ColumnName(name) => object_name_last_ident(name).into_iter().collect(),
+        AssignmentTarget::Tuple(names) => names.iter().filter_map(object_name_last_ident).collect(),
+    }
+}
+
 /// The output name SQL infers for an unaliased projection item: a bare
 /// column keeps its own name; anything else is anonymous.
 fn inferred_output_name(expr: &Expr) -> Option<Ident> {
@@ -1216,6 +1444,60 @@ mod tests {
                 "id",
                 vec![inferred("t", "id"), inferred("t", "id")]
             )]
+        );
+    }
+
+    #[test]
+    fn insert_select_writes_target_over_source_reads() {
+        // The source SELECT is the read-carrying input; the column list is
+        // the write target. No reads come from the target.
+        assert_eq!(
+            bind_one("INSERT INTO target (a, b) SELECT x, y FROM source"),
+            Plan::Write(Write {
+                target: tref("target"),
+                target_columns: vec![Ident::new("a"), Ident::new("b")],
+                input: Box::new(Plan::Project(Project {
+                    input: Box::new(scan("source")),
+                    outputs: vec![
+                        passthrough_col("x", vec![inferred("source", "x")]),
+                        passthrough_col("y", vec![inferred("source", "y")]),
+                    ],
+                })),
+            })
+        );
+    }
+
+    #[test]
+    fn update_reads_set_rhs_and_predicate() {
+        // The SET right-hand side and the WHERE predicate are reads on the
+        // target; the SET left-hand side `c` is the write.
+        assert_eq!(
+            bind_one("UPDATE t SET c = a + b WHERE d > 0"),
+            Plan::Write(Write {
+                target: tref("t"),
+                target_columns: vec![Ident::new("c")],
+                input: Box::new(Plan::PassThrough(PassThrough {
+                    inputs: vec![scan("t")],
+                    reads: vec![inferred("t", "a"), inferred("t", "b"), inferred("t", "d")],
+                })),
+            })
+        );
+    }
+
+    #[test]
+    fn delete_reads_predicate_and_writes_no_columns() {
+        // DELETE removes whole rows: the predicate is a read, but there
+        // are no column writes (the target still surfaces for table-level).
+        assert_eq!(
+            bind_one("DELETE FROM t WHERE d > 0"),
+            Plan::Write(Write {
+                target: tref("t"),
+                target_columns: vec![],
+                input: Box::new(Plan::PassThrough(PassThrough {
+                    inputs: vec![scan("t")],
+                    reads: vec![inferred("t", "d")],
+                })),
+            })
         );
     }
 
