@@ -152,23 +152,27 @@ pub fn extract_column_operations(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnOperation {
     pub statement_kind: StatementKind,
-    /// Columns read by the statement, in walk order. Occurrence-based:
-    /// a column referenced more than once appears more than once
-    /// (e.g. `SELECT a FROM t WHERE a > 0` yields `t.a` twice). Each
-    /// entry pairs the [`ColumnReference`] identity with the
-    /// resolver's [`ResolutionKind`](crate::ResolutionKind) in the placement.
-    /// A consumer wanting the distinct identity set dedups
-    /// `reads.iter().map(|r| &r.reference)` via a `HashSet`.
+    /// Columns read by the statement. Occurrence-based: a column
+    /// referenced more than once appears more than once (e.g.
+    /// `SELECT a FROM t WHERE a > 0` yields `t.a` twice). Each entry pairs
+    /// the [`ColumnReference`] identity with its
+    /// [`ResolutionKind`](crate::ResolutionKind). **Order is not
+    /// contractual** — it reflects an internal traversal and may change
+    /// between versions; occurrence count is preserved, and each entry
+    /// carries its source span, so a consumer wanting source-text order
+    /// sorts by `reference.name.span` and one wanting the distinct identity
+    /// set dedups `reads.iter().map(|r| &r.reference)` via a `HashSet`.
     pub reads: Vec<ColumnRead>,
-    /// Columns written by the statement, in walk order. Occurrence-based
-    /// like `reads`. Write targets come straight from SQL syntax and
-    /// are always `ResolutionKind::Cataloged` by construction, so the
-    /// resolution field is elided here.
+    /// Columns written by the statement, in source (column-list) order.
+    /// Occurrence-based like `reads`. Write targets come straight from SQL
+    /// syntax and are always `ResolutionKind::Cataloged` by construction,
+    /// so the resolution field is elided here.
     pub writes: Vec<ColumnReference>,
-    /// Lineage edges in emission order. Statements that physically
-    /// move data emit collapsed end-to-end edges (source →
-    /// `ColumnTarget::Relation`); bare `SELECT` emits source →
-    /// `ColumnTarget::QueryOutput` edges.
+    /// Lineage edges. Statements that physically move data emit collapsed
+    /// end-to-end edges (source → `ColumnTarget::Relation`); a bare
+    /// `SELECT` emits source → `ColumnTarget::QueryOutput` edges. **Order
+    /// is not contractual** (occurrence / multiplicity is preserved);
+    /// consumers compare as a set / multiset.
     pub lineage: Vec<ColumnLineageEdge>,
     /// Column-level diagnostics: wildcard suppression plus the
     /// `UnsupportedStatement` projection inherited from table
@@ -287,49 +291,67 @@ impl ColumnOperationExtractor {
         catalog: Option<&Catalog>,
         casing: IdentifierCasing,
     ) -> Result<ColumnOperation, Error> {
-        let kind = super::table_operation_extractor::classify_statement(statement);
-        let resolution = Resolver::resolve_statement(catalog, statement, casing)?;
+        // Column-level extraction is served by the bound-plan engine; the
+        // resolver-based path is retained as `resolver_column_operation`
+        // only for the strangler differential harness until the resolver is
+        // removed.
+        Ok(crate::plan::operation::column_operation(
+            statement, catalog, casing,
+        ))
+    }
+}
 
-        // Start from resolver-level diagnostics; extractor adds its own
-        // only when classify_statement detects an unsupported case the
-        // resolver did not already report.
-        let mut diagnostics = resolution.diagnostics.clone();
+/// The legacy resolver-based column extraction, kept for the differential
+/// harness that pins the plan engine against the resolver. Removed with
+/// the resolver.
+#[allow(dead_code)] // strangler: used only by the test differential harness
+pub(crate) fn resolver_column_operation(
+    statement: &Statement,
+    catalog: Option<&Catalog>,
+    casing: IdentifierCasing,
+) -> Result<ColumnOperation, Error> {
+    let kind = super::table_operation_extractor::classify_statement(statement);
+    let resolution = Resolver::resolve_statement(catalog, statement, casing)?;
 
-        if matches!(kind, StatementKind::Unsupported) {
-            if !diagnostics
-                .iter()
-                .any(|d| matches!(d.kind, ColumnLevelDiagnosticKind::UnsupportedStatement))
-            {
-                diagnostics.push(ColumnLevelDiagnostic {
-                    kind: ColumnLevelDiagnosticKind::UnsupportedStatement,
-                    message: format!(
-                        "Unsupported statement for column operation extraction: {}",
-                        statement
-                    ),
-                    span: None,
-                });
-            }
-            return Ok(ColumnOperation {
-                statement_kind: kind,
-                reads: Vec::new(),
-                writes: Vec::new(),
-                lineage: Vec::new(),
-                diagnostics,
+    // Start from resolver-level diagnostics; extractor adds its own
+    // only when classify_statement detects an unsupported case the
+    // resolver did not already report.
+    let mut diagnostics = resolution.diagnostics.clone();
+
+    if matches!(kind, StatementKind::Unsupported) {
+        if !diagnostics
+            .iter()
+            .any(|d| matches!(d.kind, ColumnLevelDiagnosticKind::UnsupportedStatement))
+        {
+            diagnostics.push(ColumnLevelDiagnostic {
+                kind: ColumnLevelDiagnosticKind::UnsupportedStatement,
+                message: format!(
+                    "Unsupported statement for column operation extraction: {}",
+                    statement
+                ),
+                span: None,
             });
         }
-
-        let reads = collect_reads(&resolution);
-        let writes = collect_writes(statement, &resolution)?;
-        let lineage = extract_lineage(&resolution);
-
-        Ok(ColumnOperation {
+        return Ok(ColumnOperation {
             statement_kind: kind,
-            reads,
-            writes,
-            lineage,
+            reads: Vec::new(),
+            writes: Vec::new(),
+            lineage: Vec::new(),
             diagnostics,
-        })
+        });
     }
+
+    let reads = collect_reads(&resolution);
+    let writes = collect_writes(statement, &resolution)?;
+    let lineage = extract_lineage(&resolution);
+
+    Ok(ColumnOperation {
+        statement_kind: kind,
+        reads,
+        writes,
+        lineage,
+        diagnostics,
+    })
 }
 
 /// Map the resolver's pre-built `lineage_edges` 1:1 to public

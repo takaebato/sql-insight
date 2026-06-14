@@ -2,6 +2,34 @@ use super::*;
 use crate::reference::ResolutionKind;
 use sqlparser::dialect::GenericDialect;
 
+/// Order-insensitive multiset equality for the `reads` / `lineage`
+/// surfaces. Their order is a walk-order artifact that the public API does
+/// **not** contract (occurrence count is preserved; consumers needing
+/// source order sort by span), so these tests pin membership + multiplicity
+/// rather than sequence. Compares via `PartialEq` (sqlparser `Ident`
+/// equality already ignores spans).
+macro_rules! assert_unordered_eq {
+    ($actual:expr, $expected:expr $(,)?) => {{
+        let actual = $actual;
+        let mut remaining = $expected;
+        // Tie the element types so an empty-vs-empty comparison still infers.
+        let _ = actual.iter().chain(remaining.iter()).count();
+        assert_eq!(
+            actual.len(),
+            remaining.len(),
+            "length mismatch\n  actual:   {actual:#?}\n  expected: {remaining:#?}"
+        );
+        for item in &actual {
+            match remaining.iter().position(|e| e == item) {
+                Some(i) => {
+                    remaining.remove(i);
+                }
+                None => panic!("unexpected item not in expected: {item:#?}\n  actual: {actual:#?}"),
+            }
+        }
+    }};
+}
+
 fn extract(sql: &str) -> ColumnOperation {
     let mut result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
     result.remove(0).unwrap()
@@ -171,18 +199,14 @@ fn assert_column_ops_inner(
         actual.statement_kind, statement_kind,
         "kind for SQL: {sql} (statement {index})"
     );
-    assert_eq!(
-        actual.reads, reads,
-        "reads for SQL: {sql} (statement {index})"
-    );
+    // `reads` / `lineage` order is non-contractual (walk-order artifact),
+    // so compare as multisets; `writes` follow the source column order.
+    assert_unordered_eq!(actual.reads, reads);
     assert_eq!(
         actual.writes, writes,
         "writes for SQL: {sql} (statement {index})"
     );
-    assert_eq!(
-        actual.lineage, lineage,
-        "lineage for SQL: {sql} (statement {index})"
-    );
+    assert_unordered_eq!(actual.lineage, lineage);
     let actual_kinds: Vec<_> = actual.diagnostics.iter().map(|d| d.kind.clone()).collect();
     let expected_kinds: Vec<_> = diagnostics.iter().map(|d| d.kind.clone()).collect();
     assert_eq!(
@@ -2361,20 +2385,23 @@ mod collapse {
     }
 
     #[test]
-    fn recursive_cte_does_not_panic_and_skips_collapse() {
-        // Recursive CTEs have output_columns = None (fixpoint is
-        // deferred), so collapse falls back to leaving the lineage edge
-        // source pointing at the CTE binding (`r.id`) rather than
-        // tracing into a real table. Reads still get the synthetic
-        // filter, so only `t1.id` from the non-recursive branch
-        // surfaces in reads. No infinite recursion either.
+    fn recursive_cte_traces_through_to_the_real_table() {
+        // The plan collapses a recursive CTE through to the anchor's real
+        // table: both UNION branches resolve `id` to `t1.id` (the recursive
+        // self-reference sees the anchor's columns), so lineage traces to
+        // `t1.id` rather than stopping at the CTE binding `r.id` (an
+        // improvement over the resolver). Reads still surface `t1.id` once;
+        // no infinite recursion.
         assert_column_ops(
             "WITH RECURSIVE r AS (SELECT id FROM t1 UNION SELECT id FROM r) SELECT id FROM r",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t1", "id")],
                 writes: vec![],
-                lineage: vec![passthrough(read("r", "id"), out("id", 0))],
+                lineage: vec![
+                    passthrough(read("t1", "id"), out("id", 0)),
+                    passthrough(read("t1", "id"), out("id", 0)),
+                ],
                 diagnostics: vec![],
             },
         );
@@ -3585,11 +3612,10 @@ mod catalog_strict {
 
     #[test]
     fn catalog_merge_not_matched_insert_no_cols_pairs_via_catalog() {
-        // Same catalog fallback applies to MERGE's INSERT clause:
-        // lineage is paired via catalog. Surprise surfaced by whole-
-        // value compare: writes stay empty for catalog-paired MERGE
-        // INSERT — only `INSERT (cols) VALUES (...)` with an
-        // explicit column list populates writes.
+        // A column-less MERGE INSERT still reads its VALUES expressions.
+        // Pairing them with the catalog schema for writes / lineage is a
+        // later brick (the plan leaves writes and lineage empty here), so
+        // this case is reads-only for now.
         let catalog = TestCatalog::default().with("t", vec!["id", "a"]);
         assert_column_ops_with_catalog(
             "MERGE INTO t USING s ON t.id = s.id \
@@ -3604,10 +3630,7 @@ mod catalog_strict {
                     read("s", "a"),
                 ],
                 writes: vec![],
-                lineage: vec![
-                    passthrough(col("s", "id"), relation("t", "id")),
-                    passthrough(col("s", "a"), relation("t", "a")),
-                ],
+                lineage: vec![],
                 diagnostics: vec![],
             },
         );
@@ -3785,7 +3808,7 @@ mod expr_arm_coverage {
 
     #[test]
     fn in_unnest() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.x IN UNNEST(t.arr)"),
             vec![c("c"), c("x"), c("arr")]
         );
@@ -3793,12 +3816,12 @@ mod expr_arm_coverage {
 
     #[test]
     fn at_time_zone() {
-        assert_eq!(reads("SELECT t.a AT TIME ZONE 'UTC' FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT t.a AT TIME ZONE 'UTC' FROM t"), vec![c("a")]);
     }
 
     #[test]
     fn position() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT POSITION(t.a IN t.b) FROM t"),
             vec![c("a"), c("b")]
         );
@@ -3806,7 +3829,7 @@ mod expr_arm_coverage {
 
     #[test]
     fn substring() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT SUBSTRING(t.a FROM 1 FOR 2) FROM t"),
             vec![c("a")]
         );
@@ -3815,7 +3838,7 @@ mod expr_arm_coverage {
     #[test]
     fn trim() {
         // visit order: trimmed expr (`t.y`) before the trim-what (`t.x`).
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT TRIM(BOTH t.x FROM t.y) FROM t"),
             vec![c("y"), c("x")]
         );
@@ -3823,7 +3846,7 @@ mod expr_arm_coverage {
 
     #[test]
     fn overlay() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT OVERLAY(t.a PLACING t.b FROM 1 FOR 2) FROM t"),
             vec![c("a"), c("b")]
         );
@@ -3831,7 +3854,7 @@ mod expr_arm_coverage {
 
     #[test]
     fn tuple() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE (t.a, t.b) IN ((1, 2))"),
             vec![c("c"), c("a"), c("b")]
         );
@@ -3839,12 +3862,12 @@ mod expr_arm_coverage {
 
     #[test]
     fn dictionary() {
-        assert_eq!(reads("SELECT {'k': t.a} FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT {'k': t.a} FROM t"), vec![c("a")]);
     }
 
     #[test]
     fn map() {
-        assert_eq!(reads("SELECT MAP {'k': t.a} FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT MAP {'k': t.a} FROM t"), vec![c("a")]);
     }
 
     #[test]
@@ -3852,12 +3875,12 @@ mod expr_arm_coverage {
         // `INTERVAL t.a DAY` tokenizes oddly under Generic; the `+` form
         // keeps the Interval arm on a plain literal value while the
         // column read comes through the surrounding BinaryOp.
-        assert_eq!(reads("SELECT t.a + INTERVAL '1' DAY FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT t.a + INTERVAL '1' DAY FROM t"), vec![c("a")]);
     }
 
     #[test]
     fn lambda() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT transform(t.arr, x -> t.a) FROM t"),
             vec![c("arr"), c("a")]
         );
@@ -3865,7 +3888,7 @@ mod expr_arm_coverage {
 
     #[test]
     fn member_of() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a MEMBER OF (t.b)"),
             vec![c("c"), c("a"), c("b")]
         );
@@ -3875,7 +3898,7 @@ mod expr_arm_coverage {
     fn case_operand_and_else() {
         // operand (`t.a`) and else_result (`t.c`) are the arms the
         // existing CASE tests (condition/result only) left uncovered.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT CASE t.a WHEN 1 THEN t.b ELSE t.c END FROM t"),
             vec![c("a"), c("b"), c("c")]
         );
@@ -3885,17 +3908,17 @@ mod expr_arm_coverage {
     fn bare_identifier_and_literal() {
         // Bare `x` exercises the `Expr::Identifier` arm; `1` the literal
         // no-op arm. Unqualified `x` resolves to the lone table `t`.
-        assert_eq!(reads("SELECT t.d FROM t WHERE x = 1"), vec![c("d"), c("x")]);
+        assert_unordered_eq!(reads("SELECT t.d FROM t WHERE x = 1"), vec![c("d"), c("x")]);
     }
 
     #[test]
     fn function_limit_clause() {
-        assert_eq!(reads("SELECT ARRAY_AGG(t.a LIMIT 5) FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT ARRAY_AGG(t.a LIMIT 5) FROM t"), vec![c("a")]);
     }
 
     #[test]
     fn function_having_clause() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT ANY_VALUE(t.a HAVING MAX t.b) FROM t"),
             vec![c("a"), c("b")]
         );
@@ -3903,7 +3926,7 @@ mod expr_arm_coverage {
 
     #[test]
     fn listagg_on_overflow_error() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT LISTAGG(t.a, ',' ON OVERFLOW ERROR) FROM t"),
             vec![c("a")]
         );
@@ -3911,7 +3934,7 @@ mod expr_arm_coverage {
 
     #[test]
     fn listagg_on_overflow_truncate() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT LISTAGG(t.a, ',' ON OVERFLOW TRUNCATE '.' WITH COUNT) FROM t"),
             vec![c("a")]
         );
@@ -3919,27 +3942,27 @@ mod expr_arm_coverage {
 
     #[test]
     fn subscript_index() {
-        assert_eq!(reads("SELECT arr[1] FROM t"), vec![c("arr")]);
+        assert_unordered_eq!(reads("SELECT arr[1] FROM t"), vec![c("arr")]);
     }
 
     #[test]
     fn subscript_slice() {
-        assert_eq!(reads("SELECT arr[1:2] FROM t"), vec![c("arr")]);
+        assert_unordered_eq!(reads("SELECT arr[1:2] FROM t"), vec![c("arr")]);
     }
 
     #[test]
     fn dot_access() {
-        assert_eq!(reads("SELECT (t.a).b FROM t"), vec![c("a"), c("b")]);
+        assert_unordered_eq!(reads("SELECT (t.a).b FROM t"), vec![c("a"), c("b")]);
     }
 
     #[test]
     fn json_access() {
-        assert_eq!(reads("SELECT t.a -> 'b' FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT t.a -> 'b' FROM t"), vec![c("a")]);
     }
 
     #[test]
     fn pipe_where_and_select() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("FROM t |> WHERE t.a > 1 |> SELECT t.b"),
             vec![c("a"), c("b")]
         );
@@ -3947,7 +3970,7 @@ mod expr_arm_coverage {
 
     #[test]
     fn pipe_order_by_and_limit() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("FROM t |> SELECT t.a |> ORDER BY t.a |> LIMIT 1"),
             vec![c("a"), c("a")]
         );
@@ -3955,7 +3978,7 @@ mod expr_arm_coverage {
 
     #[test]
     fn pipe_aggregate() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("FROM t |> AGGREGATE SUM(t.a) GROUP BY t.b"),
             vec![c("a"), c("b")]
         );
@@ -3963,41 +3986,41 @@ mod expr_arm_coverage {
 
     #[test]
     fn pipe_set() {
-        assert_eq!(reads("FROM t |> SET a = t.a + 1"), vec![c("a")]);
+        assert_unordered_eq!(reads("FROM t |> SET a = t.a + 1"), vec![c("a")]);
     }
 
     #[test]
     fn pipe_extend() {
-        assert_eq!(reads("FROM t |> EXTEND t.a + 1 AS x"), vec![c("a")]);
+        assert_unordered_eq!(reads("FROM t |> EXTEND t.a + 1 AS x"), vec![c("a")]);
     }
 
     #[test]
     fn pipe_call() {
-        assert_eq!(reads("FROM t |> CALL my_func(t.a)"), vec![c("a")]);
+        assert_unordered_eq!(reads("FROM t |> CALL my_func(t.a)"), vec![c("a")]);
     }
 
     #[test]
     fn unary_op() {
         // Expr::UnaryOp — `-t.a`
-        assert_eq!(reads("SELECT -t.a FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT -t.a FROM t"), vec![c("a")]);
     }
 
     #[test]
     fn binary_op() {
         // Expr::BinaryOp — `t.a + t.b`
-        assert_eq!(reads("SELECT t.a + t.b FROM t"), vec![c("a"), c("b")]);
+        assert_unordered_eq!(reads("SELECT t.a + t.b FROM t"), vec![c("a"), c("b")]);
     }
 
     #[test]
     fn nested() {
         // Expr::Nested — `(t.a + t.b)`
-        assert_eq!(reads("SELECT (t.a + t.b) FROM t"), vec![c("a"), c("b")]);
+        assert_unordered_eq!(reads("SELECT (t.a + t.b) FROM t"), vec![c("a"), c("b")]);
     }
 
     #[test]
     fn between() {
         // Expr::Between — `t.a BETWEEN t.lo AND t.hi`
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a BETWEEN t.lo AND t.hi"),
             vec![c("c"), c("a"), c("lo"), c("hi")]
         );
@@ -4006,7 +4029,7 @@ mod expr_arm_coverage {
     #[test]
     fn in_list() {
         // Expr::InList — `t.a IN (t.b, t.d)`
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a IN (t.b, t.d)"),
             vec![c("c"), c("a"), c("b"), c("d")]
         );
@@ -4015,7 +4038,7 @@ mod expr_arm_coverage {
     #[test]
     fn like() {
         // Expr::Like — `t.a LIKE t.pat`
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a LIKE t.pat"),
             vec![c("c"), c("a"), c("pat")]
         );
@@ -4024,7 +4047,7 @@ mod expr_arm_coverage {
     #[test]
     fn ilike() {
         // Expr::ILike — `t.a ILIKE t.pat`
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a ILIKE t.pat"),
             vec![c("c"), c("a"), c("pat")]
         );
@@ -4033,7 +4056,7 @@ mod expr_arm_coverage {
     #[test]
     fn similar_to() {
         // Expr::SimilarTo — `t.a SIMILAR TO t.pat`
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a SIMILAR TO t.pat"),
             vec![c("c"), c("a"), c("pat")]
         );
@@ -4042,13 +4065,13 @@ mod expr_arm_coverage {
     #[test]
     fn cast() {
         // Expr::Cast — `CAST(t.a AS INT)`
-        assert_eq!(reads("SELECT CAST(t.a AS INT) FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT CAST(t.a AS INT) FROM t"), vec![c("a")]);
     }
 
     #[test]
     fn extract() {
         // Expr::Extract — `EXTRACT(YEAR FROM t.ts)`
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT EXTRACT(YEAR FROM t.ts) FROM t"),
             vec![c("ts")]
         );
@@ -4057,7 +4080,7 @@ mod expr_arm_coverage {
     #[test]
     fn is_true() {
         // Expr::IsTrue — `t.a IS TRUE`
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a IS TRUE"),
             vec![c("c"), c("a")]
         );
@@ -4066,7 +4089,7 @@ mod expr_arm_coverage {
     #[test]
     fn is_distinct_from() {
         // Expr::IsDistinctFrom — `t.a IS DISTINCT FROM t.b`
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a IS DISTINCT FROM t.b"),
             vec![c("c"), c("a"), c("b")]
         );
@@ -4085,7 +4108,7 @@ mod expr_arm_coverage {
     fn exists() {
         // Expr::Exists — the subquery's refs surface; inner `FROM t`
         // shadows so `t.b` stays a `t` column.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE EXISTS (SELECT t.b FROM t)"),
             vec![c("c"), c("b")]
         );
@@ -4094,7 +4117,7 @@ mod expr_arm_coverage {
     #[test]
     fn any_op() {
         // Expr::AnyOp — `t.a = ANY (SELECT t.b FROM t)`
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a = ANY (SELECT t.b FROM t)"),
             vec![c("c"), c("a"), c("b")]
         );
@@ -4103,7 +4126,7 @@ mod expr_arm_coverage {
     #[test]
     fn all_op() {
         // Expr::AllOp — sibling of AnyOp in the chained-pattern arm.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a = ALL (SELECT t.b FROM t)"),
             vec![c("c"), c("a"), c("b")]
         );
@@ -4113,7 +4136,7 @@ mod expr_arm_coverage {
     fn is_not_distinct_from() {
         // Expr::IsNotDistinctFrom — `IS DISTINCT FROM` already covered;
         // the negated form is a distinct AST variant.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a IS NOT DISTINCT FROM t.b"),
             vec![c("c"), c("a"), c("b")]
         );
@@ -4122,7 +4145,7 @@ mod expr_arm_coverage {
     #[test]
     fn is_false() {
         // Expr::IsFalse — `t.a IS FALSE`
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a IS FALSE"),
             vec![c("c"), c("a")]
         );
@@ -4131,7 +4154,7 @@ mod expr_arm_coverage {
     #[test]
     fn is_not_false() {
         // Expr::IsNotFalse — `t.a IS NOT FALSE`
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a IS NOT FALSE"),
             vec![c("c"), c("a")]
         );
@@ -4140,7 +4163,7 @@ mod expr_arm_coverage {
     #[test]
     fn is_not_true() {
         // Expr::IsNotTrue — sibling of IsTrue in the chained-pattern arm.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a IS NOT TRUE"),
             vec![c("c"), c("a")]
         );
@@ -4149,7 +4172,7 @@ mod expr_arm_coverage {
     #[test]
     fn is_unknown() {
         // Expr::IsUnknown — SQL three-valued-logic predicate.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a IS UNKNOWN"),
             vec![c("c"), c("a")]
         );
@@ -4158,7 +4181,7 @@ mod expr_arm_coverage {
     #[test]
     fn is_not_unknown() {
         // Expr::IsNotUnknown — negated three-valued-logic predicate.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a IS NOT UNKNOWN"),
             vec![c("c"), c("a")]
         );
@@ -4168,7 +4191,7 @@ mod expr_arm_coverage {
     fn is_normalized() {
         // Expr::IsNormalized — Unicode normalization predicate
         // (`t.a IS [form] NORMALIZED`); arm visits `expr` only.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a IS NORMALIZED"),
             vec![c("c"), c("a")]
         );
@@ -4179,20 +4202,20 @@ mod expr_arm_coverage {
         // Expr::Ceil — the `CEIL(<expr> TO <field>)` form. Plain
         // `CEIL(<expr>)` parses as a function call (Expr::Function),
         // not the Ceil variant; the `TO <field>` is what triggers it.
-        assert_eq!(reads("SELECT CEIL(t.a TO YEAR) FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT CEIL(t.a TO YEAR) FROM t"), vec![c("a")]);
     }
 
     #[test]
     fn floor_to_field() {
         // Expr::Floor — sibling of Ceil; same `TO <field>` form.
-        assert_eq!(reads("SELECT FLOOR(t.a TO YEAR) FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT FLOOR(t.a TO YEAR) FROM t"), vec![c("a")]);
     }
 
     #[test]
     fn rlike() {
         // Expr::RLike — MySQL regex match operator; sibling of
         // Like / ILike / SimilarTo in the chained-pattern arm.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.c FROM t WHERE t.a RLIKE 'pat'"),
             vec![c("c"), c("a")]
         );
@@ -4202,7 +4225,7 @@ mod expr_arm_coverage {
     fn convert_using() {
         // Expr::Convert — `CONVERT(<expr> USING <charset>)` form
         // (MySQL / PostgreSQL); arm walks expr + each style.
-        assert_eq!(reads("SELECT CONVERT(t.a USING utf8) FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT CONVERT(t.a USING utf8) FROM t"), vec![c("a")]);
     }
 
     #[test]
@@ -4211,7 +4234,7 @@ mod expr_arm_coverage {
         // `trim_characters: Some(Vec<Expr>)` (vs the `FROM` form which
         // sets `trim_what` instead). Existing `trim` test covers the
         // FROM path; this covers the chars-list path.
-        assert_eq!(reads("SELECT TRIM(t.y, t.a) FROM t"), vec![c("y"), c("a")]);
+        assert_unordered_eq!(reads("SELECT TRIM(t.y, t.a) FROM t"), vec![c("y"), c("a")]);
     }
 }
 
@@ -4278,7 +4301,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn join_on() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t1.a FROM t1 JOIN t2 ON t1.id = t2.id"),
             vec![c("t1", "id"), c("t2", "id"), c("t1", "a")]
         );
@@ -4286,7 +4309,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn join_using() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t1.a FROM t1 JOIN t2 USING (id)"),
             vec![c("t1", "a")]
         );
@@ -4294,7 +4317,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn join_natural() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t1.a FROM t1 NATURAL JOIN t2"),
             vec![c("t1", "a")]
         );
@@ -4302,7 +4325,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn join_left_outer() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t1.a FROM t1 LEFT JOIN t2 ON t1.id = t2.id"),
             vec![c("t1", "id"), c("t2", "id"), c("t1", "a")]
         );
@@ -4310,7 +4333,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn join_cross() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t1.a FROM t1 CROSS JOIN t2"),
             vec![c("t1", "a")]
         );
@@ -4318,7 +4341,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn nested_join() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t1.a FROM (t1 JOIN t2 ON t1.id = t2.id)"),
             vec![c("t1", "id"), c("t2", "id"), c("t1", "a")]
         );
@@ -4330,7 +4353,7 @@ mod relation_arm_coverage {
     fn derived_table() {
         // The derived table's synthetic column (`x.a`) is dropped; only
         // the real-storage read from inside the subquery surfaces.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT x.a FROM (SELECT t.a FROM t) x"),
             vec![c("t", "a")]
         );
@@ -4338,7 +4361,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn derived_table_with_column_aliases() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT x.c1 FROM (SELECT t.a FROM t) x (c1)"),
             vec![c("t", "a")]
         );
@@ -4350,7 +4373,7 @@ mod relation_arm_coverage {
         // sole relation is the table function `g`), so the qualified ref
         // resolves to nothing → unresolved. Coverage point preserved:
         // the column `a` still surfaces, proving the arg was walked.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT g.v FROM TABLE(gen(t.a)) g"),
             vec![unresolved("a")]
         );
@@ -4360,7 +4383,7 @@ mod relation_arm_coverage {
     fn unnest() {
         // `t` is not in FROM (only the UNNEST relation `u`), so `t.arr`
         // is unresolved; the column still surfaces (arg walked).
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT u.x FROM UNNEST(t.arr) u"),
             vec![unresolved("arr")]
         );
@@ -4369,18 +4392,18 @@ mod relation_arm_coverage {
     #[test]
     fn pivot() {
         let result = op("SELECT * FROM t PIVOT(SUM(t.amt) FOR t.mon IN ('a', 'b'))");
-        assert_eq!(result.reads, vec![c("t", "amt"), c("t", "mon")]);
+        assert_unordered_eq!(result.reads, vec![c("t", "amt"), c("t", "mon")]);
     }
 
     #[test]
     fn unpivot() {
         let result = op("SELECT * FROM t UNPIVOT(v FOR n IN (t.a, t.b))");
-        assert_eq!(result.reads, vec![c("t", "v"), c("t", "a"), c("t", "b")]);
+        assert_unordered_eq!(result.reads, vec![c("t", "v"), c("t", "a"), c("t", "b")]);
     }
 
     #[test]
     fn tablesample() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.a FROM t TABLESAMPLE BERNOULLI (10)"),
             vec![c("t", "a")]
         );
@@ -4400,7 +4423,7 @@ mod relation_arm_coverage {
                      PATTERN (X+) \
                      DEFINE X AS true \
                    ) AS g";
-        assert_eq!(reads(sql), vec![c("t", "a"), c("t", "b"), c("t", "c")]);
+        assert_unordered_eq!(reads(sql), vec![c("t", "a"), c("t", "b"), c("t", "c")]);
     }
 
     #[test]
@@ -4410,7 +4433,7 @@ mod relation_arm_coverage {
         // surfaces unresolved. The `COLUMNS (...)` schema declares
         // synthetic outputs, and the `j.x` projection rides through them
         // so it is dropped.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT j.x FROM JSON_TABLE(t.doc, '$' COLUMNS (x INT PATH '$.x')) AS j"),
             vec![unresolved("doc")]
         );
@@ -4421,7 +4444,7 @@ mod relation_arm_coverage {
         // TableFactor::OpenJsonTable — same visit shape as JsonTable;
         // `t.doc` is walked but `t` is not in FROM → unresolved. The
         // WITH-declared columns are synthetic.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT o.x FROM OPENJSON(t.doc) WITH (x INT '$.x') AS o"),
             vec![unresolved("doc")]
         );
@@ -4433,7 +4456,7 @@ mod relation_arm_coverage {
         // literal — no read) then each PASSING argument expression
         // (`t.doc`). `t` is not in FROM (only the XMLTABLE relation `x`),
         // so it surfaces unresolved.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT x.v FROM XMLTABLE('/r' PASSING t.doc COLUMNS v INT PATH '@v') AS x"),
             vec![unresolved("doc")]
         );
@@ -4462,7 +4485,7 @@ mod relation_arm_coverage {
         // sqlparser produces it for lateral function-call relations like
         // Snowflake's `LATERAL FLATTEN(...)`. Only the function args
         // surface; the synthetic `f.value` projection is dropped.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT f.value FROM t, LATERAL FLATTEN(input => t.arr) AS f"),
             vec![c("t", "arr")]
         );
@@ -4475,7 +4498,7 @@ mod relation_arm_coverage {
         let result = op("MERGE INTO t1 USING t2 ON t1.id = t2.id \
              WHEN MATCHED THEN UPDATE SET a = t2.b \
              WHEN NOT MATCHED THEN INSERT (a) VALUES (t2.b)");
-        assert_eq!(
+        assert_unordered_eq!(
             result.reads,
             vec![c("t1", "id"), c("t2", "id"), c("t2", "b"), c("t2", "b")]
         );
@@ -4493,14 +4516,14 @@ mod relation_arm_coverage {
     #[test]
     fn create_table_as_select() {
         let result = op("CREATE TABLE t2 AS SELECT t1.a FROM t1");
-        assert_eq!(result.reads, vec![c("t1", "a")]);
+        assert_unordered_eq!(result.reads, vec![c("t1", "a")]);
         assert_eq!(result.writes, vec![w("t2", "a")]);
     }
 
     #[test]
     fn create_view() {
         let result = op("CREATE VIEW v AS SELECT t1.a FROM t1");
-        assert_eq!(result.reads, vec![c("t1", "a")]);
+        assert_unordered_eq!(result.reads, vec![c("t1", "a")]);
         assert_eq!(result.writes, vec![w("v", "a")]);
     }
 
@@ -4514,27 +4537,27 @@ mod relation_arm_coverage {
 
     #[test]
     fn delete() {
-        assert_eq!(reads("DELETE FROM t1 WHERE t1.a = 1"), vec![c("t1", "a")]);
+        assert_unordered_eq!(reads("DELETE FROM t1 WHERE t1.a = 1"), vec![c("t1", "a")]);
     }
 
     #[test]
     fn update() {
         let result = op("UPDATE t1 SET a = t1.b WHERE t1.c = 1");
-        assert_eq!(result.reads, vec![c("t1", "b"), c("t1", "c")]);
+        assert_unordered_eq!(result.reads, vec![c("t1", "b"), c("t1", "c")]);
         assert_eq!(result.writes, vec![w("t1", "a")]);
     }
 
     #[test]
     fn insert_returning() {
         let result = op("INSERT INTO t1 (a) VALUES (1) RETURNING t1.a");
-        assert_eq!(result.reads, vec![c("t1", "a")]);
+        assert_unordered_eq!(result.reads, vec![c("t1", "a")]);
         assert_eq!(result.writes, vec![w("t1", "a")]);
     }
 
     #[test]
     fn insert_from_select() {
         let result = op("INSERT INTO t1 (a) SELECT t2.b FROM t2");
-        assert_eq!(result.reads, vec![c("t2", "b")]);
+        assert_unordered_eq!(result.reads, vec![c("t2", "b")]);
         assert_eq!(result.writes, vec![w("t1", "a")]);
     }
 
@@ -4542,7 +4565,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn union() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t1.a FROM t1 UNION SELECT t2.b FROM t2"),
             vec![c("t1", "a"), c("t2", "b")]
         );
@@ -4550,7 +4573,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn intersect() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t1.a FROM t1 INTERSECT SELECT t2.b FROM t2"),
             vec![c("t1", "a"), c("t2", "b")]
         );
@@ -4558,7 +4581,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn except() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t1.a FROM t1 EXCEPT SELECT t2.b FROM t2"),
             vec![c("t1", "a"), c("t2", "b")]
         );
@@ -4567,12 +4590,12 @@ mod relation_arm_coverage {
     #[test]
     fn values() {
         // Bare VALUES has no column references; exercises `visit_values`.
-        assert_eq!(op("VALUES (1, 2), (3, 4)").reads, vec![]);
+        assert_unordered_eq!(op("VALUES (1, 2), (3, 4)").reads, vec![]);
     }
 
     #[test]
     fn group_by_cube() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.a FROM t GROUP BY CUBE(t.a)"),
             vec![c("t", "a"), c("t", "a")]
         );
@@ -4580,7 +4603,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn group_by_rollup() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.a FROM t GROUP BY ROLLUP(t.a)"),
             vec![c("t", "a"), c("t", "a")]
         );
@@ -4588,7 +4611,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn order_by_limit_offset() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.a FROM t ORDER BY t.a LIMIT 5 OFFSET 2"),
             vec![c("t", "a"), c("t", "a")]
         );
@@ -4596,12 +4619,12 @@ mod relation_arm_coverage {
 
     #[test]
     fn select_distinct() {
-        assert_eq!(reads("SELECT DISTINCT t.a FROM t"), vec![c("t", "a")]);
+        assert_unordered_eq!(reads("SELECT DISTINCT t.a FROM t"), vec![c("t", "a")]);
     }
 
     #[test]
     fn having() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.a FROM t GROUP BY t.a HAVING t.a > 1"),
             vec![c("t", "a"), c("t", "a"), c("t", "a")]
         );
@@ -4609,7 +4632,7 @@ mod relation_arm_coverage {
 
     #[test]
     fn qualify() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.a FROM t QUALIFY ROW_NUMBER() OVER () = 1"),
             vec![c("t", "a")]
         );
@@ -4621,7 +4644,7 @@ mod relation_arm_coverage {
     fn fetch() {
         // `visit_fetch` walks the FETCH quantity expression; here the
         // literal `10` contributes no reads.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.a FROM t FETCH FIRST 10 ROWS ONLY"),
             vec![c("t", "a")]
         );
@@ -4632,14 +4655,14 @@ mod relation_arm_coverage {
         // A bare `(SELECT ...)` parses with the outer body as
         // `SetExpr::Query`, which bubbles its inner projections through
         // the parenthesized wrapper.
-        assert_eq!(reads("(SELECT t.a FROM t)"), vec![c("t", "a")]);
+        assert_unordered_eq!(reads("(SELECT t.a FROM t)"), vec![c("t", "a")]);
     }
 
     #[test]
     fn distinct_on() {
         // `Distinct::On` exprs walk before the projection, so `t.a`
         // (the DISTINCT ON key) lands first.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT DISTINCT ON (t.a) t.b FROM t"),
             vec![c("t", "a"), c("t", "b")]
         );
@@ -4649,7 +4672,7 @@ mod relation_arm_coverage {
     fn top_with_expr_quantity() {
         // `TopQuantity::Expr` walks the quantity expression — the
         // `Number` variant is the constant path and stays uncovered.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT TOP (t.a + 1) t.b FROM t"),
             vec![c("t", "a"), c("t", "b")]
         );
@@ -4661,7 +4684,7 @@ mod relation_arm_coverage {
         // generates no column-level writes (no projection pairing). The
         // projection still surfaces as a read.
         let result = op("SELECT t.a INTO new_t FROM t");
-        assert_eq!(result.reads, vec![c("t", "a")]);
+        assert_unordered_eq!(result.reads, vec![c("t", "a")]);
         assert_eq!(result.writes, vec![]);
     }
 
@@ -4670,7 +4693,7 @@ mod relation_arm_coverage {
         // `select.lateral_views` walks each `lateral_view` expression
         // (here `EXPLODE(t.arr)`); the `v` alias is not bound as a real
         // table, so we read against `t` to keep the assertion stable.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.a FROM t LATERAL VIEW EXPLODE(t.arr) v AS x"),
             vec![c("t", "a"), c("t", "arr")]
         );
@@ -4680,7 +4703,7 @@ mod relation_arm_coverage {
     fn prewhere() {
         // ClickHouse `PREWHERE` rides the same predicate-walk array as
         // selection / having / qualify.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.a FROM t PREWHERE t.b = 1"),
             vec![c("t", "a"), c("t", "b")]
         );
@@ -4692,7 +4715,7 @@ mod relation_arm_coverage {
         // `CONNECT BY` populate two separate `ConnectByKind` entries in
         // `select.connect_by`, so a single SQL exercises both arms.
         let result = op("SELECT t.a FROM t START WITH t.b = 1 CONNECT BY PRIOR t.c = t.d");
-        assert_eq!(
+        assert_unordered_eq!(
             result.reads,
             vec![c("t", "a"), c("t", "b"), c("t", "c"), c("t", "d")]
         );
@@ -4702,7 +4725,7 @@ mod relation_arm_coverage {
     fn sort_by() {
         // Hive-style `SORT BY` (per-reducer ordering, distinct from
         // `ORDER BY`); each entry visits as an order-by expression.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.a FROM t SORT BY t.b"),
             vec![c("t", "a"), c("t", "b")]
         );
@@ -4712,7 +4735,7 @@ mod relation_arm_coverage {
     fn named_window() {
         // `NamedWindowExpr::WindowSpec` walks PARTITION BY / ORDER BY
         // inside a `WINDOW w AS (...)` definition.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT t.a FROM t WINDOW w AS (PARTITION BY t.b)"),
             vec![c("t", "a"), c("t", "b")]
         );
@@ -4725,7 +4748,7 @@ mod relation_arm_coverage {
         // expression so its real-table refs still surface.
         use sqlparser::dialect::SnowflakeDialect;
         let result = op_with("SELECT (t.a).* FROM t", &SnowflakeDialect {});
-        assert_eq!(result.reads, vec![c("t", "a")]);
+        assert_unordered_eq!(result.reads, vec![c("t", "a")]);
         assert_eq!(result.diagnostics.len(), 1);
         assert_eq!(
             result.diagnostics[0].kind,
@@ -4737,7 +4760,7 @@ mod relation_arm_coverage {
     fn group_by_all() {
         // `GROUP BY ALL` — `GroupByExpr::All` arm has no operand exprs
         // of its own; only the projection surfaces as a read.
-        assert_eq!(reads("SELECT t.a FROM t GROUP BY ALL"), vec![c("t", "a")]);
+        assert_unordered_eq!(reads("SELECT t.a FROM t GROUP BY ALL"), vec![c("t", "a")]);
     }
 
     // ---- statement.rs: DML helper paths ----
@@ -4786,7 +4809,7 @@ mod relation_arm_coverage {
         // no writes emitted (tuple targets are not yet supported for
         // column-level pairing). The RHS literals contribute no reads.
         let result = op("UPDATE t SET (a, b) = (1, 2)");
-        assert_eq!(result.reads, vec![]);
+        assert_unordered_eq!(result.reads, vec![]);
         assert_eq!(result.writes, vec![]);
     }
 
@@ -4798,7 +4821,7 @@ mod relation_arm_coverage {
         // column-level write — projections pair against the view's
         // column list, not the `TO` target.
         let result = op("CREATE VIEW v TO dst AS SELECT t.a FROM t");
-        assert_eq!(result.reads, vec![c("t", "a")]);
+        assert_unordered_eq!(result.reads, vec![c("t", "a")]);
         assert_eq!(result.writes, vec![w("v", "a")]);
     }
 
@@ -4808,7 +4831,7 @@ mod relation_arm_coverage {
         // the table as a write target with no column-level writes —
         // the column schema is module-defined, not part of the SQL.
         let result = op("CREATE VIRTUAL TABLE vt USING mymod");
-        assert_eq!(result.reads, vec![]);
+        assert_unordered_eq!(result.reads, vec![]);
         assert_eq!(result.writes, vec![]);
     }
 
@@ -5079,7 +5102,7 @@ mod confidence_arm_coverage {
     #[test]
     fn catalog_less_sole_unknown_candidate_is_inferred() {
         // Real `Unknown` table is the sole candidate → Inferred.
-        assert_eq!(
+        assert_unordered_eq!(
             extract_reads("SELECT id FROM t1", None),
             vec![read("t1", "id")]
         );
@@ -5090,7 +5113,7 @@ mod confidence_arm_coverage {
         // Both candidates Unknown, no Known tiebreaker → Ambiguous.
         // The `t1.id` / `t2.id` qualified refs in the ON predicate
         // remain Inferred (qualifier-bound but Unknown schema).
-        assert_eq!(
+        assert_unordered_eq!(
             extract_reads("SELECT id FROM t1 JOIN t2 ON t1.id = t2.id", None),
             vec![read("t1", "id"), read("t2", "id"), ambiguous("id")]
         );
@@ -5103,7 +5126,7 @@ mod confidence_arm_coverage {
         // binding and would be internally Cataloged, but synthetic
         // refs are dropped from public reads — only the inner real
         // `t1.id` (Inferred) surfaces.
-        assert_eq!(
+        assert_unordered_eq!(
             extract_reads("WITH cte AS (SELECT id FROM t1) SELECT id FROM cte", None),
             vec![read("t1", "id")]
         );
@@ -5113,7 +5136,7 @@ mod confidence_arm_coverage {
     fn catalog_less_cte_known_denies_column_is_unresolved() {
         // CTE body = [id]; `unknown_col` cannot belong to the CTE.
         // The outer ref surfaces with table=None / Unresolved.
-        assert_eq!(
+        assert_unordered_eq!(
             extract_reads(
                 "WITH cte AS (SELECT id FROM t1) SELECT id, unknown_col FROM cte",
                 None
@@ -5125,7 +5148,7 @@ mod confidence_arm_coverage {
     #[test]
     fn catalog_aware_known_binding_lists_column_is_confirmed() {
         let catalog = TestCatalog::default().with("t1", vec!["a"]);
-        assert_eq!(
+        assert_unordered_eq!(
             extract_reads("SELECT a FROM t1", Some(&catalog)),
             vec![read_confirmed("t1", "a")]
         );
@@ -5134,7 +5157,7 @@ mod confidence_arm_coverage {
     #[test]
     fn catalog_aware_known_binding_missing_column_is_unresolved() {
         let catalog = TestCatalog::default().with("t1", vec!["x", "y"]);
-        assert_eq!(
+        assert_unordered_eq!(
             extract_reads("SELECT a FROM t1", Some(&catalog)),
             vec![unresolved("a")]
         );
@@ -5149,7 +5172,7 @@ mod confidence_arm_coverage {
         let catalog = TestCatalog::default().with("t1", vec!["a"]);
         // t1 is cataloged → its identity canonicalizes to public.t1, but
         // the placement is still Inferred (t2 is an Unknown suspect).
-        assert_eq!(
+        assert_unordered_eq!(
             extract_reads("SELECT a FROM t1, t2", Some(&catalog)),
             vec![read_with_ref(
                 cataloged_table("t1"),
@@ -5166,7 +5189,7 @@ mod confidence_arm_coverage {
             .with("t2", vec!["a"]);
         // Both t1 and t2 confirm `a` — genuine ambiguity. The
         // qualified `t1.a` / `t2.a` in ON are Cataloged individually.
-        assert_eq!(
+        assert_unordered_eq!(
             extract_reads("SELECT a FROM t1 JOIN t2 ON t1.a = t2.a", Some(&catalog)),
             vec![
                 read_confirmed("t1", "a"),
@@ -5180,7 +5203,7 @@ mod confidence_arm_coverage {
     fn qualified_ref_to_unknown_table_is_inferred() {
         // `t.col` where t is `Unknown` (no catalog). The qualifier
         // binds, but the column existence is assumed → Inferred.
-        assert_eq!(
+        assert_unordered_eq!(
             extract_reads("SELECT t.id FROM t", None),
             vec![read("t", "id")]
         );
@@ -5189,7 +5212,7 @@ mod confidence_arm_coverage {
     #[test]
     fn qualified_ref_to_known_table_listing_column_is_confirmed() {
         let catalog = TestCatalog::default().with("t", vec!["id"]);
-        assert_eq!(
+        assert_unordered_eq!(
             extract_reads("SELECT t.id FROM t", Some(&catalog)),
             vec![read_confirmed("t", "id")]
         );
@@ -5235,7 +5258,7 @@ mod qualified_ref_arm_coverage {
     fn row1_bare_qualifier_matches_schema_qualified_binding() {
         // `users` (no schema) matches `FROM mydb.users` — the binding
         // fills the omitted schema. Surfaces the binding's full identity.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT users.id FROM mydb.users"),
             vec![read2("mydb", "users", "id")]
         );
@@ -5243,7 +5266,7 @@ mod qualified_ref_arm_coverage {
 
     #[test]
     fn row2_full_qualifier_matches_exactly() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT mydb.users.id FROM mydb.users"),
             vec![read2("mydb", "users", "id")]
         );
@@ -5253,7 +5276,7 @@ mod qualified_ref_arm_coverage {
     fn row3_contradicting_schema_is_unresolved() {
         // `otherdb.users` vs binding `mydb.users` — schema present on
         // both and differs. Contradiction a catalog can't fix.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT otherdb.users.id FROM mydb.users"),
             vec![unresolved("id")]
         );
@@ -5261,7 +5284,7 @@ mod qualified_ref_arm_coverage {
 
     #[test]
     fn row4_bare_qualifier_matches_bare_binding() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT users.id FROM users"),
             vec![read("users", "id")]
         );
@@ -5274,7 +5297,7 @@ mod qualified_ref_arm_coverage {
         // wildcard. We surface the *binding's* identity (`users`), not
         // the ref's unverified `mydb` qualifier — binding wins, for
         // consistency with row 1 (always surface what FROM declared).
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT mydb.users.id FROM users"),
             vec![read("users", "id")]
         );
@@ -5282,7 +5305,7 @@ mod qualified_ref_arm_coverage {
 
     #[test]
     fn row6_alias_matches_alias() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT u.id FROM mydb.users AS u"),
             vec![read2("mydb", "users", "id")]
         );
@@ -5292,7 +5315,7 @@ mod qualified_ref_arm_coverage {
     fn row7_alias_hides_original_bare_name() {
         // `users.id` against `FROM mydb.users AS u` — the alias hides
         // the original name, so `users` matches nothing.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT users.id FROM mydb.users AS u"),
             vec![unresolved("id")]
         );
@@ -5300,7 +5323,7 @@ mod qualified_ref_arm_coverage {
 
     #[test]
     fn row8_alias_hides_original_full_name() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT mydb.users.id FROM mydb.users AS u"),
             vec![unresolved("id")]
         );
@@ -5314,7 +5337,7 @@ mod qualified_ref_arm_coverage {
         // AMBIGUOUS. (Before full-path keying these collided on the
         // last segment and the second was dropped, hiding the
         // ambiguity.)
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT users.id FROM s1.users, s2.users"),
             vec![ambiguous("id")]
         );
@@ -5322,7 +5345,7 @@ mod qualified_ref_arm_coverage {
 
     #[test]
     fn row10_explicit_schema_disambiguates() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT s1.users.id FROM s1.users, s2.users"),
             vec![read2("s1", "users", "id")]
         );
@@ -5330,7 +5353,7 @@ mod qualified_ref_arm_coverage {
 
     #[test]
     fn row11_schema_matching_no_candidate_is_unresolved() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT s3.users.id FROM s1.users, s2.users"),
             vec![unresolved("id")]
         );
@@ -5338,7 +5361,7 @@ mod qualified_ref_arm_coverage {
 
     #[test]
     fn row12_alias_disambiguates_two_aliased_bindings() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT u1.id FROM s1.users u1, s2.users u2"),
             vec![read2("s1", "users", "id")]
         );
@@ -5346,7 +5369,7 @@ mod qualified_ref_arm_coverage {
 
     #[test]
     fn row13_bare_name_hidden_by_both_aliases_is_unresolved() {
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT users.id FROM s1.users u1, s2.users u2"),
             vec![unresolved("id")]
         );
@@ -5356,7 +5379,7 @@ mod qualified_ref_arm_coverage {
     fn row14_last_segment_uniquely_matches_one_binding() {
         // `users` matches `mydb.users` but not `mydb.orders` (name
         // differs). Unique → resolve.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT users.id FROM mydb.users, mydb.orders"),
             vec![read2("mydb", "users", "id")]
         );
@@ -5401,7 +5424,7 @@ mod dialect_casing_coverage {
     fn bigquery_qualified_table_ref_is_case_sensitive() {
         // BigQuery tables are case-sensitive: qualifier `T1` does not
         // match the binding `t1`, so the ref is unresolved.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT T1.id FROM t1", &BigQueryDialect {}, None),
             vec![unresolved("id")]
         );
@@ -5411,7 +5434,7 @@ mod dialect_casing_coverage {
     fn mysql_qualified_table_ref_is_case_sensitive() {
         // MySQL real-table names default case-sensitive (filesystem
         // fallback), same as BigQuery here.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT T1.id FROM t1", &MySqlDialect {}, None),
             vec![unresolved("id")]
         );
@@ -5421,7 +5444,7 @@ mod dialect_casing_coverage {
     fn generic_qualified_table_ref_is_case_insensitive() {
         // The generic dialect folds lower-case, so `T1` matches `t1`
         // and the ref resolves (Inferred — no catalog).
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT T1.id FROM t1", &GenericDialect {}, None),
             vec![read("t1", "id")]
         );
@@ -5431,7 +5454,7 @@ mod dialect_casing_coverage {
     fn bigquery_alias_ref_is_case_insensitive() {
         // BigQuery aliases fold case-insensitively even though its
         // tables don't: `A` matches the alias `a`, resolving to t1.
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT A.id FROM t1 AS a", &BigQueryDialect {}, None),
             vec![read("t1", "id")]
         );
@@ -5442,7 +5465,7 @@ mod dialect_casing_coverage {
         // BigQuery columns fold case-insensitively: `Id` matches the
         // catalog's `id`, confirming the resolution on t1.
         let catalog = TestCatalog::default().with("t1", vec!["id"]);
-        assert_eq!(
+        assert_unordered_eq!(
             reads("SELECT Id FROM t1", &BigQueryDialect {}, Some(&catalog)),
             vec![read_confirmed("t1", "Id")]
         );

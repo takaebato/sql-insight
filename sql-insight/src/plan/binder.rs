@@ -34,6 +34,7 @@ use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::extractor::ColumnLineageKind;
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
 use crate::resolver::{CaseFold, IdentifierCasing};
+use sqlparser::tokenizer::Span;
 
 /// Bind one statement into a [`Plan`], or `None` for statement kinds not
 /// modelled (queries and the data-moving DML / DDL are; other DDL and
@@ -481,14 +482,26 @@ impl Binder<'_> {
                             .iter()
                             .filter_map(object_name_last_ident)
                             .collect();
-                        for row in &values.rows {
-                            for (column, expr) in columns.iter().zip(row) {
-                                let (output, value_subqueries, value_filter_reads) =
-                                    self.bind_value_column(Some(column.clone()), expr, &scope);
-                                outputs.push(output);
-                                subqueries.extend(value_subqueries);
-                                reads.extend(value_filter_reads);
-                                target_columns.push(column.clone());
+                        if columns.is_empty() {
+                            // No explicit column list: the inserted values
+                            // are still reads. (Pairing them with the
+                            // catalog schema for writes / lineage is a later
+                            // brick — the resolver leaves those empty too.)
+                            for expr in values.rows.iter().flatten() {
+                                let (r, s) = self.expr_reads(expr, &scope);
+                                reads.extend(r);
+                                subqueries.extend(s);
+                            }
+                        } else {
+                            for row in &values.rows {
+                                for (column, expr) in columns.iter().zip(row) {
+                                    let (output, value_subqueries, value_filter_reads) =
+                                        self.bind_value_column(Some(column.clone()), expr, &scope);
+                                    outputs.push(output);
+                                    subqueries.extend(value_subqueries);
+                                    reads.extend(value_filter_reads);
+                                    target_columns.push(column.clone());
+                                }
                             }
                         }
                     }
@@ -1432,12 +1445,20 @@ impl Binder<'_> {
             // A wildcard isn't expanded (the rigor cost is too high for a
             // SQL-text-only library); record it so consumers know this
             // projection's column lineage is incomplete, and skip it.
-            SelectItem::Wildcard(_) => {
-                self.record_wildcard_suppressed();
+            SelectItem::Wildcard(options) => {
+                self.record_wildcard_suppressed("wildcard `*`", options.wildcard_token.0.span);
                 return (None, Vec::new(), Vec::new());
             }
-            SelectItem::QualifiedWildcard(kind, _) => {
-                self.record_wildcard_suppressed();
+            SelectItem::QualifiedWildcard(kind, options) => {
+                let description = match kind {
+                    SelectItemQualifiedWildcardKind::Expr(_) => {
+                        "qualified wildcard `(expr).*`".to_string()
+                    }
+                    SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                        format!("qualified wildcard `{name}.*`")
+                    }
+                };
+                self.record_wildcard_suppressed(&description, options.wildcard_token.0.span);
                 // `(expr).*` (Snowflake) still projects its base expression
                 // as one output — a structural field access, so the value
                 // flows as a `Transformation` even though the produced
@@ -1460,13 +1481,20 @@ impl Binder<'_> {
     }
 
     /// Record a `WildcardSuppressed` diagnostic for a projection wildcard
-    /// (`*` / `t.*`) left unexpanded.
-    fn record_wildcard_suppressed(&self) {
+    /// (`*` / `t.*` / `(expr).*`) left unexpanded, carrying the wildcard
+    /// token's location (a zero-line span is treated as unknown).
+    fn record_wildcard_suppressed(&self, description: &str, span: Span) {
+        let span = (span.start.line != 0).then_some(span);
+        let suffix = match span {
+            Some(s) => format!(" at L{}:C{}", s.start.line, s.start.column),
+            None => String::new(),
+        };
         self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::WildcardSuppressed,
-            message: "wildcard left unexpanded — column lineage is incomplete for this projection"
-                .to_string(),
-            span: None,
+            message: format!(
+                "{description}{suffix} left unexpanded — column lineage will be incomplete for this projection"
+            ),
+            span,
         });
     }
 

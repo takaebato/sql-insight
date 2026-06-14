@@ -27,18 +27,18 @@ pub(crate) fn column_operation(
         return unsupported(statement_kind, statement);
     }
     let (plan, diagnostics) = super::binder::build_with_diagnostics(statement, catalog, casing);
-    match plan {
-        Some(plan) => ColumnOperation {
-            statement_kind,
-            reads: super::extract::extract_reads(&plan),
-            writes: super::extract::extract_writes(&plan),
-            lineage: super::extract::extract_lineage(&plan),
-            // The bind accumulates WildcardSuppressed for each suppressed
-            // projection wildcard (nested ones included).
-            diagnostics,
-        },
-        // Classified as supported but unbindable — treat as unsupported.
-        None => unsupported(statement_kind, statement),
+    // A supported statement kind that binds to no plan (`DROP` / `TRUNCATE`
+    // and other structure-only DDL) has empty surfaces but is *not*
+    // unsupported — it carries no diagnostic.
+    let plan = plan.unwrap_or(super::ir::Plan::OpaqueLeaf);
+    ColumnOperation {
+        statement_kind,
+        reads: super::extract::extract_reads(&plan),
+        writes: super::extract::extract_writes(&plan),
+        lineage: super::extract::extract_lineage(&plan),
+        // The bind accumulates WildcardSuppressed for each suppressed
+        // projection wildcard (nested ones included).
+        diagnostics,
     }
 }
 

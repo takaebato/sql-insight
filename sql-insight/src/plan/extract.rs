@@ -372,9 +372,7 @@ pub(crate) fn output_operands(plan: &Plan) -> Vec<&[BoundColumn]> {
 mod differential {
     use super::*;
     use crate::catalog::{Catalog, CatalogTable};
-    use crate::extractor::{
-        extract_column_operations, extract_table_operations, ColumnOperation, TableOperation,
-    };
+    use crate::extractor::{extract_table_operations, ColumnOperation, TableOperation};
     use crate::resolver::IdentifierCasing;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -397,10 +395,12 @@ mod differential {
         dialect: &dyn sqlparser::dialect::Dialect,
         catalog: Option<&Catalog>,
     ) -> ColumnOperation {
-        extract_column_operations(dialect, sql, catalog)
-            .unwrap()
-            .remove(0)
-            .unwrap()
+        // Call the retained resolver path directly — the public extractor
+        // now routes through the plan, so this keeps the harness a real
+        // plan-vs-resolver comparison.
+        let statements = Parser::parse_sql(dialect, sql).unwrap();
+        let casing = IdentifierCasing::for_dialect(dialect);
+        crate::extractor::resolver_column_operation(&statements[0], catalog, casing).unwrap()
     }
 
     /// The plan-based column operation (the extractor switch's surface).

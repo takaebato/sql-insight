@@ -28,10 +28,10 @@ pub(crate) fn table_operation(
     }
     let (plan, column_diagnostics) =
         super::binder::build_with_diagnostics(statement, catalog, casing);
-    let Some(plan) = plan else {
-        // Classified as supported but unbindable — treat as unsupported.
-        return unsupported(statement_kind, statement);
-    };
+    // A supported kind that binds to no plan (structure-only DDL) has empty
+    // surfaces but is not unsupported (no diagnostic). (`DROP` / `TRUNCATE`
+    // surfacing the dropped relation as a table write is a later brick.)
+    let plan = plan.unwrap_or(super::ir::Plan::OpaqueLeaf);
     // Lineage is only for statements that move data into a target. A
     // column-less INSERT and a DELETE both bind to a `Write`, so the
     // structural walk can't tell them apart — gate on the kind.
