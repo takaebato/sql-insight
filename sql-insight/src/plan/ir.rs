@@ -47,6 +47,11 @@ pub(crate) struct Scan {
 pub(crate) struct PassThrough {
     pub(crate) inputs: Vec<Plan>,
     pub(crate) reads: Vec<ColumnRead>,
+    /// Sub-plans of subqueries in the predicate (a `WHERE … IN (SELECT …)`
+    /// / `EXISTS (…)`): full bound plans so their tables / reads surface by
+    /// walking, rather than being folded away. Filter position — never a
+    /// lineage source.
+    pub(crate) subqueries: Vec<Plan>,
 }
 
 /// The SELECT list — the only column-defining producer. Each output
@@ -56,6 +61,11 @@ pub(crate) struct PassThrough {
 pub(crate) struct Project {
     pub(crate) input: Box<Plan>,
     pub(crate) outputs: Vec<BoundColumn>,
+    /// Sub-plans of scalar subqueries in the projection expressions
+    /// (`SELECT (SELECT …) …`): kept whole so their tables / reads surface
+    /// by walking. Value position — each one's output is also folded into
+    /// the owning output column's provenance (as a lineage source).
+    pub(crate) subqueries: Vec<Plan>,
 }
 
 /// A set operation (UNION / INTERSECT / EXCEPT): the result columns are

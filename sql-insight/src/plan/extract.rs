@@ -28,6 +28,9 @@ fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
             for input in &pt.inputs {
                 collect_reads(input, out);
             }
+            for subquery in &pt.subqueries {
+                collect_reads(subquery, out);
+            }
         }
         Plan::Project(project) => {
             for column in &project.outputs {
@@ -44,6 +47,9 @@ fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
                 );
             }
             collect_reads(&project.input, out);
+            for subquery in &project.subqueries {
+                collect_reads(subquery, out);
+            }
         }
         Plan::SetOp(set) => {
             for operand in &set.operands {

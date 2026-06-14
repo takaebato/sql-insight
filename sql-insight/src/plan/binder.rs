@@ -279,6 +279,7 @@ impl Binder<'_> {
             input: Box::new(Plan::Project(Project {
                 input: Box::new(wrap_inputs(inputs, reads)),
                 outputs,
+                subqueries: Vec::new(),
             })),
         }))
     }
@@ -394,6 +395,7 @@ impl Binder<'_> {
             input: Box::new(Plan::Project(Project {
                 input: Box::new(source),
                 outputs,
+                subqueries: Vec::new(),
             })),
         }))
     }
@@ -586,6 +588,7 @@ impl Binder<'_> {
             Some(predicate) => Plan::PassThrough(PassThrough {
                 inputs: vec![from],
                 reads: self.expr_reads(predicate, &from_scope),
+                subqueries: Vec::new(),
             }),
             None => from,
         };
@@ -604,6 +607,7 @@ impl Binder<'_> {
         let project = Plan::Project(Project {
             input: Box::new(wrap_reads(input, projection_filters)),
             outputs: outputs.clone(),
+            subqueries: Vec::new(),
         });
         // GROUP BY / HAVING / SORT BY see the output aliases (clause
         // phase): resolve against the FROM relations *plus* the outputs,
@@ -646,6 +650,7 @@ impl Binder<'_> {
                     Plan::PassThrough(PassThrough {
                         inputs,
                         reads: Vec::new(),
+                        subqueries: Vec::new(),
                     }),
                     scope,
                 )
@@ -677,6 +682,7 @@ impl Binder<'_> {
             node = Plan::PassThrough(PassThrough {
                 inputs: vec![node, right],
                 reads,
+                subqueries: Vec::new(),
             });
             scope = combined;
         }
@@ -1318,7 +1324,11 @@ fn wrap_inputs(mut inputs: Vec<Plan>, reads: Vec<ColumnRead>) -> Plan {
     if reads.is_empty() && inputs.len() == 1 {
         inputs.pop().unwrap()
     } else {
-        Plan::PassThrough(PassThrough { inputs, reads })
+        Plan::PassThrough(PassThrough {
+            inputs,
+            reads,
+            subqueries: Vec::new(),
+        })
     }
 }
 
@@ -1331,6 +1341,7 @@ fn wrap_reads(plan: Plan, reads: Vec<ColumnRead>) -> Plan {
         Plan::PassThrough(PassThrough {
             inputs: vec![plan],
             reads,
+            subqueries: Vec::new(),
         })
     }
 }
@@ -1510,6 +1521,22 @@ mod tests {
         Plan::Scan(Scan { table: tref(name) })
     }
 
+    fn project(input: Plan, outputs: Vec<BoundColumn>) -> Plan {
+        Plan::Project(Project {
+            input: Box::new(input),
+            outputs,
+            subqueries: Vec::new(),
+        })
+    }
+
+    fn pass(inputs: Vec<Plan>, reads: Vec<ColumnRead>) -> Plan {
+        Plan::PassThrough(PassThrough {
+            inputs,
+            reads,
+            subqueries: Vec::new(),
+        })
+    }
+
     fn inferred(table: &str, column: &str) -> ColumnRead {
         read(&tref(table), &Ident::new(column), ResolutionKind::Inferred)
     }
@@ -1558,13 +1585,13 @@ mod tests {
         // forwarded as a passthrough output.
         assert_eq!(
             bind_one("SELECT a, b FROM t"),
-            Plan::Project(Project {
-                input: Box::new(scan("t")),
-                outputs: vec![
+            project(
+                scan("t"),
+                vec![
                     passthrough_col("a", vec![inferred("t", "a")]),
                     passthrough_col("b", vec![inferred("t", "b")]),
                 ],
-            })
+            )
         );
     }
 
@@ -1574,16 +1601,16 @@ mod tests {
         // another. The projection's qualified `x.a` resolves to x.
         assert_eq!(
             bind_one("SELECT x.a FROM x JOIN y ON x.id = y.id WHERE y.b > 0"),
-            Plan::Project(Project {
-                input: Box::new(Plan::PassThrough(PassThrough {
-                    inputs: vec![Plan::PassThrough(PassThrough {
-                        inputs: vec![scan("x"), scan("y")],
-                        reads: vec![inferred("x", "id"), inferred("y", "id")],
-                    })],
-                    reads: vec![inferred("y", "b")],
-                })),
-                outputs: vec![passthrough_col("a", vec![inferred("x", "a")])],
-            })
+            project(
+                pass(
+                    vec![pass(
+                        vec![scan("x"), scan("y")],
+                        vec![inferred("x", "id"), inferred("y", "id")],
+                    )],
+                    vec![inferred("y", "b")],
+                ),
+                vec![passthrough_col("a", vec![inferred("x", "a")])],
+            )
         );
     }
 
@@ -1595,16 +1622,16 @@ mod tests {
         // both Projects carry the same inner real column.
         assert_eq!(
             bind_one("SELECT d.x FROM (SELECT a AS x FROM t) d"),
-            Plan::Project(Project {
-                input: Box::new(Plan::Project(Project {
-                    input: Box::new(scan("t")),
-                    outputs: vec![passthrough_col("x", vec![inferred("t", "a")])],
-                })),
+            project(
+                project(
+                    scan("t"),
+                    vec![passthrough_col("x", vec![inferred("t", "a")])]
+                ),
                 // The outer `d.x` reaches `t.a` through the derived relation,
                 // so it's a synthetic-origin source (a lineage source, not a
                 // physical read — that read is the inner Project's).
-                outputs: vec![synthetic_col("x", vec![inferred("t", "a")])],
-            })
+                vec![synthetic_col("x", vec![inferred("t", "a")])],
+            )
         );
     }
 
@@ -1615,14 +1642,14 @@ mod tests {
         // derived table. The CTE's plan is cloned in below the body Project.
         assert_eq!(
             bind_one("WITH c AS (SELECT id FROM t) SELECT id FROM c"),
-            Plan::Project(Project {
-                input: Box::new(Plan::Project(Project {
-                    input: Box::new(scan("t")),
-                    outputs: vec![passthrough_col("id", vec![inferred("t", "id")])],
-                })),
+            project(
+                project(
+                    scan("t"),
+                    vec![passthrough_col("id", vec![inferred("t", "id")])]
+                ),
                 // Referenced through the CTE relation → synthetic-origin.
-                outputs: vec![synthetic_col("id", vec![inferred("t", "id")])],
-            })
+                vec![synthetic_col("id", vec![inferred("t", "id")])],
+            )
         );
     }
 
@@ -1722,13 +1749,13 @@ mod tests {
             Plan::Write(Write {
                 target: tref("target"),
                 target_columns: vec![Ident::new("a"), Ident::new("b")],
-                input: Box::new(Plan::Project(Project {
-                    input: Box::new(scan("source")),
-                    outputs: vec![
+                input: Box::new(project(
+                    scan("source"),
+                    vec![
                         passthrough_col("x", vec![inferred("source", "x")]),
                         passthrough_col("y", vec![inferred("source", "y")]),
                     ],
-                })),
+                )),
             })
         );
     }
@@ -1743,16 +1770,13 @@ mod tests {
             Plan::Write(Write {
                 target: tref("t"),
                 target_columns: vec![Ident::new("c")],
-                input: Box::new(Plan::Project(Project {
-                    input: Box::new(Plan::PassThrough(PassThrough {
-                        inputs: vec![scan("t")],
-                        reads: vec![inferred("t", "d")],
-                    })),
-                    outputs: vec![transform_col(
+                input: Box::new(project(
+                    pass(vec![scan("t")], vec![inferred("t", "d")]),
+                    vec![transform_col(
                         "c",
                         vec![inferred("t", "a"), inferred("t", "b")]
                     )],
-                })),
+                )),
             })
         );
     }
@@ -1766,10 +1790,7 @@ mod tests {
             Plan::Write(Write {
                 target: tref("t"),
                 target_columns: vec![],
-                input: Box::new(Plan::PassThrough(PassThrough {
-                    inputs: vec![scan("t")],
-                    reads: vec![inferred("t", "d")],
-                })),
+                input: Box::new(pass(vec![scan("t")], vec![inferred("t", "d")])),
             })
         );
     }
