@@ -137,6 +137,20 @@ mod differential {
             "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x > 0)",
             "SELECT a FROM t WHERE a > (SELECT avg(b) FROM u)",
             "SELECT (SELECT max(x) FROM u) AS m FROM t",
+            // Correlated subqueries: an inner reference to an outer
+            // relation falls through the correlation stack to it.
+            "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a)",
+            "SELECT (SELECT max(x) FROM u WHERE u.t_id = t.id) AS m FROM t",
+            "SELECT a FROM t WHERE b > (SELECT avg(c) FROM u WHERE u.k = t.a)",
+            // Set operations (UNION / INTERSECT / EXCEPT): reads fan in
+            // from every branch; a derived/CTE over a UNION traces each.
+            "SELECT a FROM t UNION SELECT b FROM u",
+            "SELECT a FROM t INTERSECT SELECT b FROM u",
+            "SELECT x FROM (SELECT a AS x FROM t UNION SELECT b AS x FROM u) d",
+            // Recursive CTE: the anchor's columns are visible to the
+            // recursive branch's self-reference (shallow collapse).
+            "WITH RECURSIVE c AS (SELECT id FROM t UNION ALL SELECT id FROM c) SELECT id FROM c",
+            "WITH RECURSIVE c(n) AS (SELECT 1 FROM t UNION ALL SELECT n + 1 FROM c WHERE n < 10) SELECT n FROM c",
         ]
     }
 
@@ -158,16 +172,18 @@ mod differential {
         .into_iter()
         .collect();
         for sql in [
-            "SELECT a FROM x",                                // Cataloged
-            "SELECT z FROM x",                                // Unresolved (catalog denies)
-            "SELECT a, b FROM t WHERE a > 0",                 // all Cataloged
-            "SELECT x.a, y.b FROM x JOIN y ON x.id = y.id",   // qualified Cataloged
-            "SELECT a FROM x JOIN y ON x.id = y.id",          // a only in x → Known witness
-            "SELECT id FROM x JOIN y ON x.id = y.id",         // id in both → Ambiguous
-            "SELECT d.a FROM (SELECT a FROM x) d",            // Cataloged through a derived table
+            "SELECT a FROM x",                                                  // Cataloged
+            "SELECT z FROM x",                // Unresolved (catalog denies)
+            "SELECT a, b FROM t WHERE a > 0", // all Cataloged
+            "SELECT x.a, y.b FROM x JOIN y ON x.id = y.id", // qualified Cataloged
+            "SELECT a FROM x JOIN y ON x.id = y.id", // a only in x → Known witness
+            "SELECT id FROM x JOIN y ON x.id = y.id", // id in both → Ambiguous
+            "SELECT d.a FROM (SELECT a FROM x) d", // Cataloged through a derived table
             "SELECT a FROM (SELECT a FROM x) d", // unqualified, Cataloged through derived
             "WITH c AS (SELECT a FROM x) SELECT a FROM c", // Cataloged through a CTE
             "SELECT a FROM x WHERE id IN (SELECT id FROM y)", // subquery Cataloged
+            "SELECT a FROM x WHERE EXISTS (SELECT 1 FROM y WHERE y.id = x.id)", // correlated Cataloged
+            "SELECT a FROM x UNION SELECT b FROM y", // UNION Cataloged both branches
         ] {
             assert_parity(sql, Some(&catalog));
         }

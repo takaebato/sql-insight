@@ -12,12 +12,12 @@
 //! coexist; the differential harness pins them together).
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    Cte, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     GroupByWithModifier, Ident, Join, JoinConstraint, JoinOperator, OrderBy, OrderByKind, Query,
-    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
 };
 
-use super::ir::{BoundColumn, OpaqueLeaf, PassThrough, Plan, Project, Scan};
+use super::ir::{BoundColumn, OpaqueLeaf, PassThrough, Plan, Project, Scan, SetOp};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::extractor::ColumnLineageKind;
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
@@ -36,6 +36,7 @@ pub(crate) fn build(
         catalog,
         casing,
         ctes: Vec::new(),
+        outer_scopes: Vec::new(),
     };
     match statement {
         Statement::Query(query) => Some(binder.bind_query(query).0),
@@ -79,7 +80,9 @@ impl Scope {
 }
 
 /// A relation visible in a [`Scope`]: its use-site alias and where its
-/// columns come from.
+/// columns come from. Cloned into the binder's outer-scope stack so a
+/// correlated subquery can resolve against enclosing relations.
+#[derive(Clone)]
 struct Relation {
     alias: Option<Ident>,
     source: RelationSource,
@@ -98,6 +101,7 @@ impl Relation {
 }
 
 /// Where a relation's columns come from.
+#[derive(Clone)]
 enum RelationSource {
     /// A real stored table: its canonical identity plus catalog column
     /// knowledge (`Open` catalog-free, `Known` with a catalog).
@@ -113,6 +117,7 @@ enum RelationSource {
 }
 
 /// What a real table exposes for resolution.
+#[derive(Clone)]
 enum RelationColumns {
     /// Column set unknown (catalog-free, or a catalog miss / ambiguous
     /// match) — any name could plausibly belong here (`Inferred`).
@@ -154,57 +159,115 @@ struct CteRelation {
 }
 
 /// Carries the bind-time context: the optional catalog, the dialect
-/// casing, and the common table expressions in scope (accumulated in
-/// declaration order, innermost `WITH` last). (A correlation scope stack
-/// joins it in a later brick.)
+/// casing, the common table expressions in scope (accumulated in
+/// declaration order, innermost `WITH` last), and the enclosing queries'
+/// relations (the correlation stack, outermost first) that an inner
+/// subquery's references fall through to.
 struct Binder<'a> {
     catalog: Option<&'a Catalog>,
     casing: IdentifierCasing,
     ctes: Vec<CteRelation>,
+    outer_scopes: Vec<Vec<Relation>>,
 }
 
 impl Binder<'_> {
     /// Bind a query, returning the plan node and its output scope. A
     /// leading `WITH` is peeled first: each CTE binds in declaration order
-    /// into an environment the later CTEs and the body resolve against
-    /// (non-recursive — a `RECURSIVE` self-reference is a later brick and
-    /// for now falls through to normal table resolution).
+    /// into an environment the later CTEs and the body resolve against. A
+    /// `RECURSIVE` CTE also sees itself (via its anchor's columns) while
+    /// its recursive branch binds.
     fn bind_query(&self, query: &Query) -> (Plan, Scope) {
         let Some(with) = &query.with else {
             return self.bind_query_body(query);
         };
         let mut env = self.ctes.clone();
         for cte in &with.cte_tables {
-            let (plan, scope) = self.with_ctes(env.clone()).bind_query(&cte.query);
-            env.push(CteRelation {
-                name: cte.alias.name.clone(),
-                plan,
-                outputs: scope.outputs,
-            });
+            let cte_relation = if with.recursive {
+                self.bind_recursive_cte(cte, &env)
+            } else {
+                let (plan, scope) = self.with_ctes(env.clone()).bind_query(&cte.query);
+                let mut outputs = scope.outputs;
+                apply_column_aliases(&mut outputs, &cte.alias);
+                CteRelation {
+                    name: cte.alias.name.clone(),
+                    plan,
+                    outputs,
+                }
+            };
+            env.push(cte_relation);
         }
         self.with_ctes(env).bind_query_body(query)
     }
 
-    /// A child binder sharing this one's catalog / casing but with a
-    /// different CTE environment (used to extend scope across a `WITH`).
-    fn with_ctes(&self, ctes: Vec<CteRelation>) -> Binder<'_> {
+    /// Bind a `RECURSIVE` CTE: bind the anchor (the body set-operation's
+    /// non-recursive left branch) to learn the output shape, register the
+    /// CTE name with those columns so the recursive branch's
+    /// self-reference resolves, then bind the full body. Self-reference
+    /// resolution sees the anchor's columns (shallow — matching the
+    /// resolver's deferred recursive collapse). A `RECURSIVE` CTE whose
+    /// body isn't a set operation degenerates to a plain CTE.
+    fn bind_recursive_cte(&self, cte: &Cte, env: &[CteRelation]) -> CteRelation {
+        let name = cte.alias.name.clone();
+        let SetExpr::SetOperation { left, .. } = cte.query.body.as_ref() else {
+            let (plan, scope) = self.with_ctes(env.to_vec()).bind_query(&cte.query);
+            let mut outputs = scope.outputs;
+            apply_column_aliases(&mut outputs, &cte.alias);
+            return CteRelation {
+                name,
+                plan,
+                outputs,
+            };
+        };
+        let mut anchor_outputs = self.with_ctes(env.to_vec()).bind_set_expr(left).1.outputs;
+        apply_column_aliases(&mut anchor_outputs, &cte.alias);
+        // Provisional registration: the recursive branch sees the CTE name
+        // resolving to the anchor's columns (the stub plan is never walked
+        // — only the outputs are consulted during resolution).
+        let mut provisional = env.to_vec();
+        provisional.push(CteRelation {
+            name: name.clone(),
+            plan: Plan::OpaqueLeaf(OpaqueLeaf { alias: None }),
+            outputs: anchor_outputs,
+        });
+        let (plan, scope) = self.with_ctes(provisional).bind_query(&cte.query);
+        let mut outputs = scope.outputs;
+        apply_column_aliases(&mut outputs, &cte.alias);
+        CteRelation {
+            name,
+            plan,
+            outputs,
+        }
+    }
+
+    /// A child binder sharing this one's catalog / casing, with the given
+    /// CTE environment and correlation stack.
+    fn child(&self, ctes: Vec<CteRelation>, outer_scopes: Vec<Vec<Relation>>) -> Binder<'_> {
         Binder {
             catalog: self.catalog,
             casing: self.casing,
             ctes,
+            outer_scopes,
         }
+    }
+
+    /// A child binder with a different CTE environment (extending scope
+    /// across a `WITH`); the correlation stack carries over unchanged.
+    fn with_ctes(&self, ctes: Vec<CteRelation>) -> Binder<'_> {
+        self.child(ctes, self.outer_scopes.clone())
+    }
+
+    /// A child binder with one more enclosing scope on the correlation
+    /// stack (used when descending into a subquery in an expression).
+    fn with_outer_scope(&self, relations: Vec<Relation>) -> Binder<'_> {
+        let mut outer_scopes = self.outer_scopes.clone();
+        outer_scopes.push(relations);
+        self.child(self.ctes.clone(), outer_scopes)
     }
 
     /// Bind a query's body and trailing ORDER BY (the WITH clause is
     /// already in scope via `self.ctes`).
     fn bind_query_body(&self, query: &Query) -> (Plan, Scope) {
-        let (body, scope) = match query.body.as_ref() {
-            SetExpr::Select(select) => self.bind_select(select),
-            SetExpr::Query(inner) => self.bind_query(inner),
-            // Set operations, VALUES, `WITH … <DML>` wrappers: later
-            // bricks — an opaque relation with no columns for now.
-            _ => (Plan::OpaqueLeaf(OpaqueLeaf { alias: None }), Scope::empty()),
-        };
+        let (body, scope) = self.bind_set_expr(&query.body);
         // A trailing ORDER BY sits above the body and sees its output
         // aliases (resolved against the body's output scope).
         let plan = match &query.order_by {
@@ -215,6 +278,37 @@ impl Binder<'_> {
             None => body,
         };
         (plan, scope)
+    }
+
+    /// Bind a query body's set expression: a leaf `SELECT`, a
+    /// parenthesized inner query, or a set operation (`UNION` /
+    /// `INTERSECT` / `EXCEPT`). A set operation fans its operands into a
+    /// [`SetOp`] and merges their outputs positionally — each result
+    /// column unions the branches' provenance (so a derived / CTE over a
+    /// `UNION` traces to every branch's base columns), taking its name
+    /// from the left branch. The set-operation kind itself doesn't change
+    /// lineage, so it's dropped.
+    fn bind_set_expr(&self, set_expr: &SetExpr) -> (Plan, Scope) {
+        match set_expr {
+            SetExpr::Select(select) => self.bind_select(select),
+            SetExpr::Query(inner) => self.bind_query(inner),
+            SetExpr::SetOperation { left, right, .. } => {
+                let (left_plan, left_scope) = self.bind_set_expr(left);
+                let (right_plan, right_scope) = self.bind_set_expr(right);
+                let outputs = merge_set_outputs(left_scope.outputs, right_scope.outputs);
+                (
+                    Plan::SetOp(SetOp {
+                        operands: vec![left_plan, right_plan],
+                    }),
+                    Scope {
+                        relations: Vec::new(),
+                        outputs,
+                    },
+                )
+            }
+            // VALUES / table-valued bodies: no inspectable columns yet.
+            _ => (Plan::OpaqueLeaf(OpaqueLeaf { alias: None }), Scope::empty()),
+        }
     }
 
     fn bind_select(&self, select: &Select) -> (Plan, Scope) {
@@ -369,11 +463,13 @@ impl Binder<'_> {
                 subquery, alias, ..
             } => {
                 let (plan, sub_scope) = self.bind_query(subquery);
+                let mut columns = sub_scope.outputs;
+                if let Some(alias) = alias {
+                    apply_column_aliases(&mut columns, alias);
+                }
                 let relation = Relation {
                     alias: alias.as_ref().map(|a| a.name.clone()),
-                    source: RelationSource::Derived {
-                        columns: sub_scope.outputs,
-                    },
+                    source: RelationSource::Derived { columns },
                 };
                 (plan, Scope::of(relation))
             }
@@ -418,11 +514,12 @@ impl Binder<'_> {
 
     /// Every column read an expression contributes against `scope`: its
     /// direct column references (resolved to provenance) plus the reads of
-    /// any nested subquery (scalar / IN / EXISTS), bound independently.
-    /// Used for both value positions (a projection column's provenance)
-    /// and filter positions (a predicate's reads) — the subquery's reads
-    /// inherit the position of the containing expression. (Correlated
-    /// subqueries — referencing outer relations — are a later brick.)
+    /// any nested subquery (scalar / IN / EXISTS). Used for both value
+    /// positions (a projection column's provenance) and filter positions
+    /// (a predicate's reads) — the subquery's reads inherit the position
+    /// of the containing expression. A subquery binds with `scope`'s
+    /// relations pushed onto the correlation stack, so a correlated
+    /// reference resolves against the enclosing query.
     fn expr_reads(&self, expr: &Expr, scope: &Scope) -> Vec<ColumnRead> {
         let mut reads = Vec::new();
         self.collect_expr_reads(expr, scope, &mut reads);
@@ -450,14 +547,15 @@ impl Binder<'_> {
                     }
                 }
             }
-            // Subqueries: bind independently and fold in their reads.
+            // Subqueries: bind against the enclosing scope (correlation)
+            // and fold in their reads.
             Expr::Subquery(query)
             | Expr::Exists {
                 subquery: query, ..
-            } => out.extend(self.subquery_reads(query)),
+            } => out.extend(self.subquery_reads(query, scope)),
             Expr::InSubquery { expr, subquery, .. } => {
                 self.collect_expr_reads(expr, scope, out);
-                out.extend(self.subquery_reads(subquery));
+                out.extend(self.subquery_reads(subquery, scope));
             }
             _ => {}
         }
@@ -491,9 +589,12 @@ impl Binder<'_> {
     }
 
     /// The reads of a subquery nested in an expression: bind it as its own
-    /// plan and walk it. Independent scope for now (no correlation).
-    fn subquery_reads(&self, query: &Query) -> Vec<ColumnRead> {
-        let (plan, _) = self.bind_query(query);
+    /// plan (with the containing `scope`'s relations pushed onto the
+    /// correlation stack, so a correlated reference resolves outward) and
+    /// walk it.
+    fn subquery_reads(&self, query: &Query, scope: &Scope) -> Vec<ColumnRead> {
+        let binder = self.with_outer_scope(scope.relations.clone());
+        let (plan, _) = binder.bind_query(query);
         super::extract::extract_reads(&plan)
     }
 
@@ -501,17 +602,20 @@ impl Binder<'_> {
     /// Mirrors the resolver: unqualified scans candidate relations
     /// (Known-witness over Open suspects); qualified matches the
     /// qualifier first. Catalog-free everything is `Open` → `Inferred` /
-    /// `Ambiguous`.
+    /// `Ambiguous`. A name no relation in the current scope can own falls
+    /// through to the enclosing scopes (correlation), innermost-first,
+    /// before giving up as `Unresolved`.
     fn resolve_ref(&self, parts: &[Ident], scope: &Scope) -> Vec<ColumnRead> {
         let Some(column) = parts.last() else {
             return Vec::new();
         };
-        let candidates: Vec<Candidate> = if parts.len() == 1 {
-            // Output-alias visibility (GROUP BY / HAVING / ORDER BY): a
-            // bare name matching an enclosing output column is a
-            // reference to that output — return its provenance so an
-            // introduced alias resolves to its real sources instead of a
-            // phantom stored column. Empty at FROM-level (no outputs).
+        // Output-alias visibility (GROUP BY / HAVING / ORDER BY): a bare
+        // name matching an enclosing output column is a reference to that
+        // output — return its provenance so an introduced alias resolves
+        // to its real sources instead of a phantom stored column. Empty at
+        // FROM-level (no outputs). Only the current scope's outputs are
+        // visible; correlation reaches enclosing *relations*, not aliases.
+        if parts.len() == 1 {
             if let Some(output) = scope
                 .outputs
                 .iter()
@@ -519,15 +623,37 @@ impl Binder<'_> {
             {
                 return output.provenance.clone();
             }
-            scope
-                .relations
+        }
+        if let Some(reads) = self.resolve_in_relations(parts, &scope.relations, column) {
+            return reads;
+        }
+        for outer in self.outer_scopes.iter().rev() {
+            if let Some(reads) = self.resolve_in_relations(parts, outer, column) {
+                return reads;
+            }
+        }
+        vec![unresolved(column)]
+    }
+
+    /// Resolve `parts` against one set of relations, returning `None` when
+    /// none of them could own the column (so the caller can fall through
+    /// to an enclosing scope) and `Some(reads)` once at least one is a
+    /// candidate — even if that resolves `Ambiguous` (a name owned within
+    /// this scope doesn't escape it).
+    fn resolve_in_relations(
+        &self,
+        parts: &[Ident],
+        relations: &[Relation],
+        column: &Ident,
+    ) -> Option<Vec<ColumnRead>> {
+        let candidates: Vec<Candidate> = if parts.len() == 1 {
+            relations
                 .iter()
                 .filter_map(|rel| self.unqualified_candidate(rel, column))
                 .collect()
         } else {
             let qualifier = &parts[parts.len() - 2];
-            scope
-                .relations
+            relations
                 .iter()
                 .filter(|rel| {
                     rel.exposed_name()
@@ -536,7 +662,7 @@ impl Binder<'_> {
                 .filter_map(|rel| self.qualified_candidate(rel, column))
                 .collect()
         };
-        self.pick(candidates, column)
+        (!candidates.is_empty()).then(|| self.pick(candidates, column))
     }
 
     /// Reads contributed by GROUP BY (plain keys + ROLLUP / CUBE /
@@ -800,6 +926,43 @@ fn wrap_reads(plan: Plan, reads: Vec<ColumnRead>) -> Plan {
     }
 }
 
+/// Merge two set-operation branches' output columns positionally: each
+/// result column unions both branches' provenance, takes its name from
+/// the left branch, and transforms if either branch's column does. Extra
+/// columns on either side (mismatched arity) are dropped — a set
+/// operation requires equal arity, and any dropped branch's reads still
+/// surface from its own sub-plan.
+fn merge_set_outputs(left: Vec<BoundColumn>, right: Vec<BoundColumn>) -> Vec<BoundColumn> {
+    left.into_iter()
+        .zip(right)
+        .map(|(left, right)| {
+            let mut provenance = left.provenance;
+            provenance.extend(right.provenance);
+            let kind = if left.kind == ColumnLineageKind::Transformation
+                || right.kind == ColumnLineageKind::Transformation
+            {
+                ColumnLineageKind::Transformation
+            } else {
+                ColumnLineageKind::Passthrough
+            };
+            BoundColumn {
+                name: left.name,
+                provenance,
+                kind,
+            }
+        })
+        .collect()
+}
+
+/// Apply a CTE / derived table's explicit column list (`AS c(x, y)`),
+/// renaming the body's output columns positionally. Surplus outputs keep
+/// their inferred names; surplus alias names have nothing to bind to.
+fn apply_column_aliases(outputs: &mut [BoundColumn], alias: &TableAlias) {
+    for (output, column) in outputs.iter_mut().zip(&alias.columns) {
+        output.name = Some(column.name.clone());
+    }
+}
+
 /// The output name SQL infers for an unaliased projection item: a bare
 /// column keeps its own name; anything else is anonymous.
 fn inferred_output_name(expr: &Expr) -> Option<Ident> {
@@ -1001,6 +1164,58 @@ mod tests {
         assert_eq!(
             where_pt.reads,
             vec![inferred("t", "b"), inferred("u", "id")]
+        );
+    }
+
+    #[test]
+    fn correlated_subquery_resolves_outward() {
+        // The inner `t.a` finds no `t` in the subquery's own scope `[u]`,
+        // so it falls through the correlation stack to the outer `t`.
+        let Plan::Project(project) =
+            bind_one("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a)")
+        else {
+            panic!("expected Project");
+        };
+        let Plan::PassThrough(where_pt) = project.input.as_ref() else {
+            panic!("expected WHERE PassThrough");
+        };
+        assert_eq!(where_pt.reads, vec![inferred("u", "x"), inferred("t", "a")]);
+    }
+
+    #[test]
+    fn union_merges_branch_provenance() {
+        // A derived table over `UNION` exposes one output `x` whose
+        // provenance unions both branches' base columns.
+        let Plan::Project(project) =
+            bind_one("SELECT x FROM (SELECT a AS x FROM t UNION SELECT b AS x FROM u) d")
+        else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            project.outputs,
+            vec![passthrough_col(
+                "x",
+                vec![inferred("t", "a"), inferred("u", "b")]
+            )]
+        );
+    }
+
+    #[test]
+    fn recursive_cte_self_reference_traces_the_anchor() {
+        // The recursive branch's `FROM c` resolves to the anchor's `id`
+        // (→ `t.id`); the body's `id` then unions both branches, both
+        // tracing to the same real column.
+        let Plan::Project(project) = bind_one(
+            "WITH RECURSIVE c AS (SELECT id FROM t UNION ALL SELECT id FROM c) SELECT id FROM c",
+        ) else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            project.outputs,
+            vec![passthrough_col(
+                "id",
+                vec![inferred("t", "id"), inferred("t", "id")]
+            )]
         );
     }
 
