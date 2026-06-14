@@ -22,7 +22,9 @@ pub(crate) fn extract_reads(plan: &Plan) -> Vec<ColumnRead> {
 
 fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
     match plan {
-        Plan::Scan(_) | Plan::OpaqueLeaf => {}
+        // A `CteRef` is resolved through the scope at bind time; its body's
+        // reads are counted once at the `With` node below, not per reference.
+        Plan::Scan(_) | Plan::OpaqueLeaf | Plan::CteRef(_) => {}
         Plan::PassThrough(pt) => {
             out.extend(pt.reads.iter().cloned());
             for input in &pt.inputs {
@@ -57,6 +59,14 @@ fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
             }
         }
         Plan::Write(write) => collect_reads(&write.input, out),
+        // Each declared CTE body is walked once here regardless of how many
+        // references consume it (or whether any do) — its reads count once.
+        Plan::With(with) => {
+            collect_reads(&with.body, out);
+            for cte in &with.ctes {
+                collect_reads(&cte.plan, out);
+            }
+        }
     }
 }
 
@@ -143,7 +153,11 @@ pub(crate) fn output_operands(plan: &Plan) -> Vec<&[BoundColumn]> {
         Plan::Project(project) => vec![&project.outputs],
         Plan::SetOp(set) => set.operands.iter().flat_map(output_operands).collect(),
         Plan::PassThrough(pt) => pt.inputs.first().map(output_operands).unwrap_or_default(),
-        Plan::Scan(_) | Plan::OpaqueLeaf | Plan::Write(_) => Vec::new(),
+        // A `With` exposes its body's outputs; its CTE bodies feed
+        // references (via collapsed provenance), never the query output. A
+        // `CteRef` has no inspectable outputs of its own (resolved at bind).
+        Plan::With(with) => output_operands(&with.body),
+        Plan::Scan(_) | Plan::OpaqueLeaf | Plan::Write(_) | Plan::CteRef(_) => Vec::new(),
     }
 }
 
@@ -349,6 +363,12 @@ mod differential {
             "WITH c AS (SELECT a, b FROM t) SELECT a FROM c WHERE b > 0",
             "WITH c AS (SELECT id FROM t) SELECT c.id FROM c",
             "WITH c AS (SELECT id FROM t) SELECT d.id FROM c AS d",
+            // Shared-node CTE: the body is walked once regardless of
+            // reference count, so its reads are counted once (not per
+            // reference) and an unreferenced CTE's body still surfaces —
+            // both matching the resolver.
+            "WITH c AS (SELECT a FROM t) SELECT c1.a FROM c c1 JOIN c c2 ON c1.a = c2.a",
+            "WITH c AS (SELECT a FROM t) SELECT b FROM other",
             // NB: a chained `WITH a …, b AS (… FROM a) … FROM b` is an
             // intentional *improvement* (B resolves the body ref through
             // the chain to the real table; the resolver yields Ambiguous

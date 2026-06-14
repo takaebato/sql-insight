@@ -21,7 +21,10 @@ use sqlparser::ast::{
 
 use std::cell::RefCell;
 
-use super::ir::{BoundColumn, PassThrough, Plan, Project, ProvenanceSource, Scan, SetOp, Write};
+use super::ir::{
+    BoundColumn, CtePlan, CteRef, PassThrough, Plan, Project, ProvenanceSource, Scan, SetOp, With,
+    Write,
+};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::extractor::ColumnLineageKind;
@@ -171,14 +174,15 @@ struct Candidate {
 }
 
 /// A common table expression in scope: a named synthetic relation. Bound
-/// once at its `WITH` declaration; references in FROM clone its `plan`
-/// into the tree and expose its `outputs` (so unreferenced CTEs
-/// contribute nothing, and the body is collapsed by construction like a
-/// derived table).
+/// once at its `WITH` declaration. This is the bind-time *resolution*
+/// entry — just the name and the exposed `outputs` (already
+/// collapsed like a derived table). The body sub-plan itself lives on the
+/// [`With`] node (so it is walked once regardless of reference count); a
+/// FROM reference resolves through these `outputs` and emits a lightweight
+/// [`CteRef`], never a clone of the body.
 #[derive(Clone)]
 struct CteRelation {
     name: Ident,
-    plan: Plan,
     outputs: Vec<BoundColumn>,
 }
 
@@ -453,22 +457,39 @@ impl Binder<'_> {
             return self.bind_query_body(query);
         };
         let mut env = self.ctes.clone();
+        // The bodies declared by *this* clause, kept to hang on the `With`
+        // node so each is walked exactly once (inherited outer CTEs hang on
+        // their own outer `With`, so they aren't re-attached here).
+        let mut declared = Vec::new();
         for cte in &with.cte_tables {
-            let cte_relation = if with.recursive {
+            let (relation, plan) = if with.recursive {
                 self.bind_recursive_cte(cte, &env)
             } else {
                 let (plan, scope) = self.with_ctes(env.clone()).bind_query(&cte.query);
                 let mut outputs = scope.outputs;
                 apply_column_aliases(&mut outputs, &cte.alias);
-                CteRelation {
-                    name: cte.alias.name.clone(),
+                (
+                    CteRelation {
+                        name: cte.alias.name.clone(),
+                        outputs,
+                    },
                     plan,
-                    outputs,
-                }
+                )
             };
-            env.push(cte_relation);
+            declared.push(CtePlan {
+                name: relation.name.clone(),
+                plan,
+            });
+            env.push(relation);
         }
-        self.with_ctes(env).bind_query_body(query)
+        let (body, scope) = self.with_ctes(env).bind_query_body(query);
+        (
+            Plan::With(With {
+                ctes: declared,
+                body: Box::new(body),
+            }),
+            scope,
+        )
     }
 
     /// Bind a `RECURSIVE` CTE: bind the anchor (the body set-operation's
@@ -478,37 +499,28 @@ impl Binder<'_> {
     /// resolution sees the anchor's columns (shallow — matching the
     /// resolver's deferred recursive collapse). A `RECURSIVE` CTE whose
     /// body isn't a set operation degenerates to a plain CTE.
-    fn bind_recursive_cte(&self, cte: &Cte, env: &[CteRelation]) -> CteRelation {
+    fn bind_recursive_cte(&self, cte: &Cte, env: &[CteRelation]) -> (CteRelation, Plan) {
         let name = cte.alias.name.clone();
         let SetExpr::SetOperation { left, .. } = cte.query.body.as_ref() else {
             let (plan, scope) = self.with_ctes(env.to_vec()).bind_query(&cte.query);
             let mut outputs = scope.outputs;
             apply_column_aliases(&mut outputs, &cte.alias);
-            return CteRelation {
-                name,
-                plan,
-                outputs,
-            };
+            return (CteRelation { name, outputs }, plan);
         };
         let mut anchor_outputs = self.with_ctes(env.to_vec()).bind_set_expr(left).1.outputs;
         apply_column_aliases(&mut anchor_outputs, &cte.alias);
         // Provisional registration: the recursive branch sees the CTE name
-        // resolving to the anchor's columns (the stub plan is never walked
-        // — only the outputs are consulted during resolution).
+        // resolving to the anchor's columns (resolution consults only the
+        // outputs; the self-reference binds to a `CteRef`, never a body).
         let mut provisional = env.to_vec();
         provisional.push(CteRelation {
             name: name.clone(),
-            plan: Plan::OpaqueLeaf,
             outputs: anchor_outputs,
         });
         let (plan, scope) = self.with_ctes(provisional).bind_query(&cte.query);
         let mut outputs = scope.outputs;
         apply_column_aliases(&mut outputs, &cte.alias);
-        CteRelation {
-            name,
-            plan,
-            outputs,
-        }
+        (CteRelation { name, outputs }, plan)
     }
 
     /// A child binder sharing this one's catalog / casing, with the given
@@ -714,18 +726,22 @@ impl Binder<'_> {
                 };
                 let alias = alias.as_ref().map(|a| a.name.clone());
                 // A bare name matching an in-scope CTE resolves to that
-                // CTE's synthetic relation — its plan (cloned into the
-                // tree) plus its pre-collapsed outputs — exactly like a
-                // derived table. Qualified names are never CTEs.
+                // CTE's synthetic relation — its pre-collapsed outputs,
+                // exposed via the scope exactly like a derived table. The
+                // plan node is a lightweight `CteRef` (not a clone of the
+                // body): the body is walked once at its `With` declaration,
+                // so references neither double-count nor lose its reads.
+                // Qualified names are never CTEs.
                 if written.schema.is_none() && written.catalog.is_none() {
                     if let Some(cte) = self.lookup_cte(&written.name) {
+                        let name = cte.name.clone();
                         let relation = Relation {
                             alias: alias.or_else(|| Some(cte.name.clone())),
                             source: RelationSource::Derived {
                                 columns: cte.outputs.clone(),
                             },
                         };
-                        return (cte.plan.clone(), Scope::of(relation));
+                        return (Plan::CteRef(CteRef { name }), Scope::of(relation));
                     }
                 }
                 // A unique catalog hit canonicalizes the identity and
@@ -1578,6 +1594,27 @@ mod tests {
         })
     }
 
+    /// A `WITH` node: named CTE bodies wrapping a body plan.
+    fn with(ctes: Vec<(&str, Plan)>, body: Plan) -> Plan {
+        Plan::With(With {
+            ctes: ctes
+                .into_iter()
+                .map(|(name, plan)| CtePlan {
+                    name: Ident::new(name),
+                    plan,
+                })
+                .collect(),
+            body: Box::new(body),
+        })
+    }
+
+    /// A lightweight FROM reference to an in-scope CTE.
+    fn cteref(name: &str) -> Plan {
+        Plan::CteRef(CteRef {
+            name: Ident::new(name),
+        })
+    }
+
     fn inferred(table: &str, column: &str) -> ColumnRead {
         read(&tref(table), &Ident::new(column), ResolutionKind::Inferred)
     }
@@ -1678,18 +1715,73 @@ mod tests {
 
     #[test]
     fn cte_reference_resolves_to_inner_columns() {
-        // A WITH-bound CTE referenced in FROM is a synthetic relation: the
-        // body's `id` resolves through it to the real `t.id`, same as a
-        // derived table. The CTE's plan is cloned in below the body Project.
+        // A WITH-bound CTE is a synthetic relation: the body's `id`
+        // resolves through it to the real `t.id`, same as a derived table.
+        // The CTE body lives once on the `With` node; the FROM reference is
+        // a lightweight `CteRef`, not a clone of the body.
         assert_eq!(
             bind_one("WITH c AS (SELECT id FROM t) SELECT id FROM c"),
-            project(
+            with(
+                vec![(
+                    "c",
+                    project(
+                        scan("t"),
+                        vec![passthrough_col("id", vec![inferred("t", "id")])]
+                    )
+                )],
                 project(
-                    scan("t"),
-                    vec![passthrough_col("id", vec![inferred("t", "id")])]
+                    cteref("c"),
+                    // Referenced through the CTE relation → synthetic-origin.
+                    vec![synthetic_col("id", vec![inferred("t", "id")])],
                 ),
-                // Referenced through the CTE relation → synthetic-origin.
-                vec![synthetic_col("id", vec![inferred("t", "id")])],
+            )
+        );
+    }
+
+    #[test]
+    fn cte_referenced_twice_keeps_one_shared_body() {
+        // Two references to the same CTE share its single body on the `With`
+        // node (each FROM item is a `CteRef`), so the body's `t.a` is walked
+        // exactly once — not duplicated per reference.
+        assert_eq!(
+            bind_one("WITH c AS (SELECT a FROM t) SELECT c1.a FROM c c1 JOIN c c2 ON c1.a = c2.a"),
+            with(
+                vec![(
+                    "c",
+                    project(
+                        scan("t"),
+                        vec![passthrough_col("a", vec![inferred("t", "a")])]
+                    )
+                )],
+                project(
+                    // JOIN of two `CteRef`s; the ON predicate `c1.a = c2.a`
+                    // resolves through the CTE relations (synthetic-origin),
+                    // so it contributes no physical reads here.
+                    pass(vec![cteref("c"), cteref("c")], vec![]),
+                    vec![synthetic_col("a", vec![inferred("t", "a")])],
+                ),
+            )
+        );
+    }
+
+    #[test]
+    fn unreferenced_cte_body_is_still_present() {
+        // An unreferenced CTE's body still hangs on the `With` node (so its
+        // reads surface), while the body plan reads an unrelated table.
+        assert_eq!(
+            bind_one("WITH c AS (SELECT a FROM t) SELECT b FROM other"),
+            with(
+                vec![(
+                    "c",
+                    project(
+                        scan("t"),
+                        vec![passthrough_col("a", vec![inferred("t", "a")])]
+                    )
+                )],
+                project(
+                    scan("other"),
+                    vec![passthrough_col("b", vec![inferred("other", "b")])],
+                ),
             )
         );
     }
@@ -1701,13 +1793,16 @@ mod tests {
         // improvement over the resolver (whose flat scope yields
         // Ambiguous), so this is pinned here rather than in the
         // differential-parity corpus.
-        let Plan::Project(project) =
+        let Plan::With(with) =
             bind_one("WITH a AS (SELECT id FROM t), b AS (SELECT id FROM a) SELECT id FROM b")
         else {
-            panic!("expected Project");
+            panic!("expected With");
+        };
+        let Plan::Project(body) = with.body.as_ref() else {
+            panic!("expected body Project");
         };
         assert_eq!(
-            project.outputs,
+            body.outputs,
             vec![synthetic_col("id", vec![inferred("t", "id")])]
         );
     }
@@ -1782,13 +1877,16 @@ mod tests {
         // The recursive branch's `FROM c` resolves to the anchor's `id`
         // (→ `t.id`); the body's `id` then unions both branches, both
         // tracing to the same real column.
-        let Plan::Project(project) = bind_one(
+        let Plan::With(with) = bind_one(
             "WITH RECURSIVE c AS (SELECT id FROM t UNION ALL SELECT id FROM c) SELECT id FROM c",
         ) else {
-            panic!("expected Project");
+            panic!("expected With");
+        };
+        let Plan::Project(body) = with.body.as_ref() else {
+            panic!("expected body Project");
         };
         assert_eq!(
-            project.outputs,
+            body.outputs,
             vec![synthetic_col(
                 "id",
                 vec![inferred("t", "id"), inferred("t", "id")]

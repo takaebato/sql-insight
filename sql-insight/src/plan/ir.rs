@@ -28,6 +28,13 @@ pub(crate) enum Plan {
     Project(Project),
     SetOp(SetOp),
     Write(Write),
+    With(With),
+    /// A FROM-clause reference to an in-scope CTE. Its columns are
+    /// resolved (and collapsed into the referencing value's provenance)
+    /// at bind time through the scope, so the reference itself contributes
+    /// nothing to extraction — the CTE body's reads / tables are counted
+    /// once at the owning [`With`] node, never re-counted per reference.
+    CteRef(CteRef),
 }
 
 /// A real stored table (leaf), identified by its (catalog-canonicalized)
@@ -84,6 +91,40 @@ pub(crate) struct Write {
     pub(crate) target: TableReference,
     pub(crate) target_columns: Vec<Ident>,
     pub(crate) input: Box<Plan>,
+}
+
+/// A `WITH` clause: the CTEs it declares, kept as named sub-plans, plus
+/// the `body` that resolves against them. Each declared body is bound
+/// **once** and lives here regardless of how many references consume it
+/// (or whether any do), so extraction walks it exactly once — a
+/// reference is a lightweight [`CteRef`], never a clone of the body. This
+/// is the shared-node model: SQL says a CTE is one named relation, so the
+/// plan stores one sub-plan, mirroring how a recursive CTE keeps a single
+/// shared work-table rather than inlining a copy per reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct With {
+    /// The CTEs this clause declares, in declaration order.
+    pub(crate) ctes: Vec<CtePlan>,
+    pub(crate) body: Box<Plan>,
+}
+
+/// One declared CTE: its name paired with its bound body sub-plan. The
+/// name links it to the [`CteRef`]s that consume it; the plan is walked
+/// once (for reads / tables) at this declaration site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CtePlan {
+    pub(crate) name: Ident,
+    pub(crate) plan: Plan,
+}
+
+/// A FROM-clause reference to an in-scope CTE: just the CTE's name. Its
+/// columns were resolved and collapsed into the referencing value's
+/// provenance at bind time (via the scope), so this leaf contributes no
+/// reads / lineage of its own — the body's reads are counted once at the
+/// owning [`With`] node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CteRef {
+    pub(crate) name: Ident,
 }
 
 /// One resolved output column: its (optional) name and the real base
