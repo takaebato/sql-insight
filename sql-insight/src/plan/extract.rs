@@ -7,11 +7,13 @@ use super::ir::{BoundColumn, Plan, Write};
 use crate::extractor::{ColumnLineageEdge, ColumnTarget};
 use crate::reference::{ColumnRead, ColumnReference};
 
-/// Every column read the bound plan expresses: each `Project` output
-/// column's (pre-collapsed) provenance plus every `PassThrough`'s filter
-/// reads. Occurrence-based and unordered relative to the old resolver —
-/// the differential harness compares the *set*, so order / multiplicity
-/// differences (inherent to pre-collapse) don't register as regressions.
+/// Every physical column read the bound plan expresses: each `Project`
+/// output column's non-synthetic provenance plus every `PassThrough`'s
+/// filter reads. Occurrence-based, each carrying its source span;
+/// synthetic-origin (collapse / alias) references are excluded so only
+/// physical references are counted. The order is the tree walk's, which
+/// the differential harness treats as incidental (it compares the
+/// span-tagged multiset, not the sequence).
 pub(crate) fn extract_reads(plan: &Plan) -> Vec<ColumnRead> {
     let mut reads = Vec::new();
     collect_reads(plan, &mut reads);
@@ -29,7 +31,17 @@ fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
         }
         Plan::Project(project) => {
             for column in &project.outputs {
-                out.extend(column.provenance.iter().map(|source| source.read.clone()));
+                // A synthetic-origin source (referenced through a derived /
+                // CTE relation or an output alias) is a lineage source but
+                // not a physical read — that read is counted at the inner
+                // producer, so it is excluded here.
+                out.extend(
+                    column
+                        .provenance
+                        .iter()
+                        .filter(|source| !source.synthetic_origin)
+                        .map(|source| source.read.clone()),
+                );
             }
             collect_reads(&project.input, out);
         }
@@ -160,10 +172,11 @@ pub(crate) fn output_operands(plan: &Plan) -> Vec<&[BoundColumn]> {
 }
 
 /// Differential harness (the strangler safety net): for SQL the binder
-/// covers, the **set** of real column reads it produces must match the
-/// current resolver-based `extract_column_operations`. As the binder
-/// grows (lineage, writes, more clauses), this corpus and the compared
-/// surfaces grow with it; a set mismatch flags a regression to classify.
+/// covers, its `reads` (as a span-tagged multiset — occurrence + source
+/// span, order excepted), `writes`, and `lineage` must match the current
+/// resolver-based `extract_column_operations`. The lazy-collapse binder
+/// counts each physical reference once with its own span, so it matches
+/// the resolver's occurrence + spans, not just the read set.
 #[cfg(test)]
 mod differential {
     use super::*;
@@ -194,6 +207,43 @@ mod differential {
         items.iter().cloned().collect()
     }
 
+    /// A span-free key for a read, so occurrences sort / compare by
+    /// identity + resolution (sqlparser's `Ident` equality already ignores
+    /// spans).
+    fn read_key(r: &ColumnRead) -> String {
+        let table = r
+            .reference
+            .table
+            .as_ref()
+            .map(|t| {
+                format!(
+                    "{}.{}.{}",
+                    t.catalog.as_ref().map(|c| c.value.as_str()).unwrap_or(""),
+                    t.schema.as_ref().map(|s| s.value.as_str()).unwrap_or(""),
+                    t.name.value
+                )
+            })
+            .unwrap_or_else(|| "?".into());
+        format!("{}.{}|{:?}", table, r.reference.name.value, r.resolution)
+    }
+
+    /// Reads as a sorted, **span-tagged** multiset — proves the binder
+    /// matches the resolver not just on identity + resolution + occurrence
+    /// but on each reference's source span (the per-reference location that
+    /// makes occurrences worth distinguishing). Order is *not* compared: a
+    /// read's position is incidental walk order, not contractual.
+    fn read_span_bag(reads: &[ColumnRead]) -> Vec<String> {
+        let mut keys: Vec<String> = reads
+            .iter()
+            .map(|r| {
+                let s = &r.reference.name.span;
+                format!("{}@{}:{}", read_key(r), s.start.line, s.start.column)
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// The binder's `reads` / `writes` / `lineage` **sets** must each
     /// match the resolver's for every covered statement, under the same
     /// catalog. Sets (not order / multiplicity) so pre-collapse occurrence
@@ -202,9 +252,9 @@ mod differential {
         let plan = bind_one(sql, catalog);
         let old = resolver_op(sql, catalog);
         assert_eq!(
-            set(&extract_reads(&plan)),
-            set(&old.reads),
-            "read-set mismatch for: {sql}"
+            read_span_bag(&extract_reads(&plan)),
+            read_span_bag(&old.reads),
+            "read-multiset mismatch for: {sql}"
         );
         assert_eq!(
             set(&extract_writes(&plan)),
@@ -227,9 +277,9 @@ mod differential {
         let plan = bind_one(sql, catalog);
         let old = resolver_op(sql, catalog);
         assert_eq!(
-            set(&extract_reads(&plan)),
-            set(&old.reads),
-            "read-set mismatch for: {sql}"
+            read_span_bag(&extract_reads(&plan)),
+            read_span_bag(&old.reads),
+            "read-multiset mismatch for: {sql}"
         );
         assert_eq!(
             set(&extract_writes(&plan)),
@@ -242,9 +292,9 @@ mod differential {
     /// deliberately differ (see [`reads_only_corpus`]).
     fn assert_reads_parity(sql: &str, catalog: Option<&Catalog>) {
         assert_eq!(
-            set(&extract_reads(&bind_one(sql, catalog))),
-            set(&resolver_op(sql, catalog).reads),
-            "read-set mismatch for: {sql}"
+            read_span_bag(&extract_reads(&bind_one(sql, catalog))),
+            read_span_bag(&resolver_op(sql, catalog).reads),
+            "read-multiset mismatch for: {sql}"
         );
     }
 

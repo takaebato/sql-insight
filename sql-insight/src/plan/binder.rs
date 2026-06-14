@@ -779,6 +779,7 @@ impl Binder<'_> {
             .map(|source| ProvenanceSource {
                 kind: combine_kind(source.kind, outer),
                 read: source.read,
+                synthetic_origin: source.synthetic_origin,
             })
             .collect();
         (BoundColumn { name, provenance }, filters)
@@ -787,13 +788,17 @@ impl Binder<'_> {
     /// The plain column reads of an expression (filter position — WHERE /
     /// ON / clause predicates / DML predicates): every column it touches,
     /// with the value/filter distinction collapsed (both its value sources
-    /// and nested-subquery filters are just reads here).
+    /// and nested-subquery filters are just reads here). Synthetic-origin
+    /// sources (a reference through a derived / CTE relation or to an
+    /// output alias) are dropped — their physical read is counted at the
+    /// inner producer, not at this reference.
     fn expr_reads(&self, expr: &Expr, scope: &Scope) -> Vec<ColumnRead> {
         let mut sources = Vec::new();
         let mut filters = Vec::new();
         self.collect_expr(expr, scope, &mut sources, &mut filters);
         sources
             .into_iter()
+            .filter(|source| !source.synthetic_origin)
             .map(|source| source.read)
             .chain(filters)
             .collect()
@@ -913,12 +918,29 @@ impl Binder<'_> {
         // FROM-level (no outputs). Only the current scope's outputs are
         // visible; correlation reaches enclosing *relations*, not aliases.
         if parts.len() == 1 {
+            // An *introduced* output alias (computed expr or rename) named
+            // here is a reference to that output value, not a stored
+            // column — return its sources marked synthetic-origin so they
+            // stay lineage sources but aren't double-counted as reads (the
+            // physical reads are already at the projection). An *identity*
+            // alias (`GROUP BY a` for a bare `a`) falls through to normal
+            // resolution, so it resolves to the real column with *this*
+            // reference's own span and counts as its own occurrence.
             if let Some(output) = scope
                 .outputs
                 .iter()
                 .find(|c| self.name_matches(c.name.as_ref(), column))
             {
-                return output.provenance.clone();
+                if !self.is_identity_output(output) {
+                    return output
+                        .provenance
+                        .iter()
+                        .map(|source| ProvenanceSource {
+                            synthetic_origin: true,
+                            ..source.clone()
+                        })
+                        .collect();
+                }
             }
             // USING merge column: fan in to every relation that could own
             // it — one source per side — instead of resolving to one /
@@ -946,6 +968,18 @@ impl Binder<'_> {
             }
         }
         vec![passthrough(unresolved(column))]
+    }
+
+    /// Whether an output column is a bare-column passthrough under its own
+    /// name (its single source's column name matches the output name).
+    fn is_identity_output(&self, output: &BoundColumn) -> bool {
+        let Some(name) = &output.name else {
+            return false;
+        };
+        matches!(
+            output.provenance.as_slice(),
+            [source] if self.name_matches(Some(&source.read.reference.name), name)
+        )
     }
 
     /// Resolve `parts` against one set of relations, returning `None` when
@@ -1078,12 +1112,23 @@ impl Binder<'_> {
     /// A derived relation is a candidate iff it exposes an output column
     /// named `column`; its (already collapsed) provenance is the
     /// candidate's. Synthetic — the witness tiebreaker keeps it verbatim.
+    /// Every source is marked `synthetic_origin`: this reference goes
+    /// *through* the derived / CTE relation, so its physical read was
+    /// already counted at the relation's own body (it stays a lineage
+    /// source, but not a `reads` occurrence).
     fn derived_candidate(&self, columns: &[BoundColumn], column: &Ident) -> Option<Candidate> {
         columns
             .iter()
             .find(|c| self.name_matches(c.name.as_ref(), column))
             .map(|c| Candidate {
-                provenance: c.provenance.clone(),
+                provenance: c
+                    .provenance
+                    .iter()
+                    .map(|source| ProvenanceSource {
+                        synthetic_origin: true,
+                        ..source.clone()
+                    })
+                    .collect(),
                 confirmed: true,
                 synthetic: true,
             })
@@ -1347,11 +1392,13 @@ fn combine_kind(inner: ColumnLineageKind, outer: ColumnLineageKind) -> ColumnLin
 
 /// Wrap a read as a `Passthrough` provenance source — a base column or an
 /// unresolved / ambiguous placeholder forwards its value by default; the
-/// containing expression's kind folds in later.
+/// containing expression's kind folds in later. A direct physical
+/// reference, so not synthetic.
 fn passthrough(read: ColumnRead) -> ProvenanceSource {
     ProvenanceSource {
         read,
         kind: ColumnLineageKind::Passthrough,
+        synthetic_origin: false,
     }
 }
 
@@ -1443,6 +1490,24 @@ mod tests {
                 .map(|read| ProvenanceSource {
                     read,
                     kind: ColumnLineageKind::Transformation,
+                    synthetic_origin: false,
+                })
+                .collect(),
+        }
+    }
+
+    /// A passthrough output whose sources are reached through a synthetic
+    /// (derived / CTE) relation — the collapse references that are lineage
+    /// sources but excluded from `reads`.
+    fn synthetic_col(name: &str, reads: Vec<ColumnRead>) -> BoundColumn {
+        BoundColumn {
+            name: Some(Ident::new(name)),
+            provenance: reads
+                .into_iter()
+                .map(|read| ProvenanceSource {
+                    read,
+                    kind: ColumnLineageKind::Passthrough,
+                    synthetic_origin: true,
                 })
                 .collect(),
         }
@@ -1496,7 +1561,10 @@ mod tests {
                     input: Box::new(scan("t")),
                     outputs: vec![passthrough_col("x", vec![inferred("t", "a")])],
                 })),
-                outputs: vec![passthrough_col("x", vec![inferred("t", "a")])],
+                // The outer `d.x` reaches `t.a` through the derived relation,
+                // so it's a synthetic-origin source (a lineage source, not a
+                // physical read — that read is the inner Project's).
+                outputs: vec![synthetic_col("x", vec![inferred("t", "a")])],
             })
         );
     }
@@ -1513,7 +1581,8 @@ mod tests {
                     input: Box::new(scan("t")),
                     outputs: vec![passthrough_col("id", vec![inferred("t", "id")])],
                 })),
-                outputs: vec![passthrough_col("id", vec![inferred("t", "id")])],
+                // Referenced through the CTE relation → synthetic-origin.
+                outputs: vec![synthetic_col("id", vec![inferred("t", "id")])],
             })
         );
     }
@@ -1532,7 +1601,7 @@ mod tests {
         };
         assert_eq!(
             project.outputs,
-            vec![passthrough_col("id", vec![inferred("t", "id")])]
+            vec![synthetic_col("id", vec![inferred("t", "id")])]
         );
     }
 
@@ -1579,7 +1648,7 @@ mod tests {
         };
         assert_eq!(
             project.outputs,
-            vec![passthrough_col(
+            vec![synthetic_col(
                 "x",
                 vec![inferred("t", "a"), inferred("u", "b")]
             )]
@@ -1598,7 +1667,7 @@ mod tests {
         };
         assert_eq!(
             project.outputs,
-            vec![passthrough_col(
+            vec![synthetic_col(
                 "id",
                 vec![inferred("t", "id"), inferred("t", "id")]
             )]

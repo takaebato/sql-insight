@@ -92,8 +92,17 @@ pub(crate) struct BoundColumn {
 /// One pre-collapsed lineage source of a [`BoundColumn`]: the real base
 /// column read, paired with the composed kind of the path from it to the
 /// output column.
+///
+/// `synthetic_origin` marks a source reached *through* a synthetic step —
+/// a reference to a derived-table / CTE column, or to the query's own
+/// output alias — rather than a fresh physical reference to a base
+/// column. Such a source still carries the collapsed base column for
+/// lineage, but the physical read it stands for was already counted at
+/// the inner producer, so it is excluded from `reads` (which counts
+/// physical references, each with its own source span).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProvenanceSource {
     pub(crate) read: ColumnRead,
     pub(crate) kind: ColumnLineageKind,
+    pub(crate) synthetic_origin: bool,
 }
