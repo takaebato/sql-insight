@@ -862,6 +862,11 @@ mod differential {
             "SELECT a FROM x UNION SELECT b FROM y", // UNION Cataloged both branches
             "SELECT id FROM x JOIN y USING (id)",    // USING fan-in, both declare → Cataloged
             "SELECT a FROM x JOIN y USING (a)",      // USING fan-in narrows to x (y lacks a)
+            // Column-less INSERT pairs the source against the target's
+            // catalog schema (t = [a, b]); writes / lineage use those
+            // columns, truncated to the source's arity.
+            "INSERT INTO t SELECT x, y FROM s",
+            "INSERT INTO t SELECT x, y, z FROM s",
         ] {
             assert_parity(sql, Some(&catalog));
         }

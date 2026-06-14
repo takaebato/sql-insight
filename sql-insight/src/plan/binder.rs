@@ -282,10 +282,21 @@ impl Binder<'_> {
     fn bind_insert(&self, insert: &Insert) -> Option<Plan> {
         let (target, _alias) = TableReference::from_insert_with_alias(insert).ok()?;
         let target = self.canonical_target(target);
-        let target_columns = insert.columns.clone();
         let (input, source_scope) = match &insert.source {
             Some(source) => self.bind_query(source),
             None => (Plan::OpaqueLeaf, Scope::empty()),
+        };
+        // An explicit column list wins; otherwise pair the source against
+        // the target's catalog schema, up to the source's arity (so a
+        // column-less `INSERT INTO t SELECT a, b` writes / traces `t`'s
+        // first two columns). No catalog → no inferred columns.
+        let target_columns = if insert.columns.is_empty() {
+            self.catalog_columns(&target)
+                .into_iter()
+                .take(source_scope.outputs.len())
+                .collect()
+        } else {
+            insert.columns.clone()
         };
         // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: a conflict-time
         // mini-UPDATE on the target. Its reads / sub-plans fold onto the
@@ -1412,6 +1423,18 @@ impl Binder<'_> {
             alias: Some(Ident::new("EXCLUDED")),
             source,
         })
+    }
+
+    /// The target table's catalog column names (unquoted), for filling in
+    /// the target columns of a column-less `INSERT` — `INSERT INTO t SELECT
+    /// …` pairs the source positionally with `t`'s schema. Empty without a
+    /// unique catalog hit (column-less INSERT then writes / pairs nothing).
+    fn catalog_columns(&self, target: &TableReference) -> Vec<Ident> {
+        self.table_match(target)
+            .columns
+            .iter()
+            .map(|column| Ident::new(&column.value))
+            .collect()
     }
 
     /// A resolution scope holding just the write target (for `INSERT …
