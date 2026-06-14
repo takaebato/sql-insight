@@ -3,8 +3,8 @@
 //! differential harness below is the strangler safety net — every
 //! covered statement's surfaces must match the current resolver.
 
-use super::ir::{BoundColumn, Plan, ScanRole, Write};
-use crate::extractor::{ColumnLineageEdge, ColumnTarget};
+use super::ir::{BoundColumn, CtePlan, Plan, ScanRole, Write};
+use crate::extractor::{ColumnLineageEdge, ColumnTarget, TableLineageEdge};
 use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference};
 
 /// Every physical column read the bound plan expresses: each `Project`
@@ -152,6 +152,88 @@ pub(crate) fn extract_table_writes(plan: &Plan) -> Vec<TableReference> {
         // A statement-level `WITH … INSERT/UPDATE …` wraps the DML `Write`.
         Plan::With(with) => extract_table_writes(&with.body),
         _ => Vec::new(),
+    }
+}
+
+/// Table-level lineage: one `source → target` edge per real table that
+/// **feeds data** into the [`Write`] target, occurrence-based (a source
+/// used twice emits two edges). Feeding sources are the read-role scans on
+/// the value / data path of the source — FROM / JOIN relations, value
+/// (projection / SET) subqueries, and the bodies of referenced CTEs —
+/// **not** predicate (filter) subqueries, and never the write target
+/// itself (its scan is write-role). A bare query, or a `Write` that moves
+/// no data (`DELETE`), has no lineage; the caller gates on the statement
+/// kind, since a column-less INSERT and a DELETE are structurally alike.
+pub(crate) fn extract_table_lineage(plan: &Plan) -> Vec<TableLineageEdge> {
+    // Peel leading WITHs, keeping their CTE bodies so a `CteRef` on the
+    // feeding path can be resolved to the body's feeding scans.
+    let mut ctes: Vec<&CtePlan> = Vec::new();
+    let mut node = plan;
+    while let Plan::With(with) = node {
+        ctes.extend(with.ctes.iter());
+        node = &with.body;
+    }
+    let Plan::Write(write) = node else {
+        return Vec::new();
+    };
+    let mut sources = Vec::new();
+    feeding_scans(&write.input, &mut ctes, &mut sources);
+    sources
+        .into_iter()
+        .map(|source| TableLineageEdge {
+            source,
+            target: write.target.clone(),
+        })
+        .collect()
+}
+
+/// Collect the read-role scans that feed data up through `plan` (a value /
+/// data path): joins and filters pass their inputs through, a projection
+/// also pulls its value subqueries, but a filter's predicate subqueries do
+/// not feed. A `CteRef` resolves to the referenced CTE body's feeding
+/// scans (innermost declaration shadows).
+fn feeding_scans<'a>(plan: &'a Plan, ctes: &mut Vec<&'a CtePlan>, out: &mut Vec<TableRead>) {
+    match plan {
+        Plan::Scan(scan) => {
+            if scan.role == ScanRole::Read {
+                out.push(TableRead {
+                    reference: scan.table.clone(),
+                    resolution: scan.resolution,
+                });
+            }
+        }
+        Plan::OpaqueLeaf => {}
+        Plan::CteRef(cteref) => {
+            // A reference on the feeding path pulls the CTE body's sources.
+            if let Some(cte) = ctes.iter().rev().find(|c| c.name == cteref.name).copied() {
+                feeding_scans(&cte.plan, ctes, out);
+            }
+        }
+        Plan::PassThrough(pt) => {
+            // Inputs feed; predicate (filter) subqueries do not.
+            for input in &pt.inputs {
+                feeding_scans(input, ctes, out);
+            }
+        }
+        Plan::Project(project) => {
+            feeding_scans(&project.input, ctes, out);
+            // Value-position subqueries (scalar projection / SET RHS) feed.
+            for subquery in &project.subqueries {
+                feeding_scans(subquery, ctes, out);
+            }
+        }
+        Plan::SetOp(set) => {
+            for operand in &set.operands {
+                feeding_scans(operand, ctes, out);
+            }
+        }
+        Plan::Write(write) => feeding_scans(&write.input, ctes, out),
+        Plan::With(with) => {
+            let added = with.ctes.len();
+            ctes.extend(with.ctes.iter());
+            feeding_scans(&with.body, ctes, out);
+            ctes.truncate(ctes.len() - added);
+        }
     }
 }
 
@@ -578,6 +660,38 @@ mod differential {
     }
 
     #[test]
+    fn table_lineage_feeds_values_not_predicates() {
+        // At table granularity a source feeds the target iff it is on the
+        // value / data path: the FROM source and a value-position subquery
+        // feed; a predicate-position subquery does not (it's a read only).
+        let plan = bind_one(
+            "INSERT INTO target SELECT (SELECT max(v) FROM u) FROM source \
+             WHERE id IN (SELECT id FROM x)",
+            None,
+        );
+        let edges: Vec<(String, String)> = extract_table_lineage(&plan)
+            .iter()
+            .map(|e| {
+                (
+                    e.source.reference.name.value.clone(),
+                    e.target.name.value.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            set(&edges),
+            set(&[
+                ("source".to_string(), "target".to_string()),
+                ("u".to_string(), "target".to_string()),
+            ])
+        );
+        // `x` (predicate subquery) is excluded from lineage but is a read.
+        assert!(extract_table_reads(&plan)
+            .iter()
+            .any(|r| r.reference.name.value == "x"));
+    }
+
+    #[test]
     fn catalog_free_reads_match_resolver() {
         for sql in covered_corpus() {
             assert_parity(sql, None);
@@ -620,7 +734,7 @@ mod differential {
         }
     }
 
-    // ---- Table-level differential (reads + writes; lineage deferred) ----
+    // ---- Table-level differential ----
 
     fn table_plan_op(sql: &str, catalog: Option<&Catalog>) -> TableOperation {
         let dialect = GenericDialect {};
@@ -674,10 +788,29 @@ mod differential {
         kinds
     }
 
-    /// Table-level `statement_kind` + diagnostic kinds + `reads`
-    /// (path|resolution multiset) + `writes` (path multiset) must match the
-    /// resolver. `lineage` is excluded — it is a follow-up brick.
-    fn assert_table_reads_writes_parity(sql: &str, catalog: Option<&Catalog>) {
+    /// Lineage as a sorted multiset of `source|resolution → target` keys
+    /// (occurrence-based, order non-contractual).
+    fn table_lineage_bag(edges: &[TableLineageEdge]) -> Vec<String> {
+        let mut keys: Vec<String> = edges
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}|{:?}->{}",
+                    table_path(&e.source.reference),
+                    e.source.resolution,
+                    table_path(&e.target),
+                )
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Full table-level parity: `statement_kind` + diagnostic kinds +
+    /// `reads` (path|resolution multiset) + `writes` (path multiset) +
+    /// `lineage` (source|resolution → target multiset) must match the
+    /// resolver.
+    fn assert_table_parity(sql: &str, catalog: Option<&Catalog>) {
         let plan = table_plan_op(sql, catalog);
         let old = table_resolver_op(sql, catalog);
         assert_eq!(
@@ -699,35 +832,50 @@ mod differential {
             table_ref_bag(&old.writes),
             "table write-multiset mismatch for: {sql}"
         );
+        assert_eq!(
+            table_lineage_bag(&plan.lineage),
+            table_lineage_bag(&old.lineage),
+            "table lineage-multiset mismatch for: {sql}"
+        );
     }
 
-    /// Table-level cases not already in the column corpus: the
-    /// write-target role split (USING source is a read, the target isn't;
-    /// a no-FROM UPDATE has no reads), a no-column read (`SELECT 1 FROM t`),
-    /// and CTE transitivity feeding a write.
+    /// Table-level cases not already in the column corpus: the write-target
+    /// role split (USING source is a read, the target isn't; a no-FROM
+    /// UPDATE has no reads / lineage), a no-column read (`SELECT 1 FROM t`),
+    /// and lineage feeding rules — value (projection) subqueries feed while
+    /// predicate subqueries don't, joins feed every side, a self FROM feeds
+    /// `t → t`, CTE transitivity feeds the inner real table, and an
+    /// unreferenced CTE / a DELETE feed nothing.
     fn table_only_corpus() -> &'static [&'static str] {
         &[
             "DELETE FROM t USING s WHERE t.id = s.id",
             "UPDATE t SET c = 1",
             "SELECT 1 FROM t",
             "WITH c AS (SELECT a FROM s) INSERT INTO t SELECT a FROM c",
+            "WITH c AS (SELECT a FROM s) INSERT INTO t SELECT 1",
+            "INSERT INTO t SELECT a FROM s1 JOIN s2 ON s1.id = s2.id",
+            "INSERT INTO target SELECT x FROM source WHERE id IN (SELECT id FROM x)",
+            "INSERT INTO t SELECT (SELECT max(v) FROM u) FROM s",
+            "INSERT INTO t SELECT t.a FROM t",
+            "UPDATE t SET c = (SELECT v FROM u WHERE u.id = t.id)",
+            "CREATE TABLE dst AS SELECT a FROM s1 UNION SELECT b FROM s2",
         ]
     }
 
     #[test]
-    fn catalog_free_table_reads_writes_match_resolver() {
+    fn catalog_free_table_match_resolver() {
         for sql in covered_corpus()
             .iter()
             .chain(reads_writes_only_corpus())
             .chain(reads_only_corpus())
             .chain(table_only_corpus())
         {
-            assert_table_reads_writes_parity(sql, None);
+            assert_table_parity(sql, None);
         }
     }
 
     #[test]
-    fn catalog_aware_table_reads_match_resolver() {
+    fn catalog_aware_table_match_resolver() {
         // `public.x` / `public.y` are registered; `dup` is registered in
         // two schemas (→ Ambiguous); `missing` is unregistered (→ Inferred).
         let catalog: Catalog = [
@@ -743,10 +891,10 @@ mod differential {
             "SELECT a FROM x JOIN y ON x.id = y.id", // both Cataloged
             "SELECT a FROM missing",                 // Inferred (no hit)
             "SELECT a FROM dup",                     // Ambiguous (two hits)
-            "INSERT INTO x SELECT a FROM y",         // read y Cataloged, write x
+            "INSERT INTO x SELECT a FROM y",         // y Cataloged feeds x
             "SELECT 1 FROM x",                       // no-column read, Cataloged
         ] {
-            assert_table_reads_writes_parity(sql, Some(&catalog));
+            assert_table_parity(sql, Some(&catalog));
         }
     }
 }
