@@ -415,6 +415,18 @@ mod differential {
             // Unsupported statement: empty surfaces + an UnsupportedStatement
             // diagnostic, matching the resolver-based extractor.
             "CREATE INDEX idx ON t (a)",
+            // Wildcards: left unexpanded, one WildcardSuppressed diagnostic
+            // each (nested ones included). (A wildcard *before* a named
+            // column would shift that column's QueryOutput position — a
+            // separate refinement — so the corpus keeps wildcards last.)
+            "SELECT * FROM t",
+            "SELECT a, * FROM t",
+            "SELECT *, * FROM t",
+            // Nested wildcard (in a CTE body) is reported too. (Referencing
+            // a column *out of* a wildcard relation — where the relation
+            // should act open rather than empty — is a separate refinement,
+            // so this case doesn't read through `c`.)
+            "WITH c AS (SELECT * FROM t) SELECT 1 FROM c",
         ]
     }
 

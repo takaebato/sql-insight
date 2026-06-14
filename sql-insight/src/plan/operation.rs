@@ -26,16 +26,16 @@ pub(crate) fn column_operation(
     if statement_kind == StatementKind::Unsupported {
         return unsupported(statement_kind, statement);
     }
-    match super::binder::build(statement, catalog, casing) {
+    let (plan, diagnostics) = super::binder::build_with_diagnostics(statement, catalog, casing);
+    match plan {
         Some(plan) => ColumnOperation {
             statement_kind,
             reads: super::extract::extract_reads(&plan),
             writes: super::extract::extract_writes(&plan),
             lineage: super::extract::extract_lineage(&plan),
-            // Diagnostics so far: only the unsupported case above.
-            // WildcardSuppressed joins once the binder tracks suppressed
-            // wildcards (a later brick).
-            diagnostics: Vec::new(),
+            // The bind accumulates WildcardSuppressed for each suppressed
+            // projection wildcard (nested ones included).
+            diagnostics,
         },
         // Classified as supported but unbindable — treat as unsupported.
         None => unsupported(statement_kind, statement),

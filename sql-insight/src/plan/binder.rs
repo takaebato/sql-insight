@@ -19,8 +19,11 @@ use sqlparser::ast::{
     TableWithJoins, Update, UpdateTableFromKind,
 };
 
+use std::cell::RefCell;
+
 use super::ir::{BoundColumn, PassThrough, Plan, Project, ProvenanceSource, Scan, SetOp, Write};
 use crate::catalog::{Catalog, CatalogTable};
+use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::extractor::ColumnLineageKind;
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
 use crate::resolver::{CaseFold, IdentifierCasing};
@@ -34,13 +37,28 @@ pub(crate) fn build(
     catalog: Option<&Catalog>,
     casing: IdentifierCasing,
 ) -> Option<Plan> {
+    build_with_diagnostics(statement, catalog, casing).0
+}
+
+/// Like [`build`], but also returns the column-level diagnostics the bind
+/// accumulated (currently `WildcardSuppressed` for each suppressed
+/// projection wildcard). The diagnostics buffer is shared across child
+/// binders (CTE bodies, subqueries), so nested wildcards are reported too.
+pub(crate) fn build_with_diagnostics(
+    statement: &Statement,
+    catalog: Option<&Catalog>,
+    casing: IdentifierCasing,
+) -> (Option<Plan>, Vec<ColumnLevelDiagnostic>) {
+    let diagnostics = RefCell::new(Vec::new());
     let binder = Binder {
         catalog,
         casing,
         ctes: Vec::new(),
         outer_scopes: Vec::new(),
+        diagnostics: &diagnostics,
     };
-    binder.bind_statement(statement)
+    let plan = binder.bind_statement(statement);
+    (plan, diagnostics.into_inner())
 }
 
 /// Bind-time resolution scope: the relations visible at a point in the
@@ -174,6 +192,9 @@ struct Binder<'a> {
     casing: IdentifierCasing,
     ctes: Vec<CteRelation>,
     outer_scopes: Vec<Vec<Relation>>,
+    /// Column-level diagnostics accumulated during the bind, shared across
+    /// child binders (CTE bodies / subqueries) so nested ones surface too.
+    diagnostics: &'a RefCell<Vec<ColumnLevelDiagnostic>>,
 }
 
 impl Binder<'_> {
@@ -490,6 +511,7 @@ impl Binder<'_> {
             casing: self.casing,
             ctes,
             outer_scopes,
+            diagnostics: self.diagnostics,
         }
     }
 
@@ -749,10 +771,27 @@ impl Binder<'_> {
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.clone())),
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return None,
+            // A wildcard isn't expanded (the rigor cost is too high for a
+            // SQL-text-only library); record it so consumers know this
+            // projection's column lineage is incomplete, and skip it.
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                self.record_wildcard_suppressed();
+                return None;
+            }
         };
         let name = alias.or_else(|| inferred_output_name(expr));
         Some(self.bind_value_column(name, expr, scope))
+    }
+
+    /// Record a `WildcardSuppressed` diagnostic for a projection wildcard
+    /// (`*` / `t.*`) left unexpanded.
+    fn record_wildcard_suppressed(&self) {
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::WildcardSuppressed,
+            message: "wildcard left unexpanded — column lineage is incomplete for this projection"
+                .to_string(),
+            span: None,
+        });
     }
 
     /// Bind a value-producing expression (a projection item or a SET /
