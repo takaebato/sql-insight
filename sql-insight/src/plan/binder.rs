@@ -17,8 +17,8 @@ use sqlparser::ast::{
     FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments,
     GroupByExpr, GroupByWithModifier, Ident, Insert, Join, JoinConstraint, JoinOperator,
     LimitClause, ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind, NamedWindowExpr,
-    ObjectName, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, Query, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript, TableAlias,
+    ObjectName, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator, Query,
+    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript, TableAlias,
     TableFactor, TableWithJoins, TopQuantity, Update, UpdateTableFromKind, Values,
     WindowFrameBound, WindowSpec, WindowType,
 };
@@ -756,7 +756,89 @@ impl Binder<'_> {
             reads.extend(r);
             subqueries.extend(s);
         }
+        // Pipe operators (`|> WHERE …`, `|> SELECT …`, …) transform the
+        // body; their column references surface as reads (their output
+        // rewriting / lineage is a later refinement).
+        if !query.pipe_operators.is_empty() {
+            let mut c = ExprCollector::filter();
+            for op in &query.pipe_operators {
+                self.collect_pipe_operator(op, &clause_scope, &mut c);
+            }
+            reads.extend(c.filter_reads);
+            subqueries.extend(c.subplans);
+        }
         (wrap_reads(body, reads, subqueries), scope)
+    }
+
+    /// Collect a pipe operator's column references as reads (the `|> …`
+    /// pipeline syntax). Output-rewriting operators (`SELECT` / `EXTEND` /
+    /// `AGGREGATE` / `SET`) are read for their expressions only — modelling
+    /// how they reshape the query output (and its lineage) is a later
+    /// refinement. The match is exhaustive so new pipe operators are
+    /// reviewed here.
+    fn collect_pipe_operator(&self, op: &PipeOperator, scope: &Scope, c: &mut ExprCollector) {
+        match op {
+            PipeOperator::Limit { expr, offset } => {
+                self.collect_expr(expr, scope, c);
+                if let Some(offset) = offset {
+                    self.collect_expr(offset, scope, c);
+                }
+            }
+            PipeOperator::Where { expr } => self.collect_expr(expr, scope, c),
+            PipeOperator::OrderBy { exprs } => {
+                for order_by in exprs {
+                    self.collect_order_by_expr(order_by, scope, c);
+                }
+            }
+            PipeOperator::Select { exprs } | PipeOperator::Extend { exprs } => {
+                for item in exprs {
+                    if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } =
+                        item
+                    {
+                        self.collect_expr(expr, scope, c);
+                    }
+                }
+            }
+            PipeOperator::Set { assignments } => {
+                for assignment in assignments {
+                    self.collect_expr(&assignment.value, scope, c);
+                }
+            }
+            PipeOperator::Aggregate {
+                full_table_exprs,
+                group_by_expr,
+            } => {
+                for expr in full_table_exprs.iter().chain(group_by_expr) {
+                    self.collect_expr(&expr.expr.expr, scope, c);
+                }
+            }
+            PipeOperator::Call { function, .. } => self.collect_function(function, scope, c),
+            PipeOperator::Pivot {
+                aggregate_functions,
+                value_source,
+                ..
+            } => {
+                for expr in aggregate_functions {
+                    self.collect_expr(&expr.expr, scope, c);
+                }
+                self.collect_pivot_value_source(value_source, scope, c);
+            }
+            PipeOperator::Union { queries, .. }
+            | PipeOperator::Intersect { queries, .. }
+            | PipeOperator::Except { queries, .. } => {
+                for query in queries {
+                    self.collect_subquery(query, scope, c);
+                }
+            }
+            // No inspectable column expressions (or a later refinement):
+            // a sampling clause, a re-introduced join / rename / drop.
+            PipeOperator::Join(_)
+            | PipeOperator::TableSample { .. }
+            | PipeOperator::Drop { .. }
+            | PipeOperator::As { .. }
+            | PipeOperator::Rename { .. }
+            | PipeOperator::Unpivot { .. } => {}
+        }
     }
 
     /// Filter-position reads from a `LIMIT` / `OFFSET` / `LIMIT BY` clause

@@ -754,16 +754,25 @@ mod differential {
         ]
     }
 
-    /// Statements whose `reads` match but whose `writes` *and* `lineage`
+    /// Statements whose `reads` match but whose `writes` and / or `lineage`
     /// intentionally differ. A MERGE `WHEN MATCHED UPDATE SET t.col = …`
     /// writes through the target's *alias*: the resolver surfaces the
     /// write / lineage target as the alias-qualified `t.col`, while B
-    /// canonicalizes it to the real `target.col` (consistent with every
-    /// other write target). Reads are unaffected.
+    /// canonicalizes it to the real `target.col`. Pipe operators (`|> …`)
+    /// reshape the query output, so B reads their expressions but doesn't
+    /// model their output rewriting (lineage); reads are unaffected.
     fn reads_only_corpus() -> &'static [&'static str] {
-        &["MERGE INTO target t USING source s ON t.id = s.id \
-           WHEN MATCHED THEN UPDATE SET t.v = s.v \
-           WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"]
+        &[
+            "MERGE INTO target t USING source s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.v = s.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+            "FROM t |> WHERE t.a > 1 |> SELECT t.b",
+            "FROM t |> AGGREGATE SUM(t.a) GROUP BY t.b",
+            "FROM t |> EXTEND t.a + 1 AS x",
+            "FROM t |> SET a = t.a + 1",
+            "FROM t |> CALL my_func(t.a)",
+            "FROM t |> SELECT t.a |> ORDER BY t.a |> LIMIT 1",
+        ]
     }
 
     #[test]
