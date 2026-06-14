@@ -585,6 +585,16 @@ mod differential {
             "SELECT * FROM t UNPIVOT(v FOR n IN (t.a, t.b))",
             "SELECT t1.a FROM (t1 JOIN t2 ON t1.id = t2.id)",
             "SELECT f.value FROM t, LATERAL FLATTEN(input => t.arr) AS f",
+            // Auxiliary SELECT clauses — all filter-position reads against
+            // the FROM scope (DISTINCT ON keys, TOP, PREWHERE, SORT BY,
+            // named WINDOW, CONNECT BY / START WITH, Hive LATERAL VIEW).
+            "SELECT DISTINCT ON (t.a) t.b FROM t",
+            "SELECT TOP (t.a + 1) t.b FROM t",
+            "SELECT t.a FROM t PREWHERE t.b = 1",
+            "SELECT t.a FROM t SORT BY t.b",
+            "SELECT t.a FROM t WINDOW w AS (PARTITION BY t.b)",
+            "SELECT t.a FROM t START WITH t.b = 1 CONNECT BY PRIOR t.c = t.d",
+            "SELECT t.a FROM t LATERAL VIEW EXPLODE(t.arr) v AS x",
             // GROUP BY / HAVING / ORDER BY (clause-phase, alias visibility).
             "SELECT a, COUNT(*) FROM t GROUP BY a",
             "SELECT a FROM t GROUP BY a HAVING SUM(b) > 0",
@@ -881,6 +891,17 @@ mod differential {
         assert_parity_d(
             "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b)",
             &MySqlDialect {},
+            None,
+        );
+    }
+
+    #[test]
+    fn qualified_wildcard_expr_matches_resolver() {
+        // Snowflake `(expr).*`: the wildcard is suppressed but its base
+        // expression still reads `t.a`.
+        assert_parity_d(
+            "SELECT (t.a).* FROM t",
+            &sqlparser::dialect::SnowflakeDialect {},
             None,
         );
     }

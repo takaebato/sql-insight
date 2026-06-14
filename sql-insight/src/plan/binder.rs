@@ -12,13 +12,14 @@
 //! coexist; the differential harness pins them together).
 
 use sqlparser::ast::{
-    AccessExpr, AlterTable, AlterTableOperation, Array, AssignmentTarget, CreateTable, CreateView,
-    Cte, Delete, DictionaryField, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
-    GroupByWithModifier, Ident, Insert, Join, JoinConstraint, JoinOperator, ListAggOnOverflow, Map,
-    Merge, MergeAction, MergeInsertKind, ObjectName, OnConflictAction, OnInsert, OrderBy,
-    OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Subscript, TableAlias,
-    TableFactor, TableWithJoins, Update, UpdateTableFromKind, Values, WindowFrameBound, WindowSpec,
+    AccessExpr, AlterTable, AlterTableOperation, Array, AssignmentTarget, ConnectByKind,
+    CreateTable, CreateView, Cte, Delete, DictionaryField, Distinct, Expr, FromTable, Function,
+    FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments,
+    GroupByExpr, GroupByWithModifier, Ident, Insert, Join, JoinConstraint, JoinOperator,
+    ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName,
+    OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript, TableAlias, TableFactor,
+    TableWithJoins, TopQuantity, Update, UpdateTableFromKind, Values, WindowFrameBound, WindowSpec,
     WindowType,
 };
 
@@ -788,22 +789,69 @@ impl Binder<'_> {
         )
     }
 
+    /// Filter-position reads from a SELECT's auxiliary clauses, resolved
+    /// against the FROM scope: `DISTINCT ON` keys, `TOP n`, Hive `LATERAL
+    /// VIEW` generators, `PREWHERE`, `QUALIFY`, `CONNECT BY` / `START WITH`,
+    /// `CLUSTER BY` / `DISTRIBUTE BY`, and named `WINDOW` specs. None feed
+    /// values — they are all reads, never lineage sources.
+    fn select_clause_reads(&self, select: &Select, scope: &Scope) -> (Vec<ColumnRead>, Vec<Plan>) {
+        let mut c = ExprCollector::filter();
+        if let Some(Distinct::On(exprs)) = &select.distinct {
+            for expr in exprs {
+                self.collect_expr(expr, scope, &mut c);
+            }
+        }
+        if let Some(top) = &select.top {
+            if let Some(TopQuantity::Expr(expr)) = &top.quantity {
+                self.collect_expr(expr, scope, &mut c);
+            }
+        }
+        for lateral_view in &select.lateral_views {
+            self.collect_expr(&lateral_view.lateral_view, scope, &mut c);
+        }
+        if let Some(expr) = &select.prewhere {
+            self.collect_expr(expr, scope, &mut c);
+        }
+        if let Some(expr) = &select.qualify {
+            self.collect_expr(expr, scope, &mut c);
+        }
+        for connect_by in &select.connect_by {
+            match connect_by {
+                ConnectByKind::ConnectBy { relationships, .. } => {
+                    for expr in relationships {
+                        self.collect_expr(expr, scope, &mut c);
+                    }
+                }
+                ConnectByKind::StartWith { condition, .. } => {
+                    self.collect_expr(condition, scope, &mut c)
+                }
+            }
+        }
+        for expr in select.cluster_by.iter().chain(&select.distribute_by) {
+            self.collect_expr(expr, scope, &mut c);
+        }
+        for window in &select.named_window {
+            if let NamedWindowExpr::WindowSpec(spec) = &window.1 {
+                self.collect_window_spec(spec, scope, &mut c);
+            }
+        }
+        (c.filter_reads, c.subplans)
+    }
+
     fn bind_select(&self, select: &Select) -> (Plan, Scope) {
         let (from, from_scope) = self.bind_from(&select.from);
-        // WHERE wraps the FROM in a PassThrough: its reads resolve
-        // against the FROM scope only (Project is above, so no aliases
-        // are visible — the clause-phase rule, structurally).
-        let input = match &select.selection {
-            Some(predicate) => {
-                let (reads, subqueries) = self.expr_reads(predicate, &from_scope);
-                Plan::PassThrough(PassThrough {
-                    inputs: vec![from],
-                    reads,
-                    subqueries,
-                })
-            }
-            None => from,
-        };
+        // The WHERE-family clauses wrap the FROM in a filter PassThrough:
+        // they resolve against the FROM scope only (Project is above, so no
+        // output aliases are visible — the clause-phase rule, structurally).
+        let (mut reads, mut subqueries) = select
+            .selection
+            .as_ref()
+            .map(|predicate| self.expr_reads(predicate, &from_scope))
+            .unwrap_or_default();
+        let (clause_reads, clause_subqueries) = self.select_clause_reads(select, &from_scope);
+        reads.extend(clause_reads);
+        subqueries.extend(clause_subqueries);
+        let input = wrap_reads(from, reads, subqueries);
         // PassThrough is identity, so the projection resolves against the
         // FROM scope either way. A projection scalar subquery's sub-plan is
         // kept on the Project (walked for its tables / reads); its output
@@ -815,13 +863,10 @@ impl Binder<'_> {
         // them as filter reads on a PassThrough below the Project.
         let mut projection_filter_reads = Vec::new();
         for item in &select.projection {
-            if let Some((column, subqueries, filter_reads)) =
-                self.bind_output_column(item, &from_scope)
-            {
-                outputs.push(column);
-                projection_subqueries.extend(subqueries);
-                projection_filter_reads.extend(filter_reads);
-            }
+            let (column, subqueries, filter_reads) = self.bind_output_column(item, &from_scope);
+            outputs.extend(column);
+            projection_subqueries.extend(subqueries);
+            projection_filter_reads.extend(filter_reads);
         }
         let project = Plan::Project(Project {
             input: Box::new(wrap_reads(input, projection_filter_reads, Vec::new())),
@@ -1207,24 +1252,46 @@ impl Binder<'_> {
     /// column plus the filter-only reads it contributes (a projection
     /// subquery's internal predicates — reads but not lineage sources).
     /// Wildcards are skipped (`None`).
+    /// Bind one projection item: an optional output column (`None` for a
+    /// wildcard, which isn't expanded) plus the sub-plans and filter reads
+    /// it contributes. A `(expr).*` qualified wildcard still reads its base
+    /// expression even though the produced columns are suppressed.
     fn bind_output_column(
         &self,
         item: &SelectItem,
         scope: &Scope,
-    ) -> Option<(BoundColumn, Vec<Plan>, Vec<ColumnRead>)> {
+    ) -> (Option<BoundColumn>, Vec<Plan>, Vec<ColumnRead>) {
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.clone())),
             // A wildcard isn't expanded (the rigor cost is too high for a
             // SQL-text-only library); record it so consumers know this
             // projection's column lineage is incomplete, and skip it.
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+            SelectItem::Wildcard(_) => {
                 self.record_wildcard_suppressed();
-                return None;
+                return (None, Vec::new(), Vec::new());
+            }
+            SelectItem::QualifiedWildcard(kind, _) => {
+                self.record_wildcard_suppressed();
+                // `(expr).*` (Snowflake) still projects its base expression
+                // as one output — a structural field access, so the value
+                // flows as a `Transformation` even though the produced
+                // columns aren't enumerated. `alias.*` (an ObjectName) has
+                // no inspectable base expression.
+                if let SelectItemQualifiedWildcardKind::Expr(expr) = kind {
+                    let (mut column, subplans, filter_reads) =
+                        self.bind_value_column(None, expr, scope);
+                    for source in &mut column.provenance {
+                        source.kind = ColumnLineageKind::Transformation;
+                    }
+                    return (Some(column), subplans, filter_reads);
+                }
+                return (None, Vec::new(), Vec::new());
             }
         };
         let name = alias.or_else(|| inferred_output_name(expr));
-        Some(self.bind_value_column(name, expr, scope))
+        let (column, subplans, filter_reads) = self.bind_value_column(name, expr, scope);
+        (Some(column), subplans, filter_reads)
     }
 
     /// Record a `WildcardSuppressed` diagnostic for a projection wildcard
@@ -1254,10 +1321,7 @@ impl Binder<'_> {
             .iter()
             // Sub-plans / filter reads of a RETURNING expression (rare —
             // a subquery or CASE in RETURNING) aren't modelled yet.
-            .filter_map(|item| {
-                self.bind_output_column(item, scope)
-                    .map(|(column, _, _)| column)
-            })
+            .filter_map(|item| self.bind_output_column(item, scope).0)
             .collect()
     }
 
