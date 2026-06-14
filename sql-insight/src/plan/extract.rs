@@ -679,7 +679,15 @@ mod differential {
             "UPDATE t SET a.b.c.d.e = 1",
             "DELETE FROM t WHERE d > 0",
             "CREATE TABLE dst AS SELECT a, b FROM src",
+            // Plain (non-CTAS) CREATE TABLE: the column defs aren't writes.
+            "CREATE TABLE t1 (a INT, b INT)",
             "CREATE VIEW v AS SELECT a, b FROM src WHERE c > 0",
+            // ALTER VIEW is treated like CREATE VIEW.
+            "ALTER VIEW v AS SELECT x AS a FROM s",
+            // LIMIT subquery is a filter read; a trailing ORDER BY over a
+            // set operation can't see the branch aliases (unresolved).
+            "SELECT a FROM t1 LIMIT (SELECT n FROM cfg)",
+            "SELECT a FROM t1 UNION SELECT b FROM t2 ORDER BY a",
             // Statement-level WITH over DML: sqlparser nests the INSERT as
             // the WITH-query's body, so writes / lineage must peel the With.
             "WITH c AS (SELECT a FROM s) INSERT INTO t (col) SELECT a FROM c",

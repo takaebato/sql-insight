@@ -16,11 +16,11 @@ use sqlparser::ast::{
     CreateTable, CreateView, Cte, Delete, DictionaryField, Distinct, Expr, FromTable, Function,
     FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments,
     GroupByExpr, GroupByWithModifier, Ident, Insert, Join, JoinConstraint, JoinOperator,
-    ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName,
-    OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript, TableAlias, TableFactor,
-    TableWithJoins, TopQuantity, Update, UpdateTableFromKind, Values, WindowFrameBound, WindowSpec,
-    WindowType,
+    LimitClause, ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind, NamedWindowExpr,
+    ObjectName, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, Query, Select,
+    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript, TableAlias,
+    TableFactor, TableWithJoins, TopQuantity, Update, UpdateTableFromKind, Values,
+    WindowFrameBound, WindowSpec, WindowType,
 };
 
 use std::cell::RefCell;
@@ -269,6 +269,12 @@ impl Binder<'_> {
             Statement::Merge(merge) => self.bind_merge(merge),
             Statement::CreateTable(create) => self.bind_create_table(create),
             Statement::CreateView(create) => self.bind_create_view(create),
+            Statement::AlterView {
+                name,
+                columns,
+                query,
+                ..
+            } => self.bind_alter_view(name, columns, query),
             Statement::AlterTable(alter) => self.bind_alter_table(alter),
             // Other DDL / session statements aren't data operations — not
             // bound (the wildcard mirrors `build`'s "unsupported → None").
@@ -534,12 +540,21 @@ impl Binder<'_> {
 
     /// `CREATE TABLE dst AS <query>` (CTAS): the source query's reads,
     /// paired with the new table's columns (explicit defs win, else the
-    /// source output names). A non-CTAS `CREATE TABLE` (no query) isn't a
-    /// data operation — not bound.
+    /// source output names). A plain `CREATE TABLE t (cols)` (no query) is a
+    /// write target with no columns / reads / lineage — its column
+    /// definitions aren't writes — so it binds to a target-only `Write`.
     fn bind_create_table(&self, create: &CreateTable) -> Option<Plan> {
-        let query = create.query.as_ref()?;
-        let (input, scope) = self.bind_query(query);
         let target = self.canonical_target(TableReference::try_from(&create.name).ok()?);
+        let Some(query) = create.query.as_ref() else {
+            return Some(Plan::Write(Write {
+                target,
+                target_columns: Vec::new(),
+                input: Box::new(Plan::OpaqueLeaf),
+                returning: Vec::new(),
+                conflict_updates: Vec::new(),
+            }));
+        };
+        let (input, scope) = self.bind_query(query);
         let target_columns = if create.columns.is_empty() {
             output_names(&scope.outputs)
         } else {
@@ -563,6 +578,26 @@ impl Binder<'_> {
             output_names(&scope.outputs)
         } else {
             create.columns.iter().map(|c| c.name.clone()).collect()
+        };
+        Some(Plan::Write(Write {
+            target,
+            target_columns,
+            input: Box::new(input),
+            returning: Vec::new(),
+            conflict_updates: Vec::new(),
+        }))
+    }
+
+    /// `ALTER VIEW v AS <query>`: treated like CREATE VIEW — the
+    /// replacement query's reads paired with the view's columns (explicit
+    /// list wins, else the source output names).
+    fn bind_alter_view(&self, name: &ObjectName, columns: &[Ident], query: &Query) -> Option<Plan> {
+        let (input, scope) = self.bind_query(query);
+        let target = self.canonical_target(TableReference::try_from(name).ok()?);
+        let target_columns = if columns.is_empty() {
+            output_names(&scope.outputs)
+        } else {
+            columns.to_vec()
         };
         Some(Plan::Write(Write {
             target,
@@ -696,20 +731,57 @@ impl Binder<'_> {
         self.child(self.ctes.clone(), outer_scopes)
     }
 
-    /// Bind a query's body and trailing ORDER BY (the WITH clause is
-    /// already in scope via `self.ctes`).
+    /// Bind a query's body and its trailing ORDER BY / LIMIT (the WITH
+    /// clause is already in scope via `self.ctes`).
     fn bind_query_body(&self, query: &Query) -> (Plan, Scope) {
         let (body, scope) = self.bind_set_expr(&query.body);
         // A trailing ORDER BY sits above the body and sees its output
-        // aliases (resolved against the body's output scope).
-        let plan = match &query.order_by {
-            Some(order_by) => {
-                let (reads, subqueries) = self.order_by_reads(order_by, &scope);
-                wrap_reads(body, reads, subqueries)
-            }
-            None => body,
+        // aliases — but only for a single SELECT. Over a set operation
+        // there's no single relation to resolve against, so a reference is
+        // unresolved (an empty scope makes that fall out).
+        let clause_scope = match &body {
+            Plan::SetOp(_) => Scope::empty(),
+            _ => scope.clone(),
         };
-        (plan, scope)
+        let mut reads = Vec::new();
+        let mut subqueries = Vec::new();
+        if let Some(order_by) = &query.order_by {
+            let (r, s) = self.order_by_reads(order_by, &clause_scope);
+            reads.extend(r);
+            subqueries.extend(s);
+        }
+        // LIMIT / OFFSET / LIMIT BY are row-count bounds — filter reads.
+        if let Some(limit) = &query.limit_clause {
+            let (r, s) = self.limit_reads(limit, &clause_scope);
+            reads.extend(r);
+            subqueries.extend(s);
+        }
+        (wrap_reads(body, reads, subqueries), scope)
+    }
+
+    /// Filter-position reads from a `LIMIT` / `OFFSET` / `LIMIT BY` clause
+    /// (row-count bounds — never value sources).
+    fn limit_reads(&self, limit: &LimitClause, scope: &Scope) -> (Vec<ColumnRead>, Vec<Plan>) {
+        let mut c = ExprCollector::filter();
+        match limit {
+            LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            } => {
+                for expr in limit.iter().chain(limit_by) {
+                    self.collect_expr(expr, scope, &mut c);
+                }
+                if let Some(offset) = offset {
+                    self.collect_expr(&offset.value, scope, &mut c);
+                }
+            }
+            LimitClause::OffsetCommaLimit { offset, limit } => {
+                self.collect_expr(offset, scope, &mut c);
+                self.collect_expr(limit, scope, &mut c);
+            }
+        }
+        (c.filter_reads, c.subplans)
     }
 
     /// Bind a query body's set expression: a leaf `SELECT`, a
