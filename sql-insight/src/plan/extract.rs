@@ -559,6 +559,15 @@ mod differential {
             "SELECT a FROM x JOIN y ON x.id = y.id",
             "SELECT a FROM x JOIN y ON x.id = y.id WHERE x.c > 0",
             "SELECT p.a FROM p, q WHERE p.id = q.id",
+            // Multi-segment qualifier matching is right-anchored: an omitted
+            // segment wildcards, a contradicting schema or a schema with no
+            // candidate is unresolved, an explicit schema disambiguates, and
+            // a 5-part qualifier overshoots the catalog.schema.name depth.
+            "SELECT users.id FROM mydb.users",
+            "SELECT otherdb.users.id FROM mydb.users",
+            "SELECT s1.users.id FROM s1.users, s2.users",
+            "SELECT s3.users.id FROM s1.users, s2.users",
+            "SELECT extra.c1.s1.t1.a FROM c1.s1.t1",
             // Expression-arm coverage: every sub-expression's column refs
             // surface as reads; the value / filter split (CASE conditions,
             // window PARTITION / ORDER keys, aggregate FILTER) keeps
@@ -665,6 +674,9 @@ mod differential {
             "INSERT INTO target (a, b) VALUES (1, 2)",
             "UPDATE t SET c = a + b WHERE d > 0",
             "UPDATE t SET c = a + b FROM s WHERE t.id = s.id",
+            // A tuple SET target and a > 4-segment target are skipped.
+            "UPDATE t SET (a, b) = (1, 2)",
+            "UPDATE t SET a.b.c.d.e = 1",
             "DELETE FROM t WHERE d > 0",
             "CREATE TABLE dst AS SELECT a, b FROM src",
             "CREATE VIEW v AS SELECT a, b FROM src WHERE c > 0",
@@ -898,6 +910,15 @@ mod differential {
             &MySqlDialect {},
             None,
         );
+    }
+
+    #[test]
+    fn dialect_casing_qualified_table_ref_matches_resolver() {
+        use sqlparser::dialect::{BigQueryDialect, MySqlDialect};
+        // BigQuery / MySQL real table names are case-sensitive, so the
+        // qualifier `T1` doesn't match the binding `t1` → unresolved.
+        assert_parity_d("SELECT T1.id FROM t1", &BigQueryDialect {}, None);
+        assert_parity_d("SELECT T1.id FROM t1", &MySqlDialect {}, None);
     }
 
     #[test]

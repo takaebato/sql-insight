@@ -2005,14 +2005,17 @@ impl Binder<'_> {
                 .filter_map(|rel| self.unqualified_candidate(rel, column))
                 .collect()
         } else {
-            let qualifier = &parts[parts.len() - 2];
+            // The qualifier is every segment but the column. Decode it into
+            // a `TableReference` for right-anchored matching; `None` when it
+            // overshoots `catalog.schema.name` depth (a 5+-part ref), which
+            // no real table can match.
+            let qualifier_parts = &parts[..parts.len() - 1];
+            let qualifier_ref = TableReference::try_from_parts(qualifier_parts);
             relations
                 .iter()
-                .filter(|rel| {
-                    rel.exposed_name()
-                        .is_some_and(|n| self.ident_eq(n, qualifier))
+                .filter_map(|rel| {
+                    self.qualified_candidate(rel, qualifier_parts, qualifier_ref.as_ref(), column)
                 })
-                .filter_map(|rel| self.qualified_candidate(rel, column))
                 .collect()
         };
         (!candidates.is_empty()).then(|| self.pick(candidates, column))
@@ -2094,12 +2097,34 @@ impl Binder<'_> {
         }
     }
 
-    /// A candidate for a qualified ref whose qualifier already matched
-    /// `rel`. Differs from the unqualified case only for a `Known` table
-    /// that doesn't list the column: the qualifier pins the relation, so
-    /// it still resolves (`Inferred`) rather than dropping out. A derived
-    /// relation that doesn't expose the column contributes nothing.
-    fn qualified_candidate(&self, rel: &Relation, column: &Ident) -> Option<Candidate> {
+    /// A candidate owner of a qualified reference. The qualifier matches a
+    /// **non-aliased real table** by right-anchored path
+    /// (`catalog.schema.name`, omitted segments wildcard, table casing) and
+    /// anything with a single exposed name (an aliased table / derived /
+    /// CTE / table function) by a single-segment alias match (table-alias
+    /// casing). A qualifier that overshoots the path depth (a 5+-part ref,
+    /// `qualifier_ref` is `None`) matches no real table. When the qualifier
+    /// pins a `Known` table that doesn't list the column it still resolves
+    /// (`Inferred`); a derived relation that doesn't expose it contributes
+    /// nothing.
+    fn qualified_candidate(
+        &self,
+        rel: &Relation,
+        qualifier_parts: &[Ident],
+        qualifier_ref: Option<&TableReference>,
+        column: &Ident,
+    ) -> Option<Candidate> {
+        let qualifier_ok = match &rel.source {
+            RelationSource::Table { table, .. } if rel.alias.is_none() => {
+                qualifier_ref.is_some_and(|q| self.qualifier_matches_table(q, table))
+            }
+            _ => rel
+                .exposed_name()
+                .is_some_and(|name| matches!(qualifier_parts, [only] if self.ident_eq(only, name))),
+        };
+        if !qualifier_ok {
+            return None;
+        }
         match &rel.source {
             RelationSource::Table {
                 table,
@@ -2237,6 +2262,23 @@ impl Binder<'_> {
 
     fn ident_eq(&self, a: &Ident, b: &Ident) -> bool {
         self.casing.table_alias.normalize(a) == self.casing.table_alias.normalize(b)
+    }
+
+    /// Right-anchored match of a decoded qualifier against a real table's
+    /// `catalog.schema.name`, under the dialect's *table* casing: the name
+    /// must match, and each present qualifier segment must match its
+    /// counterpart (an omitted segment is a wildcard, so a bare `users`
+    /// matches `mydb.users` but `otherdb.users` does not).
+    fn qualifier_matches_table(&self, qualifier: &TableReference, table: &TableReference) -> bool {
+        let fold = self.casing.table;
+        let eq = |a: &Ident, b: &Ident| fold.normalize(a) == fold.normalize(b);
+        let opt_eq = |a: Option<&Ident>, b: Option<&Ident>| match (a, b) {
+            (Some(x), Some(y)) => eq(x, y),
+            _ => true,
+        };
+        eq(&qualifier.name, &table.name)
+            && opt_eq(qualifier.schema.as_ref(), table.schema.as_ref())
+            && opt_eq(qualifier.catalog.as_ref(), table.catalog.as_ref())
     }
 
     /// Canonicalize a write target to its registered full path when the
@@ -2518,8 +2560,14 @@ fn object_name_last_ident(name: &ObjectName) -> Option<Ident> {
 /// `(a, b) = …`, each reduced to its bare name.
 fn assignment_target_columns(target: &AssignmentTarget) -> Vec<Ident> {
     match target {
-        AssignmentTarget::ColumnName(name) => object_name_last_ident(name).into_iter().collect(),
-        AssignmentTarget::Tuple(names) => names.iter().filter_map(object_name_last_ident).collect(),
+        // A SET target is `col` up to `catalog.schema.table.col` (≤ 4
+        // segments); a deeper qualifier overshoots and is skipped.
+        AssignmentTarget::ColumnName(name) if name.0.len() <= 4 => {
+            object_name_last_ident(name).into_iter().collect()
+        }
+        // Tuple targets `(a, b) = …` aren't column-paired (skipped, like
+        // the resolver), and a too-deep `ColumnName` overshoots.
+        AssignmentTarget::ColumnName(_) | AssignmentTarget::Tuple(_) => Vec::new(),
     }
 }
 
