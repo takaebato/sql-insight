@@ -49,22 +49,47 @@ fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
 #[cfg(test)]
 mod differential {
     use super::*;
+    use crate::catalog::{Catalog, CatalogTable};
     use crate::extractor::extract_column_operations;
     use crate::resolver::IdentifierCasing;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
     use std::collections::HashSet;
 
-    fn bind_one(sql: &str) -> Plan {
+    fn bind_one(sql: &str, catalog: Option<&Catalog>) -> Plan {
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql).unwrap();
         let casing = IdentifierCasing::for_dialect(&dialect);
-        crate::plan::binder::build(&statements[0], casing).expect("supported statement")
+        crate::plan::binder::build(&statements[0], catalog, casing).expect("supported statement")
+    }
+
+    fn old_reads(sql: &str, catalog: Option<&Catalog>) -> Vec<ColumnRead> {
+        let dialect = GenericDialect {};
+        extract_column_operations(&dialect, sql, catalog)
+            .unwrap()
+            .remove(0)
+            .unwrap()
+            .reads
+    }
+
+    fn read_set(reads: &[ColumnRead]) -> HashSet<ColumnRead> {
+        reads.iter().cloned().collect()
+    }
+
+    /// The binder's read-set must match the resolver's for every covered
+    /// statement, under the same catalog.
+    fn assert_parity(sql: &str, catalog: Option<&Catalog>) {
+        let new_set = read_set(&extract_reads(&bind_one(sql, catalog)));
+        let old_set = read_set(&old_reads(sql, catalog));
+        assert_eq!(
+            new_set, old_set,
+            "read-set mismatch for: {sql}\n  plan: {new_set:?}\n  old:  {old_set:?}"
+        );
     }
 
     /// SQL fully within the binder's current coverage (single SELECT,
     /// FROM / comma / `JOIN … ON`, WHERE, column / simple-expr
-    /// projection — catalog-free).
+    /// projection).
     fn covered_corpus() -> &'static [&'static str] {
         &[
             "SELECT a FROM t",
@@ -79,28 +104,32 @@ mod differential {
         ]
     }
 
-    fn read_set(reads: &[ColumnRead]) -> HashSet<ColumnRead> {
-        reads.iter().cloned().collect()
-    }
-
-    fn old_reads(sql: &str) -> Vec<ColumnRead> {
-        let dialect = GenericDialect {};
-        extract_column_operations(&dialect, sql, None)
-            .unwrap()
-            .remove(0)
-            .unwrap()
-            .reads
+    #[test]
+    fn catalog_free_reads_match_resolver() {
+        for sql in covered_corpus() {
+            assert_parity(sql, None);
+        }
     }
 
     #[test]
-    fn plan_reads_set_matches_resolver_on_covered_corpus() {
-        for sql in covered_corpus() {
-            let new_set = read_set(&extract_reads(&bind_one(sql)));
-            let old_set = read_set(&old_reads(sql));
-            assert_eq!(
-                new_set, old_set,
-                "read-set mismatch for: {sql}\n  plan: {new_set:?}\n  old:  {old_set:?}"
-            );
+    fn catalog_aware_reads_match_resolver() {
+        // public.x = [id, a], public.y = [id, b]; `z` is in neither.
+        let catalog: Catalog = [
+            CatalogTable::new("public", "x").columns(["id", "a"]),
+            CatalogTable::new("public", "y").columns(["id", "b"]),
+            CatalogTable::new("public", "t").columns(["a", "b"]),
+        ]
+        .into_iter()
+        .collect();
+        for sql in [
+            "SELECT a FROM x",                              // Cataloged
+            "SELECT z FROM x",                              // Unresolved (catalog denies)
+            "SELECT a, b FROM t WHERE a > 0",               // all Cataloged
+            "SELECT x.a, y.b FROM x JOIN y ON x.id = y.id", // qualified Cataloged
+            "SELECT a FROM x JOIN y ON x.id = y.id",        // a only in x → Known witness
+            "SELECT id FROM x JOIN y ON x.id = y.id",       // id in both → Ambiguous
+        ] {
+            assert_parity(sql, Some(&catalog));
         }
     }
 }
