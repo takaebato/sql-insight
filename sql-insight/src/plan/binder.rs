@@ -18,7 +18,7 @@ use sqlparser::ast::{
     GroupByWithModifier, Ident, Insert, Join, JoinConstraint, JoinOperator, ListAggOnOverflow, Map,
     Merge, MergeAction, MergeInsertKind, ObjectName, OnConflictAction, OnInsert, OrderBy,
     OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Subscript, TableAlias,
-    TableFactor, TableWithJoins, Update, UpdateTableFromKind, WindowFrameBound, WindowSpec,
+    TableFactor, TableWithJoins, Update, UpdateTableFromKind, Values, WindowFrameBound, WindowSpec,
     WindowType,
 };
 
@@ -288,9 +288,17 @@ impl Binder<'_> {
         };
         // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: a conflict-time
         // mini-UPDATE on the target. Its reads / sub-plans fold onto the
-        // input; its assignments drive extra writes + lineage.
+        // input; its assignments drive extra writes + lineage. EXCLUDED
+        // collapses to the source only for a query source — a VALUES source
+        // exposes no projection, so EXCLUDED stays opaque (a synthetic
+        // self-reference), matching the resolver.
+        let excluded_source = if source_has_projection(insert) {
+            source_scope.clone()
+        } else {
+            Scope::empty()
+        };
         let (conflict_updates, conflict_reads, conflict_subplans) = match &insert.on {
-            Some(on) => self.bind_conflict(on, &target, &target_columns, &source_scope),
+            Some(on) => self.bind_conflict(on, &target, &target_columns, &excluded_source),
             None => (Vec::new(), Vec::new(), Vec::new()),
         };
         let input = wrap_reads(input, conflict_reads, conflict_subplans);
@@ -706,13 +714,22 @@ impl Binder<'_> {
         match set_expr {
             SetExpr::Select(select) => self.bind_select(select),
             SetExpr::Query(inner) => self.bind_query(inner),
-            // `WITH … INSERT/UPDATE …`: the DML statement is the query
-            // body. Bind it to its `Write` tree; it exposes no output scope
-            // to an enclosing query.
-            SetExpr::Insert(statement) | SetExpr::Update(statement) => (
+            // `WITH … INSERT/UPDATE/DELETE/MERGE …`: the DML statement is
+            // the query body. Bind it to its `Write` tree; it exposes no
+            // output scope to an enclosing query.
+            SetExpr::Insert(statement)
+            | SetExpr::Update(statement)
+            | SetExpr::Delete(statement)
+            | SetExpr::Merge(statement) => (
                 self.bind_statement(statement).unwrap_or(Plan::OpaqueLeaf),
                 Scope::empty(),
             ),
+            // `VALUES (…), (…)`: a literal row set. Each column position is
+            // an output whose provenance unions that position's row
+            // expressions, so a `(VALUES …) AS v(x)` exposes resolvable
+            // columns (literals collapse to nothing; a row expression
+            // referencing an outer relation surfaces it).
+            SetExpr::Values(values) => self.bind_values(values),
             SetExpr::SetOperation { left, right, .. } => {
                 let (left_plan, left_scope) = self.bind_set_expr(left);
                 let (right_plan, right_scope) = self.bind_set_expr(right);
@@ -728,9 +745,47 @@ impl Binder<'_> {
                     },
                 )
             }
-            // VALUES / table-valued bodies: no inspectable columns yet.
+            // `TABLE foo` and other table-valued bodies: no inspectable
+            // columns yet.
             _ => (Plan::OpaqueLeaf, Scope::empty()),
         }
+    }
+
+    /// Bind a `VALUES (…), (…)` row set into a column-defining `Project`:
+    /// one opaque output per column position (no provenance — the produced
+    /// row is synthesized, so a reference to it collapses to a synthetic
+    /// self-source, never to a row expression). The row expressions
+    /// themselves are reads, resolved against the empty current scope and
+    /// falling through to the correlation stack — a `(VALUES (t.a)) AS v`
+    /// reads the enclosing / sibling `t.a` like a derived subquery's body.
+    fn bind_values(&self, values: &Values) -> (Plan, Scope) {
+        let width = values.rows.iter().map(Vec::len).max().unwrap_or(0);
+        let outputs: Vec<BoundColumn> = (0..width)
+            .map(|_| BoundColumn {
+                name: None,
+                provenance: Vec::new(),
+            })
+            .collect();
+        let mut reads = Vec::new();
+        let mut subplans = Vec::new();
+        for expr in values.rows.iter().flatten() {
+            let (r, s) = self.expr_reads(expr, &Scope::empty());
+            reads.extend(r);
+            subplans.extend(s);
+        }
+        let plan = Plan::Project(Project {
+            input: Box::new(wrap_reads(Plan::OpaqueLeaf, reads, subplans)),
+            outputs: outputs.clone(),
+            subqueries: Vec::new(),
+        });
+        (
+            plan,
+            Scope {
+                relations: Vec::new(),
+                outputs,
+                merge_columns: Vec::new(),
+            },
+        )
     }
 
     fn bind_select(&self, select: &Select) -> (Plan, Scope) {
@@ -1945,7 +2000,7 @@ impl Binder<'_> {
                 confirmed: false,
                 synthetic: false,
             }),
-            RelationSource::Derived { columns } => self.derived_candidate(columns, column),
+            RelationSource::Derived { columns } => self.derived_candidate(rel, columns, column),
             // A table function's columns are opaque; a bare name is not
             // claimed by it (so it stays resolvable against real tables).
             RelationSource::TableFunction => None,
@@ -1986,7 +2041,7 @@ impl Binder<'_> {
                 confirmed: false,
                 synthetic: false,
             }),
-            RelationSource::Derived { columns } => self.derived_candidate(columns, column),
+            RelationSource::Derived { columns } => self.derived_candidate(rel, columns, column),
             // A reference qualified by a table function's alias resolves to
             // it: the produced column isn't stored, so it's marked
             // synthetic-origin — excluded from `reads`, but still a lineage
@@ -2016,23 +2071,49 @@ impl Binder<'_> {
     /// Every source is marked `synthetic_origin`: this reference goes
     /// *through* the derived / CTE relation, so its physical read was
     /// already counted at the relation's own body (it stays a lineage
-    /// source, but not a `reads` occurrence).
-    fn derived_candidate(&self, columns: &[BoundColumn], column: &Ident) -> Option<Candidate> {
-        columns
+    /// source, but not a `reads` occurrence). A column with no underlying
+    /// source (a `VALUES` literal / `SELECT` constant) falls back to a
+    /// synthetic self-reference (`alias.column`), so it is still a lineage
+    /// source rather than vanishing.
+    fn derived_candidate(
+        &self,
+        rel: &Relation,
+        columns: &[BoundColumn],
+        column: &Ident,
+    ) -> Option<Candidate> {
+        let exposed = columns
             .iter()
-            .find(|c| self.name_matches(c.name.as_ref(), column))
-            .map(|c| Candidate {
-                provenance: c
-                    .provenance
-                    .iter()
-                    .map(|source| ProvenanceSource {
+            .find(|c| self.name_matches(c.name.as_ref(), column))?;
+        let provenance = if exposed.provenance.is_empty() {
+            rel.exposed_name()
+                .map(|name| {
+                    let table = TableReference {
+                        catalog: None,
+                        schema: None,
+                        name: name.clone(),
+                    };
+                    ProvenanceSource {
                         synthetic_origin: true,
-                        ..source.clone()
-                    })
-                    .collect(),
-                confirmed: true,
-                synthetic: true,
-            })
+                        ..passthrough(read(&table, column, ResolutionKind::Inferred))
+                    }
+                })
+                .into_iter()
+                .collect()
+        } else {
+            exposed
+                .provenance
+                .iter()
+                .map(|source| ProvenanceSource {
+                    synthetic_origin: true,
+                    ..source.clone()
+                })
+                .collect()
+        };
+        Some(Candidate {
+            provenance,
+            confirmed: true,
+            synthetic: true,
+        })
     }
 
     /// Collapse candidates to the reference's provenance (the resolver's
@@ -2226,6 +2307,17 @@ fn wrap_inputs(mut inputs: Vec<Plan>, reads: Vec<ColumnRead>, subqueries: Vec<Pl
             subqueries,
         })
     }
+}
+
+/// Whether an `INSERT`'s source query exposes a per-column projection
+/// (a `SELECT` / set-operation / nested query) rather than a `VALUES`
+/// row set. Drives whether `EXCLUDED.col` collapses to the source: a
+/// `VALUES` source has no projection, so `EXCLUDED` stays opaque.
+fn source_has_projection(insert: &Insert) -> bool {
+    insert
+        .source
+        .as_ref()
+        .is_some_and(|query| !matches!(query.body.as_ref(), SetExpr::Values(_)))
 }
 
 /// The column names an `ALTER TABLE` operation writes to. Column-naming

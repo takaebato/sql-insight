@@ -661,6 +661,16 @@ mod differential {
             // Statement-level WITH over DML: sqlparser nests the INSERT as
             // the WITH-query's body, so writes / lineage must peel the With.
             "WITH c AS (SELECT a FROM s) INSERT INTO t (col) SELECT a FROM c",
+            "WITH cte AS (SELECT id FROM s WHERE flag) \
+             DELETE FROM t WHERE id IN (SELECT id FROM cte)",
+            "WITH cte AS (SELECT max(x) AS m FROM s) \
+             UPDATE t SET a = (SELECT m FROM cte) WHERE id = 1",
+            // VALUES as a derived / CTE relation: literals collapse to no
+            // source (the aliased columns drop from reads); a row expression
+            // referencing an outer sibling surfaces it.
+            "SELECT x, y FROM (VALUES (1, 'a'), (2, 'b')) AS t(x, y)",
+            "SELECT v.x FROM t1, (VALUES (t1.a)) AS v(x)",
+            "WITH c(x, y) AS (VALUES (1, 'a')) SELECT x FROM c",
             // RETURNING: a projection over the written relation — reads the
             // target's columns and emits QueryOutput lineage, alongside the
             // statement's write / write-lineage.
