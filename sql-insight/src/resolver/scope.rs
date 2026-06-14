@@ -52,6 +52,14 @@ pub(crate) struct Scope {
     /// hold their per-operand names; the query's body scope holds the
     /// first operand's names (the result schema).
     pub(super) output_names: Vec<sqlparser::ast::Ident>,
+    /// Column names introduced as `JOIN … USING (col)` merge columns in
+    /// this scope. A `USING (a)` join folds both sides' `a` into one
+    /// logical column, so an unqualified ref to `a` fans in to *every*
+    /// joined relation that could own it (not a single owner). Recorded
+    /// when the join constraint is walked; consumed by
+    /// [`Resolver::capture_column_ref`](super::Resolver) to emit one
+    /// captured ref per member instead of an ambiguous single ref.
+    pub(super) merge_columns: Vec<sqlparser::ast::Ident>,
 }
 
 /// Iterate the scope ids on the chain `from → parent → parent → … → root`,
@@ -68,6 +76,7 @@ impl Scope {
             parent,
             bindings: IndexMap::new(),
             output_names: Vec::new(),
+            merge_columns: Vec::new(),
         }
     }
 

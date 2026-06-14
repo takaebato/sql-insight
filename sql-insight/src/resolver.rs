@@ -53,12 +53,12 @@ use sqlparser::ast::{
     AccessExpr, Array, ConnectByKind, Delete, DictionaryField, Distinct, Expr, Fetch, FromTable,
     Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList,
     FunctionArguments, GroupByExpr, GroupByWithModifier, Ident, Interpolate, Join, JoinConstraint,
-    JoinOperator, LimitClause, ListAggOnOverflow, Map, Merge, NamedWindowExpr, ObjectType,
-    OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource,
-    Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript,
-    Table, TableFactor, TableSample, TableSampleKind, TableWithJoins, TopQuantity, Update,
-    UpdateTableFromKind, Values, WildcardAdditionalOptions, WindowFrameBound, WindowSpec,
-    WindowType,
+    JoinOperator, LimitClause, ListAggOnOverflow, Map, Merge, NamedWindowExpr, ObjectName,
+    ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator,
+    PivotValueSource, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+    Statement, Subscript, Table, TableFactor, TableSample, TableSampleKind, TableWithJoins,
+    TopQuantity, Update, UpdateTableFromKind, Values, WildcardAdditionalOptions, WindowFrameBound,
+    WindowSpec, WindowType,
 };
 
 use crate::catalog::Catalog;
@@ -1862,7 +1862,31 @@ impl<'a> Resolver<'a> {
     fn visit_join_constraint(&mut self, constraint: &JoinConstraint) -> Result<(), Error> {
         match constraint {
             JoinConstraint::On(expr) => self.suppress_lineage(|r| r.visit_expr(expr)),
-            JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
+            JoinConstraint::Using(columns) => {
+                // `USING (a)` merges both sides' `a` into one logical
+                // column — record the names so an unqualified ref fans in
+                // to every joined relation instead of resolving ambiguous.
+                self.record_merge_columns(columns);
+                Ok(())
+            }
+            // NATURAL merges *all* same-named columns of both sides,
+            // which can't be enumerated from SQL text alone (it needs
+            // both schemas) — left unhandled, like wildcard expansion.
+            JoinConstraint::Natural | JoinConstraint::None => Ok(()),
+        }
+    }
+
+    /// Record each `USING (col, …)` column name on the current scope as
+    /// a merge column. The members are derived later (at capture time)
+    /// from the scope's bindings, so this only needs the names.
+    fn record_merge_columns(&mut self, columns: &[ObjectName]) {
+        let scope_id = self.current_scope_id();
+        for column in columns {
+            if let Some(ident) = column.0.last().and_then(|part| part.as_ident()) {
+                self.resolution.scopes[scope_id.0]
+                    .merge_columns
+                    .push(ident.clone());
+            }
         }
     }
 

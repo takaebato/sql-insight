@@ -115,6 +115,14 @@ impl<'a> Resolver<'a> {
         let scope_id = self.current_scope_id();
         let is_lineage_source = self.context.is_lineage_source;
         let clause = self.context.current_clause;
+        // A `JOIN … USING (a)` merge column has no single owner — an
+        // unqualified ref to it fans in to every joined relation. Handle
+        // that before the single-owner resolution path.
+        if let [name] = parts.as_slice() {
+            if self.try_capture_merge_column(name, scope_id, clause, is_lineage_source) {
+                return;
+            }
+        }
         let (resolved, synthetic, resolution) = self.resolve_ref(&parts, scope_id);
         self.resolution.column_refs.push(CapturedColumnRef {
             parts,
@@ -125,6 +133,66 @@ impl<'a> Resolver<'a> {
             is_lineage_source,
             resolution,
         });
+    }
+
+    /// If `name` is a `USING` merge column of `scope_id`, emit one
+    /// captured ref per joined relation that could own it (fan-in for
+    /// the COALESCE-style merged column) and return `true`. Otherwise
+    /// return `false` and let the caller take the single-owner path.
+    ///
+    /// Members are derived here, at capture time, from the scope's
+    /// bindings — so a catalog narrows the fan-in to relations that
+    /// actually declare the column (`binding_could_contain_column`),
+    /// while catalog-free mode fans in to every joined relation.
+    /// `synthetic` members (CTE / derived sides of the join) surface as
+    /// synthetic refs and collapse like any other.
+    fn try_capture_merge_column(
+        &mut self,
+        name: &Ident,
+        scope_id: ScopeId,
+        clause: RefClause,
+        is_lineage_source: bool,
+    ) -> bool {
+        let column_fold = self.resolution.casing.column;
+        let key = BindingKey::new(name, column_fold);
+        let scope = &self.resolution.scopes[scope_id.0];
+        let is_merge = scope
+            .merge_columns
+            .iter()
+            .any(|merge| BindingKey::new(merge, column_fold) == key);
+        if !is_merge {
+            return false;
+        }
+        // Collect members first (immutable borrow), then push.
+        let members: Vec<(TableReference, bool, ResolutionKind)> = scope
+            .iter_bindings()
+            .filter_map(|binding| {
+                let table = binding_could_contain_column(binding, name, column_fold)?;
+                let resolution = if binding_confirms_column(binding, name, column_fold) {
+                    ResolutionKind::Cataloged
+                } else {
+                    ResolutionKind::Inferred
+                };
+                Some((table, is_synthetic_binding(binding), resolution))
+            })
+            .collect();
+        if members.is_empty() {
+            // A declared merge column with no candidate owner — fall back
+            // to the normal path (surfaces as Unresolved).
+            return false;
+        }
+        for (table, synthetic, resolution) in members {
+            self.resolution.column_refs.push(CapturedColumnRef {
+                parts: vec![name.clone()],
+                scope_id,
+                clause,
+                resolved: Some(table),
+                synthetic,
+                is_lineage_source,
+                resolution,
+            });
+        }
+        true
     }
 
     fn resolve_ref(

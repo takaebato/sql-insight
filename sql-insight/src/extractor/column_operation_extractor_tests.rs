@@ -2666,46 +2666,76 @@ mod set_operations {
 }
 
 mod join_using_and_natural {
-    //! USING / NATURAL JOIN merge expansion is documented as
-    //! future work (see the module-level note in
-    //! column_operation_extractor). These tests pin down the
-    //! *current* shape so when USING / NATURAL JOIN expansion lands
-    //! (merged refs splitting into both source tables), the diff
-    //! will surface here.
+    //! `JOIN … USING (col)` merge columns fan in: an unqualified ref to
+    //! a USING column resolves to *every* joined relation that could own
+    //! it (the COALESCE-style merged column has no single owner), so it
+    //! surfaces one read / lineage source per side rather than an
+    //! ambiguous `table: None`. NATURAL JOIN stays unexpanded (its merge
+    //! set needs both schemas, like wildcard expansion).
     use super::*;
 
     #[test]
-    fn join_using_id_in_projection_is_unresolved_due_to_ambiguity() {
-        // `id` in the projection is unqualified with two candidate
-        // tables (t1, t2) — the resolver leaves it unresolved
-        // (`table: None`) because no catalog disambiguates and
-        // USING is not yet expanded into a merged-column binding.
+    fn join_using_id_in_projection_fans_in_to_both_tables() {
+        // `id` is a USING merge column → the projection ref fans in to
+        // both joined tables (t1.id and t2.id), each an Inferred read
+        // and a lineage source into the output. No catalog, so neither
+        // side is Cataloged.
         assert_column_ops(
             "SELECT id FROM t1 JOIN t2 USING (id)",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![ambiguous("id")],
+                reads: vec![read("t1", "id"), read("t2", "id")],
                 writes: vec![],
-                lineage: vec![passthrough(ambiguous("id"), out("id", 0))],
+                lineage: vec![
+                    passthrough(col("t1", "id"), out("id", 0)),
+                    passthrough(col("t2", "id"), out("id", 0)),
+                ],
                 diagnostics: vec![],
             },
         );
     }
 
     #[test]
-    fn join_using_id_in_projection_and_where_yields_two_independent_unresolved_refs() {
-        // The same `id` ref in projection vs. WHERE produces two
-        // SEPARATE CapturedColumnRefs, each with a single-kind `kinds`
-        // vec. There is no merge into one ref-with-multi-kinds
-        // here — that would require resolver-level tracking of
-        // ref identity across clauses, which we don't do.
+    fn join_using_id_fans_in_at_each_occurrence() {
+        // The merge column fans in independently per occurrence: the
+        // projection `id` and the WHERE `id` each expand to t1.id +
+        // t2.id. WHERE is filter position, so its two refs are reads
+        // only (no lineage).
         assert_column_ops(
             "SELECT id FROM t1 JOIN t2 USING (id) WHERE id > 0",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![ambiguous("id"), ambiguous("id")],
+                reads: vec![
+                    read("t1", "id"),
+                    read("t2", "id"),
+                    read("t1", "id"),
+                    read("t2", "id"),
+                ],
                 writes: vec![],
-                lineage: vec![passthrough(ambiguous("id"), out("id", 0))],
+                lineage: vec![
+                    passthrough(col("t1", "id"), out("id", 0)),
+                    passthrough(col("t2", "id"), out("id", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_select_using_column_fans_in_to_target() {
+        // The merged source column feeds the target from both sides:
+        // both t1.id and t2.id flow into dst.id (fan-in lineage into a
+        // named relation).
+        assert_column_ops(
+            "INSERT INTO dst (id) SELECT id FROM t1 JOIN t2 USING (id)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("t1", "id"), read("t2", "id")],
+                writes: vec![write("dst", "id")],
+                lineage: vec![
+                    passthrough(col("t1", "id"), relation("dst", "id")),
+                    passthrough(col("t2", "id"), relation("dst", "id")),
+                ],
                 diagnostics: vec![],
             },
         );
@@ -3577,6 +3607,29 @@ mod catalog_strict {
                 lineage: vec![
                     passthrough(col("s", "id"), relation("t", "id")),
                     passthrough(col("s", "a"), relation("t", "a")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn catalog_using_merge_column_fans_in_cataloged() {
+        // A USING merge column fans in to both joined tables; with a
+        // catalog confirming `id` on each, both sides resolve Cataloged.
+        let catalog = TestCatalog::default()
+            .with("t1", vec!["id"])
+            .with("t2", vec!["id"]);
+        assert_column_ops_with_catalog(
+            "SELECT id FROM t1 JOIN t2 USING (id)",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read_confirmed("t1", "id"), read_confirmed("t2", "id")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col_confirmed("t1", "id"), out("id", 0)),
+                    passthrough(col_confirmed("t2", "id"), out("id", 0)),
                 ],
                 diagnostics: vec![],
             },

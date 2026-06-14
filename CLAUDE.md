@@ -219,6 +219,22 @@ by hand.
   column) is not modelled — the fine `RefClause` tag leaves room. This
   is the first slice of moving the non-lexical "clause-phase" resolution
   axis out of walk-time into a post-pass.
+- `JOIN … USING (col)` merge columns **fan in**: a `USING (a)` join
+  folds both sides' `a` into one COALESCE-style logical column with no
+  single owner, so an unqualified ref to `a` resolves to *every* joined
+  relation that could own it — one read / lineage source per side, not
+  an ambiguous `table: None`. Mechanism: `visit_join_constraint`
+  records the USING names on `Scope::merge_columns`; `capture_column_ref`
+  detects a merge-column ref and emits one `CapturedColumnRef` per
+  candidate binding (`try_capture_merge_column`), deriving members from
+  the scope's bindings at capture time — so a catalog narrows the fan-in
+  to relations that actually declare the column (and makes them
+  `Cataloged`), while catalog-free mode fans in to every joined relation
+  (`Inferred`). Qualified `t.a` keeps its single owner. NATURAL JOIN is
+  **not** expanded (its merge set is every same-named column of both
+  sides — needs both schemas, same reason wildcards aren't expanded).
+  Known limit: for a 3+-relation scope the catalog-free fan-in includes
+  every relation, not just the two USING operands.
 
 ## Code conventions
 
