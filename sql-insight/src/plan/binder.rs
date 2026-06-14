@@ -74,23 +74,41 @@ impl Scope {
     }
 }
 
-/// A relation visible in a [`Scope`]: its (canonical) identity, use-site
-/// alias, and column knowledge.
+/// A relation visible in a [`Scope`]: its use-site alias and where its
+/// columns come from.
 struct Relation {
-    table: TableReference,
     alias: Option<Ident>,
-    columns: RelationColumns,
+    source: RelationSource,
 }
 
 impl Relation {
     /// The name this relation answers to in a qualifier: its alias if
-    /// aliased, otherwise its table's bare name.
-    fn exposed_name(&self) -> &Ident {
-        self.alias.as_ref().unwrap_or(&self.table.name)
+    /// aliased, otherwise a real table's bare name. A derived table with
+    /// no alias answers to nothing (SQL requires the alias anyway).
+    fn exposed_name(&self) -> Option<&Ident> {
+        self.alias.as_ref().or(match &self.source {
+            RelationSource::Table { table, .. } => Some(&table.name),
+            RelationSource::Derived { .. } => None,
+        })
     }
 }
 
-/// What a relation exposes for resolution.
+/// Where a relation's columns come from.
+enum RelationSource {
+    /// A real stored table: its canonical identity plus catalog column
+    /// knowledge (`Open` catalog-free, `Known` with a catalog).
+    Table {
+        table: TableReference,
+        columns: RelationColumns,
+    },
+    /// A derived table / subquery: its output columns, each already
+    /// resolved to real base columns (pre-collapsed provenance).
+    /// *Synthetic* — it has no table identity, so a reference through it
+    /// surfaces the inner real columns, never the derived name itself.
+    Derived { columns: Vec<BoundColumn> },
+}
+
+/// What a real table exposes for resolution.
 enum RelationColumns {
     /// Column set unknown (catalog-free, or a catalog miss / ambiguous
     /// match) — any name could plausibly belong here (`Inferred`).
@@ -101,12 +119,22 @@ enum RelationColumns {
     Known(Vec<Ident>),
 }
 
-/// One candidate owner of a column reference during resolution.
+/// One candidate owner of a column reference during resolution, carrying
+/// the provenance it would contribute.
 struct Candidate {
-    table: TableReference,
-    /// A `Known` schema lists the column (drives `Cataloged` vs
-    /// `Inferred` and the Known-witness-over-Open tiebreaker).
+    /// The real base columns this candidate resolves the reference to:
+    /// one entry for a real table, the derived column's full (already
+    /// collapsed) provenance for a synthetic one.
+    provenance: Vec<ColumnRead>,
+    /// A `Known` schema lists the column (or a derived relation exposes
+    /// it) — drives the Known-witness-over-Open tiebreaker.
     confirmed: bool,
+    /// The candidate is a derived / synthetic relation. Its provenance is
+    /// already collapsed to real columns, so the witness tiebreaker keeps
+    /// it verbatim rather than downgrading to `Inferred`: a real table's
+    /// own ref is downgraded, but a synthetic relation's inner refs keep
+    /// their resolution (the synthetic name never surfaces anyway).
+    synthetic: bool,
 }
 
 /// Carries the bind-time context: the optional catalog and the dialect
@@ -248,9 +276,11 @@ impl Binder<'_> {
                         RelationColumns::Open => ResolutionKind::Inferred,
                     };
                     let relation = Relation {
-                        table: table.clone(),
                         alias: alias.clone(),
-                        columns,
+                        source: RelationSource::Table {
+                            table: table.clone(),
+                            columns,
+                        },
                     };
                     (
                         Plan::Scan(Scan {
@@ -263,8 +293,26 @@ impl Binder<'_> {
                 }
                 Err(_) => (Plan::OpaqueLeaf(OpaqueLeaf { alias: None }), Scope::empty()),
             },
-            // Derived tables / table functions / pivots etc. are later
-            // bricks; they expose no inspectable columns yet.
+            // A derived table `(<subquery>) AS d`: bind the subquery and
+            // expose its output columns as a synthetic relation. Those
+            // outputs already carry collapsed provenance, so an outer
+            // reference through `d` surfaces the inner real columns —
+            // collapse falls out of construction. The subquery's plan is
+            // this factor's plan (an input to the enclosing operators).
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let (plan, sub_scope) = self.bind_query(subquery);
+                let relation = Relation {
+                    alias: alias.as_ref().map(|a| a.name.clone()),
+                    source: RelationSource::Derived {
+                        columns: sub_scope.outputs,
+                    },
+                };
+                (plan, Scope::of(relation))
+            }
+            // Table functions / pivots / VALUES etc. are later bricks;
+            // they expose no inspectable columns yet.
             _ => (Plan::OpaqueLeaf(OpaqueLeaf { alias: None }), Scope::empty()),
         }
     }
@@ -338,14 +386,14 @@ impl Binder<'_> {
             scope
                 .relations
                 .iter()
-                .filter(|rel| self.ident_eq(rel.exposed_name(), qualifier))
-                .map(|rel| Candidate {
-                    table: rel.table.clone(),
-                    confirmed: self.relation_lists(rel, column),
+                .filter(|rel| {
+                    rel.exposed_name()
+                        .is_some_and(|n| self.ident_eq(n, qualifier))
                 })
+                .filter_map(|rel| self.qualified_candidate(rel, column))
                 .collect()
         };
-        vec![self.pick(candidates, column)]
+        self.pick(candidates, column)
     }
 
     /// Reads contributed by GROUP BY (plain keys + ROLLUP / CUBE /
@@ -387,53 +435,105 @@ impl Binder<'_> {
     }
 
     /// A relation is an unqualified candidate iff it could own `column`:
-    /// a `Known` schema must list it; an `Open` one always could.
+    /// a `Known` schema must list it; an `Open` real table always could;
+    /// a derived relation must expose it.
     fn unqualified_candidate(&self, rel: &Relation, column: &Ident) -> Option<Candidate> {
-        match &rel.columns {
-            RelationColumns::Known(cols) => self.list_has(cols, column).then(|| Candidate {
-                table: rel.table.clone(),
+        match &rel.source {
+            RelationSource::Table {
+                table,
+                columns: RelationColumns::Known(cols),
+            } => self.list_has(cols, column).then(|| Candidate {
+                provenance: vec![read(table, column, ResolutionKind::Cataloged)],
                 confirmed: true,
+                synthetic: false,
             }),
-            RelationColumns::Open => Some(Candidate {
-                table: rel.table.clone(),
+            RelationSource::Table {
+                table,
+                columns: RelationColumns::Open,
+            } => Some(Candidate {
+                provenance: vec![read(table, column, ResolutionKind::Inferred)],
                 confirmed: false,
+                synthetic: false,
             }),
+            RelationSource::Derived { columns } => self.derived_candidate(columns, column),
         }
     }
 
-    /// Whether a `Known` schema lists `column` (for qualified
-    /// confirmation; `Open` never confirms).
-    fn relation_lists(&self, rel: &Relation, column: &Ident) -> bool {
-        match &rel.columns {
-            RelationColumns::Known(cols) => self.list_has(cols, column),
-            RelationColumns::Open => false,
+    /// A candidate for a qualified ref whose qualifier already matched
+    /// `rel`. Differs from the unqualified case only for a `Known` table
+    /// that doesn't list the column: the qualifier pins the relation, so
+    /// it still resolves (`Inferred`) rather than dropping out. A derived
+    /// relation that doesn't expose the column contributes nothing.
+    fn qualified_candidate(&self, rel: &Relation, column: &Ident) -> Option<Candidate> {
+        match &rel.source {
+            RelationSource::Table {
+                table,
+                columns: RelationColumns::Known(cols),
+            } => {
+                let confirmed = self.list_has(cols, column);
+                Some(Candidate {
+                    provenance: vec![read(
+                        table,
+                        column,
+                        if confirmed {
+                            ResolutionKind::Cataloged
+                        } else {
+                            ResolutionKind::Inferred
+                        },
+                    )],
+                    confirmed,
+                    synthetic: false,
+                })
+            }
+            RelationSource::Table {
+                table,
+                columns: RelationColumns::Open,
+            } => Some(Candidate {
+                provenance: vec![read(table, column, ResolutionKind::Inferred)],
+                confirmed: false,
+                synthetic: false,
+            }),
+            RelationSource::Derived { columns } => self.derived_candidate(columns, column),
         }
     }
 
-    /// Collapse candidates to one resolved read (the resolver's rule):
-    /// none → Unresolved; one → Cataloged if confirmed else Inferred;
-    /// several with exactly one confirmed → that Known witness wins as
-    /// Inferred; otherwise Ambiguous.
-    fn pick(&self, candidates: Vec<Candidate>, column: &Ident) -> ColumnRead {
-        match candidates.as_slice() {
-            [] => unresolved(column),
-            [only] => read(
-                &only.table,
-                column,
-                if only.confirmed {
-                    ResolutionKind::Cataloged
+    /// A derived relation is a candidate iff it exposes an output column
+    /// named `column`; its (already collapsed) provenance is the
+    /// candidate's. Synthetic — the witness tiebreaker keeps it verbatim.
+    fn derived_candidate(&self, columns: &[BoundColumn], column: &Ident) -> Option<Candidate> {
+        columns
+            .iter()
+            .find(|c| self.name_matches(c.name.as_ref(), column))
+            .map(|c| Candidate {
+                provenance: c.provenance.clone(),
+                confirmed: true,
+                synthetic: true,
+            })
+    }
+
+    /// Collapse candidates to the reference's provenance (the resolver's
+    /// rule): none → `Unresolved`; one → its provenance verbatim (already
+    /// `Cataloged` / `Inferred` / collapsed); several with exactly one
+    /// confirmed → that Known witness wins (a real table downgrades to
+    /// `Inferred`, a synthetic one keeps its provenance); otherwise
+    /// `Ambiguous`.
+    fn pick(&self, candidates: Vec<Candidate>, column: &Ident) -> Vec<ColumnRead> {
+        if candidates.is_empty() {
+            return vec![unresolved(column)];
+        }
+        if candidates.len() == 1 {
+            return candidates.into_iter().next().unwrap().provenance;
+        }
+        let mut confirmed = candidates.into_iter().filter(|c| c.confirmed);
+        match (confirmed.next(), confirmed.next()) {
+            (Some(witness), None) => {
+                if witness.synthetic {
+                    witness.provenance
                 } else {
-                    ResolutionKind::Inferred
-                },
-            ),
-            _ => {
-                let confirmed: Vec<&Candidate> =
-                    candidates.iter().filter(|c| c.confirmed).collect();
-                match confirmed.as_slice() {
-                    [witness] => read(&witness.table, column, ResolutionKind::Inferred),
-                    _ => ambiguous(column),
+                    downgrade_to_inferred(witness.provenance)
                 }
             }
+            _ => vec![ambiguous(column)],
         }
     }
 
@@ -636,6 +736,20 @@ fn read(table: &TableReference, column: &Ident, resolution: ResolutionKind) -> C
     }
 }
 
+/// Downgrade a real-table witness's provenance to `Inferred` — the
+/// Known-witness-over-Open tiebreaker adopts it without firm evidence.
+/// (Synthetic witnesses skip this: their inner refs keep their own
+/// resolution since the synthetic name never surfaces.)
+fn downgrade_to_inferred(provenance: Vec<ColumnRead>) -> Vec<ColumnRead> {
+    provenance
+        .into_iter()
+        .map(|mut read| {
+            read.resolution = ResolutionKind::Inferred;
+            read
+        })
+        .collect()
+}
+
 fn ambiguous(column: &Ident) -> ColumnRead {
     ColumnRead {
         reference: ColumnReference {
@@ -728,6 +842,24 @@ mod tests {
                     reads: vec![inferred("y", "b")],
                 })),
                 outputs: vec![passthrough_col("a", vec![inferred("x", "a")])],
+            })
+        );
+    }
+
+    #[test]
+    fn derived_table_exposes_inner_columns_collapsed() {
+        // `(SELECT a AS x FROM t) d` becomes a synthetic relation whose
+        // output column `x` already carries `t.a` as provenance. The outer
+        // `d.x` resolves to that — collapse falls out of construction, so
+        // both Projects carry the same inner real column.
+        assert_eq!(
+            bind_one("SELECT d.x FROM (SELECT a AS x FROM t) d"),
+            Plan::Project(Project {
+                input: Box::new(Plan::Project(Project {
+                    input: Box::new(scan("t")),
+                    outputs: vec![passthrough_col("x", vec![inferred("t", "a")])],
+                })),
+                outputs: vec![passthrough_col("x", vec![inferred("t", "a")])],
             })
         );
     }

@@ -110,6 +110,15 @@ mod differential {
             "SELECT a, b FROM t GROUP BY ROLLUP(a, b)",
             "SELECT a, b FROM t GROUP BY GROUPING SETS ((a, b), (a))",
             "SELECT x.a FROM x JOIN y ON x.id = y.id GROUP BY x.a ORDER BY x.a",
+            // Derived tables (subquery in FROM): the outer ref resolves to
+            // the subquery's output column, whose provenance is the inner
+            // real column — collapse falls out of construction.
+            "SELECT d.x FROM (SELECT a AS x FROM t) d",
+            "SELECT x FROM (SELECT a AS x FROM t) d",
+            "SELECT d.x, d.y FROM (SELECT a AS x, b AS y FROM t) d",
+            "SELECT x FROM (SELECT a + b AS x FROM t) d",
+            "SELECT x FROM (SELECT a AS x FROM t) d JOIN u ON d.x = u.id",
+            "SELECT d.x FROM (SELECT a AS x FROM t WHERE b > 0) d WHERE d.x > 0",
         ]
     }
 
@@ -137,6 +146,8 @@ mod differential {
             "SELECT x.a, y.b FROM x JOIN y ON x.id = y.id", // qualified Cataloged
             "SELECT a FROM x JOIN y ON x.id = y.id",        // a only in x → Known witness
             "SELECT id FROM x JOIN y ON x.id = y.id",       // id in both → Ambiguous
+            "SELECT d.a FROM (SELECT a FROM x) d",          // Cataloged through a derived table
+            "SELECT a FROM (SELECT a FROM x) d", // unqualified, Cataloged through derived
         ] {
             assert_parity(sql, Some(&catalog));
         }
