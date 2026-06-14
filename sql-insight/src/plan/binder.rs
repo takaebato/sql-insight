@@ -19,7 +19,9 @@ use sqlparser::ast::{
     TableWithJoins, Update, UpdateTableFromKind,
 };
 
-use super::ir::{BoundColumn, OpaqueLeaf, PassThrough, Plan, Project, Scan, SetOp, Write};
+use super::ir::{
+    BoundColumn, OpaqueLeaf, PassThrough, Plan, Project, ProvenanceSource, Scan, SetOp, Write,
+};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::extractor::ColumnLineageKind;
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
@@ -132,7 +134,7 @@ struct Candidate {
     /// The real base columns this candidate resolves the reference to:
     /// one entry for a real table, the derived column's full (already
     /// collapsed) provenance for a synthetic one.
-    provenance: Vec<ColumnRead>,
+    provenance: Vec<ProvenanceSource>,
     /// A `Known` schema lists the column (or a derived relation exposes
     /// it) — drives the Known-witness-over-Open tiebreaker.
     confirmed: bool,
@@ -207,9 +209,11 @@ impl Binder<'_> {
     }
 
     /// `UPDATE target SET col = expr [FROM src] WHERE pred`: the target
-    /// (write) plus any FROM relations (read) form the scope; the SET RHS
-    /// expressions and WHERE predicate are the reads; the SET LHS columns
-    /// are the writes.
+    /// (write) plus any FROM relations (read) form the scope. The SET
+    /// assignments become a `Project` whose outputs are named by their
+    /// target columns (so the lineage `RHS → target` pairing falls out of
+    /// the same output-column machinery as INSERT / CTAS); the WHERE
+    /// predicate is a filter `PassThrough` below it.
     fn bind_update(&self, update: &Update) -> Option<Plan> {
         let (target_plan, mut scope) = self.bind_table_with_joins(&update.table);
         let mut inputs = vec![target_plan];
@@ -225,23 +229,32 @@ impl Binder<'_> {
                 scope = scope.merge(from_scope);
             }
         }
-        let mut reads = Vec::new();
+        let where_reads = update
+            .selection
+            .as_ref()
+            .map(|s| self.expr_reads(s, &scope))
+            .unwrap_or_default();
+        let source = wrap_inputs(inputs, where_reads);
+        let mut outputs = Vec::new();
+        let mut target_columns = Vec::new();
         for assignment in &update.assignments {
-            self.collect_expr_reads(&assignment.value, &scope, &mut reads);
-        }
-        if let Some(selection) = &update.selection {
-            self.collect_expr_reads(selection, &scope, &mut reads);
+            for column in assignment_target_columns(&assignment.target) {
+                outputs.push(self.bind_value_column(
+                    Some(column.clone()),
+                    &assignment.value,
+                    &scope,
+                ));
+                target_columns.push(column);
+            }
         }
         let target = TableReference::try_from(&update.table.relation).ok()?;
-        let target_columns = update
-            .assignments
-            .iter()
-            .flat_map(|a| assignment_target_columns(&a.target))
-            .collect();
         Some(Plan::Write(Write {
             target,
             target_columns,
-            input: Box::new(Plan::PassThrough(PassThrough { inputs, reads })),
+            input: Box::new(Plan::Project(Project {
+                input: Box::new(source),
+                outputs,
+            })),
         }))
     }
 
@@ -260,11 +273,12 @@ impl Binder<'_> {
             inputs.push(plan);
             scope = scope.merge(twj_scope);
         }
-        let mut reads = Vec::new();
-        if let Some(selection) = &delete.selection {
-            self.collect_expr_reads(selection, &scope, &mut reads);
-        }
-        let input = Plan::PassThrough(PassThrough { inputs, reads });
+        let reads = delete
+            .selection
+            .as_ref()
+            .map(|s| self.expr_reads(s, &scope))
+            .unwrap_or_default();
+        let input = wrap_inputs(inputs, reads);
         // The deleted relation is the explicit `DELETE t` list when
         // present, else the FROM target.
         let target = if let Some(name) = delete.tables.first() {
@@ -285,44 +299,61 @@ impl Binder<'_> {
     }
 
     /// `MERGE INTO target USING source ON pred WHEN … THEN …`: target
-    /// (write) and source (read) form the scope; reads come from ON, each
-    /// clause predicate, the UPDATE assignment RHS, and INSERT VALUES;
-    /// writes are the UPDATE SET targets and INSERT columns.
+    /// (write) and source (read) form the scope. ON and the per-clause
+    /// predicates are filter reads; each WHEN action's value expressions
+    /// become `Project` outputs named by their written column (UPDATE SET
+    /// target / INSERT column), so the `value → target` lineage pairing
+    /// reuses the output-column machinery.
     fn bind_merge(&self, merge: &Merge) -> Option<Plan> {
         let (target_plan, target_scope) = self.bind_table_factor(&merge.table);
         let (source_plan, source_scope) = self.bind_table_factor(&merge.source);
         let scope = target_scope.merge(source_scope);
-        let mut reads = Vec::new();
+        let mut reads = self.expr_reads(&merge.on, &scope);
+        let mut outputs = Vec::new();
         let mut target_columns = Vec::new();
-        self.collect_expr_reads(&merge.on, &scope, &mut reads);
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
-                self.collect_expr_reads(predicate, &scope, &mut reads);
+                reads.extend(self.expr_reads(predicate, &scope));
             }
             match &clause.action {
                 MergeAction::Insert(insert) => {
                     if let Some(predicate) = &insert.insert_predicate {
-                        self.collect_expr_reads(predicate, &scope, &mut reads);
+                        reads.extend(self.expr_reads(predicate, &scope));
                     }
                     if let MergeInsertKind::Values(values) = &insert.kind {
+                        let columns: Vec<Ident> = insert
+                            .columns
+                            .iter()
+                            .filter_map(object_name_last_ident)
+                            .collect();
                         for row in &values.rows {
-                            for expr in row {
-                                self.collect_expr_reads(expr, &scope, &mut reads);
+                            for (column, expr) in columns.iter().zip(row) {
+                                outputs.push(self.bind_value_column(
+                                    Some(column.clone()),
+                                    expr,
+                                    &scope,
+                                ));
+                                target_columns.push(column.clone());
                             }
                         }
                     }
-                    target_columns.extend(insert.columns.iter().filter_map(object_name_last_ident));
                 }
                 MergeAction::Update(update) => {
                     for assignment in &update.assignments {
-                        self.collect_expr_reads(&assignment.value, &scope, &mut reads);
-                        target_columns.extend(assignment_target_columns(&assignment.target));
+                        for column in assignment_target_columns(&assignment.target) {
+                            outputs.push(self.bind_value_column(
+                                Some(column.clone()),
+                                &assignment.value,
+                                &scope,
+                            ));
+                            target_columns.push(column);
+                        }
                     }
                     for predicate in [&update.update_predicate, &update.delete_predicate]
                         .into_iter()
                         .flatten()
                     {
-                        self.collect_expr_reads(predicate, &scope, &mut reads);
+                        reads.extend(self.expr_reads(predicate, &scope));
                     }
                 }
                 // DELETE moves no column values.
@@ -330,12 +361,13 @@ impl Binder<'_> {
             }
         }
         let target = TableReference::try_from(&merge.table).ok()?;
+        let source = wrap_inputs(vec![target_plan, source_plan], reads);
         Some(Plan::Write(Write {
             target,
             target_columns,
-            input: Box::new(Plan::PassThrough(PassThrough {
-                inputs: vec![target_plan, source_plan],
-                reads,
+            input: Box::new(Plan::Project(Project {
+                input: Box::new(source),
+                outputs,
             })),
         }))
     }
@@ -695,83 +727,96 @@ impl Binder<'_> {
     }
 
     /// Resolve one SELECT-list item against `scope`. Wildcards are
-    /// skipped for now (`None`). The column's provenance is the value the
-    /// expression carries — its direct references plus any scalar
-    /// subquery's reads (which become this output's sources).
+    /// skipped for now (`None`).
     fn bind_output_column(&self, item: &SelectItem, scope: &Scope) -> Option<BoundColumn> {
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.clone())),
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return None,
         };
-        let provenance = self.expr_reads(expr, scope);
         let name = alias.or_else(|| inferred_output_name(expr));
-        let kind = if is_single_column(expr) {
-            ColumnLineageKind::Passthrough
-        } else {
-            ColumnLineageKind::Transformation
-        };
-        Some(BoundColumn {
-            name,
-            provenance,
-            kind,
-        })
+        Some(self.bind_value_column(name, expr, scope))
     }
 
-    /// Every column read an expression contributes against `scope`: its
-    /// direct column references (resolved to provenance) plus the reads of
-    /// any nested subquery (scalar / IN / EXISTS). Used for both value
-    /// positions (a projection column's provenance) and filter positions
-    /// (a predicate's reads) — the subquery's reads inherit the position
-    /// of the containing expression. A subquery binds with `scope`'s
-    /// relations pushed onto the correlation stack, so a correlated
-    /// reference resolves against the enclosing query.
+    /// Bind a value-producing expression (a projection item or a SET /
+    /// VALUES assignment RHS) into a named output column. Each source's
+    /// composed kind folds in this expression's own kind: a bare column
+    /// ref is `Passthrough`, anything else `Transformation` — so a
+    /// transforming step anywhere along the chain wins.
+    fn bind_value_column(&self, name: Option<Ident>, expr: &Expr, scope: &Scope) -> BoundColumn {
+        let outer = expr_kind(expr);
+        let provenance = self
+            .expr_provenance(expr, scope)
+            .into_iter()
+            .map(|source| ProvenanceSource {
+                kind: combine_kind(source.kind, outer),
+                read: source.read,
+            })
+            .collect();
+        BoundColumn { name, provenance }
+    }
+
+    /// Every lineage source an expression contributes against `scope`:
+    /// its direct column references (resolved to their pre-collapsed
+    /// provenance) plus any nested subquery's reads. Used for value
+    /// positions (a column's provenance); the filter-only callers strip
+    /// the kind via [`Self::expr_reads`].
+    fn expr_provenance(&self, expr: &Expr, scope: &Scope) -> Vec<ProvenanceSource> {
+        let mut out = Vec::new();
+        self.collect_expr_provenance(expr, scope, &mut out);
+        out
+    }
+
+    /// The plain column reads of an expression (filter position — WHERE /
+    /// ON / clause predicates): the provenance with its lineage kind
+    /// dropped.
     fn expr_reads(&self, expr: &Expr, scope: &Scope) -> Vec<ColumnRead> {
-        let mut reads = Vec::new();
-        self.collect_expr_reads(expr, scope, &mut reads);
-        reads
+        self.expr_provenance(expr, scope)
+            .into_iter()
+            .map(|source| source.read)
+            .collect()
     }
 
-    fn collect_expr_reads(&self, expr: &Expr, scope: &Scope, out: &mut Vec<ColumnRead>) {
+    fn collect_expr_provenance(&self, expr: &Expr, scope: &Scope, out: &mut Vec<ProvenanceSource>) {
         match expr {
             Expr::Identifier(id) => out.extend(self.resolve_ref(std::slice::from_ref(id), scope)),
             Expr::CompoundIdentifier(ids) => out.extend(self.resolve_ref(ids, scope)),
             Expr::BinaryOp { left, right, .. } => {
-                self.collect_expr_reads(left, scope, out);
-                self.collect_expr_reads(right, scope, out);
+                self.collect_expr_provenance(left, scope, out);
+                self.collect_expr_provenance(right, scope, out);
             }
             Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
-                self.collect_expr_reads(expr, scope, out)
+                self.collect_expr_provenance(expr, scope, out)
             }
-            Expr::Function(function) => self.collect_function_reads(function, scope, out),
+            Expr::Function(function) => self.collect_function_provenance(function, scope, out),
             // GROUP BY ROLLUP / CUBE / GROUPING SETS — each grouping set is
             // a list of expressions.
             Expr::Rollup(sets) | Expr::Cube(sets) | Expr::GroupingSets(sets) => {
                 for set in sets {
                     for expr in set {
-                        self.collect_expr_reads(expr, scope, out);
+                        self.collect_expr_provenance(expr, scope, out);
                     }
                 }
             }
             // Subqueries: bind against the enclosing scope (correlation)
-            // and fold in their reads.
+            // and fold in their reads as transformation sources.
             Expr::Subquery(query)
             | Expr::Exists {
                 subquery: query, ..
-            } => out.extend(self.subquery_reads(query, scope)),
+            } => out.extend(self.subquery_sources(query, scope)),
             Expr::InSubquery { expr, subquery, .. } => {
-                self.collect_expr_reads(expr, scope, out);
-                out.extend(self.subquery_reads(subquery, scope));
+                self.collect_expr_provenance(expr, scope, out);
+                out.extend(self.subquery_sources(subquery, scope));
             }
             _ => {}
         }
     }
 
-    fn collect_function_reads(
+    fn collect_function_provenance(
         &self,
         function: &Function,
         scope: &Scope,
-        out: &mut Vec<ColumnRead>,
+        out: &mut Vec<ProvenanceSource>,
     ) {
         if let FunctionArguments::List(list) = &function.args {
             for arg in &list.args {
@@ -788,20 +833,27 @@ impl Binder<'_> {
                     _ => None,
                 };
                 if let Some(expr) = inner {
-                    self.collect_expr_reads(expr, scope, out);
+                    self.collect_expr_provenance(expr, scope, out);
                 }
             }
         }
     }
 
-    /// The reads of a subquery nested in an expression: bind it as its own
-    /// plan (with the containing `scope`'s relations pushed onto the
-    /// correlation stack, so a correlated reference resolves outward) and
-    /// walk it.
-    fn subquery_reads(&self, query: &Query, scope: &Scope) -> Vec<ColumnRead> {
+    /// The lineage sources of a subquery nested in an expression: bind it
+    /// as its own plan (with the containing `scope`'s relations pushed
+    /// onto the correlation stack, so a correlated reference resolves
+    /// outward) and walk it. A subquery derives its value, so its sources
+    /// are tagged `Transformation`.
+    fn subquery_sources(&self, query: &Query, scope: &Scope) -> Vec<ProvenanceSource> {
         let binder = self.with_outer_scope(scope.relations.clone());
         let (plan, _) = binder.bind_query(query);
         super::extract::extract_reads(&plan)
+            .into_iter()
+            .map(|read| ProvenanceSource {
+                read,
+                kind: ColumnLineageKind::Transformation,
+            })
+            .collect()
     }
 
     /// Resolve a single column reference to its pre-collapsed provenance.
@@ -811,7 +863,7 @@ impl Binder<'_> {
     /// `Ambiguous`. A name no relation in the current scope can own falls
     /// through to the enclosing scopes (correlation), innermost-first,
     /// before giving up as `Unresolved`.
-    fn resolve_ref(&self, parts: &[Ident], scope: &Scope) -> Vec<ColumnRead> {
+    fn resolve_ref(&self, parts: &[Ident], scope: &Scope) -> Vec<ProvenanceSource> {
         let Some(column) = parts.last() else {
             return Vec::new();
         };
@@ -830,20 +882,20 @@ impl Binder<'_> {
                 return output.provenance.clone();
             }
         }
-        if let Some(reads) = self.resolve_in_relations(parts, &scope.relations, column) {
-            return reads;
+        if let Some(sources) = self.resolve_in_relations(parts, &scope.relations, column) {
+            return sources;
         }
         for outer in self.outer_scopes.iter().rev() {
-            if let Some(reads) = self.resolve_in_relations(parts, outer, column) {
-                return reads;
+            if let Some(sources) = self.resolve_in_relations(parts, outer, column) {
+                return sources;
             }
         }
-        vec![unresolved(column)]
+        vec![passthrough(unresolved(column))]
     }
 
     /// Resolve `parts` against one set of relations, returning `None` when
     /// none of them could own the column (so the caller can fall through
-    /// to an enclosing scope) and `Some(reads)` once at least one is a
+    /// to an enclosing scope) and `Some(sources)` once at least one is a
     /// candidate — even if that resolves `Ambiguous` (a name owned within
     /// this scope doesn't escape it).
     fn resolve_in_relations(
@@ -851,7 +903,7 @@ impl Binder<'_> {
         parts: &[Ident],
         relations: &[Relation],
         column: &Ident,
-    ) -> Option<Vec<ColumnRead>> {
+    ) -> Option<Vec<ProvenanceSource>> {
         let candidates: Vec<Candidate> = if parts.len() == 1 {
             relations
                 .iter()
@@ -878,11 +930,11 @@ impl Binder<'_> {
         let mut reads = Vec::new();
         if let GroupByExpr::Expressions(exprs, modifiers) = group_by {
             for expr in exprs {
-                self.collect_expr_reads(expr, scope, &mut reads);
+                reads.extend(self.expr_reads(expr, scope));
             }
             for modifier in modifiers {
                 if let GroupByWithModifier::GroupingSets(expr) = modifier {
-                    self.collect_expr_reads(expr, scope, &mut reads);
+                    reads.extend(self.expr_reads(expr, scope));
                 }
             }
         }
@@ -896,7 +948,7 @@ impl Binder<'_> {
         };
         let mut reads = Vec::new();
         for expr in exprs {
-            self.collect_expr_reads(&expr.expr, scope, &mut reads);
+            reads.extend(self.expr_reads(&expr.expr, scope));
         }
         reads
     }
@@ -914,7 +966,7 @@ impl Binder<'_> {
                 table,
                 columns: RelationColumns::Known(cols),
             } => self.list_has(cols, column).then(|| Candidate {
-                provenance: vec![read(table, column, ResolutionKind::Cataloged)],
+                provenance: vec![passthrough(read(table, column, ResolutionKind::Cataloged))],
                 confirmed: true,
                 synthetic: false,
             }),
@@ -922,7 +974,7 @@ impl Binder<'_> {
                 table,
                 columns: RelationColumns::Open,
             } => Some(Candidate {
-                provenance: vec![read(table, column, ResolutionKind::Inferred)],
+                provenance: vec![passthrough(read(table, column, ResolutionKind::Inferred))],
                 confirmed: false,
                 synthetic: false,
             }),
@@ -943,7 +995,7 @@ impl Binder<'_> {
             } => {
                 let confirmed = self.list_has(cols, column);
                 Some(Candidate {
-                    provenance: vec![read(
+                    provenance: vec![passthrough(read(
                         table,
                         column,
                         if confirmed {
@@ -951,7 +1003,7 @@ impl Binder<'_> {
                         } else {
                             ResolutionKind::Inferred
                         },
-                    )],
+                    ))],
                     confirmed,
                     synthetic: false,
                 })
@@ -960,7 +1012,7 @@ impl Binder<'_> {
                 table,
                 columns: RelationColumns::Open,
             } => Some(Candidate {
-                provenance: vec![read(table, column, ResolutionKind::Inferred)],
+                provenance: vec![passthrough(read(table, column, ResolutionKind::Inferred))],
                 confirmed: false,
                 synthetic: false,
             }),
@@ -988,9 +1040,9 @@ impl Binder<'_> {
     /// confirmed → that Known witness wins (a real table downgrades to
     /// `Inferred`, a synthetic one keeps its provenance); otherwise
     /// `Ambiguous`.
-    fn pick(&self, candidates: Vec<Candidate>, column: &Ident) -> Vec<ColumnRead> {
+    fn pick(&self, candidates: Vec<Candidate>, column: &Ident) -> Vec<ProvenanceSource> {
         if candidates.is_empty() {
-            return vec![unresolved(column)];
+            return vec![passthrough(unresolved(column))];
         }
         if candidates.len() == 1 {
             return candidates.into_iter().next().unwrap().provenance;
@@ -1004,7 +1056,7 @@ impl Binder<'_> {
                     downgrade_to_inferred(witness.provenance)
                 }
             }
-            _ => vec![ambiguous(column)],
+            _ => vec![passthrough(ambiguous(column))],
         }
     }
 
@@ -1119,6 +1171,18 @@ fn join_constraint(join: &Join) -> Option<&JoinConstraint> {
     }
 }
 
+/// Combine source inputs under an optional filter: a lone input with no
+/// reads passes through unwrapped; otherwise a `PassThrough` joins the
+/// inputs and carries the filter `reads`. Used to build a DML statement's
+/// scanned-and-filtered source below its SET / VALUES `Project`.
+fn wrap_inputs(mut inputs: Vec<Plan>, reads: Vec<ColumnRead>) -> Plan {
+    if reads.is_empty() && inputs.len() == 1 {
+        inputs.pop().unwrap()
+    } else {
+        Plan::PassThrough(PassThrough { inputs, reads })
+    }
+}
+
 /// Wrap `plan` in a filter `PassThrough` carrying `reads`, or return it
 /// unchanged when there are none.
 fn wrap_reads(plan: Plan, reads: Vec<ColumnRead>) -> Plan {
@@ -1133,28 +1197,19 @@ fn wrap_reads(plan: Plan, reads: Vec<ColumnRead>) -> Plan {
 }
 
 /// Merge two set-operation branches' output columns positionally: each
-/// result column unions both branches' provenance, takes its name from
-/// the left branch, and transforms if either branch's column does. Extra
-/// columns on either side (mismatched arity) are dropped — a set
-/// operation requires equal arity, and any dropped branch's reads still
-/// surface from its own sub-plan.
+/// result column unions both branches' (kind-carrying) provenance and
+/// takes its name from the left branch. Extra columns on either side
+/// (mismatched arity) are dropped — a set operation requires equal arity,
+/// and any dropped branch's reads still surface from its own sub-plan.
 fn merge_set_outputs(left: Vec<BoundColumn>, right: Vec<BoundColumn>) -> Vec<BoundColumn> {
     left.into_iter()
         .zip(right)
         .map(|(left, right)| {
             let mut provenance = left.provenance;
             provenance.extend(right.provenance);
-            let kind = if left.kind == ColumnLineageKind::Transformation
-                || right.kind == ColumnLineageKind::Transformation
-            {
-                ColumnLineageKind::Transformation
-            } else {
-                ColumnLineageKind::Passthrough
-            };
             BoundColumn {
                 name: left.name,
                 provenance,
-                kind,
             }
         })
         .collect()
@@ -1205,6 +1260,38 @@ fn is_single_column(expr: &Expr) -> bool {
     matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
 }
 
+/// The lineage kind an expression contributes to its direct sources: a
+/// bare column reference forwards its value (`Passthrough`); anything
+/// else derives a new value (`Transformation`).
+fn expr_kind(expr: &Expr) -> ColumnLineageKind {
+    if is_single_column(expr) {
+        ColumnLineageKind::Passthrough
+    } else {
+        ColumnLineageKind::Transformation
+    }
+}
+
+/// Compose two lineage kinds along a chain: `Transformation` wins if
+/// either step transforms (so a passthrough of a transformed value is a
+/// transformation), else `Passthrough`.
+fn combine_kind(inner: ColumnLineageKind, outer: ColumnLineageKind) -> ColumnLineageKind {
+    if inner == ColumnLineageKind::Transformation || outer == ColumnLineageKind::Transformation {
+        ColumnLineageKind::Transformation
+    } else {
+        ColumnLineageKind::Passthrough
+    }
+}
+
+/// Wrap a read as a `Passthrough` provenance source — a base column or an
+/// unresolved / ambiguous placeholder forwards its value by default; the
+/// containing expression's kind folds in later.
+fn passthrough(read: ColumnRead) -> ProvenanceSource {
+    ProvenanceSource {
+        read,
+        kind: ColumnLineageKind::Passthrough,
+    }
+}
+
 fn read(table: &TableReference, column: &Ident, resolution: ResolutionKind) -> ColumnRead {
     ColumnRead {
         reference: ColumnReference {
@@ -1219,12 +1306,12 @@ fn read(table: &TableReference, column: &Ident, resolution: ResolutionKind) -> C
 /// Known-witness-over-Open tiebreaker adopts it without firm evidence.
 /// (Synthetic witnesses skip this: their inner refs keep their own
 /// resolution since the synthetic name never surfaces.)
-fn downgrade_to_inferred(provenance: Vec<ColumnRead>) -> Vec<ColumnRead> {
+fn downgrade_to_inferred(provenance: Vec<ProvenanceSource>) -> Vec<ProvenanceSource> {
     provenance
         .into_iter()
-        .map(|mut read| {
-            read.resolution = ResolutionKind::Inferred;
-            read
+        .map(|mut source| {
+            source.read.resolution = ResolutionKind::Inferred;
+            source
         })
         .collect()
 }
@@ -1282,11 +1369,23 @@ mod tests {
         read(&tref(table), &Ident::new(column), ResolutionKind::Inferred)
     }
 
-    fn passthrough_col(name: &str, provenance: Vec<ColumnRead>) -> BoundColumn {
+    fn passthrough_col(name: &str, reads: Vec<ColumnRead>) -> BoundColumn {
         BoundColumn {
             name: Some(Ident::new(name)),
-            provenance,
-            kind: ColumnLineageKind::Passthrough,
+            provenance: reads.into_iter().map(passthrough).collect(),
+        }
+    }
+
+    fn transform_col(name: &str, reads: Vec<ColumnRead>) -> BoundColumn {
+        BoundColumn {
+            name: Some(Ident::new(name)),
+            provenance: reads
+                .into_iter()
+                .map(|read| ProvenanceSource {
+                    read,
+                    kind: ColumnLineageKind::Transformation,
+                })
+                .collect(),
         }
     }
 
@@ -1469,16 +1568,23 @@ mod tests {
 
     #[test]
     fn update_reads_set_rhs_and_predicate() {
-        // The SET right-hand side and the WHERE predicate are reads on the
-        // target; the SET left-hand side `c` is the write.
+        // The SET assignment is a Project output named by its target `c`,
+        // whose provenance (the transforming `a + b`) is the lineage
+        // source; the WHERE predicate is a filter PassThrough below it.
         assert_eq!(
             bind_one("UPDATE t SET c = a + b WHERE d > 0"),
             Plan::Write(Write {
                 target: tref("t"),
                 target_columns: vec![Ident::new("c")],
-                input: Box::new(Plan::PassThrough(PassThrough {
-                    inputs: vec![scan("t")],
-                    reads: vec![inferred("t", "a"), inferred("t", "b"), inferred("t", "d")],
+                input: Box::new(Plan::Project(Project {
+                    input: Box::new(Plan::PassThrough(PassThrough {
+                        inputs: vec![scan("t")],
+                        reads: vec![inferred("t", "d")],
+                    })),
+                    outputs: vec![transform_col(
+                        "c",
+                        vec![inferred("t", "a"), inferred("t", "b")]
+                    )],
                 })),
             })
         );
@@ -1512,8 +1618,7 @@ mod tests {
             project.outputs,
             vec![BoundColumn {
                 name: Some(Ident::new("a")),
-                provenance: vec![ambiguous(&Ident::new("a"))],
-                kind: ColumnLineageKind::Passthrough,
+                provenance: vec![passthrough(ambiguous(&Ident::new("a")))],
             }]
         );
     }

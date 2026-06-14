@@ -85,12 +85,24 @@ pub(crate) struct Write {
     pub(crate) input: Box<Plan>,
 }
 
-/// One resolved output column: its (optional) name, the real base
-/// columns it derives from (pre-collapsed provenance), and whether it
-/// forwards a value unchanged or transforms it.
+/// One resolved output column: its (optional) name and the real base
+/// columns it derives from. Each source is pre-collapsed to a real
+/// column and carries its **composed** lineage kind — `Transformation`
+/// if any step from that base column up to this output transformed the
+/// value (so a passthrough output of a transforming derived column is
+/// `Transformation`), else `Passthrough`. Lineage extraction emits one
+/// edge per source straight from this.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BoundColumn {
     pub(crate) name: Option<Ident>,
-    pub(crate) provenance: Vec<ColumnRead>,
+    pub(crate) provenance: Vec<ProvenanceSource>,
+}
+
+/// One pre-collapsed lineage source of a [`BoundColumn`]: the real base
+/// column read, paired with the composed kind of the path from it to the
+/// output column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProvenanceSource {
+    pub(crate) read: ColumnRead,
     pub(crate) kind: ColumnLineageKind,
 }
