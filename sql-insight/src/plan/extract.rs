@@ -101,6 +101,15 @@ mod differential {
             "SELECT a FROM x JOIN y ON x.id = y.id",
             "SELECT a FROM x JOIN y ON x.id = y.id WHERE x.c > 0",
             "SELECT p.a FROM p, q WHERE p.id = q.id",
+            // GROUP BY / HAVING / ORDER BY (clause-phase, alias visibility).
+            "SELECT a, COUNT(*) FROM t GROUP BY a",
+            "SELECT a FROM t GROUP BY a HAVING SUM(b) > 0",
+            "SELECT a + b AS total FROM t ORDER BY total",
+            "SELECT a AS x FROM t GROUP BY x",
+            "SELECT a FROM t ORDER BY b",
+            "SELECT a, b FROM t GROUP BY ROLLUP(a, b)",
+            "SELECT a, b FROM t GROUP BY GROUPING SETS ((a, b), (a))",
+            "SELECT x.a FROM x JOIN y ON x.id = y.id GROUP BY x.a ORDER BY x.a",
         ]
     }
 

@@ -12,8 +12,9 @@
 //! coexist; the differential harness pins them together).
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Join, JoinConstraint,
-    JoinOperator, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    GroupByWithModifier, Ident, Join, JoinConstraint, JoinOperator, OrderBy, OrderByKind, Query,
+    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
 };
 
 use super::ir::{BoundColumn, OpaqueLeaf, PassThrough, Plan, Project, Scan};
@@ -40,25 +41,33 @@ pub(crate) fn build(
 }
 
 /// Bind-time resolution scope: the relations visible at a point in the
-/// bind. Scratch — never stored on the [`Plan`].
+/// bind, plus (for the output-alias-visible clauses) the enclosing
+/// SELECT's output columns. Scratch — never stored on the [`Plan`].
 pub(crate) struct Scope {
     relations: Vec<Relation>,
+    /// The enclosing SELECT's output columns, visible to its own
+    /// GROUP BY / HAVING / ORDER BY (SQL alias visibility). Empty at
+    /// FROM-level resolution (WHERE / projection / JOIN ON).
+    outputs: Vec<BoundColumn>,
 }
 
 impl Scope {
     fn empty() -> Self {
         Self {
             relations: Vec::new(),
+            outputs: Vec::new(),
         }
     }
 
     fn of(relation: Relation) -> Self {
         Self {
             relations: vec![relation],
+            outputs: Vec::new(),
         }
     }
 
-    /// Concatenate two scopes (the relations of a join / comma).
+    /// Concatenate the relations of two scopes (a join / comma). Output
+    /// columns aren't merged — they belong to a single SELECT.
     fn merge(mut self, mut other: Scope) -> Scope {
         self.relations.append(&mut other.relations);
         self
@@ -110,13 +119,23 @@ struct Binder<'a> {
 impl Binder<'_> {
     /// Bind a query, returning the plan node and its output scope.
     fn bind_query(&self, query: &Query) -> (Plan, Scope) {
-        match query.body.as_ref() {
+        let (body, scope) = match query.body.as_ref() {
             SetExpr::Select(select) => self.bind_select(select),
             SetExpr::Query(inner) => self.bind_query(inner),
             // Set operations, VALUES, `WITH … <DML>` wrappers: later
             // bricks — an opaque relation with no columns for now.
             _ => (Plan::OpaqueLeaf(OpaqueLeaf { alias: None }), Scope::empty()),
-        }
+        };
+        // A trailing ORDER BY sits above the body and sees its output
+        // aliases (resolved against the body's output scope).
+        let plan = match &query.order_by {
+            Some(order_by) => {
+                let reads = self.order_by_reads(order_by, &scope);
+                wrap_reads(body, reads)
+            }
+            None => body,
+        };
+        (plan, scope)
     }
 
     fn bind_select(&self, select: &Select) -> (Plan, Scope) {
@@ -138,16 +157,26 @@ impl Binder<'_> {
             .iter()
             .filter_map(|item| self.bind_output_column(item, &from_scope))
             .collect();
-        // The query's output interface (a Known relation exposing these
-        // columns) is only needed once derived tables / clause-phase
-        // land — deferred, so return an empty output scope for now.
-        (
-            Plan::Project(Project {
-                input: Box::new(input),
-                outputs,
-            }),
-            Scope::empty(),
-        )
+        let project = Plan::Project(Project {
+            input: Box::new(input),
+            outputs: outputs.clone(),
+        });
+        // GROUP BY / HAVING / SORT BY see the output aliases (clause
+        // phase): resolve against the FROM relations *plus* the outputs.
+        let clause_scope = Scope {
+            relations: from_scope.relations,
+            outputs,
+        };
+        let mut clause_reads = self.group_by_reads(&select.group_by, &clause_scope);
+        if let Some(having) = &select.having {
+            clause_reads.extend(self.resolve_reads(having, &clause_scope));
+        }
+        for sort in &select.sort_by {
+            clause_reads.extend(self.resolve_reads(&sort.expr, &clause_scope));
+        }
+        // A trailing top-level ORDER BY also resolves against this scope,
+        // so hand it back to `bind_query`.
+        (wrap_reads(project, clause_reads), clause_scope)
     }
 
     fn bind_from(&self, items: &[TableWithJoins]) -> (Plan, Scope) {
@@ -287,6 +316,18 @@ impl Binder<'_> {
             return Vec::new();
         };
         let candidates: Vec<Candidate> = if parts.len() == 1 {
+            // Output-alias visibility (GROUP BY / HAVING / ORDER BY): a
+            // bare name matching an enclosing output column is a
+            // reference to that output — return its provenance so an
+            // introduced alias resolves to its real sources instead of a
+            // phantom stored column. Empty at FROM-level (no outputs).
+            if let Some(output) = scope
+                .outputs
+                .iter()
+                .find(|c| self.name_matches(c.name.as_ref(), column))
+            {
+                return output.provenance.clone();
+            }
             scope
                 .relations
                 .iter()
@@ -305,6 +346,44 @@ impl Binder<'_> {
                 .collect()
         };
         vec![self.pick(candidates, column)]
+    }
+
+    /// Reads contributed by GROUP BY (plain keys + ROLLUP / CUBE /
+    /// GROUPING SETS members + a `GROUPING SETS` modifier), resolved
+    /// against `scope` (which carries the output aliases).
+    fn group_by_reads(&self, group_by: &GroupByExpr, scope: &Scope) -> Vec<ColumnRead> {
+        let mut refs = Vec::new();
+        if let GroupByExpr::Expressions(exprs, modifiers) = group_by {
+            for expr in exprs {
+                collect_column_refs(expr, &mut refs);
+            }
+            for modifier in modifiers {
+                if let GroupByWithModifier::GroupingSets(expr) = modifier {
+                    collect_column_refs(expr, &mut refs);
+                }
+            }
+        }
+        refs.iter()
+            .flat_map(|parts| self.resolve_ref(parts, scope))
+            .collect()
+    }
+
+    /// Reads contributed by an ORDER BY, resolved against `scope`.
+    fn order_by_reads(&self, order_by: &OrderBy, scope: &Scope) -> Vec<ColumnRead> {
+        let OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return Vec::new();
+        };
+        let mut refs = Vec::new();
+        for expr in exprs {
+            collect_column_refs(&expr.expr, &mut refs);
+        }
+        refs.iter()
+            .flat_map(|parts| self.resolve_ref(parts, scope))
+            .collect()
+    }
+
+    fn name_matches(&self, name: Option<&Ident>, other: &Ident) -> bool {
+        name.is_some_and(|n| self.casing.column.normalize(n) == self.casing.column.normalize(other))
     }
 
     /// A relation is an unqualified candidate iff it could own `column`:
@@ -485,7 +564,29 @@ fn collect_column_refs(expr: &Expr, out: &mut Vec<Vec<Ident>>) {
             collect_column_refs(expr, out)
         }
         Expr::Function(function) => collect_function_refs(function, out),
+        // GROUP BY ROLLUP / CUBE / GROUPING SETS — each grouping set is a
+        // list of expressions.
+        Expr::Rollup(sets) | Expr::Cube(sets) | Expr::GroupingSets(sets) => {
+            for set in sets {
+                for expr in set {
+                    collect_column_refs(expr, out);
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+/// Wrap `plan` in a filter `PassThrough` carrying `reads`, or return it
+/// unchanged when there are none.
+fn wrap_reads(plan: Plan, reads: Vec<ColumnRead>) -> Plan {
+    if reads.is_empty() {
+        plan
+    } else {
+        Plan::PassThrough(PassThrough {
+            inputs: vec![plan],
+            reads,
+        })
     }
 }
 
