@@ -27,10 +27,45 @@ use super::{Binding, CaseFold, IdentifierCasing, Resolver, ScopeId};
 /// resolutions, and for recording the lexical role of the reference
 /// (value vs predicate) before the walker leaves the surrounding
 /// clause.
+/// Which clause a column reference syntactically appeared in, for
+/// projection-alias visibility.
+///
+/// `Normal` covers FROM / WHERE / JOIN ON / the SELECT list itself /
+/// everything else — those resolve against FROM bindings only. The
+/// other three are the *output-alias-visible* clauses: in standard SQL
+/// (and common extensions) an unqualified name there may refer to a
+/// SELECT-list output alias rather than a stored column. An unqualified
+/// ref in one of these clauses whose name matches its query's output
+/// column name is a reference to that output (already captured at the
+/// projection), not a storage read, and is dropped by
+/// [`Resolution::real_column_refs`](super::Resolution) so it doesn't
+/// surface as a phantom read. Kept fine-grained (not a single
+/// "output-scoped" flag) so per-clause rules — dialect precedence,
+/// ordinals — can slot in later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub(crate) enum RefClause {
+    #[default]
+    Normal,
+    GroupBy,
+    Having,
+    OrderBy,
+}
+
+impl RefClause {
+    /// True for the clauses where a SELECT-list output alias is visible
+    /// (`GroupBy` / `Having` / `OrderBy`).
+    pub(crate) fn is_output_scoped(self) -> bool {
+        !matches!(self, RefClause::Normal)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CapturedColumnRef {
     pub(crate) parts: Vec<Ident>,
     pub(crate) scope_id: ScopeId,
+    /// Clause the ref appeared in — drives output-alias suppression
+    /// (see [`RefClause`]).
+    pub(crate) clause: RefClause,
     /// Owning table captured at walk time. `None` for ambiguous /
     /// no-candidate / unrecognized-qualifier-shape cases.
     pub(crate) resolved: Option<TableReference>,
@@ -79,10 +114,12 @@ impl<'a> Resolver<'a> {
     pub(super) fn capture_column_ref(&mut self, parts: Vec<Ident>) {
         let scope_id = self.current_scope_id();
         let is_lineage_source = self.context.is_lineage_source;
+        let clause = self.context.current_clause;
         let (resolved, synthetic, resolution) = self.resolve_ref(&parts, scope_id);
         self.resolution.column_refs.push(CapturedColumnRef {
             parts,
             scope_id,
+            clause,
             resolved,
             synthetic,
             is_lineage_source,

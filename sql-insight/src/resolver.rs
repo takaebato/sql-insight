@@ -40,7 +40,7 @@ mod table_ref;
 
 pub(crate) use binding::{Binding, TableRole};
 pub(crate) use casing::{CaseFold, IdentifierCasing};
-pub(crate) use column_ref::CapturedColumnRef;
+pub(crate) use column_ref::{CapturedColumnRef, RefClause};
 pub(crate) use lineage::{LineageEdge, LineageTargetSpec};
 pub(crate) use query_body_output::{OutputColumn, QueryBodyOutput, SetOperand};
 pub(crate) use resolution::Resolution;
@@ -149,6 +149,14 @@ pub(crate) struct Context {
     /// subquery boundaries — a subquery inside a suppressed context
     /// is itself non-lineage.
     pub(crate) is_lineage_source: bool,
+    /// Which clause the walk is currently inside, for projection-alias
+    /// visibility (see [`RefClause`]). Stamped onto every captured
+    /// column ref. Set by [`Resolver::with_clause`] around the
+    /// GROUP BY / HAVING / ORDER BY walks and reset to
+    /// [`RefClause::Normal`] at each `resolve_query` boundary so a
+    /// subquery nested inside one of those clauses isn't mis-tagged
+    /// (its own columns appeared in *its* SELECT, not the outer clause).
+    pub(crate) current_clause: RefClause,
 }
 
 impl Default for Context {
@@ -159,6 +167,8 @@ impl Default for Context {
             // Walks start in value position. `suppress_lineage` flips
             // this to `false` for the duration of a non-lineage walk.
             is_lineage_source: true,
+            // Walks start outside any output-alias-visible clause.
+            current_clause: RefClause::Normal,
         }
     }
 }
@@ -216,6 +226,12 @@ impl<'a> Resolver<'a> {
     /// / pipes), then hands back the collected body output + body
     /// scope id.
     pub(super) fn resolve_query(&mut self, query: &Query) -> Result<ResolvedQuery, Error> {
+        // A nested query is its own clause-visibility world: reset the
+        // clause tag so a subquery inside an outer GROUP BY / HAVING /
+        // ORDER BY isn't mis-tagged (its columns belong to its own
+        // SELECT). Restored before returning.
+        let prev_clause = self.context.current_clause;
+        self.context.current_clause = RefClause::Normal;
         // Push a fresh body buffer onto the stack for this query;
         // the matching `pop_body_output` after the walk pulls the
         // populated buffer back out. Nested `resolve_query` (CTE
@@ -276,7 +292,7 @@ impl<'a> Resolver<'a> {
             }
             r.visit_set_expr(&query.body)?;
             if let Some(order_by) = &query.order_by {
-                r.visit_order_by(order_by)?;
+                r.with_clause(RefClause::OrderBy, |r| r.visit_order_by(order_by))?;
             }
             if let Some(limit_clause) = &query.limit_clause {
                 r.visit_limit_clause(limit_clause)?;
@@ -300,6 +316,18 @@ impl<'a> Resolver<'a> {
         } else {
             Some(body)
         };
+        // Point 2: record this query's output column names on the body
+        // scope (first operand = the set-op result schema) so a
+        // top-level ORDER BY — which is captured in this scope — can
+        // suppress alias references. See `Scope::output_names`.
+        if let Some(output) = &output_columns {
+            if let Some(operand) = output.set_operands.first() {
+                let casing = self.resolution.casing;
+                self.resolution.scopes[body_scope.0].output_names =
+                    introduced_alias_names(operand, casing);
+            }
+        }
+        self.context.current_clause = prev_clause;
         Ok(ResolvedQuery {
             output_columns,
             body_scope,
@@ -404,15 +432,21 @@ impl<'a> Resolver<'a> {
         for lateral_view in &select.lateral_views {
             self.visit_expr(&lateral_view.lateral_view)?;
         }
-        for expr in [
-            select.prewhere.as_ref(),
-            select.selection.as_ref(),
-            select.having.as_ref(),
-            select.qualify.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        // WHERE-family clauses resolve against FROM bindings only
+        // (no SELECT-alias visibility — they run before the projection).
+        // HAVING is split out because it *does* see output aliases.
+        // Order preserved (prewhere → selection → having → qualify) so
+        // the occurrence order of captured reads is unchanged.
+        if let Some(expr) = select.prewhere.as_ref() {
+            self.suppress_lineage(|r| r.visit_expr(expr))?;
+        }
+        if let Some(expr) = select.selection.as_ref() {
+            self.suppress_lineage(|r| r.visit_expr(expr))?;
+        }
+        if let Some(expr) = select.having.as_ref() {
+            self.suppress_lineage(|r| r.with_clause(RefClause::Having, |r| r.visit_expr(expr)))?;
+        }
+        if let Some(expr) = select.qualify.as_ref() {
             self.suppress_lineage(|r| r.visit_expr(expr))?;
         }
         for connect_by in &select.connect_by {
@@ -424,7 +458,7 @@ impl<'a> Resolver<'a> {
                 ConnectByKind::StartWith { condition, .. } => r.visit_expr(condition),
             })?;
         }
-        self.visit_group_by(&select.group_by)?;
+        self.with_clause(RefClause::GroupBy, |r| r.visit_group_by(&select.group_by))?;
         // CLUSTER BY / DISTRIBUTE BY (Hive / Spark) — partitioning /
         // clustering directives — partition / distribution keys,
         // not value sources. SORT BY's `visit_order_by_expr` already
@@ -432,12 +466,27 @@ impl<'a> Resolver<'a> {
         self.suppress_lineage(|r| r.visit_exprs(&select.cluster_by))?;
         self.suppress_lineage(|r| r.visit_exprs(&select.distribute_by))?;
         for order_by in &select.sort_by {
-            self.visit_order_by_expr(order_by)?;
+            self.with_clause(RefClause::OrderBy, |r| r.visit_order_by_expr(order_by))?;
         }
         for window in &select.named_window {
             if let NamedWindowExpr::WindowSpec(spec) = &window.1 {
                 self.visit_window_spec(spec)?;
             }
+        }
+        // Point 1: record this SELECT's output column names on the scope
+        // it runs in (the per-operand scope for a set operation), so its
+        // own GROUP BY / HAVING / SORT BY can suppress alias references.
+        // See `Scope::output_names`.
+        let casing = self.resolution.casing;
+        let output_names = self
+            .context
+            .body_output_stack
+            .last()
+            .and_then(|body| body.set_operands.last())
+            .map(|operand| introduced_alias_names(operand, casing));
+        if let Some(names) = output_names {
+            let scope = self.current_scope_id();
+            self.resolution.scopes[scope.0].output_names = names;
         }
         Ok(())
     }
@@ -2138,6 +2187,20 @@ impl<'a> Resolver<'a> {
         self.context.is_lineage_source = prev;
         r
     }
+
+    /// Tag column refs captured inside `f` with `clause` (for
+    /// projection-alias visibility — see [`RefClause`]). The previous
+    /// clause is restored on return. Wraps the GROUP BY / HAVING /
+    /// ORDER BY walks. Nested subqueries reset to [`RefClause::Normal`]
+    /// at their `resolve_query` boundary, so the tag doesn't leak into a
+    /// subquery's own SELECT.
+    fn with_clause<R>(&mut self, clause: RefClause, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.context.current_clause;
+        self.context.current_clause = clause;
+        let r = f(self);
+        self.context.current_clause = prev;
+        r
+    }
 }
 
 /// Rename each source operand's columns positionally to the INSERT
@@ -2181,6 +2244,45 @@ fn from_table_items(from: &FromTable) -> &[TableWithJoins] {
     match from {
         FromTable::WithFromKeyword(items) | FromTable::WithoutKeyword(items) => items,
     }
+}
+
+/// The *introduced* output-alias names of one set-operation operand
+/// (one SELECT body) — the names a later GROUP BY / HAVING / ORDER BY
+/// can reference that are pure aliases rather than real columns.
+///
+/// An identity passthrough (`SELECT a` / `SELECT a AS a` / `SELECT t.a`)
+/// keeps the underlying column's own name, so a clause ref to it *is*
+/// the real column and must not be suppressed (this is what keeps the
+/// ubiquitous `SELECT a FROM t GROUP BY a` surfacing `a` as a read).
+/// Only computed expressions and renamed passthroughs introduce a name
+/// that shadows as an alias. Unnamed columns (wildcards,
+/// computed-without-alias) expose no matchable name. Stored on
+/// [`Scope::output_names`](scope::Scope) for the suppression post-pass.
+fn introduced_alias_names(operand: &SetOperand, casing: IdentifierCasing) -> Vec<Ident> {
+    operand
+        .columns
+        .iter()
+        .filter_map(|column| {
+            let name = column.name.clone()?;
+            (!is_identity_passthrough(column, casing)).then_some(name)
+        })
+        .collect()
+}
+
+/// True iff `column` forwards a single source column under that column's
+/// own name — i.e. its output name is the real column's name, not an
+/// introduced alias.
+fn is_identity_passthrough(column: &OutputColumn, casing: IdentifierCasing) -> bool {
+    let Some(name) = &column.name else {
+        return false;
+    };
+    matches!(
+        column.source_refs.as_slice(),
+        [source] if source
+            .parts
+            .last()
+            .is_some_and(|col| casing.column.normalize(col) == casing.column.normalize(name))
+    )
 }
 
 /// Best-effort extraction of a write-target `TableReference` from a

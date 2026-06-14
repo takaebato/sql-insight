@@ -1257,6 +1257,108 @@ mod reads_by_clause {
     }
 }
 
+/// Projection-alias visibility in GROUP BY / HAVING / ORDER BY: an
+/// unqualified ref there that names an *introduced* output alias
+/// (computed expression or renamed column) is a reference to that
+/// output, not a stored column, so it's dropped from reads rather than
+/// surfacing as a phantom. Identity passthroughs (`SELECT a … GROUP BY
+/// a`) and qualified refs stay — see `reads_by_clause` for those.
+mod output_alias_visibility {
+    use super::*;
+
+    #[test]
+    fn order_by_computed_alias_is_suppressed() {
+        // `total` = `a + b` is a computed alias — no stored `total`
+        // column exists. The ORDER BY ref to it must not surface as a
+        // phantom `t.total`; the real dependency (a, b) is already
+        // captured at the projection.
+        assert_column_ops(
+            "SELECT a + b AS total FROM t ORDER BY total",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "a"), out("total", 0)),
+                    transformation(col("t", "b"), out("total", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn group_by_renamed_alias_is_suppressed() {
+        // `a AS x` renames the column — `x` is an alias, not a stored
+        // column, so GROUP BY x is dropped (the dep `a` is in reads via
+        // the projection).
+        assert_column_ops(
+            "SELECT a AS x FROM t GROUP BY x",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("x", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn having_computed_alias_is_suppressed() {
+        // `s` = `SUM(a)` is a computed alias; HAVING s references the
+        // aggregate output, not a stored column.
+        assert_column_ops(
+            "SELECT SUM(a) AS s FROM t HAVING s > 0",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![transformation(col("t", "a"), out("s", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn qualified_ref_in_order_by_is_not_an_alias() {
+        // `t.total` is qualified — aliases are unqualified-only, so it's
+        // taken as a (best-effort) column of `t`, not the computed
+        // alias. It surfaces as a read; suppression only applies to
+        // bare names.
+        assert_column_ops(
+            "SELECT a + b AS total FROM t ORDER BY t.total",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b"), read("t", "total")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "a"), out("total", 0)),
+                    transformation(col("t", "b"), out("total", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn subquery_in_order_by_keeps_its_reads() {
+        // The clause tag resets at the subquery boundary, so the
+        // subquery's own `x` isn't mis-tagged / suppressed — it surfaces
+        // as a normal read of `s`.
+        assert_column_ops(
+            "SELECT a FROM t ORDER BY (SELECT MAX(x) FROM s)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("s", "x")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+}
+
 mod diagnostics {
     use super::*;
 

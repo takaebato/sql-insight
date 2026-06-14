@@ -82,8 +82,38 @@ impl Resolution {
         self.column_refs
             .iter()
             .filter(|captured| !captured.synthetic)
+            .filter(|captured| !self.is_suppressed_output_alias(captured))
             .cloned()
             .collect()
+    }
+
+    /// True iff `captured` is an unqualified column ref in a
+    /// GROUP BY / HAVING / ORDER BY clause whose name matches one of its
+    /// own query's output column names — i.e. it references a SELECT-list
+    /// output alias, not a stored column. Those are dropped from the
+    /// public reads: the real dependency (the columns feeding that
+    /// output) is already captured at the projection, so surfacing the
+    /// alias name as a read would be a phantom (e.g. `t.total` for
+    /// `SELECT a + b AS total FROM t ORDER BY total`).
+    ///
+    /// Best-effort: matches purely on name (single segment, folded by
+    /// the column casing), so an output alias uniformly shadows a
+    /// same-named stored column in these clauses. Dialect-specific
+    /// alias-vs-column precedence (ORDER BY favours the alias, GROUP BY
+    /// the input column) is not modelled — the fine-grained
+    /// [`RefClause`](super::RefClause) tag leaves room to add it later.
+    fn is_suppressed_output_alias(&self, captured: &CapturedColumnRef) -> bool {
+        if !captured.clause.is_output_scoped() {
+            return false;
+        }
+        let [name] = captured.parts.as_slice() else {
+            return false;
+        };
+        let key = BindingKey::new(name, self.casing.column);
+        self.scopes[captured.scope_id.0]
+            .output_names
+            .iter()
+            .any(|output| BindingKey::new(output, self.casing.column) == key)
     }
 
     /// Collapse every lineage edge so its source resolves to a real

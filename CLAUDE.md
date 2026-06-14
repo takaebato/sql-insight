@@ -199,6 +199,26 @@ by hand.
   to handle correctly. Wildcards contribute nothing to `reads` /
   `lineage`; consumers needing per-column source → target lineage
   either supply resolved query plans or do their own expansion.
+- Projection-alias visibility in GROUP BY / HAVING / ORDER BY: SQL
+  exposes SELECT-list output aliases to these clauses (the clause
+  ordering = a logical-plan operator stack — ORDER BY sits over
+  Project). A bare ref there naming an **introduced** alias (computed
+  expr or renamed column, e.g. `total` in `SELECT a+b AS total …
+  ORDER BY total`) is a reference to that output, not a stored column,
+  so it's dropped from `reads` rather than surfacing as a phantom
+  (`t.total`) — the real dependency is already captured at the
+  projection. Mechanism: each `Scope` records its **introduced** output
+  alias names (`Scope::output_names`; identity passthroughs like
+  `SELECT a … GROUP BY a` are *kept*, so the common case still surfaces
+  `a`); `CapturedColumnRef.clause` (`RefClause`) tags the clause during
+  the walk (reset at each `resolve_query` boundary); the
+  `real_column_refs` post-pass drops a clause-tagged single-segment ref
+  whose name matches its scope's output aliases. Qualified refs
+  (`t.total`) are never treated as aliases. Dialect-specific
+  alias-vs-column precedence (ORDER BY favours alias, GROUP BY the input
+  column) is not modelled — the fine `RefClause` tag leaves room. This
+  is the first slice of moving the non-lexical "clause-phase" resolution
+  axis out of walk-time into a post-pass.
 
 ## Code conventions
 

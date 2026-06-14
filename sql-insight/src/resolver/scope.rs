@@ -42,6 +42,16 @@ pub(crate) struct Scope {
     /// resolution scans [`Scope::iter_bindings`] instead. `IndexMap`
     /// preserves definition order for deterministic iteration.
     pub(super) bindings: IndexMap<BindingKey, Binding>,
+    /// The named output columns of the SELECT body that runs in this
+    /// scope (its column aliases / projected names). Empty until the
+    /// body's projection is recorded. Used only by the projection-alias
+    /// suppression post-pass: an unqualified column ref in this scope's
+    /// GROUP BY / HAVING / ORDER BY whose name matches one of these is a
+    /// reference to the output, not a stored column, and is dropped from
+    /// the public reads. For a set operation the operands' own scopes
+    /// hold their per-operand names; the query's body scope holds the
+    /// first operand's names (the result schema).
+    pub(super) output_names: Vec<sqlparser::ast::Ident>,
 }
 
 /// Iterate the scope ids on the chain `from → parent → parent → … → root`,
@@ -57,6 +67,7 @@ impl Scope {
         Self {
             parent,
             bindings: IndexMap::new(),
+            output_names: Vec::new(),
         }
     }
 
