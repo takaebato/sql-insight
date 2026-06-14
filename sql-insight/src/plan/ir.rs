@@ -9,7 +9,7 @@
 use sqlparser::ast::Ident;
 
 use crate::extractor::ColumnLineageKind;
-use crate::reference::{ColumnRead, ResolutionKind, TableReference};
+use crate::reference::{ColumnRead, TableReference};
 
 /// One node in the bound operator tree.
 ///
@@ -20,30 +20,23 @@ use crate::reference::{ColumnRead, ResolutionKind, TableReference};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Plan {
     Scan(Scan),
-    OpaqueLeaf(OpaqueLeaf),
+    /// A leaf with no inspectable columns — `VALUES`, a table function,
+    /// or any FROM item not modelled yet. It contributes no source
+    /// columns (and no scope entry), so resolution / extraction skip it.
+    OpaqueLeaf,
     PassThrough(PassThrough),
     Project(Project),
     SetOp(SetOp),
     Write(Write),
 }
 
-/// A real stored table (leaf). Catalog-free its column set is unknown,
-/// so resolution treats it as an open relation.
+/// A real stored table (leaf), identified by its (catalog-canonicalized)
+/// reference. The use-site alias and catalog resolution live on the
+/// bind-time scope, not here; column reads already carry their own
+/// resolution, so the persisted node needs only the table identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Scan {
     pub(crate) table: TableReference,
-    /// Alias at this use-site, if any (drives qualifier matching).
-    pub(crate) alias: Option<Ident>,
-    /// How the catalog identified the table. Catalog-free → `Inferred`.
-    pub(crate) resolution: ResolutionKind,
-}
-
-/// A relation with no inspectable column provenance — `VALUES`, a table
-/// function, or any FROM item not modelled yet. Contributes a (possibly
-/// aliased) scope entry but no source columns.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OpaqueLeaf {
-    pub(crate) alias: Option<Ident>,
 }
 
 /// Join (N inputs) **and** every filter (WHERE / HAVING / JOIN ON):
@@ -57,27 +50,25 @@ pub(crate) struct PassThrough {
 }
 
 /// The SELECT list — the only column-defining producer. Each output
-/// column carries its pre-collapsed provenance and a
-/// passthrough/transformation kind (aggregates fold in as
-/// `Transformation`).
+/// column carries its pre-collapsed provenance, each source of which
+/// holds its own composed lineage kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Project {
     pub(crate) input: Box<Plan>,
     pub(crate) outputs: Vec<BoundColumn>,
 }
 
-/// A set operation (UNION / INTERSECT / EXCEPT): the result schema is
-/// the first operand's, with the others fanned in positionally. (Bind
-/// for this is a later brick.)
+/// A set operation (UNION / INTERSECT / EXCEPT): the result columns are
+/// the operands' columns merged positionally (name from the first
+/// operand, provenance unioned across all).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SetOp {
     pub(crate) operands: Vec<Plan>,
 }
 
 /// A statement that writes a relation (INSERT / UPDATE / MERGE / CTAS /
-/// CREATE VIEW): the source `input`'s output columns pair with
-/// `target_columns` to produce relation lineage. (Bind is a later
-/// brick.)
+/// CREATE VIEW): the source `input`'s output columns pair positionally
+/// with `target_columns` to produce relation lineage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Write {
     pub(crate) target: TableReference,

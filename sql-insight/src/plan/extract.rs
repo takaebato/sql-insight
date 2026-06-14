@@ -20,7 +20,7 @@ pub(crate) fn extract_reads(plan: &Plan) -> Vec<ColumnRead> {
 
 fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
     match plan {
-        Plan::Scan(_) | Plan::OpaqueLeaf(_) => {}
+        Plan::Scan(_) | Plan::OpaqueLeaf => {}
         Plan::PassThrough(pt) => {
             out.extend(pt.reads.iter().cloned());
             for input in &pt.inputs {
@@ -68,7 +68,7 @@ fn collect_input_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
             }
         }
         // No output columns to skip — every read is a filter read.
-        Plan::Scan(_) | Plan::OpaqueLeaf(_) | Plan::Write(_) => collect_reads(plan, out),
+        Plan::Scan(_) | Plan::OpaqueLeaf | Plan::Write(_) => collect_reads(plan, out),
     }
 }
 
@@ -155,7 +155,7 @@ pub(crate) fn output_operands(plan: &Plan) -> Vec<&[BoundColumn]> {
         Plan::Project(project) => vec![&project.outputs],
         Plan::SetOp(set) => set.operands.iter().flat_map(output_operands).collect(),
         Plan::PassThrough(pt) => pt.inputs.first().map(output_operands).unwrap_or_default(),
-        Plan::Scan(_) | Plan::OpaqueLeaf(_) | Plan::Write(_) => Vec::new(),
+        Plan::Scan(_) | Plan::OpaqueLeaf | Plan::Write(_) => Vec::new(),
     }
 }
 

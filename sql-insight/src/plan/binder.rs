@@ -19,9 +19,7 @@ use sqlparser::ast::{
     TableWithJoins, Update, UpdateTableFromKind,
 };
 
-use super::ir::{
-    BoundColumn, OpaqueLeaf, PassThrough, Plan, Project, ProvenanceSource, Scan, SetOp, Write,
-};
+use super::ir::{BoundColumn, PassThrough, Plan, Project, ProvenanceSource, Scan, SetOp, Write};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::extractor::ColumnLineageKind;
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
@@ -207,7 +205,7 @@ impl Binder<'_> {
         let target_columns = insert.columns.clone();
         let input = match &insert.source {
             Some(source) => self.bind_query(source).0,
-            None => Plan::OpaqueLeaf(OpaqueLeaf { alias: None }),
+            None => Plan::OpaqueLeaf,
         };
         Some(Plan::Write(Write {
             target,
@@ -471,7 +469,7 @@ impl Binder<'_> {
         let mut provisional = env.to_vec();
         provisional.push(CteRelation {
             name: name.clone(),
-            plan: Plan::OpaqueLeaf(OpaqueLeaf { alias: None }),
+            plan: Plan::OpaqueLeaf,
             outputs: anchor_outputs,
         });
         let (plan, scope) = self.with_ctes(provisional).bind_query(&cte.query);
@@ -553,7 +551,7 @@ impl Binder<'_> {
                 )
             }
             // VALUES / table-valued bodies: no inspectable columns yet.
-            _ => (Plan::OpaqueLeaf(OpaqueLeaf { alias: None }), Scope::empty()),
+            _ => (Plan::OpaqueLeaf, Scope::empty()),
         }
     }
 
@@ -612,7 +610,7 @@ impl Binder<'_> {
             .collect();
         match bound.len() {
             // `SELECT 1` (no FROM) — an empty opaque source.
-            0 => (Plan::OpaqueLeaf(OpaqueLeaf { alias: None }), Scope::empty()),
+            0 => (Plan::OpaqueLeaf, Scope::empty()),
             1 => bound.pop().unwrap(),
             // Comma join: a PassThrough with no predicate.
             _ => {
@@ -667,7 +665,7 @@ impl Binder<'_> {
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 let Ok(written) = TableReference::try_from_name(name) else {
-                    return (Plan::OpaqueLeaf(OpaqueLeaf { alias: None }), Scope::empty());
+                    return (Plan::OpaqueLeaf, Scope::empty());
                 };
                 let alias = alias.as_ref().map(|a| a.name.clone());
                 // A bare name matching an in-scope CTE resolves to that
@@ -695,25 +693,14 @@ impl Binder<'_> {
                     Some((canonical, _)) => (canonical, RelationColumns::Open),
                     None => (written, RelationColumns::Open),
                 };
-                let resolution = match columns {
-                    RelationColumns::Known(_) => ResolutionKind::Cataloged,
-                    RelationColumns::Open => ResolutionKind::Inferred,
-                };
                 let relation = Relation {
-                    alias: alias.clone(),
+                    alias,
                     source: RelationSource::Table {
                         table: table.clone(),
                         columns,
                     },
                 };
-                (
-                    Plan::Scan(Scan {
-                        table,
-                        alias,
-                        resolution,
-                    }),
-                    Scope::of(relation),
-                )
+                (Plan::Scan(Scan { table }), Scope::of(relation))
             }
             // A derived table `(<subquery>) AS d`: bind the subquery and
             // expose its output columns as a synthetic relation. Those
@@ -737,7 +724,7 @@ impl Binder<'_> {
             }
             // Table functions / pivots / VALUES etc. are later bricks;
             // they expose no inspectable columns yet.
-            _ => (Plan::OpaqueLeaf(OpaqueLeaf { alias: None }), Scope::empty()),
+            _ => (Plan::OpaqueLeaf, Scope::empty()),
         }
     }
 
@@ -1336,15 +1323,11 @@ fn inferred_output_name(expr: &Expr) -> Option<Ident> {
     }
 }
 
-fn is_single_column(expr: &Expr) -> bool {
-    matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-}
-
 /// The lineage kind an expression contributes to its direct sources: a
 /// bare column reference forwards its value (`Passthrough`); anything
 /// else derives a new value (`Transformation`).
 fn expr_kind(expr: &Expr) -> ColumnLineageKind {
-    if is_single_column(expr) {
+    if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
         ColumnLineageKind::Passthrough
     } else {
         ColumnLineageKind::Transformation
@@ -1438,11 +1421,7 @@ mod tests {
     }
 
     fn scan(name: &str) -> Plan {
-        Plan::Scan(Scan {
-            table: tref(name),
-            alias: None,
-            resolution: ResolutionKind::Inferred,
-        })
+        Plan::Scan(Scan { table: tref(name) })
     }
 
     fn inferred(table: &str, column: &str) -> ColumnRead {
