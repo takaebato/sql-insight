@@ -212,7 +212,7 @@ impl TableOperationExtractor {
         // resolver-based path is retained as `resolver_table_operation`
         // only for the strangler differential harness until the resolver is
         // removed.
-        Ok(crate::plan::table_operation::table_operation(
+        Ok(crate::resolver::table_operation::table_operation(
             statement, catalog, casing,
         ))
     }

@@ -193,16 +193,17 @@
 //!   `#[non_exhaustive]` at the 1.0 freeze, once the variant sets
 //!   stabilize.
 
-// The bound logical-plan analysis engine (design "B"): a materialized
-// full-stack operator tree that resolves a `Statement` and backs every
-// public extractor. It replaced the former flat-buffer `resolver`.
 pub mod catalog;
 pub mod diagnostic;
 pub mod error;
 pub mod extractor;
 pub mod formatter;
 pub mod normalizer;
-mod plan;
+
+// The analysis engine (design "B"): binds a `Statement` into a
+// materialized, full-stack bound logical-plan tree (`Plan`) and walks it
+// for the extraction surfaces. Backs every public extractor.
+mod resolver;
 
 // Dialect-aware identifier casing (case folding for table / alias /
 // column matching). Threaded into the binder and the extractors.

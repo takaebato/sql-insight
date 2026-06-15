@@ -17,13 +17,13 @@ by hand.
 
 ## Architecture
 
-- The private `plan` module is the analysis engine: it binds a
-  `Statement` into a **materialized, full-stack logical-plan tree**
-  (`ir::Plan`) and walks that tree for the extraction surfaces. It is
-  *not* an execution plan — nothing optimizes or runs SQL. (This
-  replaced an earlier flat-buffer `resolver`; some doc comments still
-  say "the resolver" generically to mean this resolution logic.)
-  Sub-modules:
+- The private `resolver` module is the analysis engine: it binds a
+  `Statement` into a **materialized, full-stack bound logical-plan
+  tree** (`ir::Plan`) and walks that tree for the extraction surfaces.
+  It is *not* an execution plan — nothing optimizes or runs SQL. (An
+  earlier design built this as an incubating `plan` module beside a
+  flat-buffer resolver; at parity it took over the `resolver` name, so
+  the module is `resolver` but its output type is `Plan`.) Sub-modules:
   - `ir` — the persistent operator-tree types.
   - `binder` — `build_with_diagnostics(stmt, catalog, casing) ->
     (Option<Plan>, Vec<ColumnLevelDiagnostic>)`, the bind pass

@@ -88,7 +88,7 @@ impl TableExtractor {
         // No catalog is consulted — this API surfaces no columns, so a
         // catalog would not change the table list.
         let (tables, diagnostics) =
-            crate::plan::table_operation::flat_table_extraction(statement, None, casing);
+            crate::resolver::table_operation::flat_table_extraction(statement, None, casing);
         Ok(TableExtraction {
             tables,
             diagnostics,

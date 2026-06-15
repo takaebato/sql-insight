@@ -290,7 +290,7 @@ impl ColumnOperationExtractor {
         // resolver-based path is retained as `resolver_column_operation`
         // only for the strangler differential harness until the resolver is
         // removed.
-        Ok(crate::plan::operation::column_operation(
+        Ok(crate::resolver::operation::column_operation(
             statement, catalog, casing,
         ))
     }

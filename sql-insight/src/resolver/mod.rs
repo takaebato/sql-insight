@@ -1,13 +1,13 @@
-//! The bound logical-plan analysis engine — design **B** from the
-//! 2026-06-14 grill. It turns a parsed `Statement` into a resolved
-//! representation the extractors consume: a materialized, full-stack
-//! operator tree ([`ir::Plan`]) whose column provenance is resolved
-//! bottom-up. It is **not** an execution plan — nothing here optimizes or
-//! runs SQL. This engine backs every public extractor (column / table /
-//! flat / CRUD); it replaced the former flat-buffer resolver.
+//! The resolution engine: turns a parsed `Statement` into a resolved
+//! representation the extractors consume — a materialized, full-stack
+//! bound logical-plan tree ([`ir::Plan`]) whose column provenance is
+//! resolved bottom-up. It is **not** an execution plan — nothing here
+//! optimizes or runs SQL. Backs every public extractor (column / table /
+//! flat / CRUD).
 //!
 //! - [`ir`] — the persistent operator tree types.
-//! - [`binder`] — `build`: AST → resolved `Plan` (the bind pass).
+//! - [`binder`] — `build_with_diagnostics`: AST → resolved `Plan` (the
+//!   bind pass).
 //! - [`extract`] — walk a `Plan` for the operation surfaces.
 //! - [`operation`] — assemble the public `ColumnOperation` from a `Plan`.
 //! - [`table_operation`] — assemble the public `TableOperation` and the
