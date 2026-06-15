@@ -453,17 +453,19 @@ mod integration {
         }
 
         #[test]
-        fn test_extract_crud_per_statement_error_surfaces() {
-            // Mirror of `test_fail_to_analyze_sql` for the CRUD path —
-            // exercises the per-statement `Err(e) => "Error: ..."` arm
-            // in `CrudTableExtractExecutor::execute`. Parse succeeds, but
-            // the over-qualified table name fails analysis.
+        fn test_extract_crud_over_qualified_name_is_best_effort() {
+            // Behavior change vs the legacy resolver: an over-qualified table
+            // name (more than `catalog.schema.name`) can't be represented as
+            // a `TableReference`. The resolver hard-errored ("Too many
+            // identifiers provided"); the bound-plan engine is best-effort,
+            // so it drops the unrepresentable relation and reports an empty
+            // result instead of failing the statement.
             sql_insight_cmd()
                 .arg("extract-crud")
                 .arg("select * from catalog.schema.table.extra")
                 .assert()
                 .success()
-                .stdout("Error: Too many identifiers provided\n")
+                .stdout("Create: [], Read: [], Update: [], Delete: []\n")
                 .stderr("");
         }
 

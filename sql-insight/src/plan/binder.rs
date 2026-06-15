@@ -17,17 +17,17 @@ use sqlparser::ast::{
     FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments,
     GroupByExpr, GroupByWithModifier, Ident, Insert, Join, JoinConstraint, JoinOperator,
     LimitClause, ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind, NamedWindowExpr,
-    ObjectName, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator, Query,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript, TableAlias,
-    TableFactor, TableWithJoins, TopQuantity, Update, UpdateTableFromKind, Values,
-    WindowFrameBound, WindowSpec, WindowType,
+    ObjectName, ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind,
+    PipeOperator, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
+    Subscript, TableAlias, TableFactor, TableWithJoins, TopQuantity, Update, UpdateTableFromKind,
+    Values, WindowFrameBound, WindowSpec, WindowType,
 };
 
 use std::cell::RefCell;
 
 use super::ir::{
-    BoundColumn, CtePlan, CteRef, PassThrough, Plan, Project, ProvenanceSource, Scan, ScanRole,
-    SetOp, With, Write,
+    BoundColumn, CtePlan, CteRef, DeletePlan, PassThrough, Plan, Project, ProvenanceSource, Scan,
+    ScanRole, SetOp, With, Write,
 };
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
@@ -217,15 +217,31 @@ struct Binder<'a> {
 /// Accumulator for walking one expression. References split by position:
 /// `sources` are value references (they flow to the output → lineage),
 /// `filter_reads` are predicate references (they only influence which rows
-/// / values are produced → reads but not lineage), and `subplans` are the
-/// whole bound plans of nested subqueries. `is_suppressed` marks the
-/// current position as a filter, mirroring the resolver's `suppress_lineage`.
+/// / values are produced → reads but not lineage). Sub-plans of nested
+/// subqueries split the same way: `value_subplans` sit in value position
+/// (their output feeds the enclosing value → lineage), `filter_subplans`
+/// sit in a predicate (`EXISTS` / `IN` / a `CASE` condition → reads only).
+/// `is_suppressed` marks the current position as a filter, mirroring the
+/// resolver's `suppress_lineage`, and routes a subquery to the right list.
 #[derive(Default)]
 struct ExprCollector {
     sources: Vec<ProvenanceSource>,
     filter_reads: Vec<ColumnRead>,
-    subplans: Vec<Plan>,
+    value_subplans: Vec<Plan>,
+    filter_subplans: Vec<Plan>,
     is_suppressed: bool,
+}
+
+/// One value expression bound into an output column, with its
+/// position-split side effects. `value_subplans` feed lineage (a scalar
+/// subquery whose result flows to the column), while `filter_reads` /
+/// `filter_subplans` are predicate-only (a `CASE` condition, an `EXISTS`
+/// test) — reads that don't feed, destined for a non-feeding position.
+struct BoundValue {
+    column: BoundColumn,
+    value_subplans: Vec<Plan>,
+    filter_reads: Vec<ColumnRead>,
+    filter_subplans: Vec<Plan>,
 }
 
 impl ExprCollector {
@@ -253,6 +269,17 @@ impl ExprCollector {
         f(self);
         self.is_suppressed = prev;
     }
+
+    /// Drain a filter-context collector (WHERE / ON / clause / arg / pipe):
+    /// its reads plus *all* its sub-plans. In a filter position no sub-plan
+    /// feeds lineage, so value- and filter-position sub-plans merge into one
+    /// non-feeding list (a filter collector never collects value sub-plans
+    /// anyway, since `is_suppressed` is never cleared).
+    fn into_filter_parts(self) -> (Vec<ColumnRead>, Vec<Plan>) {
+        let mut subplans = self.value_subplans;
+        subplans.extend(self.filter_subplans);
+        (self.filter_reads, subplans)
+    }
 }
 
 impl Binder<'_> {
@@ -277,6 +304,20 @@ impl Binder<'_> {
                 ..
             } => self.bind_alter_view(name, columns, query),
             Statement::AlterTable(alter) => self.bind_alter_table(alter),
+            Statement::Drop {
+                object_type,
+                names,
+                table,
+                ..
+            } => self.bind_drop(object_type, names, table.as_ref()),
+            Statement::Truncate(truncate) => Some(Plan::Drop(
+                truncate
+                    .table_names
+                    .iter()
+                    .filter_map(|t| TableReference::try_from(&t.name).ok())
+                    .map(|t| self.canonical_target(t))
+                    .collect(),
+            )),
             // Other DDL / session statements aren't data operations — not
             // bound (the wildcard mirrors `build`'s "unsupported → None").
             _ => None,
@@ -356,20 +397,24 @@ impl Binder<'_> {
                 scope = scope.merge(from_scope);
             }
         }
-        let (mut reads, mut subqueries) = update
+        // The WHERE predicate's reads / sub-plans are filter position (they
+        // pick which rows update, they don't feed the new value); only a SET
+        // RHS value sub-plan feeds the target.
+        let (mut reads, mut filter_subqueries) = update
             .selection
             .as_ref()
             .map(|s| self.expr_reads(s, &scope))
             .unwrap_or_default();
+        let mut value_subqueries = Vec::new();
         let mut outputs = Vec::new();
         let mut target_columns = Vec::new();
         for assignment in &update.assignments {
             for column in assignment_target_columns(&assignment.target) {
-                let (output, value_subqueries, value_filter_reads) =
-                    self.bind_value_column(Some(column.clone()), &assignment.value, &scope);
-                outputs.push(output);
-                subqueries.extend(value_subqueries);
-                reads.extend(value_filter_reads);
+                let bound = self.bind_value_column(Some(column.clone()), &assignment.value, &scope);
+                outputs.push(bound.column);
+                value_subqueries.extend(bound.value_subplans);
+                reads.extend(bound.filter_reads);
+                filter_subqueries.extend(bound.filter_subplans);
                 target_columns.push(column);
             }
         }
@@ -380,73 +425,136 @@ impl Binder<'_> {
             target,
             target_columns,
             input: Box::new(Plan::Project(Project {
-                input: Box::new(wrap_inputs(inputs, reads, Vec::new())),
+                input: Box::new(wrap_inputs(inputs, reads, filter_subqueries)),
                 outputs,
-                subqueries,
+                subqueries: value_subqueries,
             })),
             returning,
             conflict_updates: Vec::new(),
         }))
     }
 
-    /// `DELETE FROM target [USING src] WHERE pred`: the predicate's reads
-    /// against the FROM (and USING) relations; no column writes (the rows
-    /// are removed wholesale), so the [`Write`]'s `target_columns` is
-    /// empty — the target still surfaces for table-level analysis.
+    /// `DELETE`: bind every consulted relation as a scan with the right
+    /// role and collect the deletion targets. The FROM clause's role
+    /// depends on the statement shape (mirroring the resolver):
+    ///   `DELETE FROM t`                → FROM is the (write) target
+    ///   `DELETE FROM t1, t2 USING src` → FROM are targets, USING are reads
+    ///   `DELETE t1, t2 FROM src`       → FROM are reads, the list are targets
+    /// An explicit `DELETE alias FROM …` list resolves each name (possibly
+    /// a FROM alias) to its real table through the FROM scope. There are no
+    /// column writes / lineage — rows go wholesale; only `RETURNING`
+    /// projects the deleted rows.
     fn bind_delete(&self, delete: &Delete) -> Option<Plan> {
         let from_tables = match &delete.from {
             FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
         };
-        // An implicit `DELETE FROM t` (no explicit `DELETE t1, …` list)
-        // deletes its single FROM target — that relation is the write, not
-        // a read. With an explicit list the FROM relations are all reads
-        // (the named target also surfaces as a write via `Write.target`).
-        let implicit_target = delete.tables.is_empty();
+        // With no explicit `DELETE t, …` list the FROM relations are the
+        // deletion targets (write role: in scope for the predicate /
+        // RETURNING but not a read); with a list the FROM relations are all
+        // reads and the list names the targets.
+        let from_is_target = delete.tables.is_empty();
         let mut inputs = Vec::new();
         let mut scope = Scope::empty();
-        for (i, twj) in from_tables
-            .iter()
-            .chain(delete.using.iter().flatten())
-            .enumerate()
-        {
+        let mut targets = Vec::new();
+        // USING relations are always reads. Bind them first so an explicit
+        // target alias can resolve against them too (alias-defining clause).
+        for twj in delete.using.iter().flatten() {
             let (plan, twj_scope) = self.bind_table_with_joins(twj, &scope);
-            let plan = if implicit_target && i == 0 {
-                into_write_target(plan)
-            } else {
-                plan
-            };
             inputs.push(plan);
             scope = scope.merge(twj_scope);
+        }
+        for twj in from_tables {
+            if from_is_target {
+                // The FROM relations are the deletion targets. A target may
+                // be an alias into a USING relation already bound above
+                // (`DELETE FROM t_alias USING real AS t_alias`) — or just the
+                // same name as a USING relation — so resolve it through the
+                // scope and don't re-bind. Otherwise it's a fresh target
+                // table, bound write-role (in scope for the predicate /
+                // RETURNING, but not a read).
+                let resolved = TableReference::try_from(&twj.relation)
+                    .ok()
+                    .and_then(|written| self.scope_target(&written, &scope));
+                if let Some(target) = resolved {
+                    targets.push(target);
+                } else {
+                    let (plan, twj_scope) = self.bind_table_with_joins(twj, &scope);
+                    targets.extend(self.twj_table_targets(twj));
+                    inputs.push(into_write_target(plan));
+                    scope = scope.merge(twj_scope);
+                }
+            } else {
+                let (plan, twj_scope) = self.bind_table_with_joins(twj, &scope);
+                inputs.push(plan);
+                scope = scope.merge(twj_scope);
+            }
+        }
+        for name in &delete.tables {
+            if let Some(target) = self.resolve_delete_target(name, &scope) {
+                targets.push(target);
+            }
         }
         let (reads, subqueries) = delete
             .selection
             .as_ref()
             .map(|s| self.expr_reads(s, &scope))
             .unwrap_or_default();
-        // RETURNING resolves against the FROM / USING scope (which holds
-        // the target).
+        // RETURNING resolves against the FROM / USING scope (which holds the
+        // target).
         let returning = self.bind_returning(&delete.returning, &scope);
         let input = wrap_inputs(inputs, reads, subqueries);
-        // The deleted relation is the explicit `DELETE t` list when
-        // present, else the FROM target.
-        let target = if let Some(name) = delete.tables.first() {
-            TableReference::try_from_name(name).ok()
-        } else {
-            from_tables
-                .first()
-                .and_then(|twj| TableReference::try_from(&twj.relation).ok())
+        Some(Plan::Delete(DeletePlan {
+            input: Box::new(input),
+            targets,
+            returning,
+        }))
+    }
+
+    /// The plain-table targets of a FROM `TableWithJoins` (its relation plus
+    /// any joined relations), catalog-canonicalized. Used when the FROM
+    /// clause *is* the deletion target (`DELETE FROM t1, t2 …`). Derived /
+    /// table-function factors yield no target.
+    fn twj_table_targets(&self, twj: &TableWithJoins) -> Vec<TableReference> {
+        std::iter::once(&twj.relation)
+            .chain(twj.joins.iter().map(|join| &join.relation))
+            .filter_map(|factor| TableReference::try_from(factor).ok())
+            .map(|target| self.canonical_target(target))
+            .collect()
+    }
+
+    /// Resolve an explicit `DELETE` target name to its real table: a
+    /// single-segment name may be a FROM alias (or the bare name of an
+    /// in-scope relation), so consult the scope first; otherwise
+    /// canonicalize it as written.
+    fn resolve_delete_target(&self, name: &ObjectName, scope: &Scope) -> Option<TableReference> {
+        let written = TableReference::try_from_name(name).ok()?;
+        Some(
+            self.scope_target(&written, scope)
+                .unwrap_or_else(|| self.canonical_target(written)),
+        )
+    }
+
+    /// If a single-segment `written` name matches an in-scope real-table
+    /// relation by its exposed name (its alias, else its bare table name),
+    /// return that relation's real table identity. A qualified name is never
+    /// an alias, so it never matches.
+    fn scope_target(&self, written: &TableReference, scope: &Scope) -> Option<TableReference> {
+        if written.schema.is_some() || written.catalog.is_some() {
+            return None;
         }
-        .map(|target| self.canonical_target(target));
-        Some(match target {
-            Some(target) => Plan::Write(Write {
-                target,
-                target_columns: Vec::new(),
-                input: Box::new(input),
-                returning,
-                conflict_updates: Vec::new(),
-            }),
-            None => input,
-        })
+        scope
+            .relations
+            .iter()
+            .find_map(|relation| match &relation.source {
+                RelationSource::Table { table, .. }
+                    if relation
+                        .exposed_name()
+                        .is_some_and(|exposed| self.ident_eq(exposed, &written.name)) =>
+                {
+                    Some(table.clone())
+                }
+                _ => None,
+            })
     }
 
     /// `MERGE INTO target USING source ON pred WHEN … THEN …`: target
@@ -460,21 +568,24 @@ impl Binder<'_> {
         let (source_plan, source_scope) =
             self.bind_table_factor(&merge.source, &target_scope.clone());
         let scope = target_scope.merge(source_scope);
-        let (mut reads, mut subqueries) = self.expr_reads(&merge.on, &scope);
+        // ON / WHEN predicates are filter position (non-feeding); only a WHEN
+        // action's value expression feeds the target via a `Project` output.
+        let (mut reads, mut filter_subqueries) = self.expr_reads(&merge.on, &scope);
+        let mut value_subqueries = Vec::new();
         let mut outputs = Vec::new();
         let mut target_columns = Vec::new();
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
                 let (r, s) = self.expr_reads(predicate, &scope);
                 reads.extend(r);
-                subqueries.extend(s);
+                filter_subqueries.extend(s);
             }
             match &clause.action {
                 MergeAction::Insert(insert) => {
                     if let Some(predicate) = &insert.insert_predicate {
                         let (r, s) = self.expr_reads(predicate, &scope);
                         reads.extend(r);
-                        subqueries.extend(s);
+                        filter_subqueries.extend(s);
                     }
                     if let MergeInsertKind::Values(values) = &insert.kind {
                         let columns: Vec<Ident> = insert
@@ -490,16 +601,17 @@ impl Binder<'_> {
                             for expr in values.rows.iter().flatten() {
                                 let (r, s) = self.expr_reads(expr, &scope);
                                 reads.extend(r);
-                                subqueries.extend(s);
+                                filter_subqueries.extend(s);
                             }
                         } else {
                             for row in &values.rows {
                                 for (column, expr) in columns.iter().zip(row) {
-                                    let (output, value_subqueries, value_filter_reads) =
+                                    let bound =
                                         self.bind_value_column(Some(column.clone()), expr, &scope);
-                                    outputs.push(output);
-                                    subqueries.extend(value_subqueries);
-                                    reads.extend(value_filter_reads);
+                                    outputs.push(bound.column);
+                                    value_subqueries.extend(bound.value_subplans);
+                                    reads.extend(bound.filter_reads);
+                                    filter_subqueries.extend(bound.filter_subplans);
                                     target_columns.push(column.clone());
                                 }
                             }
@@ -509,11 +621,15 @@ impl Binder<'_> {
                 MergeAction::Update(update) => {
                     for assignment in &update.assignments {
                         for column in assignment_target_columns(&assignment.target) {
-                            let (output, value_subqueries, value_filter_reads) = self
-                                .bind_value_column(Some(column.clone()), &assignment.value, &scope);
-                            outputs.push(output);
-                            subqueries.extend(value_subqueries);
-                            reads.extend(value_filter_reads);
+                            let bound = self.bind_value_column(
+                                Some(column.clone()),
+                                &assignment.value,
+                                &scope,
+                            );
+                            outputs.push(bound.column);
+                            value_subqueries.extend(bound.value_subplans);
+                            reads.extend(bound.filter_reads);
+                            filter_subqueries.extend(bound.filter_subplans);
                             target_columns.push(column);
                         }
                     }
@@ -523,7 +639,7 @@ impl Binder<'_> {
                     {
                         let (r, s) = self.expr_reads(predicate, &scope);
                         reads.extend(r);
-                        subqueries.extend(s);
+                        filter_subqueries.extend(s);
                     }
                 }
                 // DELETE moves no column values.
@@ -532,11 +648,12 @@ impl Binder<'_> {
         }
         let target = self.canonical_target(TableReference::try_from(&merge.table).ok()?);
         // The MERGE target is in scope for ON / WHEN resolution but is a
-        // write, not a read; the source relation is a read.
+        // write, not a read; the source relation is a read. Predicate
+        // sub-plans ride the non-feeding PassThrough.
         let source = wrap_inputs(
             vec![into_write_target(target_plan), source_plan],
             reads,
-            Vec::new(),
+            filter_subqueries,
         );
         Some(Plan::Write(Write {
             target,
@@ -544,7 +661,7 @@ impl Binder<'_> {
             input: Box::new(Plan::Project(Project {
                 input: Box::new(source),
                 outputs,
-                subqueries,
+                subqueries: value_subqueries,
             })),
             returning: Vec::new(),
             conflict_updates: Vec::new(),
@@ -642,6 +759,30 @@ impl Binder<'_> {
         }))
     }
 
+    /// `DROP TABLE/VIEW/MATERIALIZED VIEW a, b`: the dropped relations are
+    /// write targets. Other object types (index / schema / …) name no
+    /// relations and classify as unsupported, so they don't reach here.
+    fn bind_drop(
+        &self,
+        object_type: &ObjectType,
+        names: &[ObjectName],
+        table: Option<&ObjectName>,
+    ) -> Option<Plan> {
+        if !matches!(
+            object_type,
+            ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
+        ) {
+            return None;
+        }
+        let targets = names
+            .iter()
+            .chain(table)
+            .filter_map(|name| TableReference::try_from(name).ok())
+            .map(|target| self.canonical_target(target))
+            .collect();
+        Some(Plan::Drop(targets))
+    }
+
     /// Bind a query, returning the plan node and its output scope. A
     /// leading `WITH` is peeled first: each CTE binds in declaration order
     /// into an environment the later CTEs and the body resolve against. A
@@ -697,7 +838,17 @@ impl Binder<'_> {
     fn bind_recursive_cte(&self, cte: &Cte, env: &[CteRelation]) -> (CteRelation, Plan) {
         let name = cte.alias.name.clone();
         let SetExpr::SetOperation { left, .. } = cte.query.body.as_ref() else {
-            let (plan, scope) = self.with_ctes(env.to_vec()).bind_query(&cte.query);
+            // A `RECURSIVE` CTE whose body isn't a set operation has no
+            // separate anchor to learn columns from, but its name is still
+            // in scope inside its own body — register it (with no known
+            // columns) so a self-reference resolves to a `CteRef`, not a
+            // phantom real table read.
+            let mut provisional = env.to_vec();
+            provisional.push(CteRelation {
+                name: name.clone(),
+                outputs: Vec::new(),
+            });
+            let (plan, scope) = self.with_ctes(provisional).bind_query(&cte.query);
             let mut outputs = scope.outputs;
             apply_column_aliases(&mut outputs, &cte.alias);
             return (CteRelation { name, outputs }, plan);
@@ -777,8 +928,9 @@ impl Binder<'_> {
             for op in &query.pipe_operators {
                 self.collect_pipe_operator(op, &clause_scope, &mut c);
             }
-            reads.extend(c.filter_reads);
-            subqueries.extend(c.subplans);
+            let (r, s) = c.into_filter_parts();
+            reads.extend(r);
+            subqueries.extend(s);
         }
         (wrap_reads(body, reads, subqueries), scope)
     }
@@ -876,7 +1028,7 @@ impl Binder<'_> {
                 self.collect_expr(limit, scope, &mut c);
             }
         }
-        (c.filter_reads, c.subplans)
+        c.into_filter_parts()
     }
 
     /// Bind a query body's set expression: a leaf `SELECT`, a
@@ -1013,7 +1165,7 @@ impl Binder<'_> {
                 self.collect_window_spec(spec, scope, &mut c);
             }
         }
-        (c.filter_reads, c.subplans)
+        c.into_filter_parts()
     }
 
     fn bind_select(&self, select: &Select) -> (Plan, Scope) {
@@ -1036,18 +1188,26 @@ impl Binder<'_> {
         // already folded into the owning column's provenance.
         let mut outputs = Vec::new();
         let mut projection_subqueries = Vec::new();
-        // Predicate references inside a projection expression (a `CASE`
-        // condition, an `EXISTS` test) are reads, not value sources — carry
-        // them as filter reads on a PassThrough below the Project.
+        // Predicate references / sub-plans inside a projection expression (a
+        // `CASE` condition, an `EXISTS` test) are reads, not value sources —
+        // carry them on a non-feeding PassThrough below the Project so they
+        // surface as reads without feeding lineage.
         let mut projection_filter_reads = Vec::new();
+        let mut projection_filter_subqueries = Vec::new();
         for item in &select.projection {
-            let (column, subqueries, filter_reads) = self.bind_output_column(item, &from_scope);
-            outputs.extend(column);
-            projection_subqueries.extend(subqueries);
-            projection_filter_reads.extend(filter_reads);
+            if let Some(bound) = self.bind_output_column(item, &from_scope) {
+                outputs.push(bound.column);
+                projection_subqueries.extend(bound.value_subplans);
+                projection_filter_reads.extend(bound.filter_reads);
+                projection_filter_subqueries.extend(bound.filter_subplans);
+            }
         }
         let project = Plan::Project(Project {
-            input: Box::new(wrap_reads(input, projection_filter_reads, Vec::new())),
+            input: Box::new(wrap_reads(
+                input,
+                projection_filter_reads,
+                projection_filter_subqueries,
+            )),
             outputs: outputs.clone(),
             subqueries: projection_subqueries,
         });
@@ -1206,7 +1366,10 @@ impl Binder<'_> {
                 // Table-function args (rare on a named table) read against
                 // the surrounding scope; embed them so they surface.
                 let plan = match arg_reads {
-                    Some(c) => wrap_reads(scan, c.filter_reads, c.subplans),
+                    Some(c) => {
+                        let (reads, subplans) = c.into_filter_parts();
+                        wrap_reads(scan, reads, subplans)
+                    }
                     None => scan,
                 };
                 (plan, Scope::of(relation))
@@ -1385,7 +1548,8 @@ impl Binder<'_> {
         alias: Option<&TableAlias>,
         collector: ExprCollector,
     ) -> (Plan, Scope) {
-        let plan = wrap_reads(base, collector.filter_reads, collector.subplans);
+        let (reads, subplans) = collector.into_filter_parts();
+        let plan = wrap_reads(base, reads, subplans);
         let scope = alias.map_or_else(Scope::empty, |alias| {
             Scope::of(Relation {
                 alias: Some(alias.name.clone()),
@@ -1426,19 +1590,12 @@ impl Binder<'_> {
             .find(|c| self.ident_eq(&c.name, name))
     }
 
-    /// Resolve one SELECT-list item against `scope` into a bound output
-    /// column plus the filter-only reads it contributes (a projection
-    /// subquery's internal predicates — reads but not lineage sources).
-    /// Wildcards are skipped (`None`).
-    /// Bind one projection item: an optional output column (`None` for a
-    /// wildcard, which isn't expanded) plus the sub-plans and filter reads
-    /// it contributes. A `(expr).*` qualified wildcard still reads its base
-    /// expression even though the produced columns are suppressed.
-    fn bind_output_column(
-        &self,
-        item: &SelectItem,
-        scope: &Scope,
-    ) -> (Option<BoundColumn>, Vec<Plan>, Vec<ColumnRead>) {
+    /// Bind one projection item into a [`BoundValue`] (its output column plus
+    /// the position-split sub-plans / filter reads it contributes), or `None`
+    /// for a wildcard, which isn't expanded. A `(expr).*` qualified wildcard
+    /// still reads its base expression (projected as one `Transformation`
+    /// output) even though the produced columns are suppressed.
+    fn bind_output_column(&self, item: &SelectItem, scope: &Scope) -> Option<BoundValue> {
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.clone())),
@@ -1447,7 +1604,7 @@ impl Binder<'_> {
             // projection's column lineage is incomplete, and skip it.
             SelectItem::Wildcard(options) => {
                 self.record_wildcard_suppressed("wildcard `*`", options.wildcard_token.0.span);
-                return (None, Vec::new(), Vec::new());
+                return None;
             }
             SelectItem::QualifiedWildcard(kind, options) => {
                 let description = match kind {
@@ -1465,19 +1622,17 @@ impl Binder<'_> {
                 // columns aren't enumerated. `alias.*` (an ObjectName) has
                 // no inspectable base expression.
                 if let SelectItemQualifiedWildcardKind::Expr(expr) = kind {
-                    let (mut column, subplans, filter_reads) =
-                        self.bind_value_column(None, expr, scope);
-                    for source in &mut column.provenance {
+                    let mut bound = self.bind_value_column(None, expr, scope);
+                    for source in &mut bound.column.provenance {
                         source.kind = ColumnLineageKind::Transformation;
                     }
-                    return (Some(column), subplans, filter_reads);
+                    return Some(bound);
                 }
-                return (None, Vec::new(), Vec::new());
+                return None;
             }
         };
         let name = alias.or_else(|| inferred_output_name(expr));
-        let (column, subplans, filter_reads) = self.bind_value_column(name, expr, scope);
-        (Some(column), subplans, filter_reads)
+        Some(self.bind_value_column(name, expr, scope))
     }
 
     /// Record a `WildcardSuppressed` diagnostic for a projection wildcard
@@ -1514,7 +1669,10 @@ impl Binder<'_> {
             .iter()
             // Sub-plans / filter reads of a RETURNING expression (rare —
             // a subquery or CASE in RETURNING) aren't modelled yet.
-            .filter_map(|item| self.bind_output_column(item, scope).0)
+            .filter_map(|item| {
+                self.bind_output_column(item, scope)
+                    .map(|bound| bound.column)
+            })
             .collect()
     }
 
@@ -1562,11 +1720,14 @@ impl Binder<'_> {
         };
         for assignment in assignments {
             for column in assignment_target_columns(&assignment.target) {
-                let (output, value_subqueries, value_filter_reads) =
-                    self.bind_value_column(Some(column), &assignment.value, &scope);
-                updates.push(output);
-                subplans.extend(value_subqueries);
-                reads.extend(value_filter_reads);
+                let bound = self.bind_value_column(Some(column), &assignment.value, &scope);
+                updates.push(bound.column);
+                // The conflict action's lineage rides the `conflict_updates`
+                // provenance, not these sub-plans, so both value- and
+                // filter-position sub-plans land on the non-feeding input.
+                subplans.extend(bound.value_subplans);
+                subplans.extend(bound.filter_subplans);
+                reads.extend(bound.filter_reads);
             }
         }
         if let Some(selection) = selection {
@@ -1636,20 +1797,15 @@ impl Binder<'_> {
     }
 
     /// Bind a value-producing expression (a projection item or a SET /
-    /// VALUES assignment RHS) into a named output column, returning it with
-    /// its filter-only reads. The column's provenance is the value's
-    /// lineage sources (direct refs + any nested subquery's *output*);
-    /// each source's composed kind folds in this expression's own kind (a
-    /// bare column ref is `Passthrough`, anything else `Transformation`).
-    /// The filter-only reads are a nested subquery's internal predicates —
-    /// they read columns but don't feed this value, so they're surfaced
-    /// separately rather than as lineage sources.
-    fn bind_value_column(
-        &self,
-        name: Option<Ident>,
-        expr: &Expr,
-        scope: &Scope,
-    ) -> (BoundColumn, Vec<Plan>, Vec<ColumnRead>) {
+    /// VALUES assignment RHS) into a named output column, split by position
+    /// (see [`BoundValue`]). The column's provenance is the value's lineage
+    /// sources (direct refs + any nested value subquery's *output*); each
+    /// source's composed kind folds in this expression's own kind (a bare
+    /// column ref is `Passthrough`, anything else `Transformation`). Filter
+    /// position inside the expression (a `CASE` condition, an `EXISTS` test)
+    /// yields `filter_reads` / `filter_subplans` — reads that don't feed
+    /// this value, so the caller routes them to a non-feeding position.
+    fn bind_value_column(&self, name: Option<Ident>, expr: &Expr, scope: &Scope) -> BoundValue {
         let outer = expr_kind(expr);
         let mut collector = ExprCollector::value();
         self.collect_expr(expr, scope, &mut collector);
@@ -1662,11 +1818,12 @@ impl Binder<'_> {
                 synthetic_origin: source.synthetic_origin,
             })
             .collect();
-        (
-            BoundColumn { name, provenance },
-            collector.subplans,
-            collector.filter_reads,
-        )
+        BoundValue {
+            column: BoundColumn { name, provenance },
+            value_subplans: collector.value_subplans,
+            filter_reads: collector.filter_reads,
+            filter_subplans: collector.filter_subplans,
+        }
     }
 
     /// The plain column reads of an expression (filter position — WHERE /
@@ -1679,7 +1836,7 @@ impl Binder<'_> {
     fn expr_reads(&self, expr: &Expr, scope: &Scope) -> (Vec<ColumnRead>, Vec<Plan>) {
         let mut collector = ExprCollector::filter();
         self.collect_expr(expr, scope, &mut collector);
-        (collector.filter_reads, collector.subplans)
+        collector.into_filter_parts()
     }
 
     /// Walk an expression, routing each column reference to the collector by
@@ -2075,7 +2232,15 @@ impl Binder<'_> {
     fn collect_subquery(&self, query: &Query, scope: &Scope, c: &mut ExprCollector) {
         let binder = self.with_outer_scope(scope.relations.clone());
         let (plan, _) = binder.bind_query(query);
-        if !c.is_suppressed {
+        if c.is_suppressed {
+            // A predicate subquery (`EXISTS` / `IN` / a `CASE` condition):
+            // its output doesn't feed the enclosing value, so it's a
+            // non-feeding sub-plan (its tables / reads still surface).
+            c.filter_subplans.push(plan);
+        } else {
+            // A value-position subquery (a scalar `(SELECT …)`): its output
+            // folds into the enclosing value as a synthetic-origin source,
+            // and the sub-plan feeds lineage.
             c.sources.extend(
                 output_sources(&plan)
                     .into_iter()
@@ -2084,8 +2249,8 @@ impl Binder<'_> {
                         ..source
                     }),
             );
+            c.value_subplans.push(plan);
         }
-        c.subplans.push(plan);
     }
 
     /// Resolve a single column reference to its pre-collapsed provenance.
@@ -2666,6 +2831,15 @@ fn into_write_target(plan: Plan) -> Plan {
             role: ScanRole::Write,
             ..scan
         }),
+        // A joined target (`UPDATE t1 JOIN t2 …`): only the target relation
+        // (the leftmost leaf) is the write; the joined partners stay reads.
+        Plan::PassThrough(mut pt) => {
+            if let Some(first) = pt.inputs.first_mut() {
+                let taken = std::mem::replace(first, Plan::OpaqueLeaf);
+                *first = into_write_target(taken);
+            }
+            Plan::PassThrough(pt)
+        }
         other => other,
     }
 }
@@ -3243,16 +3417,15 @@ mod tests {
 
     #[test]
     fn delete_reads_predicate_and_writes_no_columns() {
-        // DELETE removes whole rows: the predicate is a read, but there
-        // are no column writes (the target still surfaces for table-level).
+        // DELETE removes whole rows: the predicate is a read, but there are
+        // no column writes. The target is a write-role scan in the input
+        // (in scope, not a read) and surfaces via `targets`.
         assert_eq!(
             bind_one("DELETE FROM t WHERE d > 0"),
-            Plan::Write(Write {
-                target: tref("t"),
-                target_columns: vec![],
+            Plan::Delete(DeletePlan {
                 input: Box::new(pass(vec![write_scan("t")], vec![inferred("t", "d")])),
+                targets: vec![tref("t")],
                 returning: vec![],
-                conflict_updates: vec![],
             })
         );
     }

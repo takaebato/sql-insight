@@ -10,7 +10,7 @@ use sqlparser::ast::Statement;
 
 use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
-use crate::extractor::{classify_statement, StatementKind, TableOperation};
+use crate::extractor::{classify_statement, merge_moves_data, StatementKind, TableOperation};
 use crate::resolver::IdentifierCasing;
 
 /// Build the table-level operation for one statement from its bound plan.
@@ -29,13 +29,16 @@ pub(crate) fn table_operation(
     let (plan, column_diagnostics) =
         super::binder::build_with_diagnostics(statement, catalog, casing);
     // A supported kind that binds to no plan (structure-only DDL) has empty
-    // surfaces but is not unsupported (no diagnostic). (`DROP` / `TRUNCATE`
-    // surfacing the dropped relation as a table write is a later brick.)
+    // surfaces but is not unsupported (no diagnostic). `DROP` / `TRUNCATE`
+    // bind to a `Plan::Drop` carrying the dropped relations as write targets.
     let plan = plan.unwrap_or(super::ir::Plan::OpaqueLeaf);
     // Lineage is only for statements that move data into a target. A
     // column-less INSERT and a DELETE both bind to a `Write`, so the
-    // structural walk can't tell them apart — gate on the kind.
-    let lineage = if moves_data(&statement_kind) {
+    // structural walk can't tell them apart — gate on the kind. A MERGE
+    // whose WHEN clauses are only DELETEs uses its source solely to pick
+    // target rows, so it moves no data even though the source is a feeding
+    // input — gate it out the same way the resolver-based extractor does.
+    let lineage = if moves_data(&statement_kind) && merge_moves_data(statement) {
         super::extract::extract_table_lineage(&plan)
     } else {
         Vec::new()

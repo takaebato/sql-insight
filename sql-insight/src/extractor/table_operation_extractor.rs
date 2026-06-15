@@ -63,19 +63,24 @@ pub struct TableOperation {
     /// What the statement does at a coarse level (Insert / Update /
     /// Merge / CTAS / …).
     pub statement_kind: StatementKind,
-    /// Tables read by the statement, in walk order. Occurrence-based:
-    /// a table referenced more than once appears more than once. Each
-    /// [`TableRead`] pairs the identity with the catalog-match
-    /// [`ResolutionKind`](crate::ResolutionKind); a consumer wanting the
-    /// distinct identity set dedups `reads.iter().map(|r| &r.reference)`.
+    /// Tables read by the statement. Occurrence-based: a table referenced
+    /// more than once appears more than once. Each [`TableRead`] pairs the
+    /// identity with the catalog-match
+    /// [`ResolutionKind`](crate::ResolutionKind). **Order is not
+    /// contractual** — it reflects an internal traversal and may change
+    /// between versions; occurrence count is preserved, and each reference
+    /// carries its source span, so a consumer wanting source-text order
+    /// sorts by `reference.name.span` and one wanting the distinct identity
+    /// set dedups `reads.iter().map(|r| &r.reference)` via a `HashSet`.
     pub reads: Vec<TableRead>,
-    /// Tables written by the statement, in walk order.
-    /// Occurrence-based like `reads`. Bare [`TableReference`] — write
-    /// targets are trivially resolved by construction.
+    /// Tables written by the statement, in source order. Occurrence-based
+    /// like `reads`. Bare [`TableReference`] — write targets are trivially
+    /// resolved by construction.
     pub writes: Vec<TableReference>,
     /// Lineage edges, only for statements that physically move data
     /// (`INSERT`, `UPDATE`, `MERGE` with an Insert / Update WHEN
-    /// clause, CTAS, `CREATE VIEW`, `ALTER VIEW`).
+    /// clause, CTAS, `CREATE VIEW`, `ALTER VIEW`). **Order is not
+    /// contractual** (occurrence / multiplicity is preserved).
     pub lineage: Vec<TableLineageEdge>,
     /// Non-fatal diagnostics from the walk; only
     /// `UnsupportedStatement` arises at this granularity.
@@ -203,59 +208,77 @@ impl TableOperationExtractor {
         catalog: Option<&Catalog>,
         casing: IdentifierCasing,
     ) -> Result<TableOperation, Error> {
-        let kind = classify_statement(statement);
-        let resolution = Resolver::resolve_statement(catalog, statement, casing)?;
-
-        let mut reads = Vec::new();
-        let mut writes = Vec::new();
-        // Start from resolver-level diagnostics, projected down to the
-        // table granularity — column-resolution gaps and suppressed
-        // wildcards don't affect table-level completeness, so they drop
-        // out here (only `UnsupportedStatement` carries over). Extractor
-        // adds its own only when classify_statement detects an unsupported
-        // case the resolver did not already report — avoids duplicating
-        // the common case where both layers agree.
-        let mut diagnostics: Vec<TableLevelDiagnostic> = resolution
-            .diagnostics
-            .iter()
-            .filter_map(|d| d.to_table_level())
-            .collect();
-
-        if matches!(kind, StatementKind::Unsupported) {
-            if !diagnostics
-                .iter()
-                .any(|d| matches!(d.kind, TableLevelDiagnosticKind::UnsupportedStatement))
-            {
-                diagnostics.push(TableLevelDiagnostic {
-                    kind: TableLevelDiagnosticKind::UnsupportedStatement,
-                    message: format!(
-                        "Unsupported statement for operation extraction: {}",
-                        statement
-                    ),
-                    span: None,
-                });
-            }
-        } else {
-            // A multi-role table (e.g. `DELETE t1 FROM t1` — t1 is both
-            // deletion target and row source) appears in both lists.
-            reads = resolution.read_tables();
-            writes = resolution.write_tables();
-        }
-
-        let lineage = if matches!(kind, StatementKind::Merge) && !merge_moves_data(statement) {
-            Vec::new()
-        } else {
-            extract_table_lineage(&resolution, &kind)
-        };
-
-        Ok(TableOperation {
-            statement_kind: kind,
-            reads,
-            writes,
-            lineage,
-            diagnostics,
-        })
+        // Table-level extraction is served by the bound-plan engine; the
+        // resolver-based path is retained as `resolver_table_operation`
+        // only for the strangler differential harness until the resolver is
+        // removed.
+        Ok(crate::plan::table_operation::table_operation(
+            statement, catalog, casing,
+        ))
     }
+}
+
+/// The legacy resolver-based table extraction, kept for the differential
+/// harness that pins the plan engine against the resolver. Removed with
+/// the resolver.
+#[allow(dead_code)] // strangler: used only by the test differential harness
+pub(crate) fn resolver_table_operation(
+    statement: &Statement,
+    catalog: Option<&Catalog>,
+    casing: IdentifierCasing,
+) -> Result<TableOperation, Error> {
+    let kind = classify_statement(statement);
+    let resolution = Resolver::resolve_statement(catalog, statement, casing)?;
+
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    // Start from resolver-level diagnostics, projected down to the
+    // table granularity — column-resolution gaps and suppressed
+    // wildcards don't affect table-level completeness, so they drop
+    // out here (only `UnsupportedStatement` carries over). Extractor
+    // adds its own only when classify_statement detects an unsupported
+    // case the resolver did not already report — avoids duplicating
+    // the common case where both layers agree.
+    let mut diagnostics: Vec<TableLevelDiagnostic> = resolution
+        .diagnostics
+        .iter()
+        .filter_map(|d| d.to_table_level())
+        .collect();
+
+    if matches!(kind, StatementKind::Unsupported) {
+        if !diagnostics
+            .iter()
+            .any(|d| matches!(d.kind, TableLevelDiagnosticKind::UnsupportedStatement))
+        {
+            diagnostics.push(TableLevelDiagnostic {
+                kind: TableLevelDiagnosticKind::UnsupportedStatement,
+                message: format!(
+                    "Unsupported statement for operation extraction: {}",
+                    statement
+                ),
+                span: None,
+            });
+        }
+    } else {
+        // A multi-role table (e.g. `DELETE t1 FROM t1` — t1 is both
+        // deletion target and row source) appears in both lists.
+        reads = resolution.read_tables();
+        writes = resolution.write_tables();
+    }
+
+    let lineage = if matches!(kind, StatementKind::Merge) && !merge_moves_data(statement) {
+        Vec::new()
+    } else {
+        extract_table_lineage(&resolution, &kind)
+    };
+
+    Ok(TableOperation {
+        statement_kind: kind,
+        reads,
+        writes,
+        lineage,
+        diagnostics,
+    })
 }
 
 /// Emit one `TableLineageEdge` per (feeding source × write target) pair
@@ -304,7 +327,7 @@ fn is_data_moving(kind: &StatementKind) -> bool {
 /// statement and report whether at least one WHEN clause is an
 /// INSERT or UPDATE, so the lineage path can short-circuit for the
 /// DELETE-only case.
-fn merge_moves_data(statement: &Statement) -> bool {
+pub(crate) fn merge_moves_data(statement: &Statement) -> bool {
     use sqlparser::ast::MergeAction;
     let Statement::Merge(merge) = statement else {
         return true;
@@ -361,6 +384,37 @@ mod tests {
     use super::*;
     use crate::reference::ResolutionKind;
     use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
+
+    /// Assert two collections are equal as multisets (order-independent).
+    /// `reads` / `lineage` order is non-contractual in the public API (a
+    /// consumer that cares orders by span), so tests pin the *set* of
+    /// extracted facts, not the walk order. `writes` stays order-sensitive
+    /// (source order is contractual), so it keeps a plain `assert_eq!`.
+    macro_rules! assert_unordered_eq {
+        ($actual:expr, $expected:expr, $msg:expr $(,)?) => {{
+            let actual = $actual;
+            let mut remaining = $expected;
+            // Tie the element types so an empty-vs-empty comparison still infers.
+            let _ = actual.iter().chain(remaining.iter()).count();
+            assert_eq!(
+                actual.len(),
+                remaining.len(),
+                "{}\n  actual:   {actual:#?}\n  expected: {remaining:#?}",
+                $msg
+            );
+            for item in &actual {
+                match remaining.iter().position(|e| e == item) {
+                    Some(i) => {
+                        remaining.remove(i);
+                    }
+                    None => panic!(
+                        "{}: unexpected item not in expected: {item:#?}\n  actual: {actual:#?}",
+                        $msg
+                    ),
+                }
+            }
+        }};
+    }
 
     fn table(name: &str) -> TableReference {
         TableReference {
@@ -433,17 +487,19 @@ mod tests {
             actual.statement_kind, statement_kind,
             "kind for SQL: {sql} (statement {index})"
         );
-        assert_eq!(
-            actual.reads, reads,
-            "reads for SQL: {sql} (statement {index})"
+        assert_unordered_eq!(
+            actual.reads,
+            reads,
+            format!("reads for SQL: {sql} (statement {index})")
         );
         assert_eq!(
             actual.writes, writes,
             "writes for SQL: {sql} (statement {index})"
         );
-        assert_eq!(
-            actual.lineage, lineage,
-            "lineage for SQL: {sql} (statement {index})"
+        assert_unordered_eq!(
+            actual.lineage,
+            lineage,
+            format!("lineage for SQL: {sql} (statement {index})")
         );
         let actual_kinds: Vec<_> = actual.diagnostics.iter().map(|d| d.kind.clone()).collect();
         let expected_kinds: Vec<_> = diagnostics.iter().map(|d| d.kind.clone()).collect();

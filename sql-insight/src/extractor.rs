@@ -29,13 +29,16 @@ pub use crud_table_extractor::*;
 pub use table_extractor::*;
 pub use table_operation_extractor::*;
 
-// The statement classifier is resolver-independent; the incubating `plan`
-// module reuses it for statement-kind classification.
-pub(crate) use table_operation_extractor::classify_statement;
+// The statement classifier and the MERGE data-movement check are
+// resolver-independent; the incubating `plan` module reuses them for
+// statement-kind classification and to gate DELETE-only MERGE lineage.
+pub(crate) use table_operation_extractor::{classify_statement, merge_moves_data};
 
-// The legacy resolver-based column extraction, retained only for the
-// plan-vs-resolver differential harness (test-only) until the resolver is
-// removed; allow it (and its transitive helpers) to look unused in
+// The legacy resolver-based column / table extraction, retained only for
+// the plan-vs-resolver differential harness (test-only) until the resolver
+// is removed; allow it (and its transitive helpers) to look unused in
 // non-test builds during the strangler transition.
 #[allow(unused_imports)]
 pub(crate) use column_operation_extractor::resolver_column_operation;
+#[allow(unused_imports)]
+pub(crate) use table_operation_extractor::resolver_table_operation;

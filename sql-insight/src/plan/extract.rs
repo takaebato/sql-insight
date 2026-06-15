@@ -24,7 +24,8 @@ fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
     match plan {
         // A `CteRef` is resolved through the scope at bind time; its body's
         // reads are counted once at the `With` node below, not per reference.
-        Plan::Scan(_) | Plan::OpaqueLeaf | Plan::CteRef(_) => {}
+        // A `Drop` reads nothing.
+        Plan::Scan(_) | Plan::OpaqueLeaf | Plan::CteRef(_) | Plan::Drop(_) => {}
         Plan::PassThrough(pt) => {
             out.extend(pt.reads.iter().cloned());
             for input in &pt.inputs {
@@ -64,6 +65,19 @@ fn collect_reads(plan: &Plan, out: &mut Vec<ColumnRead>) {
             // provenance); a conflict-action SET reads its RHS columns.
             // Both drop synthetic-origin sources (EXCLUDED / derived).
             for column in write.returning.iter().chain(&write.conflict_updates) {
+                out.extend(
+                    column
+                        .provenance
+                        .iter()
+                        .filter(|source| !source.synthetic_origin)
+                        .map(|source| source.read.clone()),
+                );
+            }
+        }
+        Plan::Delete(delete) => {
+            collect_reads(&delete.input, out);
+            // RETURNING reads the deleted relation's columns.
+            for column in &delete.returning {
                 out.extend(
                     column
                         .provenance
@@ -136,7 +150,7 @@ fn collect_table_reads(plan: &Plan, out: &mut Vec<TableRead>) {
                 });
             }
         }
-        Plan::OpaqueLeaf | Plan::CteRef(_) => {}
+        Plan::OpaqueLeaf | Plan::CteRef(_) | Plan::Drop(_) => {}
         Plan::PassThrough(pt) => {
             for input in &pt.inputs {
                 collect_table_reads(input, out);
@@ -157,6 +171,10 @@ fn collect_table_reads(plan: &Plan, out: &mut Vec<TableRead>) {
             }
         }
         Plan::Write(write) => collect_table_reads(&write.input, out),
+        // A DELETE's read-role scans (FROM / USING row sources) are in the
+        // input; its write-role target scans are skipped there (reported as
+        // writes instead).
+        Plan::Delete(delete) => collect_table_reads(&delete.input, out),
         Plan::With(with) => {
             collect_table_reads(&with.body, out);
             for cte in &with.ctes {
@@ -171,6 +189,10 @@ fn collect_table_reads(plan: &Plan, out: &mut Vec<TableRead>) {
 pub(crate) fn extract_table_writes(plan: &Plan) -> Vec<TableReference> {
     match plan {
         Plan::Write(write) => vec![write.target.clone()],
+        // A DELETE writes (removes rows from) each of its targets.
+        Plan::Delete(delete) => delete.targets.clone(),
+        // DROP / TRUNCATE name their relations directly as write targets.
+        Plan::Drop(targets) => targets.clone(),
         // A statement-level `WITH … INSERT/UPDATE …` wraps the DML `Write`.
         Plan::With(with) => extract_table_writes(&with.body),
         _ => Vec::new(),
@@ -199,7 +221,8 @@ pub(crate) fn extract_table_lineage(plan: &Plan) -> Vec<TableLineageEdge> {
         return Vec::new();
     };
     let mut sources = Vec::new();
-    feeding_scans(&write.input, &mut ctes, &mut sources);
+    let mut active: Vec<&str> = Vec::new();
+    feeding_scans(&write.input, &mut ctes, &mut active, &mut sources);
     sources
         .into_iter()
         .map(|source| TableLineageEdge {
@@ -214,7 +237,12 @@ pub(crate) fn extract_table_lineage(plan: &Plan) -> Vec<TableLineageEdge> {
 /// also pulls its value subqueries, but a filter's predicate subqueries do
 /// not feed. A `CteRef` resolves to the referenced CTE body's feeding
 /// scans (innermost declaration shadows).
-fn feeding_scans<'a>(plan: &'a Plan, ctes: &mut Vec<&'a CtePlan>, out: &mut Vec<TableRead>) {
+fn feeding_scans<'a>(
+    plan: &'a Plan,
+    ctes: &mut Vec<&'a CtePlan>,
+    active: &mut Vec<&'a str>,
+    out: &mut Vec<TableRead>,
+) {
     match plan {
         Plan::Scan(scan) => {
             if scan.role == ScanRole::Read {
@@ -224,36 +252,50 @@ fn feeding_scans<'a>(plan: &'a Plan, ctes: &mut Vec<&'a CtePlan>, out: &mut Vec<
                 });
             }
         }
-        Plan::OpaqueLeaf => {}
+        // A `Drop` / `TRUNCATE` / `DELETE` moves no row data, so it feeds no
+        // lineage (a DELETE is never reached here — its table lineage is
+        // gated off by kind — but the match stays exhaustive).
+        Plan::OpaqueLeaf | Plan::Drop(_) | Plan::Delete(_) => {}
         Plan::CteRef(cteref) => {
             // A reference on the feeding path pulls the CTE body's sources.
+            // `active` tracks the CTE names currently being expanded down
+            // this path: a recursive CTE's body references itself, so we
+            // skip a name already in flight — its self-reference adds no new
+            // real source (the anchor's reads are collected on the first
+            // descent), and skipping it breaks the otherwise-infinite loop.
+            let name = cteref.name.value.as_str();
+            if active.contains(&name) {
+                return;
+            }
             if let Some(cte) = ctes.iter().rev().find(|c| c.name == cteref.name).copied() {
-                feeding_scans(&cte.plan, ctes, out);
+                active.push(name);
+                feeding_scans(&cte.plan, ctes, active, out);
+                active.pop();
             }
         }
         Plan::PassThrough(pt) => {
             // Inputs feed; predicate (filter) subqueries do not.
             for input in &pt.inputs {
-                feeding_scans(input, ctes, out);
+                feeding_scans(input, ctes, active, out);
             }
         }
         Plan::Project(project) => {
-            feeding_scans(&project.input, ctes, out);
+            feeding_scans(&project.input, ctes, active, out);
             // Value-position subqueries (scalar projection / SET RHS) feed.
             for subquery in &project.subqueries {
-                feeding_scans(subquery, ctes, out);
+                feeding_scans(subquery, ctes, active, out);
             }
         }
         Plan::SetOp(set) => {
             for operand in &set.operands {
-                feeding_scans(operand, ctes, out);
+                feeding_scans(operand, ctes, active, out);
             }
         }
-        Plan::Write(write) => feeding_scans(&write.input, ctes, out),
+        Plan::Write(write) => feeding_scans(&write.input, ctes, active, out),
         Plan::With(with) => {
             let added = with.ctes.len();
             ctes.extend(with.ctes.iter());
-            feeding_scans(&with.body, ctes, out);
+            feeding_scans(&with.body, ctes, active, out);
             ctes.truncate(ctes.len() - added);
         }
     }
@@ -289,6 +331,17 @@ pub(crate) fn extract_lineage(plan: &Plan) -> Vec<ColumnLineageEdge> {
             // RETURNING projects the written relation: each column emits a
             // `QueryOutput` edge, so the statement both writes and returns.
             for (position, column) in write.returning.iter().enumerate() {
+                let target = ColumnTarget::QueryOutput {
+                    name: column.name.clone(),
+                    position,
+                };
+                emit_edges(column, &target, &mut edges);
+            }
+        }
+        // A DELETE moves no data, so its only lineage is a RETURNING
+        // projection of the deleted rows (one `QueryOutput` edge per source).
+        Plan::Delete(delete) => {
+            for (position, column) in delete.returning.iter().enumerate() {
                 let target = ColumnTarget::QueryOutput {
                     name: column.name.clone(),
                     position,
@@ -358,7 +411,12 @@ pub(crate) fn output_operands(plan: &Plan) -> Vec<&[BoundColumn]> {
         // references (via collapsed provenance), never the query output. A
         // `CteRef` has no inspectable outputs of its own (resolved at bind).
         Plan::With(with) => output_operands(&with.body),
-        Plan::Scan(_) | Plan::OpaqueLeaf | Plan::Write(_) | Plan::CteRef(_) => Vec::new(),
+        Plan::Scan(_)
+        | Plan::OpaqueLeaf
+        | Plan::Write(_)
+        | Plan::Delete(_)
+        | Plan::CteRef(_)
+        | Plan::Drop(_) => Vec::new(),
     }
 }
 
@@ -372,7 +430,7 @@ pub(crate) fn output_operands(plan: &Plan) -> Vec<&[BoundColumn]> {
 mod differential {
     use super::*;
     use crate::catalog::{Catalog, CatalogTable};
-    use crate::extractor::{extract_table_operations, ColumnOperation, TableOperation};
+    use crate::extractor::{ColumnOperation, TableOperation};
     use crate::resolver::IdentifierCasing;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -959,11 +1017,12 @@ mod differential {
     }
 
     fn table_resolver_op(sql: &str, catalog: Option<&Catalog>) -> TableOperation {
+        // The public extractor now delegates to the plan engine, so the
+        // differential compares against the preserved resolver path directly.
         let dialect = GenericDialect {};
-        extract_table_operations(&dialect, sql, catalog)
-            .unwrap()
-            .remove(0)
-            .unwrap()
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        let casing = IdentifierCasing::for_dialect(&dialect);
+        crate::extractor::resolver_table_operation(&statements[0], catalog, casing).unwrap()
     }
 
     /// A table read as a `path|resolution` key. Table references carry no
@@ -1074,6 +1133,25 @@ mod differential {
             "INSERT INTO t SELECT t.a FROM t",
             "UPDATE t SET c = (SELECT v FROM u WHERE u.id = t.id)",
             "CREATE TABLE dst AS SELECT a FROM s1 UNION SELECT b FROM s2",
+            // DROP / TRUNCATE: named relations are write targets, no reads /
+            // lineage. Multi-name DROP writes each name.
+            "DROP TABLE t1, t2",
+            "DROP VIEW v",
+            "DROP MATERIALIZED VIEW mv",
+            "TRUNCATE TABLE t1",
+            "TRUNCATE t1, t2",
+            // Multi-target DELETE: every FROM / USING relation is a read,
+            // each named target a write (a table can be both).
+            "DELETE FROM t1, t2 USING t1 INNER JOIN t2 INNER JOIN t3",
+            // A predicate subquery in a projection / UPDATE SET / DELETE is a
+            // filter — its tables are reads, not lineage feeders.
+            "INSERT INTO t SELECT CASE WHEN EXISTS (SELECT 1 FROM x) THEN 1 ELSE 0 END FROM s",
+            "INSERT INTO t SELECT a FROM s WHERE a IN (SELECT id FROM x)",
+            "UPDATE t SET c = CASE WHEN EXISTS (SELECT 1 FROM x) THEN 1 ELSE 0 END",
+            // A MERGE whose only WHEN clause is DELETE moves no data.
+            "MERGE INTO t1 USING t2 ON t1.id = t2.id WHEN MATCHED THEN DELETE",
+            // A recursive CTE that only self-references has no real feeder.
+            "WITH RECURSIVE cte AS (SELECT id FROM cte) INSERT INTO t SELECT id FROM cte",
         ]
     }
 

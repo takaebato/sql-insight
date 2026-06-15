@@ -291,11 +291,21 @@ mod tests {
         }
 
         #[test]
-        fn test_statement_error_with_too_many_identifiers() {
+        fn test_too_many_identifiers_yields_empty_best_effort() {
+            // Behavior change vs the legacy resolver: a target with more
+            // segments than `catalog.schema.name` can't be represented as a
+            // `TableReference`. The resolver hard-errored ("Too many
+            // identifiers provided"); the bound-plan engine is best-effort,
+            // so it drops the unrepresentable target and returns an empty
+            // operation rather than failing the whole statement.
             let sql = "INSERT INTO catalog.schema.table.extra (a) VALUES (1)";
-            let expected = vec![Err(Error::AnalysisError(
-                "Too many identifiers provided".to_string(),
-            ))];
+            let expected = vec![Ok(CrudTables {
+                create_tables: vec![],
+                read_tables: vec![],
+                update_tables: vec![],
+                delete_tables: vec![],
+                diagnostics: vec![],
+            })];
             assert_crud_table_extraction(sql, expected, all_dialects());
         }
     }

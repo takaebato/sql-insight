@@ -28,6 +28,18 @@ pub(crate) enum Plan {
     Project(Project),
     SetOp(SetOp),
     Write(Write),
+    /// A `DELETE`: its `input` carries every consulted relation as a scan
+    /// (FROM / USING) with the right role — a read-role scan is a row
+    /// source, a write-role scan is a deletion target kept in scope but
+    /// reported via `targets`, not as a read. Unlike `Write`, a DELETE has
+    /// one *or more* targets and moves no row data into them (rows are
+    /// removed wholesale), so there is no column write or lineage; only an
+    /// optional `RETURNING` projects the deleted rows.
+    Delete(DeletePlan),
+    /// `DROP TABLE/VIEW` / `TRUNCATE`: the named relations are write
+    /// targets with no reads, lineage, or column-level writes — the
+    /// statement removes / empties relations, it doesn't move row data.
+    Drop(Vec<TableReference>),
     With(With),
     /// A FROM-clause reference to an in-scope CTE. Its columns are
     /// resolved (and collapsed into the referencing value's provenance)
@@ -125,6 +137,19 @@ pub(crate) struct Write {
     /// update. (The `EXCLUDED` pseudo-table's references are folded in here
     /// as synthetic-origin sources, like a derived relation.)
     pub(crate) conflict_updates: Vec<BoundColumn>,
+}
+
+/// A `DELETE` statement. `input` holds every FROM / USING relation as a
+/// scan (read-role = row source, write-role = deletion target in scope but
+/// not a read) plus the predicate's reads; `targets` are the deleted
+/// relations (the write surface), each catalog-canonicalized and, for an
+/// explicit `DELETE alias FROM …` list, resolved through the FROM scope to
+/// its real table. `returning` is the optional `RETURNING` projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeletePlan {
+    pub(crate) input: Box<Plan>,
+    pub(crate) targets: Vec<TableReference>,
+    pub(crate) returning: Vec<BoundColumn>,
 }
 
 /// A `WITH` clause: the CTEs it declares, kept as named sub-plans, plus
