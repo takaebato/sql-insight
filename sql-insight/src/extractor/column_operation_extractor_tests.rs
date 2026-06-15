@@ -2045,6 +2045,30 @@ mod merge {
     }
 
     #[test]
+    fn merge_column_less_insert_without_catalog_is_reads_only() {
+        // Without a catalog the target's column names are unknown, so a
+        // column-less MERGE INSERT can't pair its values — the values
+        // surface as reads but there's no write / lineage. (With a catalog
+        // they pair positionally; see the catalog-aware test.)
+        assert_column_ops(
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.a)",
+            ColumnOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![
+                    read("t", "id"),
+                    read("s", "id"),
+                    read("s", "id"),
+                    read("s", "a"),
+                ],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn merge_delete_action_emits_no_lineage_no_write() {
         assert_column_ops(
             "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
@@ -3613,10 +3637,9 @@ mod catalog_strict {
 
     #[test]
     fn catalog_merge_not_matched_insert_no_cols_pairs_via_catalog() {
-        // A column-less MERGE INSERT still reads its VALUES expressions.
-        // Pairing them with the catalog schema for writes / lineage is a
-        // later brick (the plan leaves writes and lineage empty here), so
-        // this case is reads-only for now.
+        // A column-less MERGE INSERT pairs its VALUES positionally with the
+        // target's catalog schema (id, a): each value writes its column and
+        // feeds `source → target.col` lineage.
         let catalog = TestCatalog::default().with("t", vec!["id", "a"]);
         assert_column_ops_with_catalog(
             "MERGE INTO t USING s ON t.id = s.id \
@@ -3630,8 +3653,11 @@ mod catalog_strict {
                     read("s", "id"),
                     read("s", "a"),
                 ],
-                writes: vec![],
-                lineage: vec![],
+                writes: vec![write("t", "id"), write("t", "a")],
+                lineage: vec![
+                    passthrough(col("s", "id"), relation("t", "id")),
+                    passthrough(col("s", "a"), relation("t", "a")),
+                ],
                 diagnostics: vec![],
             },
         );

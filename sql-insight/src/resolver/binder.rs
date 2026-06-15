@@ -613,6 +613,9 @@ impl Binder<'_> {
         let mut value_subqueries = Vec::new();
         let mut outputs = Vec::new();
         let mut target_columns = Vec::new();
+        // The (canonicalized) target identity, needed up-front to catalog-fill
+        // a column-less WHEN NOT MATCHED INSERT's columns.
+        let target = self.canonical_target(TableReference::try_from(&merge.table).ok()?);
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
                 let (r, s) = self.expr_reads(predicate, &scope);
@@ -627,16 +630,26 @@ impl Binder<'_> {
                         filter_subqueries.extend(s);
                     }
                     if let MergeInsertKind::Values(values) = &insert.kind {
-                        let columns: Vec<Ident> = insert
+                        // An explicit column list wins; otherwise pair the
+                        // values positionally with the target's catalog
+                        // schema (empty without a catalog). `zip` stops at
+                        // the shorter side, so a short row / schema truncates.
+                        let explicit: Vec<Ident> = insert
                             .columns
                             .iter()
                             .filter_map(object_name_last_ident)
                             .collect();
+                        let catalog_cols;
+                        let columns: &[Ident] = if explicit.is_empty() {
+                            catalog_cols = self.catalog_columns(&target);
+                            &catalog_cols
+                        } else {
+                            &explicit
+                        };
                         if columns.is_empty() {
-                            // No explicit column list: the inserted values
-                            // are still reads. (Pairing them with the
-                            // catalog schema for writes / lineage is a later
-                            // brick — the resolver leaves those empty too.)
+                            // No column list and no catalog: the inserted
+                            // values surface as reads, but pair with nothing,
+                            // so there's no write / lineage.
                             for expr in values.rows.iter().flatten() {
                                 let (r, s) = self.expr_reads(expr, &scope);
                                 reads.extend(r);
@@ -685,7 +698,6 @@ impl Binder<'_> {
                 MergeAction::Delete { .. } => {}
             }
         }
-        let target = self.canonical_target(TableReference::try_from(&merge.table).ok()?);
         // The MERGE target is in scope for ON / WHEN resolution but is a
         // write, not a read; the source relation is a read. Predicate
         // sub-plans ride the non-feeding PassThrough.
