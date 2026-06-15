@@ -3790,6 +3790,15 @@ mod expr_arm_coverage {
             .reads
     }
 
+    /// `lineage` of the first statement, resolved without a catalog.
+    fn lineage(sql: &str) -> Vec<ColumnLineageEdge> {
+        extract_column_operations(&GenericDialect {}, sql, None)
+            .unwrap()
+            .remove(0)
+            .unwrap()
+            .lineage
+    }
+
     /// A real-table column read against the single table `t`. The
     /// module runs without a catalog, so every resolved ref carries
     /// [`ResolutionKind::Inferred`].
@@ -3998,6 +4007,73 @@ mod expr_arm_coverage {
     #[test]
     fn pipe_call() {
         assert_unordered_eq!(reads("FROM t |> CALL my_func(t.a)"), vec![c("a")]);
+    }
+
+    // --- pipe output lineage: an output-producing pipe operator (SELECT /
+    // EXTEND / AGGREGATE / SET) projects its value expressions, so they feed
+    // `QueryOutput` lineage; filter operators (WHERE / ORDER BY / LIMIT /
+    // CALL) reshape nothing and emit no lineage of their own.
+
+    #[test]
+    fn pipe_select_emits_output_lineage() {
+        assert_unordered_eq!(
+            lineage("FROM t |> SELECT t.b"),
+            vec![passthrough(c("b"), out("b", 0))]
+        );
+    }
+
+    #[test]
+    fn pipe_where_then_select_lineage() {
+        // The WHERE is a filter (its `t.a` is a read, not a source); only
+        // the trailing SELECT output feeds lineage.
+        assert_unordered_eq!(
+            lineage("FROM t |> WHERE t.a > 1 |> SELECT t.b"),
+            vec![passthrough(c("b"), out("b", 0))]
+        );
+    }
+
+    #[test]
+    fn pipe_extend_emits_transformation_lineage() {
+        assert_unordered_eq!(
+            lineage("FROM t |> EXTEND t.a + 1 AS x"),
+            vec![transformation(c("a"), out("x", 0))]
+        );
+    }
+
+    #[test]
+    fn pipe_set_emits_transformation_lineage() {
+        assert_unordered_eq!(
+            lineage("FROM t |> SET a = t.a + 1"),
+            vec![transformation(c("a"), out("a", 0))]
+        );
+    }
+
+    #[test]
+    fn pipe_aggregate_emits_lineage() {
+        // SUM(t.a) is a transforming output; the GROUP BY key t.b passes
+        // through as a second output column.
+        assert_unordered_eq!(
+            lineage("FROM t |> AGGREGATE SUM(t.a) GROUP BY t.b"),
+            vec![
+                transformation(c("a"), out_anon(0)),
+                passthrough(c("b"), out("b", 1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn pipe_select_then_order_and_limit_lineage() {
+        // ORDER BY / LIMIT are filters over the SELECT output — they add no
+        // lineage; only the SELECT projection feeds it.
+        assert_unordered_eq!(
+            lineage("FROM t |> SELECT t.a |> ORDER BY t.a |> LIMIT 1"),
+            vec![passthrough(c("a"), out("a", 0))]
+        );
+    }
+
+    #[test]
+    fn pipe_call_emits_no_output_lineage() {
+        assert_unordered_eq!(lineage("FROM t |> CALL my_func(t.a)"), vec![]);
     }
 
     #[test]

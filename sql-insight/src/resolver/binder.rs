@@ -937,12 +937,37 @@ impl Binder<'_> {
     /// Bind a query's body and its trailing ORDER BY / LIMIT (the WITH
     /// clause is already in scope via `self.ctes`).
     fn bind_query_body(&self, query: &Query) -> (Plan, Scope) {
-        let (body, scope) = self.bind_set_expr(&query.body);
-        // A trailing ORDER BY sits above the body and sees its output
-        // aliases — but only for a single SELECT. Over a set operation
-        // there's no single relation to resolve against, so a reference is
-        // unresolved (an empty scope makes that fall out).
-        let clause_scope = match &body {
+        let (body, mut scope) = self.bind_set_expr(&query.body);
+        // Pipe operators (`|> WHERE`, `|> SELECT`, …) transform the body in
+        // sequence. Fold the chain on top of `node`, evolving the output
+        // scope: an output-producing operator (SELECT / EXTEND / AGGREGATE
+        // / SET) layers a `Project` so its value expressions feed
+        // `QueryOutput` lineage, while a filter operator (WHERE / ORDER BY
+        // / LIMIT / JOIN / …) adds reads. Pipe expressions resolve against
+        // the body's relations plus the running outputs (relations stay in
+        // scope across the chain — loose pipe scoping).
+        let mut node = body;
+        if !query.pipe_operators.is_empty() {
+            let mut pipe_scope = match &node {
+                // A set-op body exposes no single relation scope for refs.
+                Plan::SetOp(_) => Scope {
+                    relations: Vec::new(),
+                    outputs: scope.outputs.clone(),
+                    merge_columns: Vec::new(),
+                },
+                _ => scope.clone(),
+            };
+            for op in &query.pipe_operators {
+                node = self.bind_pipe_operator(op, node, &mut pipe_scope);
+            }
+            scope = pipe_scope;
+        }
+        // A trailing ORDER BY / LIMIT sits above the (possibly piped) body
+        // and sees its output aliases — but only for a single relation.
+        // Over a set operation there's no single relation to resolve
+        // against, so a reference is unresolved (an empty scope makes that
+        // fall out).
+        let clause_scope = match &node {
             Plan::SetOp(_) => Scope::empty(),
             _ => scope.clone(),
         };
@@ -959,18 +984,6 @@ impl Binder<'_> {
             reads.extend(r);
             subqueries.extend(s);
         }
-        // Pipe operators (`|> WHERE …`, `|> SELECT …`, …) transform the
-        // body; their column references surface as reads (their output
-        // rewriting / lineage is a later refinement).
-        if !query.pipe_operators.is_empty() {
-            let mut c = ExprCollector::filter();
-            for op in &query.pipe_operators {
-                self.collect_pipe_operator(op, &clause_scope, &mut c);
-            }
-            let (r, s) = c.into_filter_parts();
-            reads.extend(r);
-            subqueries.extend(s);
-        }
         // ClickHouse `SETTINGS key = expr`: a value may hold a subquery.
         if let Some(settings) = &query.settings {
             let mut c = ExprCollector::filter();
@@ -981,87 +994,196 @@ impl Binder<'_> {
             reads.extend(r);
             subqueries.extend(s);
         }
-        (wrap_reads(body, reads, subqueries), scope)
+        (wrap_reads(node, reads, subqueries), scope)
     }
 
-    /// Collect a pipe operator's column references as reads (the `|> …`
-    /// pipeline syntax). Output-rewriting operators (`SELECT` / `EXTEND` /
-    /// `AGGREGATE` / `SET`) are read for their expressions only — modelling
-    /// how they reshape the query output (and its lineage) is a later
-    /// refinement. The match is exhaustive so new pipe operators are
-    /// reviewed here.
-    fn collect_pipe_operator(&self, op: &PipeOperator, scope: &Scope, c: &mut ExprCollector) {
+    /// Bind one pipe operator (`|> …`) on top of `input`, returning the new
+    /// plan node and updating `scope.outputs` when the operator reshapes the
+    /// output. An **output-producing** operator (`SELECT` / `EXTEND` /
+    /// `AGGREGATE` / `SET`) layers a [`Project`] whose value expressions feed
+    /// `QueryOutput` lineage; a **filter** operator (`WHERE` / `ORDER BY` /
+    /// `LIMIT` / `CALL` / `JOIN` / …) wraps a non-feeding read `PassThrough`.
+    /// The match is exhaustive so new pipe operators are reviewed here.
+    fn bind_pipe_operator(&self, op: &PipeOperator, input: Plan, scope: &mut Scope) -> Plan {
         match op {
-            PipeOperator::Limit { expr, offset } => {
-                self.collect_expr(expr, scope, c);
-                if let Some(offset) = offset {
-                    self.collect_expr(offset, scope, c);
-                }
+            // `|> SELECT exprs`: replace the output with these columns.
+            PipeOperator::Select { exprs } => {
+                let bound = exprs
+                    .iter()
+                    .filter_map(|i| self.bind_output_column(i, scope));
+                let (node, outputs) = self.pipe_project(input, Vec::new(), bound);
+                scope.outputs = outputs;
+                node
             }
-            PipeOperator::Where { expr } => self.collect_expr(expr, scope, c),
-            PipeOperator::OrderBy { exprs } => {
-                for order_by in exprs {
-                    self.collect_order_by_expr(order_by, scope, c);
-                }
+            // `|> EXTEND exprs`: append columns to the running output.
+            PipeOperator::Extend { exprs } => {
+                let base = scope.outputs.clone();
+                let bound = exprs
+                    .iter()
+                    .filter_map(|i| self.bind_output_column(i, scope));
+                let (node, outputs) = self.pipe_project(input, base, bound);
+                scope.outputs = outputs;
+                node
             }
-            PipeOperator::Select { exprs } | PipeOperator::Extend { exprs } => {
-                for item in exprs {
-                    if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } =
-                        item
-                    {
-                        self.collect_expr(expr, scope, c);
-                    }
-                }
-            }
+            // `|> SET col = expr`: each assignment is a value column named by
+            // its target, replacing a same-named output (or appended).
             PipeOperator::Set { assignments } => {
-                for assignment in assignments {
-                    self.collect_expr(&assignment.value, scope, c);
-                }
+                let bound: Vec<BoundValue> = assignments
+                    .iter()
+                    .flat_map(|a| {
+                        assignment_target_columns(&a.target)
+                            .into_iter()
+                            .map(move |col| (col, &a.value))
+                    })
+                    .map(|(col, value)| self.bind_value_column(Some(col), value, scope))
+                    .collect();
+                let (node, outputs) = self.pipe_set_project(input, scope.outputs.clone(), bound);
+                scope.outputs = outputs;
+                node
             }
+            // `|> AGGREGATE aggs GROUP BY keys`: the output is the aggregate
+            // expressions plus the grouping keys (both value position).
             PipeOperator::Aggregate {
                 full_table_exprs,
                 group_by_expr,
             } => {
-                for expr in full_table_exprs.iter().chain(group_by_expr) {
-                    self.collect_expr(&expr.expr.expr, scope, c);
-                }
+                let bound = full_table_exprs.iter().chain(group_by_expr).map(|e| {
+                    let name = e
+                        .expr
+                        .alias
+                        .clone()
+                        .or_else(|| inferred_output_name(&e.expr.expr));
+                    self.bind_value_column(name, &e.expr.expr, scope)
+                });
+                let (node, outputs) = self.pipe_project(input, Vec::new(), bound);
+                scope.outputs = outputs;
+                node
             }
-            PipeOperator::Call { function, .. } => self.collect_function(function, scope, c),
+            // Filter operators below: reads only, output unchanged.
+            PipeOperator::Limit { expr, offset } => self.pipe_filter(input, |c| {
+                self.collect_expr(expr, scope, c);
+                if let Some(offset) = offset {
+                    self.collect_expr(offset, scope, c);
+                }
+            }),
+            PipeOperator::Where { expr } => {
+                self.pipe_filter(input, |c| self.collect_expr(expr, scope, c))
+            }
+            PipeOperator::OrderBy { exprs } => self.pipe_filter(input, |c| {
+                for order_by in exprs {
+                    self.collect_order_by_expr(order_by, scope, c);
+                }
+            }),
+            PipeOperator::Call { function, .. } => {
+                self.pipe_filter(input, |c| self.collect_function(function, scope, c))
+            }
             PipeOperator::Pivot {
                 aggregate_functions,
                 value_source,
                 ..
-            } => {
+            } => self.pipe_filter(input, |c| {
                 for expr in aggregate_functions {
                     self.collect_expr(&expr.expr, scope, c);
                 }
                 self.collect_pivot_value_source(value_source, scope, c);
-            }
+            }),
             PipeOperator::Union { queries, .. }
             | PipeOperator::Intersect { queries, .. }
-            | PipeOperator::Except { queries, .. } => {
+            | PipeOperator::Except { queries, .. } => self.pipe_filter(input, |c| {
                 for query in queries {
                     self.collect_subquery(query, scope, c);
                 }
-            }
+            }),
             // `|> JOIN t ON …` introduces another relation: bind it as a
             // read scan (a non-feeding sub-plan so its table surfaces) and
             // collect the ON predicate's reads.
-            PipeOperator::Join(join) => {
+            PipeOperator::Join(join) => self.pipe_filter(input, |c| {
                 let (plan, _) = self.bind_table_factor(&join.relation, scope);
                 c.filter_subplans.push(plan);
                 if let Some(JoinConstraint::On(expr)) = join_constraint(join) {
                     self.collect_expr(expr, scope, c);
                 }
-            }
+            }),
             // No inspectable column expressions (or a later refinement):
             // a sampling clause, a rename / drop / unpivot.
             PipeOperator::TableSample { .. }
             | PipeOperator::Drop { .. }
             | PipeOperator::As { .. }
             | PipeOperator::Rename { .. }
-            | PipeOperator::Unpivot { .. } => {}
+            | PipeOperator::Unpivot { .. } => input,
         }
+    }
+
+    /// Wrap `input` in a non-feeding read `PassThrough` carrying whatever a
+    /// filter pipe operator collected (reads + predicate sub-plans).
+    fn pipe_filter(&self, input: Plan, collect: impl FnOnce(&mut ExprCollector)) -> Plan {
+        let mut c = ExprCollector::filter();
+        collect(&mut c);
+        let (reads, subplans) = c.into_filter_parts();
+        wrap_reads(input, reads, subplans)
+    }
+
+    /// Build the [`Project`] for an output-producing pipe operator: append
+    /// the `bound` value columns to `base` (empty when the operator replaces
+    /// the output, the running outputs when it extends them). Value
+    /// sub-plans feed lineage; filter reads / sub-plans ride a non-feeding
+    /// `PassThrough` below the projection.
+    fn pipe_project(
+        &self,
+        input: Plan,
+        mut outputs: Vec<BoundColumn>,
+        bound: impl Iterator<Item = BoundValue>,
+    ) -> (Plan, Vec<BoundColumn>) {
+        let mut value_subqueries = Vec::new();
+        let mut filter_reads = Vec::new();
+        let mut filter_subqueries = Vec::new();
+        for b in bound {
+            outputs.push(b.column);
+            value_subqueries.extend(b.value_subplans);
+            filter_reads.extend(b.filter_reads);
+            filter_subqueries.extend(b.filter_subplans);
+        }
+        let project = Plan::Project(Project {
+            input: Box::new(wrap_reads(input, filter_reads, filter_subqueries)),
+            outputs: outputs.clone(),
+            subqueries: value_subqueries,
+        });
+        (project, outputs)
+    }
+
+    /// Like [`pipe_project`](Self::pipe_project) but for `|> SET`: each bound
+    /// column replaces a same-named output in `base` (or is appended), so a
+    /// `SET` after a `SELECT` rewrites that column in place rather than
+    /// duplicating it.
+    fn pipe_set_project(
+        &self,
+        input: Plan,
+        mut outputs: Vec<BoundColumn>,
+        bound: Vec<BoundValue>,
+    ) -> (Plan, Vec<BoundColumn>) {
+        let mut value_subqueries = Vec::new();
+        let mut filter_reads = Vec::new();
+        let mut filter_subqueries = Vec::new();
+        for b in bound {
+            value_subqueries.extend(b.value_subplans);
+            filter_reads.extend(b.filter_reads);
+            filter_subqueries.extend(b.filter_subplans);
+            let slot = b.column.name.as_ref().and_then(|name| {
+                outputs
+                    .iter_mut()
+                    .find(|o| o.name.as_ref().is_some_and(|n| n.value == name.value))
+            });
+            match slot {
+                Some(existing) => *existing = b.column,
+                None => outputs.push(b.column),
+            }
+        }
+        let project = Plan::Project(Project {
+            input: Box::new(wrap_reads(input, filter_reads, filter_subqueries)),
+            outputs: outputs.clone(),
+            subqueries: value_subqueries,
+        });
+        (project, outputs)
     }
 
     /// Filter-position reads from a `LIMIT` / `OFFSET` / `LIMIT BY` clause
