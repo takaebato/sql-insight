@@ -17,69 +17,88 @@ by hand.
 
 ## Architecture
 
-- The `resolver` module walks a `Statement` once and produces a
-  `Resolution`:
-  - a scope arena of `Binding`s (`Table` / `Cte` / `DerivedTable` /
-    `TableFunction`),
-  - a buffer of `RawColumnRef`s captured at walk time with
-    resolved-table + synthetic-vs-real + clause-kind metadata,
-  - a buffer of `FlowEdge`s emitted directly during the walk.
-  Two post-passes on `into_resolution` compose the flow graph
-  end-to-end through CTE / derived intermediates and filter reads
-  down to references whose walk-time owner was a real `Table`.
-  Sub-modules are split by responsibility: `binding` (scope arena),
-  `context` (`VisitContext`), `column_ref`, `projection`, `flow`,
-  `composition`, `rename`; walker files (`expr` / `query` /
-  `statement` / `table`) live as siblings and add `visit_*` methods
-  via `impl Resolver` blocks.
-- Pull-style design: `resolve_query` returns a `ResolvedQuery`
-  carrying the body's `projections: Vec<ProjectionGroup>`. Callers
-  (visit_insert / CTAS / scalar subqueries / etc.) decide what to do
-  with them — pair with target columns, emit `QueryOutput` edges,
-  bubble up through `SetExpr::Query`, etc.
-- The resolver takes an optional `&dyn Catalog`. With a catalog,
-  Table bindings come back with `Known` schemas and column
-  resolution becomes strict (typos surface as `table: None` with
-  `ResolutionKind::Unresolved`; multi-`Known`-confirms surface as
-  `ResolutionKind::Ambiguous`). Without a catalog the resolver is
-  best-effort and resolved reads surface as `ResolutionKind::Inferred`.
-- Identifier matching is dialect-aware (`resolver::casing`). The
+- The private `plan` module is the analysis engine: it binds a
+  `Statement` into a **materialized, full-stack logical-plan tree**
+  (`ir::Plan`) and walks that tree for the extraction surfaces. It is
+  *not* an execution plan — nothing optimizes or runs SQL. (This
+  replaced an earlier flat-buffer `resolver`; some doc comments still
+  say "the resolver" generically to mean this resolution logic.)
+  Sub-modules:
+  - `ir` — the persistent operator-tree types.
+  - `binder` — `build_with_diagnostics(stmt, catalog, casing) ->
+    (Option<Plan>, Vec<ColumnLevelDiagnostic>)`, the bind pass
+    (AST → resolved `Plan`); plus the bind-time `Scope` / `Relation`
+    scratch and the `ExprCollector` value/filter splitter.
+  - `extract` — walk a `Plan` for `reads` / `writes` / `lineage`
+    (column + table) and the legacy flat table list.
+  - `operation` / `table_operation` — assemble the public
+    `ColumnOperation` / `TableOperation` (and the flat list) from a
+    `Plan`, using `classify_statement` for the verb and projecting
+    column-level diagnostics down to the table level.
+- `ir::Plan` variants: `Scan` (named real-table leaf, carrying
+  `resolution: ResolutionKind` and `role: ScanRole {Read,Write}`),
+  `OpaqueLeaf` (VALUES / table function / unmodelled leaf, no
+  columns), `PassThrough` (join **and** every filter — output is the
+  identity concat of inputs; `reads` are predicate columns; filter
+  subqueries hang on `subqueries`, non-feeding), `Project` (the only
+  column-defining producer — `outputs: Vec<BoundColumn>`; value
+  subqueries on `subqueries`, feeding), `SetOp` (positional fan-in),
+  `Write` (INSERT / UPDATE / MERGE / CTAS / CREATE VIEW / ALTER —
+  `target` + `target_columns` + source `input` + `returning` +
+  `conflict_updates`), `Delete` (multi-target `DeletePlan`), `Drop`
+  (DROP / TRUNCATE relations), `With` + `CteRef` (shared-node CTE
+  model — a CTE body is bound once at the `With` and referenced by a
+  lightweight `CteRef`, so reads count once and an unreferenced CTE
+  still counts).
+- **Provenance is pre-collapsed bottom-up.** Each `BoundColumn`
+  carries `provenance: Vec<ProvenanceSource>`, already resolved to
+  real base columns, each with its composed `ColumnLineageKind`.
+  A `ProvenanceSource` reached *through* a synthetic step (derived /
+  CTE column, output alias, scalar subquery output) is marked
+  `synthetic_origin`: it stays a lineage source (the collapsed base
+  column) but is excluded from `reads` (its physical read was already
+  counted at the inner producer). So extraction is a pure walk.
+- The bind-time `Scope` (`Vec<Relation>` + `outputs` + `merge_columns`)
+  is **scratch** — threaded bottom-up (`bind_* -> (Plan, Scope)`),
+  never stored on the tree. A `Relation` is `{alias, source:
+  RelationSource}` where source is `Table {table, columns:
+  RelationColumns}` / `Derived {columns}` (synthetic) / `TableFunction`
+  (opaque synthetic). Correlation reaches enclosing scopes via the
+  binder's `outer_scopes` stack.
+- The binder takes an optional `&dyn Catalog`. With a catalog, a
+  matched table's columns are `Known` and column resolution is strict
+  (typos → `table: None` / `ResolutionKind::Unresolved`; multi-hit →
+  `Ambiguous`); catalog-free, columns are `Open` and resolved reads
+  are `Inferred`.
+- Identifier matching is dialect-aware (`crate::casing`). The
   extractor derives an `IdentifierCasing` from the `&dyn Dialect`
-  (`IdentifierCasing::for_dialect`) and threads it into
-  `resolve_statement`; every comparison funnels through
-  `BindingKey::new(ident, fold)`. The policy splits by class —
-  `table` (catalog/schema/table), `table_alias` (aliases + CTE /
-  derived / table-function names), `column` — each a `CaseFold`
-  (`Upper` / `Lower` / `Insensitive` / `Sensitive`). Most dialects
-  are homogeneous (PG=Lower, ANSI/Snowflake=Upper, DuckDB/SQLite=
+  (`IdentifierCasing::for_dialect`) and threads it into the binder;
+  comparisons fold through `CaseFold::normalize`. The policy splits by
+  class — `table` (catalog/schema/table), `table_alias` (aliases + CTE
+  / derived / table-function names), `column` — each a `CaseFold`
+  (`Upper` / `Lower` / `Insensitive` / `Sensitive`). Most dialects are
+  homogeneous (PG=Lower, ANSI/Snowflake=Upper, DuckDB/SQLite=
   Insensitive); MySQL and BigQuery split (real tables `Sensitive`,
   columns/aliases `Insensitive`). Filesystem- / collation-dependent
   models (MySQL table names, SQL Server) resolve to a fixed safe
   default; a per-deployment override API is a future addition. Only
-  matching folds — surfaced `TableReference` / `ColumnReference`
-  keep the original identifier text.
-- The scope arena keys bindings by **merge-identity**
-  (`binding_alias_key`): a non-aliased real table by its full
-  `catalog.schema.name` path (`BindingKey::from_table`), an aliased
-  table / CTE / derived / table function by its single name. The path
-  is the **catalog-canonicalized** identity: `bind_real_table` rewrites
-  a uniquely-matched reference to its registered full path *before*
-  keying (`catalog_canonical_ref`), so a bare `users` and an explicit
-  `public.users` collapse to one binding when the catalog confirms them
-  as the same table. Without a catalog — or on a miss / ambiguous match
-  — the reference keys as written, so `mydb.users` and `otherdb.users`
-  stay distinct and a bare `users` does not merge into `mydb.users`.
-  Write targets canonicalize too: the extractor routes column-write /
-  `Relation`-target identity through the resolver's canonicalized
-  binding (`canonical_write_target` / `Resolver::canonicalize`) so all
-  surfaces agree. The key drives the two **exact-identity**
-  operations — merge-on-bind and CTE-name lookup
-  (`resolve_unqualified_relation`); **right-anchored** column
-  resolution scans `iter_bindings` instead (a partial qualifier like
-  `users.col` matching `mydb.users` is not a hashable equivalence).
-- Extractors consume the resolver's output:
+  matching folds — surfaced `TableReference` / `ColumnReference` keep
+  the original identifier text.
+- **Catalog canonicalization**: `table_match` rewrites a uniquely
+  matched reference to its registered full `catalog.schema.name` path,
+  so a bare `users` and an explicit `public.users` agree. Write
+  targets canonicalize too (`canonical_target`). Without a catalog —
+  or on a miss / ambiguous match — the reference stays as written, so
+  `mydb.users` and `otherdb.users` stay distinct and a bare `users`
+  does not merge into `mydb.users`. Column resolution is
+  **right-anchored** (`qualifier_matches_table`): a partial qualifier
+  like `users.col` matches `mydb.users`. DELETE-target merge identity
+  is **exact** (`scope_target` / `table_identity_eq`): bare `t1`
+  merges with FROM `t1` but not FROM `mydb.t1`.
+- Extractors are thin wrappers around the plan engine:
   - `table_extractor` — flat list of `TableReference`s (legacy API).
-  - `crud_table_extractor` — CRUD-bucketed tables (legacy API).
+  - `crud_table_extractor` — CRUD-bucketed tables (legacy API; a thin
+    shim over `TableOperationExtractor` that buckets reads/writes).
   - `table_operation_extractor` — `extract_table_operations` returns
     `TableOperation { statement_kind, reads, writes,
     lineage, diagnostics }` per parsed statement.
@@ -90,7 +109,13 @@ by hand.
     `kind: ColumnLineageKind`.
 - Per-statement output convention: extractors return
   `Vec<Result<X, Error>>` so one bad statement does not kill the
-  rest.
+  rest. The plan engine is **best-effort** — an unrepresentable
+  construct (e.g. a >3-segment table name) is dropped rather than
+  hard-erroring.
+- `reads` / `lineage` order is **non-contractual** (a tree-walk
+  artifact); occurrence count is preserved and each reference carries
+  its source span, so consumers sort by span for source order. Tests
+  compare these surfaces as multisets. `writes` follow source order.
 
 ## Vocabulary
 
@@ -140,14 +165,15 @@ by hand.
   `reads` but not `lineage`.
 - `StatementKind` — the verb of the statement; combined with the
   `reads` / `writes` split recovers every granularity distinction.
-- Internal-only `TableRole` (Read / Write) lives inside the resolver
-  for binding metadata. It is not exposed via the public API —
-  surface it through `reads` / `writes` instead.
+- Internal-only `ScanRole` (Read / Write) lives on `ir::Scan` to mark
+  a write-target scan (kept in scope for resolution, skipped from
+  reads). It is not exposed via the public API — surface it through
+  `reads` / `writes` instead.
 - `TableReference` is identity-only (`catalog` / `schema` / `name`).
   Alias is a use-site decoration, not part of a table's identity,
   so `HashSet<TableReference>` dedup and cross-statement comparison
-  behave intuitively. Resolver bindings carry alias as a separate
-  field; the public API does not currently surface it.
+  behave intuitively. The binder's `Scope` relations carry alias as a
+  separate field; the public API does not currently surface it.
   Per-occurrence metadata lives on the read-side wrapper
   `TableRead { reference, resolution }` (mirrors `ColumnRead`), so
   `TableReference` stays a pure identity. Write-side surfaces
@@ -165,33 +191,37 @@ by hand.
   not the SQL's
   correctness. `Cataloged` means a `Known` schema (catalog or CTE /
   derived body) positively confirmed the reference; `Inferred` means
-  the resolver adopted a candidate without firm evidence (catalog-less
-  mode, qualifier-only resolution, or Known-witness-over-Unknown-suspects
+  the binder adopted a candidate without firm evidence (catalog-less
+  mode, qualifier-only resolution, or Known-witness-over-Open-suspects
   tiebreaker). `Ambiguous` / `Unresolved` are the two failure modes —
   both come with `table: None` on a `ColumnRead` (`Unresolved` is
   columns-only). At table granularity the reference is always present,
   so a `TableRead` can be `Ambiguous` (the catalog matched several
   registrations) but never `Unresolved`. Invariant:
   catalog-less mode never produces `ResolutionKind::Cataloged` on the
-  public surface (CTE-confirmed refs are synthetic and dropped by the
-  post-pass), so detecting catalog-aware analysis is as simple as
+  public surface (synthetic-origin sources are dropped from `reads`),
+  so detecting catalog-aware analysis is as simple as
   `r.resolution == Cataloged` on any surviving read.
 
 ## Design conventions
 
-- Pull design: `resolve_query` collects facts (projections), callers
-  decide edge construction. Avoid pushing state from caller into
-  resolver via flag bags — instead expose helpers like
-  `with_filter_clause` / `with_branch_scope` for scoped, lexical
-  context.
-- Walking-context state lives in `VisitContext` (just `scope_kind`)
-  — "in effect for the current visit", not "queued". Save / restore
-  goes through `with_context` (and the focused `with_branch_scope` /
-  `with_filter_clause` helpers) so the prior context is restored on
-  scope exit. `scope_kind` is preserved across a subquery boundary so
-  predicate-ness flows transitively. For owning per-query buffers
-  like `current_projections: Vec<…>`, `mem::replace` is used
-  instead.
+- **Materialize, then walk.** The binder builds a complete `Plan`
+  tree (bind = AST → tree, one pass); extraction is a pure walk of the
+  clean tree. Keep the plan a *complete* representation: where a bind
+  shortcut would throw info away (folding a subquery, dropping an
+  unreferenced CTE, discarding a role), raise plan granularity so it's
+  carried in the tree, not routed around it via side channels.
+- **Bind returns `(Plan, Scope)`** bottom-up; the `Scope` is scratch
+  (current frame = the subtree's output relations + introduced
+  outputs; enclosing frames via `outer_scopes` for correlation). Don't
+  push caller state into the binder via flag bags — use scoped helpers.
+- **Value vs filter** is decided at bind time by `ExprCollector`
+  (`sources` / `value_subplans` feed lineage; `filter_reads` /
+  `filter_subplans` don't), with `suppressed(|c| …)` forcing filter
+  position inside a `CASE` condition / `EXISTS` / `IN` / `ANY` / `ALL`
+  / window key. The split is then **structural** in the tree: value
+  subqueries sit on `Project.subqueries` (feeding), filter subqueries
+  on a non-feeding `PassThrough` — so the extraction walk needs no tag.
 - Wildcards (`SELECT *`, `t.*`) are not expanded at the parser
   level — even with a catalog. The rigor cost (USING / NATURAL JOIN
   merge, EXCLUDE / REPLACE / RENAME clauses, CTE column rename,
@@ -199,42 +229,35 @@ by hand.
   to handle correctly. Wildcards contribute nothing to `reads` /
   `lineage`; consumers needing per-column source → target lineage
   either supply resolved query plans or do their own expansion.
-- Projection-alias visibility in GROUP BY / HAVING / ORDER BY: SQL
-  exposes SELECT-list output aliases to these clauses (the clause
-  ordering = a logical-plan operator stack — ORDER BY sits over
-  Project). A bare ref there naming an **introduced** alias (computed
-  expr or renamed column, e.g. `total` in `SELECT a+b AS total …
-  ORDER BY total`) is a reference to that output, not a stored column,
-  so it's dropped from `reads` rather than surfacing as a phantom
-  (`t.total`) — the real dependency is already captured at the
-  projection. Mechanism: each `Scope` records its **introduced** output
-  alias names (`Scope::output_names`; identity passthroughs like
-  `SELECT a … GROUP BY a` are *kept*, so the common case still surfaces
-  `a`); `CapturedColumnRef.clause` (`RefClause`) tags the clause during
-  the walk (reset at each `resolve_query` boundary); the
-  `real_column_refs` post-pass drops a clause-tagged single-segment ref
-  whose name matches its scope's output aliases. Qualified refs
-  (`t.total`) are never treated as aliases. Dialect-specific
+- Projection-alias visibility in GROUP BY / HAVING / ORDER BY is
+  **structural**: the clause ordering is a logical-plan operator stack,
+  so the WHERE `PassThrough` sits *below* the `Project` (no output
+  aliases visible) while GROUP BY / HAVING / ORDER BY resolve against a
+  scope that includes the `Project`'s `outputs`. A bare ref there
+  naming an **introduced** alias (computed expr or renamed column, e.g.
+  `total` in `SELECT a+b AS total … ORDER BY total`) resolves to that
+  output column's pre-collapsed provenance, marked `synthetic_origin`,
+  so it stays a lineage source but drops from `reads` (no phantom
+  `t.total`; the real dependency is already at the projection). An
+  *identity* passthrough (`SELECT a … GROUP BY a`) falls through to
+  normal resolution, so the common case still surfaces `a`. Qualified
+  refs (`t.total`) are never treated as aliases. Dialect-specific
   alias-vs-column precedence (ORDER BY favours alias, GROUP BY the input
-  column) is not modelled — the fine `RefClause` tag leaves room. This
-  is the first slice of moving the non-lexical "clause-phase" resolution
-  axis out of walk-time into a post-pass.
+  column) is not modelled.
 - `JOIN … USING (col)` merge columns **fan in**: a `USING (a)` join
   folds both sides' `a` into one COALESCE-style logical column with no
   single owner, so an unqualified ref to `a` resolves to *every* joined
   relation that could own it — one read / lineage source per side, not
-  an ambiguous `table: None`. Mechanism: `visit_join_constraint`
-  records the USING names on `Scope::merge_columns`; `capture_column_ref`
-  detects a merge-column ref and emits one `CapturedColumnRef` per
-  candidate binding (`try_capture_merge_column`), deriving members from
-  the scope's bindings at capture time — so a catalog narrows the fan-in
-  to relations that actually declare the column (and makes them
-  `Cataloged`), while catalog-free mode fans in to every joined relation
-  (`Inferred`). Qualified `t.a` keeps its single owner. NATURAL JOIN is
-  **not** expanded (its merge set is every same-named column of both
-  sides — needs both schemas, same reason wildcards aren't expanded).
-  Known limit: for a 3+-relation scope the catalog-free fan-in includes
-  every relation, not just the two USING operands.
+  an ambiguous `table: None`. Mechanism: the binder records the USING
+  names on `Scope::merge_columns`; `resolve_ref`, for an unqualified
+  merge-column ref, fans in to each scope relation that could own it —
+  a catalog narrows the fan-in to declaring relations (`Cataloged`),
+  catalog-free reaches every joined relation (`Inferred`). Qualified
+  `t.a` keeps its single owner. NATURAL JOIN is **not** expanded (its
+  merge set is every same-named column of both sides — needs both
+  schemas, same reason wildcards aren't expanded). Known limit: for a
+  3+-relation scope the catalog-free fan-in includes every relation,
+  not just the two USING operands.
 
 ## Code conventions
 
@@ -254,8 +277,10 @@ by hand.
   Prefer enums, named methods, or small option structs.
 - Avoid growing large modules. Split before a file becomes
   unscannable.
-- Keep `sqlparser-rs` AST `match` arms exhaustive in the resolver
+- Keep `sqlparser-rs` AST `match` arms exhaustive in the binder
   and extractors — wildcard arms silently hide newly added variants.
+  Likewise keep the `match plan { … }` arms over `ir::Plan` exhaustive
+  in `extract`.
 - Public enums are **exhaustive (no `#[non_exhaustive]`) while pre-1.0**
   (`StatementKind` / `ColumnLineageKind` / `ColumnTarget` /
   `ResolutionKind` / `TableLevelDiagnosticKind` /
@@ -269,20 +294,21 @@ by hand.
 - Diagnostics are reserved for **tool-side coverage gaps**, not
   per-reference resolution outcomes. `TableLevelDiagnostic` carries
   only `UnsupportedStatement`; `ColumnLevelDiagnostic` adds
-  `WildcardSuppressed`. The resolver produces the column-level
+  `WildcardSuppressed`. The binder produces the column-level
   superset; table-level surfaces project it down via
   `ColumnLevelDiagnostic::to_table_level` (exhaustive match, so a new
   column kind forces a table-level decision). Per-occurrence
   resolution status (ambiguous / unresolved column refs) lives on
-  `ColumnRead::confidence`, not in a parallel diagnostic stream.
+  `ColumnRead::resolution`, not in a parallel diagnostic stream.
 - For unsupported SQL, accumulate diagnostics instead of `?`-bailing
   mid-walk. Reserve hard errors for genuinely unrecoverable
   conditions.
-- Tests: compare whole values (`assert_eq!(ops.reads, vec![...])`)
-  over field-by-field assertions. Use a layered helper convention
-  — `extract` → `extract_with(dialect)` → `extract_with_catalog(
-  dialect, catalog)` — so callsites stay terse and new parameters
-  fall through cleanly.
+- Tests: compare whole values over field-by-field assertions, but
+  treat `reads` / `lineage` as **multisets** (order is non-contractual)
+  — use the `assert_unordered_eq!` helper; `writes` stay order-exact.
+  Use a layered helper convention — `extract` → `extract_with(dialect)`
+  → `extract_with_catalog(dialect, catalog)` — so callsites stay terse
+  and new parameters fall through cleanly.
 - Tests double as behavior documentation: a reader should be able to
   learn what a given SQL construct produces by reading its test, so
   prefer concrete, minimal SQL with the full expected value spelled
