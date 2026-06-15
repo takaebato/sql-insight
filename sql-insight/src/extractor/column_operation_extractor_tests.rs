@@ -1402,6 +1402,39 @@ mod diagnostics {
     }
 
     #[test]
+    fn over_qualified_read_table_reports_diagnostic() {
+        // A FROM table with more than `catalog.schema.name` segments can't
+        // be represented, so it's dropped (the projected `a` is left
+        // unresolved) and flagged with `TooManyTableQualifiers`.
+        assert_column_ops(
+            "SELECT a FROM catalog.schema.table.extra",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![unresolved("a")],
+                writes: vec![],
+                lineage: vec![passthrough(unresolved("a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::TooManyTableQualifiers)],
+            },
+        );
+    }
+
+    #[test]
+    fn over_qualified_write_target_reports_diagnostic() {
+        // An INSERT target with too many segments can't be represented, so
+        // the whole statement's surfaces are empty and it's flagged.
+        assert_column_ops(
+            "INSERT INTO catalog.schema.table.extra (a) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::TooManyTableQualifiers)],
+            },
+        );
+    }
+
+    #[test]
     fn wildcard_in_projection_reports_diagnostic() {
         // Whole-value pin-down on the structural shape; assert_column_ops
         // compares diagnostics by kind only. The message text and span

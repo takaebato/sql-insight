@@ -111,7 +111,8 @@ by hand.
   `Vec<Result<X, Error>>` so one bad statement does not kill the
   rest. The plan engine is **best-effort** — an unrepresentable
   construct (e.g. a >3-segment table name) is dropped rather than
-  hard-erroring.
+  hard-erroring, but flagged with a `TooManyTableQualifiers`
+  diagnostic so the dropped relation stays observable.
 - `reads` / `lineage` order is **non-contractual** (a tree-walk
   artifact); occurrence count is preserved and each reference carries
   its source span, so consumers sort by span for source order. Tests
@@ -293,11 +294,13 @@ by hand.
   `match`es exhaustive regardless.
 - Diagnostics are reserved for **tool-side coverage gaps**, not
   per-reference resolution outcomes. `TableLevelDiagnostic` carries
-  only `UnsupportedStatement`; `ColumnLevelDiagnostic` adds
-  `WildcardSuppressed`. The binder produces the column-level
-  superset; table-level surfaces project it down via
-  `ColumnLevelDiagnostic::to_table_level` (exhaustive match, so a new
-  column kind forces a table-level decision). Per-occurrence
+  `UnsupportedStatement` and `TooManyTableQualifiers` (an
+  over-qualified, >`catalog.schema.name`, table name that's dropped);
+  `ColumnLevelDiagnostic` is the superset, adding `WildcardSuppressed`.
+  The binder produces the column-level set; table-level surfaces
+  project it down via `ColumnLevelDiagnostic::to_table_level`
+  (exhaustive match, so a new column kind forces a table-level
+  decision — `WildcardSuppressed` maps to `None`). Per-occurrence
   resolution status (ambiguous / unresolved column refs) lives on
   `ColumnRead::resolution`, not in a parallel diagnostic stream.
 - For unsupported SQL, accumulate diagnostics instead of `?`-bailing

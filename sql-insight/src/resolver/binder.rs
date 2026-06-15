@@ -18,7 +18,7 @@ use sqlparser::ast::{
     LimitClause, ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind, NamedWindowExpr,
     ObjectName, ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind,
     PipeOperator, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
-    Subscript, Table, TableAlias, TableFactor, TableWithJoins, TopQuantity, Update,
+    Subscript, Table, TableAlias, TableFactor, TableObject, TableWithJoins, TopQuantity, Update,
     UpdateTableFromKind, Values, WindowFrameBound, WindowSpec, WindowType,
 };
 
@@ -304,7 +304,7 @@ impl Binder<'_> {
                 truncate
                     .table_names
                     .iter()
-                    .filter_map(|t| TableReference::try_from(&t.name).ok())
+                    .filter_map(|t| self.table_ref(&t.name))
                     .map(|t| self.canonical_target(t))
                     .collect(),
             )),
@@ -312,7 +312,7 @@ impl Binder<'_> {
             // write target with no inspectable source (classified
             // `CreateTable`, like a plain `CREATE TABLE`).
             Statement::CreateVirtualTable { name, .. } => {
-                let target = self.canonical_target(TableReference::try_from_name(name).ok()?);
+                let target = self.canonical_target(self.table_ref(name)?);
                 Some(Plan::Write(Write {
                     target,
                     target_columns: Vec::new(),
@@ -331,8 +331,11 @@ impl Binder<'_> {
     /// the read-carrying input; the target columns are the write targets.
     /// A `VALUES` source binds to an opaque leaf (no column reads).
     fn bind_insert(&self, insert: &Insert) -> Option<Plan> {
-        let (target, _alias) = TableReference::from_insert_with_alias(insert).ok()?;
-        let target = self.canonical_target(target);
+        let name = match &insert.table {
+            TableObject::TableName(name) => name,
+            TableObject::TableFunction(function) => &function.name,
+        };
+        let target = self.canonical_target(self.table_ref(name)?);
         // MySQL `INSERT INTO t SET col = expr, …`: an UPDATE-style assignment
         // form with no VALUES / SELECT source. Each assignment is a value
         // column named by its target → writes + `RHS → target.col` lineage.
@@ -470,7 +473,7 @@ impl Binder<'_> {
                 target_columns.push(column);
             }
         }
-        let target = self.canonical_target(TableReference::try_from(&update.table.relation).ok()?);
+        let target = self.canonical_target(self.table_factor_ref(&update.table.relation)?);
         // RETURNING resolves against the statement scope (target + FROM).
         let returning = self.bind_returning(&update.returning, &scope);
         Some(Plan::Write(Write {
@@ -579,7 +582,7 @@ impl Binder<'_> {
     /// in-scope relation), so consult the scope first; otherwise
     /// canonicalize it as written.
     fn resolve_delete_target(&self, name: &ObjectName, scope: &Scope) -> Option<TableReference> {
-        let written = TableReference::try_from_name(name).ok()?;
+        let written = self.table_ref(name)?;
         Some(
             self.scope_target(&written, scope)
                 .unwrap_or_else(|| self.canonical_target(written)),
@@ -647,7 +650,7 @@ impl Binder<'_> {
         let mut target_columns = Vec::new();
         // The (canonicalized) target identity, needed up-front to catalog-fill
         // a column-less WHEN NOT MATCHED INSERT's columns.
-        let target = self.canonical_target(TableReference::try_from(&merge.table).ok()?);
+        let target = self.canonical_target(self.table_factor_ref(&merge.table)?);
         for clause in &merge.clauses {
             if let Some(predicate) = &clause.predicate {
                 let (r, s) = self.expr_reads(predicate, &scope);
@@ -757,7 +760,7 @@ impl Binder<'_> {
     /// write target with no columns / reads / lineage — its column
     /// definitions aren't writes — so it binds to a target-only `Write`.
     fn bind_create_table(&self, create: &CreateTable) -> Option<Plan> {
-        let target = self.canonical_target(TableReference::try_from(&create.name).ok()?);
+        let target = self.canonical_target(self.table_ref(&create.name)?);
         let Some(query) = create.query.as_ref() else {
             return Some(Plan::Write(Write {
                 target,
@@ -786,7 +789,7 @@ impl Binder<'_> {
     /// with the view's columns (explicit list wins, else source names).
     fn bind_create_view(&self, create: &CreateView) -> Option<Plan> {
         let (input, scope) = self.bind_query(&create.query);
-        let target = self.canonical_target(TableReference::try_from(&create.name).ok()?);
+        let target = self.canonical_target(self.table_ref(&create.name)?);
         let target_columns = if create.columns.is_empty() {
             output_names(&scope.outputs)
         } else {
@@ -827,7 +830,7 @@ impl Binder<'_> {
     /// (constraints, partitions, RENAME TABLE) name no columns. No reads or
     /// lineage — ALTER restructures, it doesn't move row data.
     fn bind_alter_table(&self, alter: &AlterTable) -> Option<Plan> {
-        let target = self.canonical_target(TableReference::try_from(&alter.name).ok()?);
+        let target = self.canonical_target(self.table_ref(&alter.name)?);
         let target_columns = alter
             .operations
             .iter()
@@ -860,7 +863,7 @@ impl Binder<'_> {
         let targets = names
             .iter()
             .chain(table)
-            .filter_map(|name| TableReference::try_from(name).ok())
+            .filter_map(|name| self.table_ref(name))
             .map(|target| self.canonical_target(target))
             .collect();
         Some(Plan::Drop(targets))
@@ -1464,15 +1467,15 @@ impl Binder<'_> {
         // (MsSql / Postgres). Wrap the projection as the write source so `t`
         // surfaces as a write target (its columns feed it positionally).
         let plan = match &select.into {
-            Some(into) => match TableReference::try_from_name(&into.name) {
-                Ok(target) => Plan::Write(Write {
+            Some(into) => match self.table_ref(&into.name) {
+                Some(target) => Plan::Write(Write {
                     target: self.canonical_target(target),
                     target_columns: Vec::new(),
                     input: Box::new(body),
                     returning: Vec::new(),
                     conflict_updates: Vec::new(),
                 }),
-                Err(_) => body,
+                None => body,
             },
             None => body,
         };
@@ -1578,7 +1581,7 @@ impl Binder<'_> {
             TableFactor::Table {
                 name, alias, args, ..
             } => {
-                let Ok(written) = TableReference::try_from_name(name) else {
+                let Some(written) = self.table_ref(name) else {
                     return (Plan::OpaqueLeaf, Scope::empty());
                 };
                 // A parameterised table reference `foo(args)` carries
@@ -1896,6 +1899,54 @@ impl Binder<'_> {
             kind: ColumnLevelDiagnosticKind::WildcardSuppressed,
             message: format!(
                 "{description}{suffix} left unexpanded — column lineage will be incomplete for this projection"
+            ),
+            span,
+        });
+    }
+
+    /// Build a table reference from a parsed name, recording a
+    /// `TooManyTableQualifiers` diagnostic and returning `None` when the
+    /// name has more identifiers than `catalog.schema.name` (the only way a
+    /// parsed name fails to convert). The dropped relation thus stays
+    /// observable rather than vanishing silently.
+    fn table_ref(&self, name: &ObjectName) -> Option<TableReference> {
+        match TableReference::try_from_name(name) {
+            Ok(table) => Some(table),
+            Err(_) => {
+                self.record_too_many_table_qualifiers(name);
+                None
+            }
+        }
+    }
+
+    /// Like [`table_ref`](Self::table_ref) for a FROM / target table factor:
+    /// a plain `Table` factor records the over-qualified diagnostic; a
+    /// derived / function factor simply has no table identity (no
+    /// diagnostic — it isn't an over-qualified name).
+    fn table_factor_ref(&self, factor: &TableFactor) -> Option<TableReference> {
+        match factor {
+            TableFactor::Table { name, .. } => self.table_ref(name),
+            other => TableReference::try_from(other).ok(),
+        }
+    }
+
+    /// Record a `TooManyTableQualifiers` diagnostic for an over-qualified
+    /// table name (more than `catalog.schema.name`), carrying its location.
+    fn record_too_many_table_qualifiers(&self, name: &ObjectName) {
+        let span = name
+            .0
+            .first()
+            .and_then(|part| part.as_ident())
+            .map(|ident| ident.span)
+            .filter(|s| s.start.line != 0);
+        let suffix = match span {
+            Some(s) => format!(" at L{}:C{}", s.start.line, s.start.column),
+            None => String::new(),
+        };
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::TooManyTableQualifiers,
+            message: format!(
+                "table reference `{name}`{suffix} has too many qualifiers (max catalog.schema.name) — dropped"
             ),
             span,
         });

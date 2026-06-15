@@ -291,22 +291,28 @@ mod tests {
         }
 
         #[test]
-        fn test_too_many_identifiers_yields_empty_best_effort() {
+        fn test_too_many_identifiers_drops_target_with_diagnostic() {
             // Behavior change vs the legacy resolver: a target with more
             // segments than `catalog.schema.name` can't be represented as a
             // `TableReference`. The resolver hard-errored ("Too many
             // identifiers provided"); the bound-plan engine is best-effort,
-            // so it drops the unrepresentable target and returns an empty
-            // operation rather than failing the whole statement.
+            // so it drops the unrepresentable target (empty surfaces) and
+            // flags a `TooManyTableQualifiers` diagnostic instead of failing
+            // the whole statement.
+            use crate::diagnostic::TableLevelDiagnosticKind;
+            use sqlparser::dialect::GenericDialect;
             let sql = "INSERT INTO catalog.schema.table.extra (a) VALUES (1)";
-            let expected = vec![Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![],
-                update_tables: vec![],
-                delete_tables: vec![],
-                diagnostics: vec![],
-            })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
+            let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+            let crud = result.into_iter().next().unwrap().unwrap();
+            assert_eq!(crud.create_tables, vec![]);
+            assert_eq!(crud.read_tables, vec![]);
+            assert_eq!(crud.update_tables, vec![]);
+            assert_eq!(crud.delete_tables, vec![]);
+            assert_eq!(crud.diagnostics.len(), 1);
+            assert_eq!(
+                crud.diagnostics[0].kind,
+                TableLevelDiagnosticKind::TooManyTableQualifiers
+            );
         }
     }
 
