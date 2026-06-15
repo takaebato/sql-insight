@@ -59,6 +59,20 @@ pub(crate) fn build_with_diagnostics(
     (plan, diagnostics.into_inner())
 }
 
+/// Like [`build_with_diagnostics`] but folds an unbound statement (a
+/// supported but structure-only kind, or one that fails to bind) to an
+/// empty [`Plan::OpaqueLeaf`], so callers always get a walkable plan
+/// without handling `None` or naming the IR. The extractors assemble the
+/// public operations from this.
+pub(crate) fn build_plan(
+    statement: &Statement,
+    catalog: Option<&Catalog>,
+    casing: IdentifierCasing,
+) -> (Plan, Vec<ColumnLevelDiagnostic>) {
+    let (plan, diagnostics) = build_with_diagnostics(statement, catalog, casing);
+    (plan.unwrap_or(Plan::OpaqueLeaf), diagnostics)
+}
+
 /// Bind-time resolution scope: the relations visible at a point in the
 /// bind, plus (for the output-alias-visible clauses) the enclosing
 /// SELECT's output columns. Scratch — never stored on the [`Plan`].

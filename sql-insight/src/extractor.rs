@@ -29,7 +29,6 @@ pub use crud_table_extractor::*;
 pub use table_extractor::*;
 pub use table_operation_extractor::*;
 
-// The statement classifier and the MERGE data-movement check feed the
-// `plan` engine: statement-kind classification and the DELETE-only MERGE
-// lineage gate.
-pub(crate) use table_operation_extractor::{classify_statement, merge_moves_data};
+// The statement classifier is shared by the column / flat extractors to
+// pick the statement verb before assembling their surfaces.
+pub(crate) use table_operation_extractor::classify_statement;

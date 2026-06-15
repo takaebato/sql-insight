@@ -69,9 +69,9 @@
 
 use crate::casing::IdentifierCasing;
 use crate::catalog::Catalog;
-use crate::diagnostic::ColumnLevelDiagnostic;
+use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::error::Error;
-use crate::extractor::table_operation_extractor::StatementKind;
+use crate::extractor::{classify_statement, StatementKind};
 use crate::reference::{ColumnRead, ColumnReference};
 use sqlparser::ast::{Ident, Statement};
 use sqlparser::dialect::Dialect;
@@ -281,18 +281,46 @@ impl ColumnOperationExtractor {
             .collect())
     }
 
+    /// Assemble the column operation from the bound plan: classify the
+    /// verb, bind the statement, and walk the plan for `reads` / `writes` /
+    /// `lineage`. A kind the binder can't model yields an empty operation
+    /// with an `UnsupportedStatement` diagnostic; a supported but
+    /// structure-only kind (e.g. `DROP`) is empty without a diagnostic.
     fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&Catalog>,
         casing: IdentifierCasing,
     ) -> Result<ColumnOperation, Error> {
-        // Column-level extraction is served by the bound-plan engine; the
-        // resolver-based path is retained as `resolver_column_operation`
-        // only for the strangler differential harness until the resolver is
-        // removed.
-        Ok(crate::resolver::operation::column_operation(
-            statement, catalog, casing,
-        ))
+        let statement_kind = classify_statement(statement);
+        if statement_kind == StatementKind::Unsupported {
+            return Ok(unsupported_column_operation(statement_kind, statement));
+        }
+        let (plan, diagnostics) = crate::resolver::build_plan(statement, catalog, casing);
+        Ok(ColumnOperation {
+            statement_kind,
+            reads: crate::resolver::extract_reads(&plan),
+            writes: crate::resolver::extract_writes(&plan),
+            lineage: crate::resolver::extract_lineage(&plan),
+            // The bind accumulates `WildcardSuppressed` / `TooManyTableQualifiers`.
+            diagnostics,
+        })
+    }
+}
+
+fn unsupported_column_operation(
+    statement_kind: StatementKind,
+    statement: &Statement,
+) -> ColumnOperation {
+    ColumnOperation {
+        statement_kind,
+        reads: Vec::new(),
+        writes: Vec::new(),
+        lineage: Vec::new(),
+        diagnostics: vec![ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::UnsupportedStatement,
+            message: format!("Unsupported statement for plan-based extraction: {statement}"),
+            span: None,
+        }],
     }
 }
 

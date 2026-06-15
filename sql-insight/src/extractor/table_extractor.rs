@@ -9,8 +9,9 @@
 use core::fmt;
 
 use crate::casing::IdentifierCasing;
-use crate::diagnostic::TableLevelDiagnostic;
+use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
+use crate::extractor::{classify_statement, StatementKind};
 use crate::reference::TableReference;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
@@ -84,14 +85,28 @@ impl TableExtractor {
         statement: &Statement,
         casing: IdentifierCasing,
     ) -> Result<TableExtraction, Error> {
-        // The legacy flat table list is derived from the bound-plan engine.
-        // No catalog is consulted — this API surfaces no columns, so a
-        // catalog would not change the table list.
-        let (tables, diagnostics) =
-            crate::resolver::table_operation::flat_table_extraction(statement, None, casing);
+        // The flat table list is derived from the bound-plan engine. No
+        // catalog is consulted — this API surfaces no columns, so a catalog
+        // would not change the table list. An unsupported statement yields
+        // an empty list with a diagnostic; otherwise walk the plan for every
+        // referenced table and project the column diagnostics down.
+        if classify_statement(statement) == StatementKind::Unsupported {
+            return Ok(TableExtraction {
+                tables: Vec::new(),
+                diagnostics: vec![TableLevelDiagnostic {
+                    kind: TableLevelDiagnosticKind::UnsupportedStatement,
+                    message: format!("Unsupported statement while inspecting SQL: {statement}"),
+                    span: None,
+                }],
+            });
+        }
+        let (plan, column_diagnostics) = crate::resolver::build_plan(statement, None, casing);
         Ok(TableExtraction {
-            tables,
-            diagnostics,
+            tables: crate::resolver::extract_flat_tables(&plan),
+            diagnostics: column_diagnostics
+                .iter()
+                .filter_map(|d| d.to_table_level())
+                .collect(),
         })
     }
 }

@@ -2,16 +2,16 @@
 //! representation the extractors consume — a materialized, full-stack
 //! bound logical-plan tree ([`ir::Plan`]) whose column provenance is
 //! resolved bottom-up. It is **not** an execution plan — nothing here
-//! optimizes or runs SQL. Backs every public extractor (column / table /
-//! flat / CRUD).
+//! optimizes or runs SQL.
+//!
+//! The crate-internal surface is two halves: [`build_plan`] (AST →
+//! resolved `Plan`) and the `extract_*` walkers (`Plan` → reads / writes
+//! / lineage / flat tables). The [`crate::extractor`] layer drives them
+//! and packages the public `*Operation` types.
 //!
 //! - [`ir`] — the persistent operator tree types.
-//! - [`binder`] — `build_with_diagnostics`: AST → resolved `Plan` (the
-//!   bind pass).
+//! - [`binder`] — the bind pass (AST → resolved `Plan`).
 //! - [`extract`] — walk a `Plan` for the operation surfaces.
-//! - [`operation`] — assemble the public `ColumnOperation` from a `Plan`.
-//! - [`table_operation`] — assemble the public `TableOperation` and the
-//!   legacy flat table list from a `Plan`.
 //!
 //! ## Coverage
 //!
@@ -25,5 +25,9 @@
 mod binder;
 mod extract;
 mod ir;
-pub(crate) mod operation;
-pub(crate) mod table_operation;
+
+pub(crate) use binder::build_plan;
+pub(crate) use extract::{
+    extract_flat_tables, extract_lineage, extract_reads, extract_table_lineage,
+    extract_table_reads, extract_table_writes, extract_writes,
+};

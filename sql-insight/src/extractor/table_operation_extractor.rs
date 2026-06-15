@@ -21,7 +21,7 @@
 
 use crate::casing::IdentifierCasing;
 use crate::catalog::Catalog;
-use crate::diagnostic::TableLevelDiagnostic;
+use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
 use crate::reference::{TableRead, TableReference};
 use sqlparser::ast::Statement;
@@ -203,18 +203,77 @@ impl TableOperationExtractor {
             .collect())
     }
 
+    /// Assemble the table operation from the bound plan: classify the verb,
+    /// bind the statement, walk the plan for `reads` / `writes`, and (for
+    /// data-moving statements only) `lineage`. Column-level diagnostics
+    /// project down to the table level. A kind the binder can't model
+    /// yields an empty operation with an `UnsupportedStatement` diagnostic.
     pub(crate) fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&Catalog>,
         casing: IdentifierCasing,
     ) -> Result<TableOperation, Error> {
-        // Table-level extraction is served by the bound-plan engine; the
-        // resolver-based path is retained as `resolver_table_operation`
-        // only for the strangler differential harness until the resolver is
-        // removed.
-        Ok(crate::resolver::table_operation::table_operation(
-            statement, catalog, casing,
-        ))
+        let statement_kind = classify_statement(statement);
+        if statement_kind == StatementKind::Unsupported {
+            return Ok(unsupported_table_operation(statement_kind, statement));
+        }
+        let (plan, column_diagnostics) = crate::resolver::build_plan(statement, catalog, casing);
+        // Lineage is only for statements that move data into a target. A
+        // column-less INSERT and a DELETE both bind to a `Write`, so the
+        // structural walk can't tell them apart — gate on the kind. A MERGE
+        // whose WHEN clauses are only DELETEs uses its source solely to pick
+        // target rows, so it moves no data even though the source is a
+        // feeding input — gate it out via `merge_moves_data`.
+        let lineage = if moves_data(&statement_kind) && merge_moves_data(statement) {
+            crate::resolver::extract_table_lineage(&plan)
+        } else {
+            Vec::new()
+        };
+        Ok(TableOperation {
+            statement_kind,
+            reads: crate::resolver::extract_table_reads(&plan),
+            writes: crate::resolver::extract_table_writes(&plan),
+            lineage,
+            // Table-level diagnostics are the column-level ones projected
+            // down (only `UnsupportedStatement` / `TooManyTableQualifiers`
+            // survive the projection).
+            diagnostics: column_diagnostics
+                .iter()
+                .filter_map(|d| d.to_table_level())
+                .collect(),
+        })
+    }
+}
+
+/// Whether a statement physically moves data into its target (so it emits
+/// table lineage). `DELETE` / `DROP` / `TRUNCATE` / `ALTER TABLE` touch a
+/// target but feed it nothing; a bare `SELECT` has no target.
+fn moves_data(kind: &StatementKind) -> bool {
+    matches!(
+        kind,
+        StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Merge
+            | StatementKind::CreateTable
+            | StatementKind::CreateView
+            | StatementKind::AlterView
+    )
+}
+
+fn unsupported_table_operation(
+    statement_kind: StatementKind,
+    statement: &Statement,
+) -> TableOperation {
+    TableOperation {
+        statement_kind,
+        reads: Vec::new(),
+        writes: Vec::new(),
+        lineage: Vec::new(),
+        diagnostics: vec![TableLevelDiagnostic {
+            kind: TableLevelDiagnosticKind::UnsupportedStatement,
+            message: format!("Unsupported statement for plan-based extraction: {statement}"),
+            span: None,
+        }],
     }
 }
 
@@ -225,7 +284,7 @@ impl TableOperationExtractor {
 /// statement and report whether at least one WHEN clause is an
 /// INSERT or UPDATE, so the lineage path can short-circuit for the
 /// DELETE-only case.
-pub(crate) fn merge_moves_data(statement: &Statement) -> bool {
+fn merge_moves_data(statement: &Statement) -> bool {
     use sqlparser::ast::MergeAction;
     let Statement::Merge(merge) = statement else {
         return true;
