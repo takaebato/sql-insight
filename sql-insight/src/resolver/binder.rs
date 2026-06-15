@@ -333,25 +333,14 @@ impl Binder<'_> {
     fn bind_insert(&self, insert: &Insert) -> Option<Plan> {
         let (target, _alias) = TableReference::from_insert_with_alias(insert).ok()?;
         let target = self.canonical_target(target);
+        // MySQL `INSERT INTO t SET col = expr, …`: an UPDATE-style assignment
+        // form with no VALUES / SELECT source. Each assignment is a value
+        // column named by its target → writes + `RHS → target.col` lineage.
+        if insert.source.is_none() && !insert.assignments.is_empty() {
+            return Some(self.bind_insert_set(insert, target));
+        }
         let (input, source_scope) = match &insert.source {
             Some(source) => self.bind_query(source),
-            // MySQL `INSERT INTO t SET a = expr, …`: no VALUES / SELECT
-            // source; the assignment right-hand sides are reads against the
-            // target, folded onto the input so their tables surface.
-            None if !insert.assignments.is_empty() => {
-                let scope = self.target_scope(&target);
-                let mut reads = Vec::new();
-                let mut subplans = Vec::new();
-                for assignment in &insert.assignments {
-                    let (r, s) = self.expr_reads(&assignment.value, &scope);
-                    reads.extend(r);
-                    subplans.extend(s);
-                }
-                (
-                    wrap_reads(Plan::OpaqueLeaf, reads, subplans),
-                    Scope::empty(),
-                )
-            }
             None => (Plan::OpaqueLeaf, Scope::empty()),
         };
         // An explicit column list wins; otherwise pair the source against
@@ -392,6 +381,49 @@ impl Binder<'_> {
             returning,
             conflict_updates,
         }))
+    }
+
+    /// MySQL `INSERT INTO t SET col = expr, …`: bind the assignment form
+    /// like a single-table `UPDATE` — each assignment is a value column
+    /// named by its target (resolved against the target's own columns), so
+    /// it writes that column and feeds `RHS → target.col` lineage. There is
+    /// no FROM / WHERE; an `ON DUPLICATE KEY UPDATE` conflict action folds
+    /// in as usual.
+    fn bind_insert_set(&self, insert: &Insert, target: TableReference) -> Plan {
+        let scope = self.target_scope(&target);
+        let mut outputs = Vec::new();
+        let mut target_columns = Vec::new();
+        let mut value_subqueries = Vec::new();
+        let mut reads = Vec::new();
+        let mut filter_subqueries = Vec::new();
+        for assignment in &insert.assignments {
+            for column in assignment_target_columns(&assignment.target) {
+                let bound = self.bind_value_column(Some(column.clone()), &assignment.value, &scope);
+                outputs.push(bound.column);
+                value_subqueries.extend(bound.value_subplans);
+                reads.extend(bound.filter_reads);
+                filter_subqueries.extend(bound.filter_subplans);
+                target_columns.push(column);
+            }
+        }
+        let (conflict_updates, conflict_reads, conflict_subplans) = match &insert.on {
+            Some(on) => self.bind_conflict(on, &target, &target_columns, &Scope::empty()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        reads.extend(conflict_reads);
+        filter_subqueries.extend(conflict_subplans);
+        let returning = self.bind_returning(&insert.returning, &scope);
+        Plan::Write(Write {
+            target,
+            target_columns,
+            input: Box::new(Plan::Project(Project {
+                input: Box::new(wrap_reads(Plan::OpaqueLeaf, reads, filter_subqueries)),
+                outputs,
+                subqueries: value_subqueries,
+            })),
+            returning,
+            conflict_updates,
+        })
     }
 
     /// `UPDATE target SET col = expr [FROM src] WHERE pred`: the target

@@ -3119,6 +3119,62 @@ mod on_conflict {
             },
         );
     }
+
+    // --- MySQL `INSERT … SET col = expr` (assignment form): like a
+    // single-table UPDATE, each assignment writes its column and feeds
+    // `RHS → target.col` lineage; the RHS resolves against the target.
+
+    #[test]
+    fn mysql_insert_set_literal_writes_only() {
+        // A literal RHS has no source column → a write, no lineage.
+        assert_column_ops_with_dialect(
+            "INSERT INTO t SET a = 1",
+            &MySqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![write("t", "a")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn mysql_insert_set_expr_emits_transformation_lineage() {
+        // `b = a + 1`: the RHS reads the target's own `a` (a value source,
+        // so it also surfaces as a read) and transforms it into `b` →
+        // `t.a → Relation(t.b)` transformation.
+        assert_column_ops_with_dialect(
+            "INSERT INTO t SET b = a + 1",
+            &MySqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("t", "a")],
+                writes: vec![write("t", "b")],
+                lineage: vec![transformation(col("t", "a"), relation("t", "b"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn mysql_insert_set_subquery_emits_lineage() {
+        // `a = (SELECT v FROM s)`: the scalar subquery's output feeds the
+        // target column; `s.v` surfaces as a read. The subquery wrapper
+        // makes the edge a Transformation (not a bare passthrough).
+        assert_column_ops_with_dialect(
+            "INSERT INTO t SET a = (SELECT v FROM s)",
+            &MySqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "v")],
+                writes: vec![write("t", "a")],
+                lineage: vec![transformation(col("s", "v"), relation("t", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
 }
 
 mod values_as_relation {
