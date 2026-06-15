@@ -1,23 +1,21 @@
 //! Plan-based table-level operation extraction: assembles the public
-//! [`TableOperation`] from a bound [`Plan`](super::ir::Plan). It reuses
-//! the resolver-independent [`classify_statement`] for the statement verb,
-//! walks the plan for the `reads` / `writes` / `lineage` surfaces, and
-//! projects the column-level diagnostics down to the table level. The
-//! differential harness in [`super::extract`] pins it against the live
-//! resolver-based extractor.
+//! [`TableOperation`] from a bound [`Plan`](super::ir::Plan). It uses
+//! [`classify_statement`] for the statement verb, walks the plan for the
+//! `reads` / `writes` / `lineage` surfaces, and projects the column-level
+//! diagnostics down to the table level. Also builds the legacy flat table
+//! list (`flat_table_extraction`).
 
 use sqlparser::ast::Statement;
 
+use crate::casing::IdentifierCasing;
 use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::extractor::{classify_statement, merge_moves_data, StatementKind, TableOperation};
 use crate::reference::TableReference;
-use crate::resolver::IdentifierCasing;
 
 /// Build the table-level operation for one statement from its bound plan.
 /// A statement kind the binder doesn't model (or can't bind) yields an
-/// empty operation carrying an `UnsupportedStatement` diagnostic, mirroring
-/// the resolver-based extractor.
+/// empty operation carrying an `UnsupportedStatement` diagnostic.
 pub(crate) fn table_operation(
     statement: &Statement,
     catalog: Option<&Catalog>,
@@ -38,7 +36,7 @@ pub(crate) fn table_operation(
     // structural walk can't tell them apart — gate on the kind. A MERGE
     // whose WHEN clauses are only DELETEs uses its source solely to pick
     // target rows, so it moves no data even though the source is a feeding
-    // input — gate it out the same way the resolver-based extractor does.
+    // input — gate it out via `merge_moves_data`.
     let lineage = if moves_data(&statement_kind) && merge_moves_data(statement) {
         super::extract::extract_table_lineage(&plan)
     } else {

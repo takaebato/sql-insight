@@ -7,9 +7,8 @@
 //! provenance / reads. With a [`Catalog`] a relation's columns are
 //! `Known` (resolution becomes strict — `Cataloged` hits, `Unresolved`
 //! denials, narrowed candidates); catalog-free they are `Open` and
-//! resolution is best-effort (`Inferred` / `Ambiguous`). The catalog
-//! matching mirrors [`crate::resolver`]'s (ported here while the two
-//! coexist; the differential harness pins them together).
+//! resolution is best-effort (`Inferred` / `Ambiguous`). Catalog matching
+//! is right-anchored and dialect-cased (via [`crate::casing`]).
 
 use sqlparser::ast::{
     AccessExpr, AlterTable, AlterTableOperation, Array, AssignmentTarget, ConnectByKind,
@@ -29,29 +28,20 @@ use super::ir::{
     BoundColumn, CtePlan, CteRef, DeletePlan, PassThrough, Plan, Project, ProvenanceSource, Scan,
     ScanRole, SetOp, With, Write,
 };
+use crate::casing::{CaseFold, IdentifierCasing};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::extractor::ColumnLineageKind;
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
-use crate::resolver::{CaseFold, IdentifierCasing};
 use sqlparser::tokenizer::Span;
 
-/// Bind one statement into a [`Plan`], or `None` for statement kinds not
-/// modelled (queries and the data-moving DML / DDL are; other DDL and
-/// session statements aren't). The top-level scope is discarded —
-/// callers consume the resolved tree, not the scope.
-pub(crate) fn build(
-    statement: &Statement,
-    catalog: Option<&Catalog>,
-    casing: IdentifierCasing,
-) -> Option<Plan> {
-    build_with_diagnostics(statement, catalog, casing).0
-}
-
-/// Like [`build`], but also returns the column-level diagnostics the bind
-/// accumulated (currently `WildcardSuppressed` for each suppressed
+/// Bind one statement into a [`Plan`] (or `None` for statement kinds not
+/// modelled — queries and the data-moving DML / DDL are; other DDL and
+/// session statements aren't), returning the column-level diagnostics the
+/// bind accumulated (currently `WildcardSuppressed` for each suppressed
 /// projection wildcard). The diagnostics buffer is shared across child
 /// binders (CTE bodies, subqueries), so nested wildcards are reported too.
+/// The top-level scope is discarded — callers consume the resolved tree.
 pub(crate) fn build_with_diagnostics(
     statement: &Statement,
     catalog: Option<&Catalog>,
@@ -3130,7 +3120,9 @@ mod tests {
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql).unwrap();
         let casing = IdentifierCasing::for_dialect(&dialect);
-        build(&statements[0], None, casing).expect("supported statement")
+        build_with_diagnostics(&statements[0], None, casing)
+            .0
+            .expect("supported statement")
     }
 
     fn tref(name: &str) -> TableReference {

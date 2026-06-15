@@ -1,22 +1,19 @@
-//! Plan-based operation extraction: assembles the public
-//! [`ColumnOperation`] from a bound [`Plan`](super::ir::Plan), the surface
-//! the extractor switch will expose. It reuses the resolver-independent
+//! Plan-based column-level operation extraction: assembles the public
+//! [`ColumnOperation`] from a bound [`Plan`](super::ir::Plan). It uses
 //! [`classify_statement`] for the statement verb, walks the plan for the
 //! `reads` / `writes` / `lineage` surfaces, and reports the tool-side
-//! diagnostics. The differential harness in [`super::extract`] pins it
-//! against the live resolver-based extractor.
+//! diagnostics. Backs [`crate::extractor::extract_column_operations`].
 
 use sqlparser::ast::Statement;
 
+use crate::casing::IdentifierCasing;
 use crate::catalog::Catalog;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::extractor::{classify_statement, ColumnOperation, StatementKind};
-use crate::resolver::IdentifierCasing;
 
 /// Build the column-level operation for one statement from its bound plan.
 /// A statement kind the binder doesn't model (or can't bind) yields an
-/// empty operation carrying an `UnsupportedStatement` diagnostic, mirroring
-/// the resolver-based extractor.
+/// empty operation carrying an `UnsupportedStatement` diagnostic.
 pub(crate) fn column_operation(
     statement: &Statement,
     catalog: Option<&Catalog>,

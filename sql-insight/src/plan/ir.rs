@@ -1,6 +1,7 @@
 //! The bound logical-plan IR: a materialized, full-stack operator tree.
 //!
-//! These types are the *persistent* output of [`super::binder::build`] — they
+//! These types are the *persistent* output of
+//! [`super::binder::build_with_diagnostics`] — they
 //! carry only resolved data (each [`BoundColumn::provenance`] is already
 //! collapsed to real base columns). The bind-time resolution scope
 //! ([`super::binder::Scope`]) is scratch and lives in the binder, not

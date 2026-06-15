@@ -3,11 +3,9 @@
 //! SQL engines disagree on how identifiers compare for equality:
 //! whether an unquoted name folds to upper- or lower-case, whether a
 //! quoted name is then case-sensitive, and whether quoting matters at
-//! all. The resolver matches identifiers (table qualifiers, column
-//! names, aliases) through [`BindingKey`](super::binding::BindingKey),
-//! so it needs to know
-//! the active dialect's rule to decide e.g. whether `Users` and
-//! `users` are the same table.
+//! all. The binder matches identifiers (table qualifiers, column names,
+//! aliases) by their folded key, so it needs the active dialect's rule
+//! to decide e.g. whether `Users` and `users` are the same table.
 //!
 //! This folds the (well-surveyed) cross-dialect matrix down to a
 //! [`CaseFold`] per identifier *class*. The six syntactic positions

@@ -1,5 +1,6 @@
 use super::*;
-use crate::reference::ResolutionKind;
+use crate::diagnostic::ColumnLevelDiagnosticKind;
+use crate::reference::{ResolutionKind, TableReference};
 use sqlparser::dialect::GenericDialect;
 
 /// Order-insensitive multiset equality for the `reads` / `lineage`
@@ -5387,7 +5388,7 @@ mod qualified_ref_arm_coverage {
 }
 
 /// Pins the dialect-aware identifier case-folding policy
-/// ([`crate::resolver`]'s `IdentifierCasing`) as observed through
+/// ([`crate::casing`]'s `IdentifierCasing`) as observed through
 /// column resolution. The distinguishing cases are table-name
 /// case-sensitivity (BigQuery / MySQL real tables are case-sensitive;
 /// most dialects fold) and alias case-insensitivity (BigQuery aliases

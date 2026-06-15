@@ -1,7 +1,7 @@
 //! Extraction APIs at four granularities of "what does this SQL touch?"
 //!
-//! Each sub-extractor is a thin wrapper around the resolver,
-//! projecting the resolution into a different surface:
+//! Each sub-extractor is a thin wrapper around the bound-plan analysis
+//! engine, projecting the resolved plan into a different surface:
 //!
 //! - [`extract_tables`] — flat list of `TableReference`s per
 //!   statement, no read/write distinction.
@@ -29,16 +29,7 @@ pub use crud_table_extractor::*;
 pub use table_extractor::*;
 pub use table_operation_extractor::*;
 
-// The statement classifier and the MERGE data-movement check are
-// resolver-independent; the incubating `plan` module reuses them for
-// statement-kind classification and to gate DELETE-only MERGE lineage.
+// The statement classifier and the MERGE data-movement check feed the
+// `plan` engine: statement-kind classification and the DELETE-only MERGE
+// lineage gate.
 pub(crate) use table_operation_extractor::{classify_statement, merge_moves_data};
-
-// The legacy resolver-based column / table extraction, retained only for
-// the plan-vs-resolver differential harness (test-only) until the resolver
-// is removed; allow it (and its transitive helpers) to look unused in
-// non-test builds during the strangler transition.
-#[allow(unused_imports)]
-pub(crate) use column_operation_extractor::resolver_column_operation;
-#[allow(unused_imports)]
-pub(crate) use table_operation_extractor::resolver_table_operation;

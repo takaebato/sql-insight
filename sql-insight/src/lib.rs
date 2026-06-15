@@ -193,11 +193,9 @@
 //!   `#[non_exhaustive]` at the 1.0 freeze, once the variant sets
 //!   stabilize.
 
-// Incubating bound logical-plan (design "B") — the resolver
-// reimplemented as a materialized full-stack operator tree, built
-// alongside the current `resolver` (strangler). Not yet wired into any
-// extractor; kept private while it grows, and will take over the
-// `resolver` name at parity.
+// The bound logical-plan analysis engine (design "B"): a materialized
+// full-stack operator tree that resolves a `Statement` and backs every
+// public extractor. It replaced the former flat-buffer `resolver`.
 pub mod catalog;
 pub mod diagnostic;
 pub mod error;
@@ -205,7 +203,10 @@ pub mod extractor;
 pub mod formatter;
 pub mod normalizer;
 mod plan;
-pub(crate) mod resolver;
+
+// Dialect-aware identifier casing (case folding for table / alias /
+// column matching). Threaded into the binder and the extractors.
+pub(crate) mod casing;
 
 // `reference` is intentionally private: the module name itself is not
 // stable enough to commit to as part of the public API. The two

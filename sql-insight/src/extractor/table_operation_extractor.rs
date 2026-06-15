@@ -19,11 +19,11 @@
 //! both roles (e.g. `DELETE t1 FROM t1` — t1 is the deletion target and
 //! a row source).
 
+use crate::casing::IdentifierCasing;
 use crate::catalog::Catalog;
-use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
+use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::reference::{TableRead, TableReference};
-use crate::resolver::{IdentifierCasing, Resolver};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -218,108 +218,6 @@ impl TableOperationExtractor {
     }
 }
 
-/// The legacy resolver-based table extraction, kept for the differential
-/// harness that pins the plan engine against the resolver. Removed with
-/// the resolver.
-#[allow(dead_code)] // strangler: used only by the test differential harness
-pub(crate) fn resolver_table_operation(
-    statement: &Statement,
-    catalog: Option<&Catalog>,
-    casing: IdentifierCasing,
-) -> Result<TableOperation, Error> {
-    let kind = classify_statement(statement);
-    let resolution = Resolver::resolve_statement(catalog, statement, casing)?;
-
-    let mut reads = Vec::new();
-    let mut writes = Vec::new();
-    // Start from resolver-level diagnostics, projected down to the
-    // table granularity — column-resolution gaps and suppressed
-    // wildcards don't affect table-level completeness, so they drop
-    // out here (only `UnsupportedStatement` carries over). Extractor
-    // adds its own only when classify_statement detects an unsupported
-    // case the resolver did not already report — avoids duplicating
-    // the common case where both layers agree.
-    let mut diagnostics: Vec<TableLevelDiagnostic> = resolution
-        .diagnostics
-        .iter()
-        .filter_map(|d| d.to_table_level())
-        .collect();
-
-    if matches!(kind, StatementKind::Unsupported) {
-        if !diagnostics
-            .iter()
-            .any(|d| matches!(d.kind, TableLevelDiagnosticKind::UnsupportedStatement))
-        {
-            diagnostics.push(TableLevelDiagnostic {
-                kind: TableLevelDiagnosticKind::UnsupportedStatement,
-                message: format!(
-                    "Unsupported statement for operation extraction: {}",
-                    statement
-                ),
-                span: None,
-            });
-        }
-    } else {
-        // A multi-role table (e.g. `DELETE t1 FROM t1` — t1 is both
-        // deletion target and row source) appears in both lists.
-        reads = resolution.read_tables();
-        writes = resolution.write_tables();
-    }
-
-    let lineage = if matches!(kind, StatementKind::Merge) && !merge_moves_data(statement) {
-        Vec::new()
-    } else {
-        extract_table_lineage(&resolution, &kind)
-    };
-
-    Ok(TableOperation {
-        statement_kind: kind,
-        reads,
-        writes,
-        lineage,
-        diagnostics,
-    })
-}
-
-/// Emit one `TableLineageEdge` per (feeding source × write target) pair
-/// for statements that physically move data. Statements without a write
-/// target or without any data-feeding source produce no lineage.
-fn extract_table_lineage(
-    resolution: &crate::resolver::Resolution,
-    kind: &StatementKind,
-) -> Vec<TableLineageEdge> {
-    if !is_data_moving(kind) {
-        return Vec::new();
-    }
-    // Data-moving statements all carry exactly one write target. If
-    // somehow zero or many appear (parser oddity, unsupported variant)
-    // we conservatively emit no lineage rather than guessing.
-    let mut targets = resolution.write_tables().into_iter();
-    let Some(target) = targets.next() else {
-        return Vec::new();
-    };
-    resolution
-        .collapsed_feeding_table_sources()
-        .into_iter()
-        .map(|source| TableLineageEdge {
-            source,
-            target: target.clone(),
-        })
-        .collect()
-}
-
-fn is_data_moving(kind: &StatementKind) -> bool {
-    matches!(
-        kind,
-        StatementKind::Insert
-            | StatementKind::Update
-            | StatementKind::Merge
-            | StatementKind::CreateTable
-            | StatementKind::CreateView
-            | StatementKind::AlterView
-    )
-}
-
 /// `MERGE` is `is_data_moving` whenever it appears, but a MERGE
 /// whose WHEN clauses are only `DELETE` actions doesn't actually
 /// move data from the source into the target — the source is just
@@ -382,6 +280,7 @@ pub(crate) fn classify_statement(statement: &Statement) -> StatementKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic::TableLevelDiagnosticKind;
     use crate::reference::ResolutionKind;
     use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
 

@@ -8,10 +8,10 @@
 
 use core::fmt;
 
+use crate::casing::IdentifierCasing;
 use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::reference::TableReference;
-use crate::resolver::IdentifierCasing;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
