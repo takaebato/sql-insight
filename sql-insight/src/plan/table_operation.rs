@@ -11,6 +11,7 @@ use sqlparser::ast::Statement;
 use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::extractor::{classify_statement, merge_moves_data, StatementKind, TableOperation};
+use crate::reference::TableReference;
 use crate::resolver::IdentifierCasing;
 
 /// Build the table-level operation for one statement from its bound plan.
@@ -55,6 +56,38 @@ pub(crate) fn table_operation(
             .filter_map(|d| d.to_table_level())
             .collect(),
     }
+}
+
+/// Build the legacy flat table list for one statement from its bound plan:
+/// every referenced table (no read/write split, no lineage), plus the
+/// table-level diagnostics. Backs the
+/// [`extract_tables`](crate::extractor::extract_tables) /
+/// [`crate::extractor::TableExtractor`] API. An unsupported statement
+/// yields an empty list with an `UnsupportedStatement` diagnostic.
+pub(crate) fn flat_table_extraction(
+    statement: &Statement,
+    catalog: Option<&Catalog>,
+    casing: IdentifierCasing,
+) -> (Vec<TableReference>, Vec<TableLevelDiagnostic>) {
+    let statement_kind = classify_statement(statement);
+    if statement_kind == StatementKind::Unsupported {
+        return (
+            Vec::new(),
+            vec![TableLevelDiagnostic {
+                kind: TableLevelDiagnosticKind::UnsupportedStatement,
+                message: format!("Unsupported statement while inspecting SQL: {statement}"),
+                span: None,
+            }],
+        );
+    }
+    let (plan, column_diagnostics) =
+        super::binder::build_with_diagnostics(statement, catalog, casing);
+    let plan = plan.unwrap_or(super::ir::Plan::OpaqueLeaf);
+    let diagnostics = column_diagnostics
+        .iter()
+        .filter_map(|d| d.to_table_level())
+        .collect();
+    (super::extract::extract_flat_tables(&plan), diagnostics)
 }
 
 /// Whether a statement physically moves data into its target (so it emits

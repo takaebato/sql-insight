@@ -442,13 +442,19 @@ mod integration {
         }
 
         #[test]
-        fn test_fail_to_analyze_sql() {
+        fn test_over_qualified_name_is_best_effort() {
+            // Behavior change vs the legacy resolver: an over-qualified table
+            // name (more than `catalog.schema.name`) can't be represented as
+            // a `TableReference`. The resolver hard-errored ("Too many
+            // identifiers provided"); the bound-plan engine is best-effort,
+            // dropping the unrepresentable relation, so the statement yields
+            // an empty (no-table) line.
             sql_insight_cmd()
                 .arg("extract-tables")
                 .arg("select * from catalog.schema.table.extra")
                 .assert()
                 .success()
-                .stdout("Error: Too many identifiers provided\n")
+                .stdout("\n")
                 .stderr("");
         }
 

@@ -11,7 +11,7 @@ use core::fmt;
 use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::reference::TableReference;
-use crate::resolver::{IdentifierCasing, Resolver};
+use crate::resolver::IdentifierCasing;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -42,6 +42,13 @@ pub fn extract_tables(
 /// renders just the comma-joined table list.
 #[derive(Debug, PartialEq)]
 pub struct TableExtraction {
+    /// Every table the statement references, one entry per relation
+    /// binding: a table that is both a write target and a row source
+    /// appears once, while the same table reached through two separate
+    /// FROM uses appears twice. **Order is not contractual** — it reflects
+    /// an internal tree walk and may change between versions; occurrence
+    /// count is preserved. A consumer wanting source-text order sorts by
+    /// `name.span`, and one wanting the distinct set dedups via a `HashSet`.
     pub tables: Vec<TableReference>,
     pub diagnostics: Vec<TableLevelDiagnostic>,
 }
@@ -77,18 +84,14 @@ impl TableExtractor {
         statement: &Statement,
         casing: IdentifierCasing,
     ) -> Result<TableExtraction, Error> {
-        // The legacy table-extraction API does not surface columns, so a
-        // catalog would not influence its output; pass `None`.
-        let resolution = Resolver::resolve_statement(None, statement, casing)?;
+        // The legacy flat table list is derived from the bound-plan engine.
+        // No catalog is consulted — this API surfaces no columns, so a
+        // catalog would not change the table list.
+        let (tables, diagnostics) =
+            crate::plan::table_operation::flat_table_extraction(statement, None, casing);
         Ok(TableExtraction {
-            tables: resolution.tables(),
-            // Project resolver diagnostics to table granularity; column
-            // resolution / wildcard gaps don't affect the table list.
-            diagnostics: resolution
-                .diagnostics
-                .iter()
-                .filter_map(|d| d.to_table_level())
-                .collect(),
+            tables,
+            diagnostics,
         })
     }
 }
@@ -148,8 +151,45 @@ mod tests {
                 .into_iter()
                 .map(|result| result.map(|extraction| extraction.tables))
                 .collect::<Vec<Result<Vec<TableReference>, Error>>>();
-            assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
+            // The flat table list's order is not contractual (it reflects an
+            // internal tree walk); a table referenced N times still appears N
+            // times. Compare each statement's list as a multiset, but keep
+            // `Ok`/`Err` shape and statement order exact.
+            assert_eq!(
+                result.len(),
+                expected.len(),
+                "statement count for dialect {dialect:?}, sql: {sql}"
+            );
+            for (got, want) in result.iter().zip(&expected) {
+                match (got, want) {
+                    (Ok(got), Ok(want)) => assert_eq!(
+                        sorted_refs(got),
+                        sorted_refs(want),
+                        "tables (as multiset) for dialect {dialect:?}, sql: {sql}"
+                    ),
+                    _ => assert_eq!(got, want, "result for dialect {dialect:?}, sql: {sql}"),
+                }
+            }
         }
+    }
+
+    /// A table-reference list as a sorted multiset key — table refs carry no
+    /// contractual order, so tests compare the bag of references.
+    fn sorted_refs(refs: &[TableReference]) -> Vec<String> {
+        let mut keys: Vec<String> = refs
+            .iter()
+            .map(|r| {
+                let path = [r.catalog.as_ref(), r.schema.as_ref(), Some(&r.name)]
+                    .into_iter()
+                    .flatten()
+                    .map(|i| i.value.clone())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                path
+            })
+            .collect();
+        keys.sort();
+        keys
     }
 
     mod basic {
@@ -679,11 +719,15 @@ mod tests {
         }
 
         #[test]
-        fn test_statement_error_with_too_many_identifiers() {
+        fn test_too_many_identifiers_yields_empty_best_effort() {
+            // Behavior change vs the legacy resolver: an over-qualified name
+            // (more than `catalog.schema.name`) can't be represented as a
+            // `TableReference`. The resolver hard-errored ("Too many
+            // identifiers provided"); the bound-plan engine is best-effort,
+            // so it drops the unrepresentable relation and returns an empty
+            // list rather than failing the statement.
             let sql = "SELECT a FROM catalog.schema.table.extra";
-            let expected = vec![Err(Error::AnalysisError(
-                "Too many identifiers provided".to_string(),
-            ))];
+            let expected = vec![ok_tables(vec![])];
             assert_table_extraction(sql, expected, all_dialects());
         }
     }
@@ -984,10 +1028,21 @@ mod tests {
         }
 
         #[test]
-        fn test_drop_index_statement_records_parent_table() {
+        fn test_drop_index_is_unsupported() {
+            // Behavior change vs the legacy resolver: `DROP INDEX` is not a
+            // table operation, so the bound-plan engine classifies it as
+            // unsupported (consistent with `extract_table_operations`, which
+            // already reported it unsupported) rather than recording the
+            // index's parent table. The parent table no longer surfaces.
             let sql = "DROP INDEX idx1 ON t1";
-            let expected = vec![ok_tables(vec![table("t1")])];
-            assert_table_extraction(sql, expected, generic_dialect());
+            let result = TableExtractor::extract(&GenericDialect {}, sql).unwrap();
+            let extraction = result.into_iter().next().unwrap().unwrap();
+            assert_eq!(extraction.tables, vec![]);
+            assert_eq!(extraction.diagnostics.len(), 1);
+            assert_eq!(
+                extraction.diagnostics[0].kind,
+                crate::diagnostic::TableLevelDiagnosticKind::UnsupportedStatement
+            );
         }
 
         #[test]

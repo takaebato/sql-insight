@@ -124,6 +124,99 @@ pub(crate) fn extract_writes(plan: &Plan) -> Vec<ColumnReference> {
     }
 }
 
+/// The flat list of every table the statement references — the legacy
+/// "what tables does this SQL touch?" surface, with no read/write split.
+/// One entry per relation *binding*: a table that plays both roles (an
+/// `UPDATE`/`DELETE`/`MERGE` target that is also a row source) appears
+/// once, while the same table reached through two separate FROM uses
+/// appears twice. Built by collecting every `Scan` (read or write role)
+/// plus the *declared* write targets that aren't themselves scans
+/// (`INSERT`/CTAS/CREATE/ALTER targets, DROP/TRUNCATE relations) — an
+/// `UPDATE`/`MERGE`/`DELETE` target is already a scan in the tree, so it
+/// isn't double-counted. Order is the tree walk's, incidental.
+pub(crate) fn extract_flat_tables(plan: &Plan) -> Vec<TableReference> {
+    let mut tables = Vec::new();
+    collect_flat_tables(plan, &mut tables);
+    tables
+}
+
+fn collect_flat_tables(plan: &Plan, out: &mut Vec<TableReference>) {
+    match plan {
+        // Every scan is a binding — read sources and write targets alike.
+        Plan::Scan(scan) => out.push(scan.table.clone()),
+        Plan::OpaqueLeaf | Plan::CteRef(_) => {}
+        // DROP / TRUNCATE relations are bindings with no scan.
+        Plan::Drop(targets) => out.extend(targets.iter().cloned()),
+        Plan::PassThrough(pt) => {
+            for input in &pt.inputs {
+                collect_flat_tables(input, out);
+            }
+            for subquery in &pt.subqueries {
+                collect_flat_tables(subquery, out);
+            }
+        }
+        Plan::Project(project) => {
+            collect_flat_tables(&project.input, out);
+            for subquery in &project.subqueries {
+                collect_flat_tables(subquery, out);
+            }
+        }
+        Plan::SetOp(set) => {
+            for operand in &set.operands {
+                collect_flat_tables(operand, out);
+            }
+        }
+        Plan::Write(write) => {
+            // An UPDATE / MERGE target is a write-role scan in the input, so
+            // it's already a binding; an INSERT / CTAS / CREATE / VIEW /
+            // ALTER target is external (no scan) — count it once, target
+            // first to match the resolver's bind order.
+            if !has_write_scan(&write.input) {
+                out.push(write.target.clone());
+            }
+            collect_flat_tables(&write.input, out);
+        }
+        // A DELETE's target usually coincides with a scan in the input
+        // (implicit target = write scan; explicit / USING target that
+        // resolved to a row-source scan), already counted by the input
+        // walk. A target that did *not* merge (a bare `t1` against FROM
+        // `mydb.t1` — distinct bindings) is a separate reference, so add it.
+        Plan::Delete(delete) => {
+            let before = out.len();
+            collect_flat_tables(&delete.input, out);
+            let from_input: Vec<TableReference> = out[before..].to_vec();
+            for target in &delete.targets {
+                if !from_input.contains(target) {
+                    out.push(target.clone());
+                }
+            }
+        }
+        Plan::With(with) => {
+            collect_flat_tables(&with.body, out);
+            for cte in &with.ctes {
+                collect_flat_tables(&cte.plan, out);
+            }
+        }
+    }
+}
+
+/// Whether `plan`'s subtree contains a write-role scan (an `UPDATE` /
+/// `MERGE` / implicit-`DELETE` target bound in scope), distinguishing
+/// those statements — whose target is already a scan — from `INSERT` /
+/// CTAS / CREATE / ALTER, whose target is external to the input.
+fn has_write_scan(plan: &Plan) -> bool {
+    match plan {
+        Plan::Scan(scan) => scan.role == ScanRole::Write,
+        Plan::PassThrough(pt) => pt.inputs.iter().any(has_write_scan),
+        Plan::Project(project) => has_write_scan(&project.input),
+        Plan::SetOp(set) => set.operands.iter().any(has_write_scan),
+        Plan::With(with) => has_write_scan(&with.body),
+        Plan::Write(write) => has_write_scan(&write.input),
+        Plan::Delete(delete) => has_write_scan(&delete.input),
+        Plan::OpaqueLeaf | Plan::CteRef(_) | Plan::Drop(_) => false,
+    }
+}
+
 /// Every table the statement reads from, occurrence-based: one
 /// [`TableRead`] per read-role `Scan` in the tree (a table scanned more
 /// than once appears more than once), carrying the scan's table-level
@@ -1152,6 +1245,8 @@ mod differential {
             "MERGE INTO t1 USING t2 ON t1.id = t2.id WHEN MATCHED THEN DELETE",
             // A recursive CTE that only self-references has no real feeder.
             "WITH RECURSIVE cte AS (SELECT id FROM cte) INSERT INTO t SELECT id FROM cte",
+            // `TABLE t1` as a CTAS source body (`SetExpr::Table`).
+            "CREATE TABLE t2 AS TABLE t1",
         ]
     }
 

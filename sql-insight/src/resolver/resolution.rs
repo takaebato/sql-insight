@@ -1,7 +1,7 @@
 //! `impl Resolution` — methods on the end-of-walk result:
 //!
-//! - Public table queries: [`Resolution::tables`],
-//!   [`Resolution::read_tables`], [`Resolution::write_tables`].
+//! - Public table queries: [`Resolution::read_tables`],
+//!   [`Resolution::write_tables`].
 //! - Column-ref post-pass: [`Resolution::real_column_refs`] filters
 //!   out refs whose walk-time owner was synthetic, so the public
 //!   `reads` surface only shows real-storage references and
@@ -301,20 +301,6 @@ impl Resolution {
                 .iter_bindings()
                 .find(|b| binding_alias_key(b, self.casing) == key)
         })
-    }
-
-    /// All tables touched by the statement, in scope-arena order. The
-    /// union of [`Self::read_tables`] and [`Self::write_tables`] (with
-    /// duplicates when a single table carries both roles).
-    pub(crate) fn tables(&self) -> Vec<TableReference> {
-        self.scopes
-            .iter()
-            .flat_map(|scope| scope.iter_bindings())
-            .filter_map(|binding| match binding {
-                Binding::Table { table, .. } => Some((**table).clone()),
-                _ => None,
-            })
-            .collect()
     }
 
     /// Every table referenced as a Read source, in scope-arena order,

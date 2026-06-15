@@ -19,8 +19,8 @@ use sqlparser::ast::{
     LimitClause, ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind, NamedWindowExpr,
     ObjectName, ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind,
     PipeOperator, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
-    Subscript, TableAlias, TableFactor, TableWithJoins, TopQuantity, Update, UpdateTableFromKind,
-    Values, WindowFrameBound, WindowSpec, WindowType,
+    Subscript, Table, TableAlias, TableFactor, TableWithJoins, TopQuantity, Update,
+    UpdateTableFromKind, Values, WindowFrameBound, WindowSpec, WindowType,
 };
 
 use std::cell::RefCell;
@@ -318,6 +318,19 @@ impl Binder<'_> {
                     .map(|t| self.canonical_target(t))
                     .collect(),
             )),
+            // `CREATE VIRTUAL TABLE t USING module(…)`: the new table is a
+            // write target with no inspectable source (classified
+            // `CreateTable`, like a plain `CREATE TABLE`).
+            Statement::CreateVirtualTable { name, .. } => {
+                let target = self.canonical_target(TableReference::try_from_name(name).ok()?);
+                Some(Plan::Write(Write {
+                    target,
+                    target_columns: Vec::new(),
+                    input: Box::new(Plan::OpaqueLeaf),
+                    returning: Vec::new(),
+                    conflict_updates: Vec::new(),
+                }))
+            }
             // Other DDL / session statements aren't data operations — not
             // bound (the wildcard mirrors `build`'s "unsupported → None").
             _ => None,
@@ -332,6 +345,23 @@ impl Binder<'_> {
         let target = self.canonical_target(target);
         let (input, source_scope) = match &insert.source {
             Some(source) => self.bind_query(source),
+            // MySQL `INSERT INTO t SET a = expr, …`: no VALUES / SELECT
+            // source; the assignment right-hand sides are reads against the
+            // target, folded onto the input so their tables surface.
+            None if !insert.assignments.is_empty() => {
+                let scope = self.target_scope(&target);
+                let mut reads = Vec::new();
+                let mut subplans = Vec::new();
+                for assignment in &insert.assignments {
+                    let (r, s) = self.expr_reads(&assignment.value, &scope);
+                    reads.extend(r);
+                    subplans.extend(s);
+                }
+                (
+                    wrap_reads(Plan::OpaqueLeaf, reads, subplans),
+                    Scope::empty(),
+                )
+            }
             None => (Plan::OpaqueLeaf, Scope::empty()),
         };
         // An explicit column list wins; otherwise pair the source against
@@ -534,27 +564,46 @@ impl Binder<'_> {
         )
     }
 
-    /// If a single-segment `written` name matches an in-scope real-table
-    /// relation by its exposed name (its alias, else its bare table name),
-    /// return that relation's real table identity. A qualified name is never
-    /// an alias, so it never matches.
+    /// If a `written` DELETE-target name matches an in-scope real-table
+    /// relation by **merge identity**, return that relation's real table.
+    /// An aliased relation matches a single-segment name against its alias;
+    /// a non-aliased relation matches its full `catalog.schema.name` path
+    /// exactly — so a bare `t1` merges with FROM `t1` but **not** with FROM
+    /// `mydb.t1` (we assume no default schema), matching the resolver.
     fn scope_target(&self, written: &TableReference, scope: &Scope) -> Option<TableReference> {
-        if written.schema.is_some() || written.catalog.is_some() {
-            return None;
-        }
+        let canonical = self.canonical_target(written.clone());
         scope
             .relations
             .iter()
             .find_map(|relation| match &relation.source {
-                RelationSource::Table { table, .. }
-                    if relation
-                        .exposed_name()
-                        .is_some_and(|exposed| self.ident_eq(exposed, &written.name)) =>
-                {
-                    Some(table.clone())
+                RelationSource::Table { table, .. } => {
+                    let matches = match &relation.alias {
+                        Some(alias) => {
+                            written.schema.is_none()
+                                && written.catalog.is_none()
+                                && self.ident_eq(alias, &written.name)
+                        }
+                        None => self.table_identity_eq(&canonical, table),
+                    };
+                    matches.then(|| table.clone())
                 }
                 _ => None,
             })
+    }
+
+    /// Exact (not right-anchored) identity match of two table references
+    /// under the dialect's table casing — every present segment must agree
+    /// and a missing segment matches only a missing one.
+    fn table_identity_eq(&self, a: &TableReference, b: &TableReference) -> bool {
+        let fold = self.casing.table;
+        let seg_eq = |x: Option<&Ident>, y: Option<&Ident>| match (x, y) {
+            (Some(p), Some(q)) => fold.normalize(p) == fold.normalize(q),
+            (None, None) => true,
+            _ => false,
+        };
+        fold.normalize(&a.name) == fold.normalize(&b.name)
+            && seg_eq(a.schema.as_ref(), b.schema.as_ref())
+            && seg_eq(a.catalog.as_ref(), b.catalog.as_ref())
     }
 
     /// `MERGE INTO target USING source ON pred WHEN … THEN …`: target
@@ -932,6 +981,16 @@ impl Binder<'_> {
             reads.extend(r);
             subqueries.extend(s);
         }
+        // ClickHouse `SETTINGS key = expr`: a value may hold a subquery.
+        if let Some(settings) = &query.settings {
+            let mut c = ExprCollector::filter();
+            for setting in settings {
+                self.collect_expr(&setting.value, &clause_scope, &mut c);
+            }
+            let (r, s) = c.into_filter_parts();
+            reads.extend(r);
+            subqueries.extend(s);
+        }
         (wrap_reads(body, reads, subqueries), scope)
     }
 
@@ -995,10 +1054,19 @@ impl Binder<'_> {
                     self.collect_subquery(query, scope, c);
                 }
             }
+            // `|> JOIN t ON …` introduces another relation: bind it as a
+            // read scan (a non-feeding sub-plan so its table surfaces) and
+            // collect the ON predicate's reads.
+            PipeOperator::Join(join) => {
+                let (plan, _) = self.bind_table_factor(&join.relation, scope);
+                c.filter_subplans.push(plan);
+                if let Some(JoinConstraint::On(expr)) = join_constraint(join) {
+                    self.collect_expr(expr, scope, c);
+                }
+            }
             // No inspectable column expressions (or a later refinement):
-            // a sampling clause, a re-introduced join / rename / drop.
-            PipeOperator::Join(_)
-            | PipeOperator::TableSample { .. }
+            // a sampling clause, a rename / drop / unpivot.
+            PipeOperator::TableSample { .. }
             | PipeOperator::Drop { .. }
             | PipeOperator::As { .. }
             | PipeOperator::Rename { .. }
@@ -1076,9 +1144,13 @@ impl Binder<'_> {
                     },
                 )
             }
-            // `TABLE foo` and other table-valued bodies: no inspectable
-            // columns yet.
-            _ => (Plan::OpaqueLeaf, Scope::empty()),
+            // `TABLE foo` / `TABLE schema.foo`: a whole-table query body
+            // (e.g. the source of `CREATE TABLE t AS TABLE foo`). Bind it as
+            // a read scan so the table surfaces.
+            SetExpr::Table(table) => match table_set_expr_ref(table) {
+                Some(written) => self.bind_named_table(&written, None),
+                None => (Plan::OpaqueLeaf, Scope::empty()),
+            },
         }
     }
 
@@ -1231,12 +1303,26 @@ impl Binder<'_> {
             clause_reads.extend(reads);
             clause_subqueries.extend(subqueries);
         }
+        let body = wrap_reads(project, clause_reads, clause_subqueries);
+        // `SELECT … INTO t`: the query also creates / writes table `t`
+        // (MsSql / Postgres). Wrap the projection as the write source so `t`
+        // surfaces as a write target (its columns feed it positionally).
+        let plan = match &select.into {
+            Some(into) => match TableReference::try_from_name(&into.name) {
+                Ok(target) => Plan::Write(Write {
+                    target: self.canonical_target(target),
+                    target_columns: Vec::new(),
+                    input: Box::new(body),
+                    returning: Vec::new(),
+                    conflict_updates: Vec::new(),
+                }),
+                Err(_) => body,
+            },
+            None => body,
+        };
         // A trailing top-level ORDER BY also resolves against this scope,
         // so hand it back to `bind_query`.
-        (
-            wrap_reads(project, clause_reads, clause_subqueries),
-            clause_scope,
-        )
+        (plan, clause_scope)
     }
 
     fn bind_from(&self, items: &[TableWithJoins]) -> (Plan, Scope) {
@@ -1300,6 +1386,37 @@ impl Binder<'_> {
         (node, scope)
     }
 
+    /// Bind a bare named table reference into a read `Scan` plus a
+    /// single-relation scope. A unique catalog hit canonicalizes the
+    /// identity, supplies the columns, and is `Cataloged`; an ambiguous hit
+    /// stays as written and `Ambiguous`; a miss / no-catalog stays as
+    /// written, open, and `Inferred`.
+    fn bind_named_table(&self, written: &TableReference, alias: Option<Ident>) -> (Plan, Scope) {
+        let TableMatch {
+            table,
+            resolution,
+            columns,
+        } = self.table_match(written);
+        let columns = if columns.is_empty() {
+            RelationColumns::Open
+        } else {
+            RelationColumns::Known(columns)
+        };
+        let relation = Relation {
+            alias,
+            source: RelationSource::Table {
+                table: table.clone(),
+                columns,
+            },
+        };
+        let scan = Plan::Scan(Scan {
+            table,
+            resolution,
+            role: ScanRole::Read,
+        });
+        (scan, Scope::of(relation))
+    }
+
     fn bind_table_factor(&self, factor: &TableFactor, siblings: &Scope) -> (Plan, Scope) {
         match factor {
             TableFactor::Table {
@@ -1337,32 +1454,7 @@ impl Binder<'_> {
                         return (Plan::CteRef(CteRef { name }), Scope::of(relation));
                     }
                 }
-                // A unique catalog hit canonicalizes the identity, supplies
-                // the columns, and is `Cataloged`; ambiguous stays as
-                // written and `Ambiguous`; a miss / no-catalog stays as
-                // written, open, and `Inferred`.
-                let TableMatch {
-                    table,
-                    resolution,
-                    columns,
-                } = self.table_match(&written);
-                let columns = if columns.is_empty() {
-                    RelationColumns::Open
-                } else {
-                    RelationColumns::Known(columns)
-                };
-                let relation = Relation {
-                    alias,
-                    source: RelationSource::Table {
-                        table: table.clone(),
-                        columns,
-                    },
-                };
-                let scan = Plan::Scan(Scan {
-                    table,
-                    resolution,
-                    role: ScanRole::Read,
-                });
+                let (scan, scope) = self.bind_named_table(&written, alias);
                 // Table-function args (rare on a named table) read against
                 // the surrounding scope; embed them so they surface.
                 let plan = match arg_reads {
@@ -1372,7 +1464,7 @@ impl Binder<'_> {
                     }
                     None => scan,
                 };
-                (plan, Scope::of(relation))
+                (plan, scope)
             }
             // A derived table `(<subquery>) AS d`: bind the subquery and
             // expose its output columns as a synthetic relation. Those
@@ -2910,6 +3002,19 @@ fn output_sources(plan: &Plan) -> Vec<ProvenanceSource> {
 /// write-target column's bare name.
 fn object_name_last_ident(name: &ObjectName) -> Option<Ident> {
     name.0.last().and_then(|part| part.as_ident().cloned())
+}
+
+/// The table reference of a `TABLE [schema.]name` set-expression body
+/// (`SetExpr::Table`), whose parts are plain strings rather than an
+/// `ObjectName`. `None` when no table name is present.
+fn table_set_expr_ref(table: &Table) -> Option<TableReference> {
+    let name = table.table_name.as_ref()?;
+    let mut parts = Vec::new();
+    if let Some(schema) = &table.schema_name {
+        parts.push(Ident::new(schema));
+    }
+    parts.push(Ident::new(name));
+    TableReference::try_from_parts(&parts)
 }
 
 /// The column(s) an assignment writes: a single `col = …` or a tuple
