@@ -483,3 +483,37 @@ impl Binder<'_> {
         }
     }
 }
+
+/// The lineage sources a bound plan exposes through its output columns —
+/// a nested subquery's output provenance, used as the lineage sources of
+/// the enclosing value (its internal filter reads are collected
+/// separately).
+fn output_sources(plan: &Plan) -> Vec<ProvenanceSource> {
+    crate::resolver::extract::output_operands(plan)
+        .iter()
+        .flat_map(|operand| operand.iter())
+        .flat_map(|column| column.provenance.iter().cloned())
+        .collect()
+}
+
+/// The lineage kind an expression contributes to its direct sources: a
+/// bare column reference forwards its value (`Passthrough`); anything
+/// else derives a new value (`Transformation`).
+fn expr_kind(expr: &Expr) -> ColumnLineageKind {
+    if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+        ColumnLineageKind::Passthrough
+    } else {
+        ColumnLineageKind::Transformation
+    }
+}
+
+/// Compose two lineage kinds along a chain: `Transformation` wins if
+/// either step transforms (so a passthrough of a transformed value is a
+/// transformation), else `Passthrough`.
+fn combine_kind(inner: ColumnLineageKind, outer: ColumnLineageKind) -> ColumnLineageKind {
+    if inner == ColumnLineageKind::Transformation || outer == ColumnLineageKind::Transformation {
+        ColumnLineageKind::Transformation
+    } else {
+        ColumnLineageKind::Passthrough
+    }
+}

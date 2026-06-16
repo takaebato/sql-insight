@@ -11,15 +11,15 @@
 //! is right-anchored and dialect-cased (via [`crate::casing`]).
 
 use sqlparser::ast::{
-    AccessExpr, AlterTable, Array, ConnectByKind, CreateTable, CreateView, Cte, Delete,
-    DictionaryField, Distinct, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
-    GroupByWithModifier, Ident, Insert, JoinConstraint, LimitClause, ListAggOnOverflow, Map, Merge,
-    MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName, ObjectType, OnConflictAction,
-    OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript, TableAlias, TableFactor,
-    TableObject, TableWithJoins, TopQuantity, Update, UpdateTableFromKind, Values,
-    WindowFrameBound, WindowSpec, WindowType,
+    AccessExpr, AlterTable, AlterTableOperation, Array, ConnectByKind, CreateTable, CreateView,
+    Cte, Delete, DictionaryField, Distinct, Expr, FromTable, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
+    GroupByWithModifier, Ident, Insert, Join, JoinConstraint, JoinOperator, LimitClause,
+    ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName,
+    ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator, Query,
+    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript, Table,
+    TableAlias, TableFactor, TableObject, TableWithJoins, TopQuantity, Update, UpdateTableFromKind,
+    Values, WindowFrameBound, WindowSpec, WindowType,
 };
 
 use std::cell::RefCell;
@@ -41,10 +41,7 @@ mod statement;
 use self::catalog_match::{canonical_ref, catalog_table_matches, fill_query_defaults, TableMatch};
 use self::collect::{BoundValue, ExprCollector};
 use self::helpers::{
-    alter_table_op_target_columns, ambiguous, apply_column_aliases, assignment_target_columns,
-    combine_kind, downgrade_to_inferred, expr_kind, inferred_output_name, into_write_target,
-    join_constraint, merge_set_outputs, object_name_last_ident, output_names, output_sources,
-    passthrough, read, source_has_projection, table_set_expr_ref, unresolved, wrap_inputs,
+    ambiguous, assignment_target_columns, object_name_last_ident, passthrough, read, unresolved,
     wrap_reads,
 };
 use self::scope::{Candidate, CteRelation, Relation, RelationColumns, RelationSource, Scope};

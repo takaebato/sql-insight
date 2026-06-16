@@ -753,3 +753,84 @@ impl Binder<'_> {
         })
     }
 }
+
+/// Combine source inputs under an optional filter: a lone input with no
+/// reads passes through unwrapped; otherwise a `PassThrough` joins the
+/// inputs and carries the filter `reads`. Used to build a DML statement's
+/// scanned-and-filtered source below its SET / VALUES `Project`.
+fn wrap_inputs(mut inputs: Vec<Plan>, reads: Vec<ColumnRead>, subqueries: Vec<Plan>) -> Plan {
+    if reads.is_empty() && subqueries.is_empty() && inputs.len() == 1 {
+        inputs.pop().unwrap()
+    } else {
+        Plan::PassThrough(PassThrough {
+            inputs,
+            reads,
+            subqueries,
+        })
+    }
+}
+
+/// Whether an `INSERT`'s source query exposes a per-column projection
+/// (a `SELECT` / set-operation / nested query) rather than a `VALUES`
+/// row set. Drives whether `EXCLUDED.col` collapses to the source: a
+/// `VALUES` source has no projection, so `EXCLUDED` stays opaque.
+fn source_has_projection(insert: &Insert) -> bool {
+    insert
+        .source
+        .as_ref()
+        .is_some_and(|query| !matches!(query.body.as_ref(), SetExpr::Values(_)))
+}
+
+/// The column names an `ALTER TABLE` operation writes to. Column-naming
+/// ops (ADD / DROP / MODIFY / ALTER COLUMN) name one column; RENAME /
+/// CHANGE name both the old and new (both ends of the rename are useful
+/// to a lineage consumer). Schema-level ops (constraints, partitions,
+/// RENAME TABLE, …) name no columns.
+fn alter_table_op_target_columns(op: &AlterTableOperation) -> Vec<Ident> {
+    match op {
+        AlterTableOperation::AddColumn { column_def, .. } => vec![column_def.name.clone()],
+        AlterTableOperation::DropColumn { column_names, .. } => column_names.clone(),
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => vec![old_column_name.clone(), new_column_name.clone()],
+        AlterTableOperation::ChangeColumn {
+            old_name, new_name, ..
+        } if old_name != new_name => vec![old_name.clone(), new_name.clone()],
+        AlterTableOperation::ChangeColumn { old_name, .. } => vec![old_name.clone()],
+        AlterTableOperation::ModifyColumn { col_name, .. } => vec![col_name.clone()],
+        AlterTableOperation::AlterColumn { column_name, .. } => vec![column_name.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Re-tag a write target's leaf `Scan` as [`ScanRole::Write`] so
+/// table-level read extraction skips it (it is reported via
+/// `Write.target`). The target is still kept in the tree so its columns
+/// stay in scope for resolving SET / WHERE / ON. A joined target keeps
+/// only its leftmost leaf as the write; partners stay reads.
+fn into_write_target(plan: Plan) -> Plan {
+    match plan {
+        Plan::Scan(scan) => Plan::Scan(Scan {
+            role: ScanRole::Write,
+            ..scan
+        }),
+        // A joined target (`UPDATE t1 JOIN t2 …`): only the target relation
+        // (the leftmost leaf) is the write; the joined partners stay reads.
+        Plan::PassThrough(mut pt) => {
+            if let Some(first) = pt.inputs.first_mut() {
+                let taken = std::mem::replace(first, Plan::OpaqueLeaf);
+                *first = into_write_target(taken);
+            }
+            Plan::PassThrough(pt)
+        }
+        other => other,
+    }
+}
+
+/// The named output columns of a bound body — the target column list a
+/// CTAS / CREATE VIEW pairs its source against when no explicit columns
+/// are given. Anonymous (un-nameable) outputs are dropped.
+fn output_names(outputs: &[BoundColumn]) -> Vec<Ident> {
+    outputs.iter().filter_map(|c| c.name.clone()).collect()
+}

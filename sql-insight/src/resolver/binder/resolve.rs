@@ -456,3 +456,17 @@ impl Binder<'_> {
         }
     }
 }
+
+/// Downgrade a real-table witness's provenance to `Inferred` — the
+/// Known-witness-over-Open tiebreaker adopts it without firm evidence.
+/// (Synthetic witnesses skip this: their inner refs keep their own
+/// resolution since the synthetic name never surfaces.)
+fn downgrade_to_inferred(provenance: Vec<ProvenanceSource>) -> Vec<ProvenanceSource> {
+    provenance
+        .into_iter()
+        .map(|mut source| {
+            source.read.resolution = ResolutionKind::Inferred;
+            source
+        })
+        .collect()
+}

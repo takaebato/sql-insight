@@ -1073,3 +1073,78 @@ impl Binder<'_> {
         (reads, subqueries)
     }
 }
+
+/// The join constraint (`ON …` / `USING …`) of a join operator, if any;
+/// `CROSS`/`APPLY` forms carry none.
+fn join_constraint(join: &Join) -> Option<&JoinConstraint> {
+    match &join.join_operator {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c) => Some(c),
+        JoinOperator::AsOf { constraint, .. } => Some(constraint),
+        JoinOperator::CrossApply | JoinOperator::OuterApply => None,
+    }
+}
+
+/// Merge two set-operation branches' output columns positionally: each
+/// result column unions both branches' (kind-carrying) provenance and
+/// takes its name from the left branch. Extra columns on either side
+/// (mismatched arity) are dropped — a set operation requires equal arity,
+/// and any dropped branch's reads still surface from its own sub-plan.
+fn merge_set_outputs(left: Vec<BoundColumn>, right: Vec<BoundColumn>) -> Vec<BoundColumn> {
+    left.into_iter()
+        .zip(right)
+        .map(|(left, right)| {
+            let mut provenance = left.provenance;
+            provenance.extend(right.provenance);
+            BoundColumn {
+                name: left.name,
+                provenance,
+            }
+        })
+        .collect()
+}
+
+/// Apply a CTE / derived table's explicit column list (`AS c(x, y)`),
+/// renaming the body's output columns positionally. Surplus outputs keep
+/// their inferred names; surplus alias names have nothing to bind to.
+fn apply_column_aliases(outputs: &mut [BoundColumn], alias: &TableAlias) {
+    for (output, column) in outputs.iter_mut().zip(&alias.columns) {
+        output.name = Some(column.name.clone());
+    }
+}
+
+/// The table reference of a `TABLE [schema.]name` set-expression body
+/// (`SetExpr::Table`), whose parts are plain strings rather than an
+/// `ObjectName`. `None` when no table name is present.
+fn table_set_expr_ref(table: &Table) -> Option<TableReference> {
+    let name = table.table_name.as_ref()?;
+    let mut parts = Vec::new();
+    if let Some(schema) = &table.schema_name {
+        parts.push(Ident::new(schema));
+    }
+    parts.push(Ident::new(name));
+    TableReference::try_from_parts(&parts)
+}
+
+/// The output name SQL infers for an unaliased projection item: a bare
+/// column keeps its own name; anything else is anonymous.
+fn inferred_output_name(expr: &Expr) -> Option<Ident> {
+    match expr {
+        Expr::Identifier(id) => Some(id.clone()),
+        Expr::CompoundIdentifier(ids) => ids.last().cloned(),
+        _ => None,
+    }
+}
