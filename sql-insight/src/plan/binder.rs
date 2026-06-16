@@ -1,23 +1,25 @@
 //! The binder: lowers a `sqlparser` AST into the bound [`Operator`] tree,
 //! resolving every column reference against the bind-time scope.
 //!
-//! Bricks ③–④: catalog-aware SELECT / FROM / JOIN / WHERE / projection +
-//! GROUP BY / HAVING / ORDER BY. A table factor is matched against the catalog
-//! (right-anchored, dialect-cased) into a canonical identity + `Known` columns
-//! + [`ResolutionKind`], or `Open` (catalog-free / miss / ambiguous). Column
-//! resolution ranks the in-scope relations (Known-witness over Open suspect →
-//! `Inferred` downgrade; several owners → `Ambiguous`; none → `Unresolved`).
-//! GROUP BY / HAVING / ORDER BY resolve against the FROM relations *plus* the
-//! projection outputs (clause-alias visibility): an introduced alias →
-//! `Derived` (dropped from reads), an identity passthrough → the real column.
-//! Their reads ride on a filter / sort above the projection. Derived tables /
-//! CTEs, set ops, and DML are later bricks — unhandled constructs fall to
-//! [`Operator::Empty`].
+//! Bricks ③–⑤: catalog-aware SELECT / FROM / JOIN / WHERE / projection,
+//! GROUP BY / HAVING / ORDER BY, derived tables, CTEs, and set operations.
+//! A table factor is matched against the catalog (right-anchored,
+//! dialect-cased) into a canonical identity with its `Known` columns and
+//! table-level [`ResolutionKind`], or `Open` (catalog-free / miss / ambiguous).
+//! Column resolution ranks the in-scope relations: a Known-witness over an Open
+//! suspect downgrades to `Inferred`, several owners give `Ambiguous`, none
+//! `Unresolved`, and a derived / CTE relation that exposes the column gives
+//! `Derived`. GROUP BY / HAVING / ORDER BY resolve against the FROM relations
+//! together with the projection outputs (clause-alias visibility): an
+//! introduced alias becomes `Derived` (dropped from reads), an identity
+//! passthrough falls through to the real column. Their reads ride on a filter /
+//! sort above the projection. DML and the remaining breadth are later bricks —
+//! unhandled constructs fall to [`Operator::Empty`].
 
 use sqlparser::ast::{
     Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     GroupByWithModifier, Ident, JoinConstraint, JoinOperator, OrderBy, OrderByExpr, OrderByKind,
-    Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
 };
 
 use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
@@ -33,7 +35,21 @@ pub(crate) fn build(
     catalog: Option<&Catalog>,
     casing: IdentifierCasing,
 ) -> Operator {
-    Binder { catalog, casing }.bind_statement(statement)
+    Binder {
+        catalog,
+        casing,
+        ctes: Vec::new(),
+    }
+    .bind_statement(statement)
+}
+
+/// A CTE in scope: its name and the output column names it exposes (so a
+/// `FROM cte` reference resolves through them). The body lives once on the
+/// owning `With` node; a reference is a lightweight `CteRef`.
+#[derive(Clone)]
+struct CteEnv {
+    name: Ident,
+    columns: Vec<Ident>,
 }
 
 // ===== bind-time scope (scratch, relation-grouped) =======================
@@ -67,21 +83,26 @@ struct Relation {
 
 enum RelSource {
     /// A real table: its canonical identity, catalog column knowledge, and
-    /// table-level resolution. (Derived / CTE / table-function relations are
-    /// later bricks.)
+    /// table-level resolution.
     Table {
         table: TableReference,
         columns: Columns,
         resolution: ResolutionKind,
     },
+    /// A derived table / CTE reference: a synthetic relation exposing the named
+    /// output columns of an inner query. A reference through it is
+    /// `Binding::Derived` — the origin traversal traces into the producing
+    /// sub-plan (`SubqueryAlias` / `CteRef`).
+    Derived { columns: Vec<Ident> },
 }
 
 impl Relation {
     /// The name this relation answers to in a qualifier: its alias, else a
-    /// real table's bare name.
+    /// real table's bare name. A derived relation answers only to its alias.
     fn exposed_name(&self) -> Option<&Ident> {
         self.alias.as_ref().or(match &self.source {
             RelSource::Table { table, .. } => Some(&table.name),
+            RelSource::Derived { .. } => None,
         })
     }
 }
@@ -96,33 +117,94 @@ struct Candidate {
 struct Binder<'a> {
     catalog: Option<&'a Catalog>,
     casing: IdentifierCasing,
+    /// CTEs in scope (declaration order, innermost `WITH` last).
+    ctes: Vec<CteEnv>,
 }
 
 impl Binder<'_> {
+    /// A child binder with a different CTE environment (sharing catalog /
+    /// casing).
+    fn with_ctes(&self, ctes: Vec<CteEnv>) -> Binder<'_> {
+        Binder {
+            catalog: self.catalog,
+            casing: self.casing,
+            ctes,
+        }
+    }
+
     fn bind_statement(&self, statement: &Statement) -> Operator {
         match statement {
-            Statement::Query(query) => self.bind_query(query),
+            Statement::Query(query) => self.bind_query(query).0,
             _ => Operator::Empty,
         }
     }
 
-    fn bind_query(&self, query: &Query) -> Operator {
+    /// Bind a query, returning the operator and its output scope (relations +
+    /// outputs). A leading `WITH` is peeled first: each CTE binds in
+    /// declaration order into an environment the later CTEs and the body
+    /// resolve against; the bodies are owned by a `With` node, references are
+    /// `CteRef`s.
+    fn bind_query(&self, query: &Query) -> (Operator, Scope) {
+        let Some(with) = &query.with else {
+            return self.bind_query_body(query);
+        };
+        let mut env = self.ctes.clone();
+        let mut declared = Vec::new();
+        for cte in &with.cte_tables {
+            let (mut plan, scope) = self.with_ctes(env.clone()).bind_query(&cte.query);
+            let columns = exposed_columns(&scope.outputs, Some(&cte.alias));
+            // An explicit `c (x, y)` column list renames the body's output
+            // columns so a reference through the CTE traces to them.
+            rename_outputs(&mut plan, &alias_column_names(&cte.alias));
+            declared.push(super::operator::Cte {
+                name: cte.alias.name.clone(),
+                plan,
+            });
+            env.push(CteEnv {
+                name: cte.alias.name.clone(),
+                columns,
+            });
+        }
+        let (body, scope) = self.with_ctes(env).bind_query_body(query);
+        (
+            Operator::With(super::operator::With {
+                ctes: declared,
+                body: Box::new(body),
+            }),
+            scope,
+        )
+    }
+
+    /// Bind a query's body and trailing ORDER BY (the `WITH` is already in
+    /// scope via `self.ctes`).
+    fn bind_query_body(&self, query: &Query) -> (Operator, Scope) {
         let (mut op, scope) = self.bind_set_expr(&query.body);
-        // A trailing ORDER BY resolves against the body's clause scope
-        // (relations + outputs) and sorts the result.
         if let Some(order_by) = &query.order_by {
             let keys = self.order_by_keys(order_by, &scope);
             if !keys.is_empty() {
                 op = sort(op, keys);
             }
         }
-        op
+        (op, scope)
     }
 
     fn bind_set_expr(&self, body: &SetExpr) -> (Operator, Scope) {
         match body {
             SetExpr::Select(select) => self.bind_select(select),
-            SetExpr::Query(query) => (self.bind_query(query), Scope::default()),
+            SetExpr::Query(query) => self.bind_query(query),
+            // A set operation: result columns are the left operand's (names
+            // from the left, positional merge).
+            SetExpr::SetOperation { left, right, .. } => {
+                let (l, scope) = self.bind_set_expr(left);
+                let (r, _) = self.bind_set_expr(right);
+                (
+                    Operator::SetOp(super::operator::SetOp {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    }),
+                    scope,
+                )
+            }
             _ => (Operator::Empty, Scope::default()),
         }
     }
@@ -213,6 +295,31 @@ impl Binder<'_> {
                 let Ok(written) = TableReference::try_from_name(name) else {
                     return (Operator::Empty, Scope::default());
                 };
+                let alias_name = alias.as_ref().map(|a| a.name.clone());
+                // A bare name matching an in-scope CTE resolves to a `CteRef`
+                // (the body lives once on the owning `With`) exposing the CTE's
+                // output columns as a synthetic relation.
+                if written.schema.is_none() && written.catalog.is_none() {
+                    if let Some(cte) = self
+                        .ctes
+                        .iter()
+                        .rev()
+                        .find(|c| self.eq(self.casing.table_alias, &c.name, &written.name))
+                    {
+                        let relation = Relation {
+                            alias: alias_name.or_else(|| Some(cte.name.clone())),
+                            source: RelSource::Derived {
+                                columns: cte.columns.clone(),
+                            },
+                        };
+                        return (
+                            Operator::CteRef(super::operator::CteRef {
+                                name: cte.name.clone(),
+                            }),
+                            scope_of(relation),
+                        );
+                    }
+                }
                 let m = self.table_match(&written);
                 let columns = if m.columns.is_empty() {
                     Columns::Open
@@ -225,22 +332,39 @@ impl Binder<'_> {
                     resolution: m.resolution,
                 });
                 let relation = Relation {
-                    alias: alias.as_ref().map(|a| a.name.clone()),
+                    alias: alias_name,
                     source: RelSource::Table {
                         table: m.table,
                         columns,
                         resolution: m.resolution,
                     },
                 };
-                (
-                    scan,
-                    Scope {
-                        relations: vec![relation],
-                        ..Scope::default()
-                    },
-                )
+                (scan, scope_of(relation))
             }
-            // Derived tables / table functions / nested joins are later bricks.
+            // A derived table `(<subquery>) AS d`: bind the subquery, expose
+            // its output columns as a synthetic relation under the alias.
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let (mut op, sub_scope) = self.bind_query(subquery);
+                let columns = exposed_columns(&sub_scope.outputs, alias.as_ref());
+                let relation = Relation {
+                    alias: alias.as_ref().map(|a| a.name.clone()),
+                    source: RelSource::Derived { columns },
+                };
+                let node = match alias {
+                    Some(a) => {
+                        rename_outputs(&mut op, &alias_column_names(a));
+                        Operator::SubqueryAlias(super::operator::SubqueryAlias {
+                            alias: a.name.clone(),
+                            input: Box::new(op),
+                        })
+                    }
+                    None => op,
+                };
+                (node, scope_of(relation))
+            }
+            // Table functions / nested joins are later bricks.
             _ => (Operator::Empty, Scope::default()),
         }
     }
@@ -435,6 +559,12 @@ impl Binder<'_> {
                 binding: base(table, ResolutionKind::Inferred),
                 confirmed: false,
             }),
+            // A derived relation owns the column iff it exposes it (confirmed
+            // witness, like a Known table); the origin traversal collapses it.
+            RelSource::Derived { columns } => self.list_has(columns, name).then_some(Candidate {
+                binding: Binding::Derived,
+                confirmed: true,
+            }),
         }
     }
 
@@ -484,6 +614,10 @@ impl Binder<'_> {
             } => Some(Candidate {
                 binding: base(table, ResolutionKind::Inferred),
                 confirmed: false,
+            }),
+            RelSource::Derived { columns } => self.list_has(columns, name).then_some(Candidate {
+                binding: Binding::Derived,
+                confirmed: true,
             }),
         }
     }
@@ -659,6 +793,69 @@ fn sort(input: Operator, keys: Vec<Expr>) -> Operator {
         input: Box::new(input),
         keys,
     })
+}
+
+fn scope_of(relation: Relation) -> Scope {
+    Scope {
+        relations: vec![relation],
+        ..Scope::default()
+    }
+}
+
+/// The names of a table alias's explicit column list (`AS d(x, y)`), empty if
+/// none.
+fn alias_column_names(alias: &TableAlias) -> Vec<Ident> {
+    alias.columns.iter().map(|c| c.name.clone()).collect()
+}
+
+/// Rename a (sub)plan's output columns positionally to `names` (an explicit
+/// `AS d(x, y)` column list). A no-op when `names` is empty. Descends through
+/// the clause layers / `With` to the producing `Project` / `Aggregate`; a
+/// `SetOp` renames both operands.
+fn rename_outputs(op: &mut Operator, names: &[Ident]) {
+    if names.is_empty() {
+        return;
+    }
+    match op {
+        Operator::Project(p) => {
+            for (ne, n) in p.exprs.iter_mut().zip(names) {
+                ne.name = Some(n.clone());
+            }
+        }
+        Operator::Aggregate(a) => {
+            for (ne, n) in a.group_by.iter_mut().chain(&mut a.aggregates).zip(names) {
+                ne.name = Some(n.clone());
+            }
+        }
+        Operator::Sort(s) => rename_outputs(&mut s.input, names),
+        Operator::Filter(f) => rename_outputs(&mut f.input, names),
+        Operator::With(w) => rename_outputs(&mut w.body, names),
+        Operator::SetOp(so) => {
+            rename_outputs(&mut so.left, names);
+            rename_outputs(&mut so.right, names);
+        }
+        _ => {}
+    }
+}
+
+/// The output column names a derived table / CTE exposes: an explicit column
+/// alias list (`AS d(x, y)`) renames positionally; otherwise each output keeps
+/// its own inferred name (anonymous outputs with no alias are unnameable, so
+/// dropped — they can't be referenced).
+fn exposed_columns(outputs: &[OutputCol], alias: Option<&TableAlias>) -> Vec<Ident> {
+    let alias_columns: Vec<&Ident> = alias
+        .map(|a| a.columns.iter().map(|c| &c.name).collect())
+        .unwrap_or_default();
+    outputs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| {
+            alias_columns
+                .get(i)
+                .map(|n| (*n).clone())
+                .or_else(|| o.name.clone())
+        })
+        .collect()
 }
 
 /// The name SQL infers for an unaliased projection item: a bare column keeps

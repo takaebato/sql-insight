@@ -125,7 +125,9 @@ fn walk(op: &Operator, f: &mut impl FnMut(&Operator)) {
 pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
     let mut ctx = Ctx::new(op);
     let mut edges = Vec::new();
-    if let Some((outputs, input)) = query_outputs(op) {
+    // One operand per query (a set operation has one per branch — positions
+    // restart at zero per branch, mirroring the resolver).
+    for (outputs, input) in output_operands(op) {
         for (position, ne) in outputs.iter().enumerate() {
             let target = ColumnTarget::QueryOutput {
                 name: ne.name.clone(),
@@ -143,17 +145,22 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
     edges
 }
 
-/// A query's output columns and the operator they are computed over (the
-/// `Project`, peeling a trailing `Sort`). `None` for a non-query root.
-fn query_outputs(op: &Operator) -> Option<(&[NamedExpr], &Operator)> {
+/// A query's output operands: one `(output columns, producing input)` per
+/// set-operation branch (a plain query has a single operand). Peels the clause
+/// layers above the projection (GROUP BY / HAVING `Filter`, ORDER BY `Sort`)
+/// and `With`.
+fn output_operands(op: &Operator) -> Vec<(&[NamedExpr], &Operator)> {
     match op {
-        Operator::Project(p) => Some((&p.exprs, &p.input)),
-        // Peel the clause layers that ride above the projection (the GROUP BY
-        // / HAVING `Filter`, the ORDER BY `Sort`) to reach the output columns.
-        Operator::Sort(s) => query_outputs(&s.input),
-        Operator::Filter(f) => query_outputs(&f.input),
-        Operator::With(w) => query_outputs(&w.body),
-        _ => None,
+        Operator::Project(p) => vec![(&p.exprs, &p.input)],
+        Operator::Sort(s) => output_operands(&s.input),
+        Operator::Filter(f) => output_operands(&f.input),
+        Operator::With(w) => output_operands(&w.body),
+        Operator::SetOp(so) => {
+            let mut operands = output_operands(&so.left);
+            operands.extend(output_operands(&so.right));
+            operands
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -318,7 +325,7 @@ fn query_col0_origins<'a>(
     op: &'a Operator,
     ctx: &mut Ctx<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
-    match query_outputs(op) {
+    match output_operands(op).first() {
         Some((outputs, input)) => match outputs.first() {
             Some(ne) => origins_of_expr(&ne.expr, input, ctx),
             None => Vec::new(),

@@ -165,6 +165,31 @@ fn clause_parity() {
 }
 
 #[test]
+fn derived_cte_setop_parity() {
+    // Derived tables, (non-recursive) CTEs, set operations (catalog-free).
+    let corpus = [
+        // derived tables
+        "SELECT x FROM (SELECT a AS x FROM t) d",
+        "SELECT d.y FROM (SELECT a + b AS y FROM t) d",
+        "SELECT x FROM (SELECT a FROM t) d WHERE x > 0",
+        "SELECT x, x FROM (SELECT a FROM t) d", // outer refs synthetic → one base read
+        // CTEs
+        "WITH c AS (SELECT a FROM t) SELECT a FROM c",
+        "WITH c (x) AS (SELECT a FROM t) SELECT x FROM c", // column-list rename
+        "WITH recent AS (SELECT id, amount FROM orders), \
+              totals AS (SELECT id, sum(amount) AS total FROM recent GROUP BY id) \
+         SELECT total FROM totals", // chained
+        "WITH c AS (SELECT a FROM t) SELECT a FROM c x JOIN c y ON x.a = y.a", // twice-referenced
+        // set operations
+        "SELECT a FROM t1 UNION SELECT b FROM t2",
+        "SELECT a FROM t1 UNION ALL SELECT a FROM t1",
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+}
+
+#[test]
 fn catalog_aware_parity() {
     use crate::catalog::CatalogTable;
     let catalog = Catalog::new()
