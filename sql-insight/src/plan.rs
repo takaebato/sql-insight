@@ -23,4 +23,5 @@
 // public extractor until the differential switch, so they read as dead.
 #![allow(dead_code)]
 
+mod binder;
 mod operator;
