@@ -1,19 +1,23 @@
 //! The binder: lowers a `sqlparser` AST into the bound [`Operator`] tree,
 //! resolving every column reference against the bind-time scope.
 //!
-//! Brick ③: catalog-aware SELECT / FROM / JOIN / WHERE / projection. A table
-//! factor is matched against the catalog (right-anchored, dialect-cased) into
-//! a canonical identity + `Known` columns + [`ResolutionKind`], or `Open`
-//! (catalog-free / miss / ambiguous). Column resolution ranks the in-scope
-//! relations (Known-witness over Open suspect → `Inferred` downgrade;
-//! several owners → `Ambiguous`; none → `Unresolved`). Clauses (GROUP BY /
-//! ORDER BY), derived tables / CTEs, set ops, and DML are later bricks —
-//! unhandled constructs fall to [`Operator::Empty`].
+//! Bricks ③–④: catalog-aware SELECT / FROM / JOIN / WHERE / projection +
+//! GROUP BY / HAVING / ORDER BY. A table factor is matched against the catalog
+//! (right-anchored, dialect-cased) into a canonical identity + `Known` columns
+//! + [`ResolutionKind`], or `Open` (catalog-free / miss / ambiguous). Column
+//! resolution ranks the in-scope relations (Known-witness over Open suspect →
+//! `Inferred` downgrade; several owners → `Ambiguous`; none → `Unresolved`).
+//! GROUP BY / HAVING / ORDER BY resolve against the FROM relations *plus* the
+//! projection outputs (clause-alias visibility): an introduced alias →
+//! `Derived` (dropped from reads), an identity passthrough → the real column.
+//! Their reads ride on a filter / sort above the projection. Derived tables /
+//! CTEs, set ops, and DML are later bricks — unhandled constructs fall to
+//! [`Operator::Empty`].
 
 use sqlparser::ast::{
-    Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-    TableWithJoins,
+    Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    GroupByWithModifier, Ident, JoinConstraint, JoinOperator, OrderBy, OrderByExpr, OrderByKind,
+    Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
 };
 
 use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
@@ -39,6 +43,19 @@ pub(crate) fn build(
 #[derive(Default)]
 struct Scope {
     relations: Vec<Relation>,
+    /// The enclosing SELECT's output columns, visible to its own GROUP BY /
+    /// HAVING / ORDER BY (clause-alias visibility). Empty at FROM-level
+    /// resolution (WHERE / projection).
+    outputs: Vec<OutputCol>,
+}
+
+/// A projection output column, for clause-alias resolution. `identity` marks a
+/// bare passthrough (`SELECT a`): a clause reference to it falls through to
+/// the real column (a read); a non-identity (introduced) alias resolves to the
+/// output itself (`Binding::Derived`, dropped from reads).
+struct OutputCol {
+    name: Option<Ident>,
+    identity: bool,
 }
 
 /// A relation in scope: its use-site alias (if any) and where its columns
@@ -90,38 +107,74 @@ impl Binder<'_> {
     }
 
     fn bind_query(&self, query: &Query) -> Operator {
-        self.bind_set_expr(&query.body)
+        let (mut op, scope) = self.bind_set_expr(&query.body);
+        // A trailing ORDER BY resolves against the body's clause scope
+        // (relations + outputs) and sorts the result.
+        if let Some(order_by) = &query.order_by {
+            let keys = self.order_by_keys(order_by, &scope);
+            if !keys.is_empty() {
+                op = sort(op, keys);
+            }
+        }
+        op
     }
 
-    fn bind_set_expr(&self, body: &SetExpr) -> Operator {
+    fn bind_set_expr(&self, body: &SetExpr) -> (Operator, Scope) {
         match body {
             SetExpr::Select(select) => self.bind_select(select),
-            SetExpr::Query(query) => self.bind_query(query),
-            _ => Operator::Empty,
+            SetExpr::Query(query) => (self.bind_query(query), Scope::default()),
+            _ => (Operator::Empty, Scope::default()),
         }
     }
 
-    fn bind_select(&self, select: &Select) -> Operator {
+    /// Bind a SELECT, returning the operator and its clause scope (FROM
+    /// relations + projection outputs) for a trailing ORDER BY to resolve
+    /// against.
+    fn bind_select(&self, select: &Select) -> (Operator, Scope) {
         let (from, scope) = self.bind_from(&select.from);
-        // WHERE: a filter over the FROM; predicate columns are reads, never
-        // lineage origins.
-        let node = match &select.selection {
+        // WHERE: a filter over the FROM (no output aliases visible — the
+        // clause-phase rule, structural).
+        let mut node = match &select.selection {
             Some(predicate) => Operator::Filter(Filter {
                 input: Box::new(from),
                 predicate: vec![self.bind_expr(predicate, &scope)],
             }),
             None => from,
         };
-        // SELECT: the projection, resolved against the FROM scope.
+        // SELECT: the projection resolves against the FROM scope.
         let exprs: Vec<NamedExpr> = select
             .projection
             .iter()
             .filter_map(|item| self.bind_select_item(item, &scope))
             .collect();
-        Operator::Project(Project {
+        let outputs = self.output_cols(&exprs);
+        node = Operator::Project(Project {
             input: Box::new(node),
             exprs,
-        })
+        });
+        // GROUP BY / HAVING / SORT BY see the output aliases (clause phase):
+        // resolve against the FROM relations *plus* the outputs. Their columns
+        // are reads, not lineage origins, so they ride on a filter / sort
+        // above the projection (which the origin traversal peels through).
+        let clause_scope = Scope {
+            relations: scope.relations,
+            outputs,
+        };
+        let mut clause_reads = self.group_by_keys(&select.group_by, &clause_scope);
+        if let Some(having) = &select.having {
+            clause_reads.push(self.bind_expr(having, &clause_scope));
+        }
+        if !clause_reads.is_empty() {
+            node = Operator::Filter(Filter {
+                input: Box::new(node),
+                predicate: clause_reads,
+            });
+        }
+        let sort_keys = self.order_by_expr_keys(&select.sort_by, &clause_scope);
+        if !sort_keys.is_empty() {
+            node = sort(node, sort_keys);
+        }
+        (node, clause_scope)
     }
 
     fn bind_from(&self, items: &[TableWithJoins]) -> (Operator, Scope) {
@@ -183,6 +236,7 @@ impl Binder<'_> {
                     scan,
                     Scope {
                         relations: vec![relation],
+                        ..Scope::default()
                     },
                 )
             }
@@ -251,6 +305,62 @@ impl Binder<'_> {
             .collect()
     }
 
+    // ===== clauses (GROUP BY / HAVING / ORDER BY) ========================
+
+    /// The GROUP BY key expressions (plain + GROUPING SETS members), resolved
+    /// against the clause scope. These are reads, not lineage origins.
+    fn group_by_keys(&self, group_by: &GroupByExpr, scope: &Scope) -> Vec<Expr> {
+        let mut keys = Vec::new();
+        if let GroupByExpr::Expressions(exprs, modifiers) = group_by {
+            let members = exprs.iter().chain(modifiers.iter().filter_map(|m| match m {
+                GroupByWithModifier::GroupingSets(expr) => Some(expr),
+                _ => None,
+            }));
+            for expr in members {
+                keys.push(self.bind_expr(expr, scope));
+            }
+        }
+        keys
+    }
+
+    /// The ORDER BY key expressions (a trailing `query.order_by`).
+    fn order_by_keys(&self, order_by: &OrderBy, scope: &Scope) -> Vec<Expr> {
+        let OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return Vec::new();
+        };
+        self.order_by_expr_keys(exprs, scope)
+    }
+
+    /// Bind a list of order-by expressions (`query.order_by` members or a
+    /// `SELECT … SORT BY` list) as clause reads.
+    fn order_by_expr_keys(&self, exprs: &[OrderByExpr], scope: &Scope) -> Vec<Expr> {
+        exprs
+            .iter()
+            .map(|e| self.bind_expr(&e.expr, scope))
+            .collect()
+    }
+
+    /// Summarise the projection outputs for clause-alias resolution. An output
+    /// is *identity* iff it is a bare column under its own name.
+    fn output_cols(&self, exprs: &[NamedExpr]) -> Vec<OutputCol> {
+        exprs
+            .iter()
+            .map(|ne| {
+                let identity = match &ne.expr {
+                    Expr::Column(c) => ne
+                        .name
+                        .as_ref()
+                        .is_some_and(|n| self.eq(self.casing.column, n, &c.name)),
+                    _ => false,
+                };
+                OutputCol {
+                    name: ne.name.clone(),
+                    identity,
+                }
+            })
+            .collect()
+    }
+
     // ===== column resolution =============================================
 
     /// Resolve a dotted reference (`parts`) against the scope. Unqualified
@@ -258,6 +368,26 @@ impl Binder<'_> {
     /// by [`pick`](Self::pick).
     fn resolve(&self, parts: &[Ident], scope: &Scope) -> ColRef {
         let name = parts.last().expect("a reference has at least one segment");
+        // Clause-alias visibility (GROUP BY / HAVING / ORDER BY): a bare ref
+        // naming an *introduced* output alias resolves to that output
+        // (`Derived`, dropped from reads — the real dependency is at the
+        // projection). An *identity* passthrough falls through to the real
+        // column. (Empty `outputs` at FROM-level, so this is a no-op there.)
+        if parts.len() == 1 {
+            if let Some(out) = scope.outputs.iter().find(|o| {
+                o.name
+                    .as_ref()
+                    .is_some_and(|n| self.eq(self.casing.column, n, name))
+            }) {
+                if !out.identity {
+                    return ColRef {
+                        qualifier: None,
+                        name: name.clone(),
+                        binding: Binding::Derived,
+                    };
+                }
+            }
+        }
         let binding = if parts.len() == 1 {
             let candidates = scope
                 .relations
@@ -521,6 +651,13 @@ fn join(left: Operator, right: Operator, on: Vec<Expr>) -> Operator {
         right: Box::new(right),
         on,
         lateral: false,
+    })
+}
+
+fn sort(input: Operator, keys: Vec<Expr>) -> Operator {
+    Operator::Sort(super::operator::Sort {
+        input: Box::new(input),
+        keys,
     })
 }
 

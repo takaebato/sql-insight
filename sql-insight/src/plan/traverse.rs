@@ -148,7 +148,10 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
 fn query_outputs(op: &Operator) -> Option<(&[NamedExpr], &Operator)> {
     match op {
         Operator::Project(p) => Some((&p.exprs, &p.input)),
+        // Peel the clause layers that ride above the projection (the GROUP BY
+        // / HAVING `Filter`, the ORDER BY `Sort`) to reach the output columns.
         Operator::Sort(s) => query_outputs(&s.input),
+        Operator::Filter(f) => query_outputs(&f.input),
         Operator::With(w) => query_outputs(&w.body),
         _ => None,
     }

@@ -146,6 +146,25 @@ fn query_core_parity() {
 }
 
 #[test]
+fn clause_parity() {
+    // GROUP BY / HAVING / ORDER BY + alias visibility (catalog-free).
+    let corpus = [
+        "SELECT a FROM t GROUP BY a", // identity alias → a read (proj + group by)
+        "SELECT a + b AS s FROM t GROUP BY s", // introduced alias → s dropped, a/b at proj
+        "SELECT dept, sum(salary) AS total FROM emp GROUP BY dept",
+        "SELECT dept FROM emp GROUP BY dept HAVING sum(salary) > 0", // HAVING reads a non-projected column
+        "SELECT a FROM t ORDER BY a",                                // identity in ORDER BY
+        "SELECT a + b AS s FROM t ORDER BY s",                       // introduced alias in ORDER BY
+        "SELECT a, b FROM t ORDER BY b, a",
+        "SELECT a FROM t WHERE a > 0 GROUP BY a HAVING count(b) > 1 ORDER BY a",
+        "SELECT t.a, sum(t.b) AS s FROM t GROUP BY t.a ORDER BY s",
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+}
+
+#[test]
 fn catalog_aware_parity() {
     use crate::catalog::CatalogTable;
     let catalog = Catalog::new()
