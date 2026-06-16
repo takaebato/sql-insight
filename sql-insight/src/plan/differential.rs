@@ -13,29 +13,35 @@ use sqlparser::dialect::{Dialect, GenericDialect};
 use sqlparser::parser::Parser;
 
 use crate::casing::IdentifierCasing;
+use crate::catalog::Catalog;
 use crate::extractor::{ColumnLineageEdge, ColumnTarget};
 use crate::reference::{ColumnRead, TableRead};
 
 /// Assert the two engines agree on every surface for `sql` (GenericDialect,
 /// catalog-free).
 fn assert_parity(sql: &str) {
-    assert_parity_with(sql, &GenericDialect {});
+    assert_parity_inner(sql, &GenericDialect {}, None);
 }
 
-fn assert_parity_with(sql: &str, dialect: &dyn Dialect) {
+/// Like [`assert_parity`] but with a catalog (catalog-aware resolution).
+fn assert_parity_cat(sql: &str, catalog: &Catalog) {
+    assert_parity_inner(sql, &GenericDialect {}, Some(catalog));
+}
+
+fn assert_parity_inner(sql: &str, dialect: &dyn Dialect, catalog: Option<&Catalog>) {
     let statements =
         Parser::parse_sql(dialect, sql).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
     let casing = IdentifierCasing::for_dialect(dialect);
     let stmt = &statements[0];
 
     // Current engine (design-B `resolver`).
-    let (cur, _diagnostics) = crate::resolver::build_plan(stmt, None, casing);
+    let (cur, _diagnostics) = crate::resolver::build_plan(stmt, catalog, casing);
     let cur_reads = crate::resolver::extract_reads(&cur);
     let cur_lineage = crate::resolver::extract_lineage(&cur);
     let cur_table_reads = crate::resolver::extract_table_reads(&cur);
 
     // Incubating engine (option-a `plan`).
-    let op = super::binder::build(stmt, None, casing);
+    let op = super::binder::build(stmt, catalog, casing);
     let new_reads = super::traverse::reads(&op);
     let new_lineage = super::traverse::column_lineage(&op);
     let new_table_reads = super::traverse::table_reads(&op);
@@ -136,5 +142,26 @@ fn query_core_parity() {
     ];
     for sql in corpus {
         assert_parity(sql);
+    }
+}
+
+#[test]
+fn catalog_aware_parity() {
+    use crate::catalog::CatalogTable;
+    let catalog = Catalog::new()
+        .table(CatalogTable::new("public", "users").columns(["id", "name"]))
+        .table(CatalogTable::new("public", "orders").columns(["id", "user_id", "amount"]))
+        .table(CatalogTable::new("public", "known_t").columns(["a", "b"]));
+    let corpus = [
+        "SELECT name FROM users",              // Cataloged hit (canonicalized)
+        "SELECT public.users.name FROM users", // qualified, canonical agrees
+        "SELECT nonexistent FROM users",       // Known miss → Unresolved
+        "SELECT id FROM users JOIN orders ON users.id = orders.user_id", // Ambiguous (both have id)
+        "SELECT name, amount FROM users JOIN orders ON users.id = orders.user_id",
+        "SELECT a FROM known_t JOIN other ON known_t.b = other.k", // Known-witness over Open → Inferred
+        "SELECT users.name FROM users WHERE users.id > 0",
+    ];
+    for sql in corpus {
+        assert_parity_cat(sql, &catalog);
     }
 }

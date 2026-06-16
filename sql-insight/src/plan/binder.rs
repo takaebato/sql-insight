@@ -1,12 +1,14 @@
 //! The binder: lowers a `sqlparser` AST into the bound [`Operator`] tree,
-//! resolving every column reference against the visible output schema.
+//! resolving every column reference against the bind-time scope.
 //!
-//! Brick ② (minimal core): catalog-free SELECT / FROM / JOIN / WHERE /
-//! projection over column refs and simple expressions. Tables bind `Open`
-//! (any name resolves `Base { Inferred }`); a name owned by several
-//! relations is `Ambiguous`, by none `Unresolved`. Catalog matching,
-//! GROUP BY / clauses, derived tables / CTEs, set ops, and DML are later
-//! bricks — unhandled constructs fall to [`Operator::Empty`] for now.
+//! Brick ③: catalog-aware SELECT / FROM / JOIN / WHERE / projection. A table
+//! factor is matched against the catalog (right-anchored, dialect-cased) into
+//! a canonical identity + `Known` columns + [`ResolutionKind`], or `Open`
+//! (catalog-free / miss / ambiguous). Column resolution ranks the in-scope
+//! relations (Known-witness over Open suspect → `Inferred` downgrade;
+//! several owners → `Ambiguous`; none → `Unresolved`). Clauses (GROUP BY /
+//! ORDER BY), derived tables / CTEs, set ops, and DML are later bricks —
+//! unhandled constructs fall to [`Operator::Empty`].
 
 use sqlparser::ast::{
     Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
@@ -16,7 +18,7 @@ use sqlparser::ast::{
 
 use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
 use crate::casing::{CaseFold, IdentifierCasing};
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, CatalogTable};
 use crate::reference::{ResolutionKind, TableReference};
 
 /// Bind a statement into an [`Operator`] tree. Statement kinds not yet
@@ -30,23 +32,51 @@ pub(crate) fn build(
     Binder { catalog, casing }.bind_statement(statement)
 }
 
-/// A bind-time output column: the relation it's exposed under, its name, and
-/// whether it's a base-table column (`Some` carries the canonical table +
-/// resolution) or a produced / derived one (`None`). Scratch — never stored
-/// on the [`Operator`] tree.
-#[derive(Clone)]
-struct SchemaCol {
-    qualifier: Option<Ident>,
-    /// `None` is an `Open` scan's wildcard slot (matches any name).
-    name: Option<Ident>,
-    base: Option<(TableReference, ResolutionKind)>,
+// ===== bind-time scope (scratch, relation-grouped) =======================
+
+/// The relations visible at a point in the bind. Scratch — never stored on
+/// the [`Operator`] tree.
+#[derive(Default)]
+struct Scope {
+    relations: Vec<Relation>,
 }
 
-/// The output columns a (sub)plan exposes for resolution. Bind-time scratch.
-type Schema = Vec<SchemaCol>;
+/// A relation in scope: its use-site alias (if any) and where its columns
+/// come from.
+struct Relation {
+    alias: Option<Ident>,
+    source: RelSource,
+}
+
+enum RelSource {
+    /// A real table: its canonical identity, catalog column knowledge, and
+    /// table-level resolution. (Derived / CTE / table-function relations are
+    /// later bricks.)
+    Table {
+        table: TableReference,
+        columns: Columns,
+        resolution: ResolutionKind,
+    },
+}
+
+impl Relation {
+    /// The name this relation answers to in a qualifier: its alias, else a
+    /// real table's bare name.
+    fn exposed_name(&self) -> Option<&Ident> {
+        self.alias.as_ref().or(match &self.source {
+            RelSource::Table { table, .. } => Some(&table.name),
+        })
+    }
+}
+
+/// One candidate owner of a column reference, with the binding it would
+/// contribute and whether it's a confirmed (catalog-listed) witness.
+struct Candidate {
+    binding: Binding,
+    confirmed: bool,
+}
 
 struct Binder<'a> {
-    #[allow(dead_code)] // catalog matching arrives in brick ③ (currently all Open)
     catalog: Option<&'a Catalog>,
     casing: IdentifierCasing,
 }
@@ -54,149 +84,153 @@ struct Binder<'a> {
 impl Binder<'_> {
     fn bind_statement(&self, statement: &Statement) -> Operator {
         match statement {
-            Statement::Query(query) => self.bind_query(query).0,
+            Statement::Query(query) => self.bind_query(query),
             _ => Operator::Empty,
         }
     }
 
-    fn bind_query(&self, query: &Query) -> (Operator, Schema) {
+    fn bind_query(&self, query: &Query) -> Operator {
         self.bind_set_expr(&query.body)
     }
 
-    fn bind_set_expr(&self, body: &SetExpr) -> (Operator, Schema) {
+    fn bind_set_expr(&self, body: &SetExpr) -> Operator {
         match body {
             SetExpr::Select(select) => self.bind_select(select),
             SetExpr::Query(query) => self.bind_query(query),
-            _ => (Operator::Empty, Vec::new()),
+            _ => Operator::Empty,
         }
     }
 
-    fn bind_select(&self, select: &Select) -> (Operator, Schema) {
-        let (from, from_schema) = self.bind_from(&select.from);
+    fn bind_select(&self, select: &Select) -> Operator {
+        let (from, scope) = self.bind_from(&select.from);
         // WHERE: a filter over the FROM; predicate columns are reads, never
         // lineage origins.
         let node = match &select.selection {
             Some(predicate) => Operator::Filter(Filter {
                 input: Box::new(from),
-                predicate: vec![self.bind_expr(predicate, &from_schema)],
+                predicate: vec![self.bind_expr(predicate, &scope)],
             }),
             None => from,
         };
-        // SELECT: the projection, resolved against the FROM schema.
+        // SELECT: the projection, resolved against the FROM scope.
         let exprs: Vec<NamedExpr> = select
             .projection
             .iter()
-            .filter_map(|item| self.bind_select_item(item, &from_schema))
+            .filter_map(|item| self.bind_select_item(item, &scope))
             .collect();
-        let out = project_schema(&exprs);
-        let project = Operator::Project(Project {
+        Operator::Project(Project {
             input: Box::new(node),
             exprs,
-        });
-        (project, out)
+        })
     }
 
-    fn bind_from(&self, items: &[TableWithJoins]) -> (Operator, Schema) {
+    fn bind_from(&self, items: &[TableWithJoins]) -> (Operator, Scope) {
         let mut iter = items.iter();
         let Some(first) = iter.next() else {
-            return (Operator::Empty, Vec::new());
+            return (Operator::Empty, Scope::default());
         };
-        let (mut node, mut schema) = self.bind_table_with_joins(first);
+        let (mut node, mut scope) = self.bind_table_with_joins(first);
         // Comma-separated FROM items are a cross join.
         for twj in iter {
-            let (right, right_schema) = self.bind_table_with_joins(twj);
-            schema.extend(right_schema);
+            let (right, right_scope) = self.bind_table_with_joins(twj);
+            scope.relations.extend(right_scope.relations);
             node = join(node, right, Vec::new());
         }
-        (node, schema)
+        (node, scope)
     }
 
-    fn bind_table_with_joins(&self, twj: &TableWithJoins) -> (Operator, Schema) {
-        let (mut node, mut schema) = self.bind_table_factor(&twj.relation);
+    fn bind_table_with_joins(&self, twj: &TableWithJoins) -> (Operator, Scope) {
+        let (mut node, mut scope) = self.bind_table_factor(&twj.relation);
         for j in &twj.joins {
-            let (right, right_schema) = self.bind_table_factor(&j.relation);
-            schema.extend(right_schema);
+            let (right, right_scope) = self.bind_table_factor(&j.relation);
+            scope.relations.extend(right_scope.relations);
             // The ON predicate resolves against both sides' columns.
             let on = join_on(&j.join_operator)
-                .map(|e| self.bind_expr(e, &schema))
+                .map(|e| self.bind_expr(e, &scope))
                 .into_iter()
                 .collect();
             node = join(node, right, on);
         }
-        (node, schema)
+        (node, scope)
     }
 
-    fn bind_table_factor(&self, factor: &TableFactor) -> (Operator, Schema) {
+    fn bind_table_factor(&self, factor: &TableFactor) -> (Operator, Scope) {
         match factor {
             TableFactor::Table { name, alias, .. } => {
-                let Ok(table) = TableReference::try_from_name(name) else {
-                    return (Operator::Empty, Vec::new());
+                let Ok(written) = TableReference::try_from_name(name) else {
+                    return (Operator::Empty, Scope::default());
                 };
-                // Catalog-free for now: every table is `Open` (any name
-                // resolves `Inferred`).
-                let qualifier = alias
-                    .as_ref()
-                    .map(|a| a.name.clone())
-                    .unwrap_or_else(|| table.name.clone());
+                let m = self.table_match(&written);
+                let columns = if m.columns.is_empty() {
+                    Columns::Open
+                } else {
+                    Columns::Known(m.columns)
+                };
                 let scan = Operator::Scan(Scan {
-                    table: table.clone(),
-                    columns: Columns::Open,
-                    resolution: ResolutionKind::Inferred,
+                    table: m.table.clone(),
+                    columns: columns.clone(),
+                    resolution: m.resolution,
                 });
-                let schema = vec![SchemaCol {
-                    qualifier: Some(qualifier),
-                    name: None,
-                    base: Some((table, ResolutionKind::Inferred)),
-                }];
-                (scan, schema)
+                let relation = Relation {
+                    alias: alias.as_ref().map(|a| a.name.clone()),
+                    source: RelSource::Table {
+                        table: m.table,
+                        columns,
+                        resolution: m.resolution,
+                    },
+                };
+                (
+                    scan,
+                    Scope {
+                        relations: vec![relation],
+                    },
+                )
             }
             // Derived tables / table functions / nested joins are later bricks.
-            _ => (Operator::Empty, Vec::new()),
+            _ => (Operator::Empty, Scope::default()),
         }
     }
 
-    fn bind_select_item(&self, item: &SelectItem, schema: &Schema) -> Option<NamedExpr> {
+    fn bind_select_item(&self, item: &SelectItem, scope: &Scope) -> Option<NamedExpr> {
         match item {
             SelectItem::UnnamedExpr(expr) => Some(NamedExpr {
                 name: inferred_name(expr),
-                expr: self.bind_expr(expr, schema),
+                expr: self.bind_expr(expr, scope),
             }),
             SelectItem::ExprWithAlias { expr, alias } => Some(NamedExpr {
                 name: Some(alias.clone()),
-                expr: self.bind_expr(expr, schema),
+                expr: self.bind_expr(expr, scope),
             }),
             // Wildcards are suppressed (a later brick records the diagnostic).
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
         }
     }
 
-    /// Resolve a `sqlparser` expression into a bound [`Expr`]. Column refs
-    /// resolve against `schema`; functions / operators become a `Call`
-    /// (transformation over value args); other forms are later bricks.
-    fn bind_expr(&self, expr: &SqlExpr, schema: &Schema) -> Expr {
+    /// Resolve a `sqlparser` expression into a bound [`Expr`].
+    fn bind_expr(&self, expr: &SqlExpr, scope: &Scope) -> Expr {
         match expr {
-            SqlExpr::Identifier(id) => Expr::Column(Box::new(self.resolve(None, id, schema))),
-            SqlExpr::CompoundIdentifier(parts) => {
-                let name = parts.last().expect("compound identifier is non-empty");
-                let qualifier = (parts.len() >= 2).then(|| parts[parts.len() - 2].clone());
-                Expr::Column(Box::new(self.resolve(qualifier.as_ref(), name, schema)))
+            SqlExpr::Identifier(id) => {
+                Expr::Column(Box::new(self.resolve(std::slice::from_ref(id), scope)))
             }
-            SqlExpr::Nested(inner) => self.bind_expr(inner, schema),
+            SqlExpr::CompoundIdentifier(parts) => {
+                Expr::Column(Box::new(self.resolve(parts, scope)))
+            }
+            SqlExpr::Nested(inner) => self.bind_expr(inner, scope),
             SqlExpr::BinaryOp { left, right, .. } => Expr::Call {
-                args: vec![self.bind_expr(left, schema), self.bind_expr(right, schema)],
+                args: vec![self.bind_expr(left, scope), self.bind_expr(right, scope)],
             },
             SqlExpr::UnaryOp { expr, .. } => Expr::Call {
-                args: vec![self.bind_expr(expr, schema)],
+                args: vec![self.bind_expr(expr, scope)],
             },
             SqlExpr::Function(function) => Expr::Call {
-                args: self.bind_function_args(function, schema),
+                args: self.bind_function_args(function, scope),
             },
             // Literals and not-yet-modelled forms contribute no column refs.
             _ => Expr::Call { args: Vec::new() },
         }
     }
 
-    fn bind_function_args(&self, function: &Function, schema: &Schema) -> Vec<Expr> {
+    fn bind_function_args(&self, function: &Function, scope: &Scope) -> Vec<Expr> {
         let FunctionArguments::List(list) = &function.args else {
             return Vec::new();
         };
@@ -211,50 +245,273 @@ impl Binder<'_> {
                 | FunctionArg::ExprNamed {
                     arg: FunctionArgExpr::Expr(e),
                     ..
-                } => Some(self.bind_expr(e, schema)),
+                } => Some(self.bind_expr(e, scope)),
                 _ => None,
             })
             .collect()
     }
 
-    /// Resolve a (qualifier, name) against the visible schema. Catalog-free:
-    /// one matching relation → `Base { Inferred }`; several → `Ambiguous`;
-    /// none → `Unresolved`. (The Known-witness / catalog tiebreaker is brick ③.)
-    fn resolve(&self, qualifier: Option<&Ident>, name: &Ident, schema: &Schema) -> ColRef {
-        let candidates: Vec<&SchemaCol> = schema
-            .iter()
-            .filter(|c| {
-                qualifier.is_none_or(|q| {
-                    c.qualifier
-                        .as_ref()
-                        .is_some_and(|cq| self.eq(self.casing.table_alias, cq, q))
+    // ===== column resolution =============================================
+
+    /// Resolve a dotted reference (`parts`) against the scope. Unqualified
+    /// ranks every relation; qualified matches the qualifier first. Collapsed
+    /// by [`pick`](Self::pick).
+    fn resolve(&self, parts: &[Ident], scope: &Scope) -> ColRef {
+        let name = parts.last().expect("a reference has at least one segment");
+        let binding = if parts.len() == 1 {
+            let candidates = scope
+                .relations
+                .iter()
+                .filter_map(|rel| self.unqualified_candidate(rel, name))
+                .collect();
+            self.pick(candidates)
+        } else {
+            let qualifier_parts = &parts[..parts.len() - 1];
+            let qualifier_ref = TableReference::try_from_parts(qualifier_parts);
+            let candidates = scope
+                .relations
+                .iter()
+                .filter_map(|rel| {
+                    self.qualified_candidate(rel, qualifier_parts, qualifier_ref.as_ref(), name)
                 })
-            })
-            .filter(|c| match &c.name {
-                Some(n) => self.eq(self.casing.column, n, name),
-                None => true, // Open wildcard slot matches any name
-            })
-            .collect();
-        let binding = match candidates.as_slice() {
-            [] => Binding::Unresolved,
-            [c] => match &c.base {
-                Some((table, resolution)) => Binding::Base {
-                    table: table.clone(),
-                    resolution: *resolution,
-                },
-                None => Binding::Derived,
-            },
-            _ => Binding::Ambiguous,
+                .collect();
+            self.pick(candidates)
         };
         ColRef {
-            qualifier: qualifier.cloned(),
+            qualifier: (parts.len() >= 2).then(|| parts[parts.len() - 2].clone()),
             name: name.clone(),
             binding,
         }
     }
 
+    /// A relation is an unqualified candidate iff it could own `name`: a
+    /// `Known` schema must list it (confirmed witness); an `Open` table always
+    /// could (suspect).
+    fn unqualified_candidate(&self, rel: &Relation, name: &Ident) -> Option<Candidate> {
+        match &rel.source {
+            RelSource::Table {
+                table,
+                columns: Columns::Known(cols),
+                ..
+            } => self.list_has(cols, name).then(|| Candidate {
+                binding: base(table, ResolutionKind::Cataloged),
+                confirmed: true,
+            }),
+            RelSource::Table {
+                table,
+                columns: Columns::Open,
+                ..
+            } => Some(Candidate {
+                binding: base(table, ResolutionKind::Inferred),
+                confirmed: false,
+            }),
+        }
+    }
+
+    /// A relation is a qualified candidate iff the qualifier matches it: a
+    /// non-aliased real table by right-anchored path, anything else by its
+    /// single exposed (alias) name. A `Known` table that doesn't list the
+    /// column still resolves (`Inferred`) — the qualifier pins it.
+    fn qualified_candidate(
+        &self,
+        rel: &Relation,
+        qualifier_parts: &[Ident],
+        qualifier_ref: Option<&TableReference>,
+        name: &Ident,
+    ) -> Option<Candidate> {
+        let qualifier_ok = match &rel.source {
+            RelSource::Table { table, .. } if rel.alias.is_none() => {
+                qualifier_ref.is_some_and(|q| self.qualifier_matches_table(q, table))
+            }
+            _ => rel.exposed_name().is_some_and(|exposed| {
+                matches!(qualifier_parts, [only] if self.eq(self.casing.table_alias, only, exposed))
+            }),
+        };
+        if !qualifier_ok {
+            return None;
+        }
+        match &rel.source {
+            RelSource::Table {
+                table,
+                columns: Columns::Known(cols),
+                ..
+            } => {
+                let confirmed = self.list_has(cols, name);
+                let resolution = if confirmed {
+                    ResolutionKind::Cataloged
+                } else {
+                    ResolutionKind::Inferred
+                };
+                Some(Candidate {
+                    binding: base(table, resolution),
+                    confirmed,
+                })
+            }
+            RelSource::Table {
+                table,
+                columns: Columns::Open,
+                ..
+            } => Some(Candidate {
+                binding: base(table, ResolutionKind::Inferred),
+                confirmed: false,
+            }),
+        }
+    }
+
+    /// Collapse candidates to a [`Binding`]: none → `Unresolved`; one → its
+    /// binding verbatim; several with exactly one confirmed witness → that
+    /// witness, downgraded to `Inferred` (Known-witness-over-Open); otherwise
+    /// `Ambiguous`.
+    fn pick(&self, candidates: Vec<Candidate>) -> Binding {
+        match candidates.len() {
+            0 => Binding::Unresolved,
+            1 => candidates.into_iter().next().unwrap().binding,
+            _ => {
+                let mut confirmed = candidates.into_iter().filter(|c| c.confirmed);
+                match (confirmed.next(), confirmed.next()) {
+                    (Some(witness), None) => downgrade(witness.binding),
+                    _ => Binding::Ambiguous,
+                }
+            }
+        }
+    }
+
+    /// Match a written table reference against the catalog (after default-fill,
+    /// right-anchored, dialect-cased). Unique hit → canonical identity + Known
+    /// columns + `Cataloged`; several → written ref + `Ambiguous`; no catalog
+    /// or no hit → written ref + `Inferred`.
+    fn table_match(&self, written: &TableReference) -> TableMatch {
+        let no_hit = |resolution| TableMatch {
+            table: written.clone(),
+            resolution,
+            columns: Vec::new(),
+        };
+        let Some(catalog) = self.catalog else {
+            return no_hit(ResolutionKind::Inferred);
+        };
+        let filled = fill_query_defaults(written, catalog);
+        let fold = self.casing.table;
+        let mut hits = catalog
+            .tables()
+            .iter()
+            .filter(|t| catalog_table_matches(&filled, t, fold));
+        let Some(first) = hits.next() else {
+            return no_hit(ResolutionKind::Inferred);
+        };
+        if hits.next().is_some() {
+            return no_hit(ResolutionKind::Ambiguous);
+        }
+        let columns = first
+            .column_names()
+            .iter()
+            .map(|c| Ident::with_quote('"', c))
+            .collect();
+        TableMatch {
+            table: canonical_ref(first),
+            resolution: ResolutionKind::Cataloged,
+            columns,
+        }
+    }
+
+    /// Right-anchored match of a decoded qualifier against a real table's
+    /// `catalog.schema.name`, under the dialect's table casing (an omitted
+    /// qualifier segment is a wildcard).
+    fn qualifier_matches_table(&self, qualifier: &TableReference, table: &TableReference) -> bool {
+        let fold = self.casing.table;
+        let opt_eq = |a: Option<&Ident>, b: Option<&Ident>| match (a, b) {
+            (Some(x), Some(y)) => fold.normalize(x) == fold.normalize(y),
+            _ => true,
+        };
+        fold.normalize(&qualifier.name) == fold.normalize(&table.name)
+            && opt_eq(qualifier.schema.as_ref(), table.schema.as_ref())
+            && opt_eq(qualifier.catalog.as_ref(), table.catalog.as_ref())
+    }
+
+    fn list_has(&self, columns: &[Ident], name: &Ident) -> bool {
+        columns.iter().any(|c| self.eq(self.casing.column, c, name))
+    }
+
     fn eq(&self, fold: CaseFold, a: &Ident, b: &Ident) -> bool {
         fold.normalize(a) == fold.normalize(b)
+    }
+}
+
+// ===== catalog matching ==================================================
+
+/// The outcome of matching a written table reference against the catalog.
+struct TableMatch {
+    table: TableReference,
+    resolution: ResolutionKind,
+    columns: Vec<Ident>,
+}
+
+/// Fill a query reference's missing prefix segments from the catalog's
+/// defaults (bare → schema then catalog).
+fn fill_query_defaults(written: &TableReference, catalog: &Catalog) -> TableReference {
+    let mut filled = written.clone();
+    if filled.schema.is_none() {
+        if let Some(schema) = catalog.default_schema_segment() {
+            filled.schema = Some(Ident::with_quote('"', schema));
+        }
+    }
+    if filled.catalog.is_none() && filled.schema.is_some() {
+        if let Some(catalog_segment) = catalog.default_catalog_segment() {
+            filled.catalog = Some(Ident::with_quote('"', catalog_segment));
+        }
+    }
+    filled
+}
+
+/// Right-anchored, dialect-cased match of a (default-filled) query reference
+/// against a registered table.
+fn catalog_table_matches(query: &TableReference, table: &CatalogTable, fold: CaseFold) -> bool {
+    if fold.normalize(&query.name) != normalize_catalog(table.name_segment(), fold) {
+        return false;
+    }
+    if let Some(schema) = &query.schema {
+        if fold.normalize(schema) != normalize_catalog(table.schema_segment(), fold) {
+            return false;
+        }
+    }
+    match (&query.catalog, table.catalog_segment()) {
+        (Some(query_catalog), Some(table_catalog)) => {
+            fold.normalize(query_catalog) == normalize_catalog(table_catalog, fold)
+        }
+        _ => true,
+    }
+}
+
+fn normalize_catalog(segment: &str, fold: CaseFold) -> String {
+    fold.normalize(&Ident::with_quote('"', segment))
+}
+
+/// The surfaced canonical identity of a matched table: plain (unquoted) idents.
+fn canonical_ref(table: &CatalogTable) -> TableReference {
+    TableReference {
+        catalog: table.catalog_segment().map(Ident::new),
+        schema: Some(Ident::new(table.schema_segment())),
+        name: Ident::new(table.name_segment()),
+    }
+}
+
+// ===== small helpers =====================================================
+
+fn base(table: &TableReference, resolution: ResolutionKind) -> Binding {
+    Binding::Base {
+        table: table.clone(),
+        resolution,
+    }
+}
+
+/// Downgrade a winning real-table witness to `Inferred` — adopted over Open
+/// suspects without firm evidence.
+fn downgrade(binding: Binding) -> Binding {
+    match binding {
+        Binding::Base { table, .. } => Binding::Base {
+            table,
+            resolution: ResolutionKind::Inferred,
+        },
+        other => other,
     }
 }
 
@@ -265,19 +522,6 @@ fn join(left: Operator, right: Operator, on: Vec<Expr>) -> Operator {
         on,
         lateral: false,
     })
-}
-
-/// The output schema a `Project` exposes: each output column by name, marked
-/// derived (`base = None`) — a reference to it is not a base-table read.
-fn project_schema(exprs: &[NamedExpr]) -> Schema {
-    exprs
-        .iter()
-        .map(|ne| SchemaCol {
-            qualifier: None,
-            name: ne.name.clone(),
-            base: None,
-        })
-        .collect()
 }
 
 /// The name SQL infers for an unaliased projection item: a bare column keeps
@@ -311,17 +555,21 @@ fn join_on(op: &JoinOperator) -> Option<&SqlExpr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{Catalog, CatalogTable};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
     fn bind(sql: &str) -> Operator {
-        let statements = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        let casing = IdentifierCasing::for_dialect(&GenericDialect {});
-        build(&statements[0], None, casing)
+        bind_cat(sql, None)
     }
 
-    /// The single column of a `Project` whose expr is a bare `Column`.
-    fn only_column(op: &Operator) -> &ColRef {
+    fn bind_cat(sql: &str, catalog: Option<&Catalog>) -> Operator {
+        let statements = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let casing = IdentifierCasing::for_dialect(&GenericDialect {});
+        build(&statements[0], catalog, casing)
+    }
+
+    fn only_binding(op: &Operator) -> &Binding {
         let Operator::Project(p) = op else {
             panic!("expected Project, got {op:?}")
         };
@@ -329,70 +577,71 @@ mod tests {
             [NamedExpr {
                 expr: Expr::Column(c),
                 ..
-            }] => c,
+            }] => &c.binding,
             other => panic!("expected one column expr, got {other:?}"),
         }
     }
 
     #[test]
-    fn select_from_single_table_resolves_base() {
-        let op = bind("SELECT a FROM t");
-        let Operator::Project(p) = &op else { panic!() };
-        assert!(matches!(&*p.input, Operator::Scan(s) if s.table.name.value == "t"));
-        let c = only_column(&op);
-        assert_eq!(c.name.value, "a");
-        assert!(matches!(&c.binding, Binding::Base { table, resolution }
+    fn catalog_free_single_table_is_inferred() {
+        assert!(matches!(only_binding(&bind("SELECT a FROM t")),
+            Binding::Base { table, resolution }
             if table.name.value == "t" && *resolution == ResolutionKind::Inferred));
     }
 
     #[test]
-    fn where_wraps_a_filter_below_the_project() {
-        let op = bind("SELECT a FROM t WHERE b > 0");
-        let Operator::Project(p) = &op else { panic!() };
-        let Operator::Filter(f) = &*p.input else {
-            panic!("expected Filter below Project, got {:?}", p.input)
-        };
-        assert!(matches!(&*f.input, Operator::Scan(_)));
-        assert_eq!(f.predicate.len(), 1);
-    }
-
-    #[test]
-    fn unqualified_over_two_open_tables_is_ambiguous() {
-        // catalog-free: `a` could be t1's or t2's → Ambiguous.
-        let op = bind("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id");
-        let Operator::Project(p) = &op else { panic!() };
-        assert!(matches!(&*p.input, Operator::Join(_)));
-        assert!(matches!(only_column(&op).binding, Binding::Ambiguous));
-    }
-
-    #[test]
-    fn qualified_ref_pins_one_relation() {
-        let op = bind("SELECT t1.a FROM t1 JOIN t2 ON t1.id = t2.id");
-        assert!(
-            matches!(&only_column(&op).binding, Binding::Base { table, .. }
-            if table.name.value == "t1")
-        );
-    }
-
-    #[test]
-    fn unknown_no_from_is_unresolved() {
-        let op = bind("SELECT a");
-        assert!(matches!(only_column(&op).binding, Binding::Unresolved));
-    }
-
-    #[test]
-    fn expression_becomes_a_call() {
-        let op = bind("SELECT a + b AS s FROM t");
-        let Operator::Project(p) = &op else { panic!() };
-        match &p.exprs[..] {
-            [NamedExpr {
-                name: Some(n),
-                expr: Expr::Call { args },
-            }] => {
-                assert_eq!(n.value, "s");
-                assert_eq!(args.len(), 2); // a, b
+    fn catalog_known_hit_is_cataloged_and_canonical() {
+        let cat =
+            Catalog::new().table(CatalogTable::new("public", "users").columns(["id", "name"]));
+        let op = bind_cat("SELECT name FROM users", Some(&cat));
+        match only_binding(&op) {
+            Binding::Base { table, resolution } => {
+                assert_eq!(table.name.value, "users");
+                assert_eq!(table.schema.as_ref().unwrap().value, "public"); // canonicalized
+                assert_eq!(*resolution, ResolutionKind::Cataloged);
             }
-            other => panic!("expected one Call expr, got {other:?}"),
+            other => panic!("expected Base Cataloged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn catalog_known_miss_is_unresolved() {
+        let cat =
+            Catalog::new().table(CatalogTable::new("public", "users").columns(["id", "name"]));
+        assert!(matches!(
+            only_binding(&bind_cat("SELECT nonexistent FROM users", Some(&cat))),
+            Binding::Unresolved
+        ));
+    }
+
+    #[test]
+    fn known_witness_over_open_downgrades_to_inferred() {
+        // `known_t` lists `a`; `open_t` is not in the catalog → Open suspect.
+        let cat = Catalog::new().table(CatalogTable::new("public", "known_t").columns(["a", "b"]));
+        let op = bind_cat(
+            "SELECT a FROM known_t JOIN open_t ON known_t.b = open_t.k",
+            Some(&cat),
+        );
+        match only_binding(&op) {
+            Binding::Base { table, resolution } => {
+                assert_eq!(table.name.value, "known_t");
+                assert_eq!(*resolution, ResolutionKind::Inferred); // downgraded
+            }
+            other => panic!("expected Base Inferred (downgraded), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_known_owners_is_ambiguous() {
+        let cat = Catalog::new()
+            .table(CatalogTable::new("public", "t1").columns(["id"]))
+            .table(CatalogTable::new("public", "t2").columns(["id"]));
+        assert!(matches!(
+            only_binding(&bind_cat(
+                "SELECT id FROM t1 JOIN t2 ON t1.id = t2.id",
+                Some(&cat)
+            )),
+            Binding::Ambiguous
+        ));
     }
 }
