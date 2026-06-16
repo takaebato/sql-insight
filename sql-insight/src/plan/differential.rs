@@ -190,6 +190,23 @@ fn derived_cte_setop_parity() {
 }
 
 #[test]
+fn subquery_parity() {
+    // Subqueries in expressions: scalar (value) vs predicate (filter), and
+    // correlation (catalog-free).
+    let corpus = [
+        "SELECT a FROM s WHERE id IN (SELECT id FROM x)", // IN: x read, not a lineage feeder
+        "SELECT (SELECT max(v) FROM u) AS m FROM s",      // scalar: u feeds the value
+        "SELECT a, (SELECT max(v) FROM u) AS m FROM s",
+        "SELECT a FROM s WHERE a > (SELECT avg(b) FROM s2)", // scalar in predicate
+        "SELECT a FROM s WHERE EXISTS (SELECT 1 FROM x WHERE x.id = s.id)", // correlated EXISTS
+        "SELECT a FROM s WHERE id IN (SELECT id FROM x WHERE x.k = s.k)", // correlated IN
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+}
+
+#[test]
 fn catalog_aware_parity() {
     use crate::catalog::CatalogTable;
     let catalog = Catalog::new()

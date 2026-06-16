@@ -39,6 +39,7 @@ pub(crate) fn build(
         catalog,
         casing,
         ctes: Vec::new(),
+        outer: Vec::new(),
     }
     .bind_statement(statement)
 }
@@ -75,12 +76,15 @@ struct OutputCol {
 }
 
 /// A relation in scope: its use-site alias (if any) and where its columns
-/// come from.
+/// come from. Cloned onto the correlation stack so an inner subquery can
+/// resolve against enclosing relations.
+#[derive(Clone)]
 struct Relation {
     alias: Option<Ident>,
     source: RelSource,
 }
 
+#[derive(Clone)]
 enum RelSource {
     /// A real table: its canonical identity, catalog column knowledge, and
     /// table-level resolution.
@@ -119,16 +123,34 @@ struct Binder<'a> {
     casing: IdentifierCasing,
     /// CTEs in scope (declaration order, innermost `WITH` last).
     ctes: Vec<CteEnv>,
+    /// Enclosing queries' relations (the correlation stack, outermost first)
+    /// that an inner subquery's references fall through to.
+    outer: Vec<Vec<Relation>>,
 }
 
 impl Binder<'_> {
     /// A child binder with a different CTE environment (sharing catalog /
-    /// casing).
+    /// casing / correlation stack).
     fn with_ctes(&self, ctes: Vec<CteEnv>) -> Binder<'_> {
         Binder {
             catalog: self.catalog,
             casing: self.casing,
             ctes,
+            outer: self.outer.clone(),
+        }
+    }
+
+    /// A child binder with one more enclosing scope on the correlation stack
+    /// (used when descending into a subquery in an expression / a LATERAL
+    /// factor).
+    fn with_outer(&self, relations: Vec<Relation>) -> Binder<'_> {
+        let mut outer = self.outer.clone();
+        outer.push(relations);
+        Binder {
+            catalog: self.catalog,
+            casing: self.casing,
+            ctes: self.ctes.clone(),
+            outer,
         }
     }
 
@@ -403,9 +425,27 @@ impl Binder<'_> {
             SqlExpr::Function(function) => Expr::Call {
                 args: self.bind_function_args(function, scope),
             },
+            // A scalar subquery (value position): its output flows into the
+            // enclosing value.
+            SqlExpr::Subquery(query) => Expr::Subquery(Box::new(self.bind_subquery(query, scope))),
+            // A test (filter position): its columns are reads, never an origin.
+            SqlExpr::Exists { subquery, .. } => {
+                Expr::Exists(Box::new(self.bind_subquery(subquery, scope)))
+            }
+            SqlExpr::InSubquery { expr, subquery, .. } => Expr::InSubquery {
+                expr: Box::new(self.bind_expr(expr, scope)),
+                subquery: Box::new(self.bind_subquery(subquery, scope)),
+            },
             // Literals and not-yet-modelled forms contribute no column refs.
             _ => Expr::Call { args: Vec::new() },
         }
+    }
+
+    /// Bind a subquery nested in an expression: its references resolve against
+    /// its own FROM plus the containing scope's relations (pushed onto the
+    /// correlation stack), so a correlated reference reaches outward.
+    fn bind_subquery(&self, query: &Query, scope: &Scope) -> Operator {
+        self.with_outer(scope.relations.clone()).bind_query(query).0
     }
 
     fn bind_function_args(&self, function: &Function, scope: &Scope) -> Vec<Expr> {
@@ -512,30 +552,46 @@ impl Binder<'_> {
                 }
             }
         }
-        let binding = if parts.len() == 1 {
-            let candidates = scope
-                .relations
-                .iter()
-                .filter_map(|rel| self.unqualified_candidate(rel, name))
-                .collect();
-            self.pick(candidates)
-        } else {
-            let qualifier_parts = &parts[..parts.len() - 1];
-            let qualifier_ref = TableReference::try_from_parts(qualifier_parts);
-            let candidates = scope
-                .relations
-                .iter()
-                .filter_map(|rel| {
-                    self.qualified_candidate(rel, qualifier_parts, qualifier_ref.as_ref(), name)
-                })
-                .collect();
-            self.pick(candidates)
-        };
+        // Resolve against the current scope, then fall through the enclosing
+        // scopes (correlation), innermost first, before giving up.
+        let binding = self
+            .resolve_in(parts, &scope.relations)
+            .or_else(|| {
+                self.outer
+                    .iter()
+                    .rev()
+                    .find_map(|relations| self.resolve_in(parts, relations))
+            })
+            .unwrap_or(Binding::Unresolved);
         ColRef {
             qualifier: (parts.len() >= 2).then(|| parts[parts.len() - 2].clone()),
             name: name.clone(),
             binding,
         }
+    }
+
+    /// Resolve `parts` against one set of relations, returning `None` when none
+    /// could own the column (so the caller falls through to an enclosing
+    /// scope) and `Some(binding)` once at least one is a candidate (even if
+    /// that collapses to `Ambiguous` — a name owned here doesn't escape).
+    fn resolve_in(&self, parts: &[Ident], relations: &[Relation]) -> Option<Binding> {
+        let name = parts.last()?;
+        let candidates: Vec<Candidate> = if parts.len() == 1 {
+            relations
+                .iter()
+                .filter_map(|rel| self.unqualified_candidate(rel, name))
+                .collect()
+        } else {
+            let qualifier_parts = &parts[..parts.len() - 1];
+            let qualifier_ref = TableReference::try_from_parts(qualifier_parts);
+            relations
+                .iter()
+                .filter_map(|rel| {
+                    self.qualified_candidate(rel, qualifier_parts, qualifier_ref.as_ref(), name)
+                })
+                .collect()
+        };
+        (!candidates.is_empty()).then(|| self.pick(candidates))
     }
 
     /// A relation is an unqualified candidate iff it could own `name`: a

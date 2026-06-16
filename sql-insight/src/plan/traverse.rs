@@ -111,9 +111,56 @@ fn walk(op: &Operator, f: &mut impl FnMut(&Operator)) {
     for child in children(op) {
         walk(child, f);
     }
+    // Subqueries nested in this node's expressions (a `WHERE … IN (SELECT …)`
+    // / scalar subquery) are sub-plans too — their scans must surface.
+    for sub in own_expr_subplans(op) {
+        walk(sub, f);
+    }
     if let Operator::With(w) = op {
         for cte in &w.ctes {
             walk(&cte.plan, f);
+        }
+    }
+}
+
+/// The sub-plans appearing in this node's *own* expressions (not its
+/// children's). `walk` recurses into them; `collect_reads` reaches them via
+/// `expr_reads`.
+fn own_expr_subplans(op: &Operator) -> Vec<&Operator> {
+    let mut out = Vec::new();
+    for expr in own_exprs(op) {
+        collect_subplans(expr, &mut out);
+    }
+    out
+}
+
+fn collect_subplans<'a>(expr: &'a Expr, out: &mut Vec<&'a Operator>) {
+    match expr {
+        Expr::Column(_) => {}
+        Expr::Call { args } => args.iter().for_each(|e| collect_subplans(e, out)),
+        Expr::Case { when, then, else_ } => {
+            when.iter()
+                .chain(then)
+                .for_each(|e| collect_subplans(e, out));
+            if let Some(e) = else_ {
+                collect_subplans(e, out);
+            }
+        }
+        Expr::Window {
+            arg,
+            partition,
+            order,
+        } => {
+            collect_subplans(arg, out);
+            partition
+                .iter()
+                .chain(order)
+                .for_each(|e| collect_subplans(e, out));
+        }
+        Expr::Subquery(plan) | Expr::Exists(plan) => out.push(plan),
+        Expr::InSubquery { expr, subquery } => {
+            collect_subplans(expr, out);
+            out.push(subquery);
         }
     }
 }
