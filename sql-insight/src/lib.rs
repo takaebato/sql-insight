@@ -205,6 +205,12 @@ pub mod normalizer;
 // for the extraction surfaces. Backs every public extractor.
 mod resolver;
 
+// INCUBATING (not wired): the option-(a) redesign — a standard logical
+// plan (`Operator`) + a column-origin traversal, built alongside
+// `resolver` and switched in at differential parity, then renamed to
+// `resolver`. See memory `project_operator_redesign`.
+mod plan;
+
 // Dialect-aware identifier casing (case folding for table / alias /
 // column matching). Threaded into the binder and the extractors.
 pub(crate) mod casing;
