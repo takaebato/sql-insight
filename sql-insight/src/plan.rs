@@ -26,3 +26,6 @@
 mod binder;
 mod operator;
 mod traverse;
+
+#[cfg(test)]
+mod differential;
