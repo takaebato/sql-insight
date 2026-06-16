@@ -23,12 +23,8 @@
 //! (pipe-operator output rewriting, MERGE catalog-fill writes).
 
 mod binder;
-mod catalog_match;
-mod collect;
 mod extract;
-mod helpers;
 mod ir;
-mod scope;
 
 pub(crate) use binder::build_plan;
 pub(crate) use extract::{

@@ -4,8 +4,7 @@
 //! [`super::binder::build_with_diagnostics`] — they
 //! carry only resolved data (each [`BoundColumn::provenance`] is already
 //! collapsed to real base columns). The bind-time resolution scope
-//! ([`super::scope::Scope`]) is scratch and lives in the binder, not
-//! here.
+//! (`Scope`, private to the binder) is scratch and lives there, not here.
 
 use sqlparser::ast::Ident;
 

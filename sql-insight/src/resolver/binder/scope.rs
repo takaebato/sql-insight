@@ -1,20 +1,20 @@
 //! The bind-time resolution vocabulary: the scratch types the [`Binder`]
 //! threads while walking the AST. None of these are stored on the
-//! [`Plan`](super::ir::Plan) — they exist only during the bind, so a
+//! [`Plan`](crate::resolver::ir::Plan) — they exist only during the bind, so a
 //! reference can be resolved against the relations / outputs visible at
 //! each point. Fields are `pub(super)` (resolver-internal): the binder
 //! constructs and reads them directly.
 //!
-//! [`Binder`]: super::binder
+//! [`Binder`]: super::Binder
 
 use sqlparser::ast::Ident;
 
-use super::ir::{BoundColumn, ProvenanceSource};
 use crate::reference::TableReference;
+use crate::resolver::ir::{BoundColumn, ProvenanceSource};
 
 /// Bind-time resolution scope: the relations visible at a point in the
 /// bind, plus (for the output-alias-visible clauses) the enclosing
-/// SELECT's output columns. Scratch — never stored on the [`Plan`](super::ir::Plan).
+/// SELECT's output columns. Scratch — never stored on the [`Plan`](crate::resolver::ir::Plan).
 #[derive(Clone, Default)]
 pub(super) struct Scope {
     pub(super) relations: Vec<Relation>,
@@ -133,9 +133,9 @@ pub(super) struct Candidate {
 /// once at its `WITH` declaration. This is the bind-time *resolution*
 /// entry — just the name and the exposed `outputs` (already collapsed like
 /// a derived table). The body sub-plan itself lives on the
-/// [`With`](super::ir::With) node (so it is walked once regardless of
+/// [`With`](crate::resolver::ir::With) node (so it is walked once regardless of
 /// reference count); a FROM reference resolves through these `outputs` and
-/// emits a lightweight [`CteRef`](super::ir::CteRef), never a clone of the
+/// emits a lightweight [`CteRef`](crate::resolver::ir::CteRef), never a clone of the
 /// body.
 #[derive(Clone)]
 pub(super) struct CteRelation {

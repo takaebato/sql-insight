@@ -3,10 +3,10 @@
 //! (value vs filter). Scratch — fields are `pub(super)` so the binder's
 //! `collect_*` methods read and write them directly.
 //!
-//! [`Binder`]: super::binder
+//! [`Binder`]: super::Binder
 
-use super::ir::{BoundColumn, Plan, ProvenanceSource};
 use crate::reference::ColumnRead;
+use crate::resolver::ir::{BoundColumn, Plan, ProvenanceSource};
 
 /// Accumulator for walking one expression. References split by position:
 /// `sources` are value references (they flow to the output → lineage),

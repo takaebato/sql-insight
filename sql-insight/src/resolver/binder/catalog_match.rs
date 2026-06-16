@@ -2,7 +2,7 @@
 //! table's canonical identity + column list, under the dialect's table
 //! casing. [`TableMatch`] is the one-shape outcome; the free functions are
 //! the (default-fill, right-anchored, cased) matching mechanics. The
-//! [`Binder::table_match`](super::binder) method drives them.
+//! [`Binder::table_match`](super::Binder::table_match) method drives them.
 
 use sqlparser::ast::Ident;
 

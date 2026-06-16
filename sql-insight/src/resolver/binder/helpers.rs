@@ -1,4 +1,4 @@
-//! Free helper functions shared by the [`Binder`](super::binder): small,
+//! Free helper functions shared by the [`Binder`](super::Binder): small,
 //! self-contained utilities for building / tagging plan nodes, pulling
 //! structure out of the sqlparser AST, and constructing reads / provenance
 //! sources. All `pub(super)` — resolver-internal.
@@ -8,9 +8,9 @@ use sqlparser::ast::{
     ObjectName, SetExpr, Table, TableAlias,
 };
 
-use super::ir::{BoundColumn, PassThrough, Plan, ProvenanceSource, Scan, ScanRole};
 use crate::extractor::ColumnLineageKind;
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
+use crate::resolver::ir::{BoundColumn, PassThrough, Plan, ProvenanceSource, Scan, ScanRole};
 
 /// The join constraint (`ON …` / `USING …`) of a join operator, if any;
 /// `CROSS`/`APPLY` forms carry none.
@@ -172,7 +172,7 @@ pub(super) fn output_names(outputs: &[BoundColumn]) -> Vec<Ident> {
 /// the enclosing value (its internal filter reads are collected
 /// separately).
 pub(super) fn output_sources(plan: &Plan) -> Vec<ProvenanceSource> {
-    super::extract::output_operands(plan)
+    crate::resolver::extract::output_operands(plan)
         .iter()
         .flat_map(|operand| operand.iter())
         .flat_map(|column| column.provenance.iter().cloned())
