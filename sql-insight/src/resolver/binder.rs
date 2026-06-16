@@ -44,7 +44,7 @@ use self::helpers::{
     ambiguous, assignment_target_columns, object_name_last_ident, passthrough, read, unresolved,
     wrap_reads,
 };
-use self::scope::{Candidate, CteRelation, Relation, RelationColumns, RelationSource, Scope};
+use self::scope::{CteRelation, Relation, RelationColumns, RelationSource, Scope};
 use super::ir::{
     BoundColumn, CtePlan, CteRef, DeletePlan, PassThrough, Plan, Project, ProvenanceSource, Scan,
     ScanRole, SetOp, With, Write,

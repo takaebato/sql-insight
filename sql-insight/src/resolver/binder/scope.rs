@@ -10,7 +10,7 @@
 use sqlparser::ast::Ident;
 
 use crate::reference::TableReference;
-use crate::resolver::ir::{BoundColumn, ProvenanceSource};
+use crate::resolver::ir::BoundColumn;
 
 /// Bind-time resolution scope: the relations visible at a point in the
 /// bind, plus (for the output-alias-visible clauses) the enclosing
@@ -109,24 +109,6 @@ pub(super) enum RelationColumns {
     /// the list resolves `Cataloged`; a name absent means the relation
     /// can't own it.
     Known(Vec<Ident>),
-}
-
-/// One candidate owner of a column reference during resolution, carrying
-/// the provenance it would contribute.
-pub(super) struct Candidate {
-    /// The real base columns this candidate resolves the reference to:
-    /// one entry for a real table, the derived column's full (already
-    /// collapsed) provenance for a synthetic one.
-    pub(super) provenance: Vec<ProvenanceSource>,
-    /// A `Known` schema lists the column (or a derived relation exposes
-    /// it) — drives the Known-witness-over-Open tiebreaker.
-    pub(super) confirmed: bool,
-    /// The candidate is a derived / synthetic relation. Its provenance is
-    /// already collapsed to real columns, so the witness tiebreaker keeps
-    /// it verbatim rather than downgrading to `Inferred`: a real table's
-    /// own ref is downgraded, but a synthetic relation's inner refs keep
-    /// their resolution (the synthetic name never surfaces anyway).
-    pub(super) synthetic: bool,
 }
 
 /// A common table expression in scope: a named synthetic relation. Bound

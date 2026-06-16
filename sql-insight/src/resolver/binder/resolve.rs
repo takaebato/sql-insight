@@ -1,5 +1,24 @@
 use super::*;
 
+/// One candidate owner of a column reference during resolution, carrying
+/// the provenance it would contribute. Built per in-scope relation and
+/// collapsed by [`Binder::pick`]; never leaves this module.
+struct Candidate {
+    /// The real base columns this candidate resolves the reference to:
+    /// one entry for a real table, the derived column's full (already
+    /// collapsed) provenance for a synthetic one.
+    provenance: Vec<ProvenanceSource>,
+    /// A `Known` schema lists the column (or a derived relation exposes
+    /// it) — drives the Known-witness-over-Open tiebreaker.
+    confirmed: bool,
+    /// The candidate is a derived / synthetic relation. Its provenance is
+    /// already collapsed to real columns, so the witness tiebreaker keeps
+    /// it verbatim rather than downgrading to `Inferred`: a real table's
+    /// own ref is downgraded, but a synthetic relation's inner refs keep
+    /// their resolution (the synthetic name never surfaces anyway).
+    synthetic: bool,
+}
+
 impl Binder<'_> {
     /// Record a `WildcardSuppressed` diagnostic for a projection wildcard
     /// (`*` / `t.*` / `(expr).*`) left unexpanded, carrying the wildcard
@@ -189,11 +208,7 @@ impl Binder<'_> {
     /// A relation is an unqualified candidate iff it could own `column`:
     /// a `Known` schema must list it; an `Open` real table always could;
     /// a derived relation must expose it.
-    pub(super) fn unqualified_candidate(
-        &self,
-        rel: &Relation,
-        column: &Ident,
-    ) -> Option<Candidate> {
+    fn unqualified_candidate(&self, rel: &Relation, column: &Ident) -> Option<Candidate> {
         match &rel.source {
             RelationSource::Table {
                 table,
@@ -228,7 +243,7 @@ impl Binder<'_> {
     /// pins a `Known` table that doesn't list the column it still resolves
     /// (`Inferred`); a derived relation that doesn't expose it contributes
     /// nothing.
-    pub(super) fn qualified_candidate(
+    fn qualified_candidate(
         &self,
         rel: &Relation,
         qualifier_parts: &[Ident],
@@ -308,7 +323,7 @@ impl Binder<'_> {
     /// source (a `VALUES` literal / `SELECT` constant) falls back to a
     /// synthetic self-reference (`alias.column`), so it is still a lineage
     /// source rather than vanishing.
-    pub(super) fn derived_candidate(
+    fn derived_candidate(
         &self,
         rel: &Relation,
         columns: &[BoundColumn],
@@ -355,7 +370,7 @@ impl Binder<'_> {
     /// confirmed → that Known witness wins (a real table downgrades to
     /// `Inferred`, a synthetic one keeps its provenance); otherwise
     /// `Ambiguous`.
-    pub(super) fn pick(&self, candidates: Vec<Candidate>, column: &Ident) -> Vec<ProvenanceSource> {
+    fn pick(&self, candidates: Vec<Candidate>, column: &Ident) -> Vec<ProvenanceSource> {
         if candidates.is_empty() {
             return vec![passthrough(unresolved(column))];
         }
