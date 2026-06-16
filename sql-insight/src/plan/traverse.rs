@@ -341,19 +341,12 @@ fn origins_into<'a>(
             ctx.active.pop();
             o
         }
-        // A base column is its own origin (reached only for a base-bound ref
-        // that nonetheless traced here, e.g. a `Scan` directly under an alias).
-        Operator::Scan(s) => vec![(
-            ColumnRead {
-                reference: ColumnReference {
-                    table: Some(s.table.clone()),
-                    name: name.clone(),
-                },
-                resolution: s.resolution,
-            },
-            ColumnLineageKind::Passthrough,
-        )],
-        Operator::Values(_) | Operator::Empty => Vec::new(),
+        // A `Derived` reference resolves at a producer's named output (a
+        // `Project` / `Aggregate` expr), never at a raw `Scan` — a reference to
+        // a base column is `Binding::Base` and returns directly, not via this
+        // traversal. So a `Scan` reached here (e.g. the other side of a join
+        // the qualified name doesn't own) contributes nothing.
+        Operator::Scan(_) | Operator::Values(_) | Operator::Empty => Vec::new(),
         // DML/DDL roots are not column producers traced into here.
         Operator::Insert(_)
         | Operator::Update(_)

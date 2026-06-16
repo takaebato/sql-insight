@@ -17,9 +17,10 @@
 //! unhandled constructs fall to [`Operator::Empty`].
 
 use sqlparser::ast::{
-    Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    GroupByWithModifier, Ident, JoinConstraint, JoinOperator, OrderBy, OrderByExpr, OrderByKind,
-    Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
+    Cte as SqlCte, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, GroupByWithModifier, Ident, JoinConstraint, JoinOperator, OrderBy, OrderByExpr,
+    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
+    TableWithJoins,
 };
 
 use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
@@ -173,19 +174,12 @@ impl Binder<'_> {
         let mut env = self.ctes.clone();
         let mut declared = Vec::new();
         for cte in &with.cte_tables {
-            let (mut plan, scope) = self.with_ctes(env.clone()).bind_query(&cte.query);
-            let columns = exposed_columns(&scope.outputs, Some(&cte.alias));
-            // An explicit `c (x, y)` column list renames the body's output
-            // columns so a reference through the CTE traces to them.
-            rename_outputs(&mut plan, &alias_column_names(&cte.alias));
+            let (entry, plan) = self.bind_cte(cte, &env, with.recursive);
             declared.push(super::operator::Cte {
-                name: cte.alias.name.clone(),
+                name: entry.name.clone(),
                 plan,
             });
-            env.push(CteEnv {
-                name: cte.alias.name.clone(),
-                columns,
-            });
+            env.push(entry);
         }
         let (body, scope) = self.with_ctes(env).bind_query_body(query);
         (
@@ -195,6 +189,39 @@ impl Binder<'_> {
             }),
             scope,
         )
+    }
+
+    /// Bind one declared CTE against the environment of the earlier CTEs,
+    /// returning its scope entry (name + exposed columns) and its bound body.
+    /// A `RECURSIVE` CTE registers its name provisionally first so the body's
+    /// self-reference resolves: a set-operation body learns its column shape
+    /// from the anchor (the left branch); any other body registers with no
+    /// known columns (so a self-reference is still a `CteRef`, not a phantom).
+    fn bind_cte(&self, cte: &SqlCte, env: &[CteEnv], recursive: bool) -> (CteEnv, Operator) {
+        let name = cte.alias.name.clone();
+        let inner_env = if recursive {
+            let provisional = match cte.query.body.as_ref() {
+                SetExpr::SetOperation { left, .. } => exposed_columns(
+                    &self.with_ctes(env.to_vec()).bind_set_expr(left).1.outputs,
+                    Some(&cte.alias),
+                ),
+                _ => Vec::new(),
+            };
+            let mut e = env.to_vec();
+            e.push(CteEnv {
+                name: name.clone(),
+                columns: provisional,
+            });
+            e
+        } else {
+            env.to_vec()
+        };
+        let (mut plan, scope) = self.with_ctes(inner_env).bind_query(&cte.query);
+        let columns = exposed_columns(&scope.outputs, Some(&cte.alias));
+        // An explicit `c (x, y)` column list renames the body's output columns
+        // so a reference through the CTE traces to them.
+        rename_outputs(&mut plan, &alias_column_names(&cte.alias));
+        (CteEnv { name, columns }, plan)
     }
 
     /// Bind a query's body and trailing ORDER BY (the `WITH` is already in
@@ -286,20 +313,26 @@ impl Binder<'_> {
         let Some(first) = iter.next() else {
             return (Operator::Empty, Scope::default());
         };
-        let (mut node, mut scope) = self.bind_table_with_joins(first);
-        // Comma-separated FROM items are a cross join.
+        let (mut node, mut scope) = self.bind_table_with_joins(first, &[]);
+        // Comma-separated FROM items are a cross join; a later item sees the
+        // earlier ones only if it is LATERAL.
         for twj in iter {
-            let (right, right_scope) = self.bind_table_with_joins(twj);
+            let (right, right_scope) = self.bind_table_with_joins(twj, &scope.relations);
             scope.relations.extend(right_scope.relations);
             node = join(node, right, Vec::new());
         }
         (node, scope)
     }
 
-    fn bind_table_with_joins(&self, twj: &TableWithJoins) -> (Operator, Scope) {
-        let (mut node, mut scope) = self.bind_table_factor(&twj.relation);
+    /// `left` are the FROM siblings to this item's left, visible to a LATERAL
+    /// factor (and to a joined factor, after the preceding join inputs).
+    fn bind_table_with_joins(&self, twj: &TableWithJoins, left: &[Relation]) -> (Operator, Scope) {
+        let (mut node, mut scope) = self.bind_table_factor(&twj.relation, left);
         for j in &twj.joins {
-            let (right, right_scope) = self.bind_table_factor(&j.relation);
+            // A joined LATERAL factor sees the left siblings plus the join
+            // inputs accumulated so far.
+            let visible: Vec<Relation> = left.iter().chain(&scope.relations).cloned().collect();
+            let (right, right_scope) = self.bind_table_factor(&j.relation, &visible);
             scope.relations.extend(right_scope.relations);
             // The ON predicate resolves against both sides' columns.
             let on = join_on(&j.join_operator)
@@ -311,7 +344,7 @@ impl Binder<'_> {
         (node, scope)
     }
 
-    fn bind_table_factor(&self, factor: &TableFactor) -> (Operator, Scope) {
+    fn bind_table_factor(&self, factor: &TableFactor, left: &[Relation]) -> (Operator, Scope) {
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 let Ok(written) = TableReference::try_from_name(name) else {
@@ -364,11 +397,20 @@ impl Binder<'_> {
                 (scan, scope_of(relation))
             }
             // A derived table `(<subquery>) AS d`: bind the subquery, expose
-            // its output columns as a synthetic relation under the alias.
+            // its output columns as a synthetic relation under the alias. A
+            // LATERAL derived table sees the left siblings (pushed onto the
+            // correlation stack); a non-lateral one does not.
             TableFactor::Derived {
-                subquery, alias, ..
+                lateral,
+                subquery,
+                alias,
+                ..
             } => {
-                let (mut op, sub_scope) = self.bind_query(subquery);
+                let (mut op, sub_scope) = if *lateral {
+                    self.with_outer(left.to_vec()).bind_query(subquery)
+                } else {
+                    self.bind_query(subquery)
+                };
                 let columns = exposed_columns(&sub_scope.outputs, alias.as_ref());
                 let relation = Relation {
                     alias: alias.as_ref().map(|a| a.name.clone()),

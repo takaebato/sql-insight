@@ -206,6 +206,63 @@ fn subquery_parity() {
     }
 }
 
+/// Build the new-engine surfaces directly (for divergence cases asserted on
+/// their own, not against resolver).
+fn plan_surfaces(sql: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+    let casing = IdentifierCasing::for_dialect(&GenericDialect {});
+    let op = super::binder::build(&stmts[0], None, casing);
+    (
+        read_bag(&super::traverse::reads(&op)),
+        lineage_bag(&super::traverse::column_lineage(&op)),
+        table_read_bag(&super::traverse::table_reads(&op)),
+    )
+}
+
+#[test]
+fn recursive_cte_terminates() {
+    // Accepted improvement divergence: the new engine collapses the output to
+    // the real anchor base once and terminates the self-reference (active-set),
+    // where resolver emits a duplicate (anchor + self-ref-collapsed-to-anchor).
+    let (mut reads, mut lineage, mut tables) = plan_surfaces(
+        "WITH RECURSIVE c AS (SELECT id FROM base UNION ALL SELECT id FROM c) SELECT id FROM c",
+    );
+    reads.sort();
+    lineage.sort();
+    tables.sort();
+    assert_eq!(reads, vec!["base.id#Inferred"]);
+    assert_eq!(lineage, vec!["base.id -Passthrough-> out[0]:id"]);
+    assert_eq!(tables, vec!["base#Inferred"]);
+}
+
+#[test]
+fn lateral_correlation_parity() {
+    // A LATERAL factor referencing a left sibling — both engines resolve it
+    // (resolver doesn't enforce lateral, the new engine threads the left
+    // siblings for a lateral factor), so they agree here.
+    let corpus = [
+        "SELECT d.s FROM t1 u, LATERAL (SELECT u.x AS s FROM t2) d",
+        "SELECT d.s FROM t1 u JOIN LATERAL (SELECT u.x AS s FROM t2) d ON true",
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+}
+
+#[test]
+fn lateral_enforcement_divergence() {
+    // A NON-lateral derived table referencing a left sibling is invalid SQL;
+    // the new engine leaves it `Unresolved` (correct), where resolver
+    // mis-resolves it to the sibling. This is the accepted improvement
+    // divergence (asserted on the new engine directly, not against resolver).
+    let (reads, _lineage, _tables) =
+        plan_surfaces("SELECT d.s FROM t1 u, (SELECT u.x AS s FROM t2) d");
+    // `u.x` inside the non-lateral derived table can't see the sibling `u` →
+    // it is `Unresolved` (resolver mis-resolves it to t1.x). `d.s` is derived
+    // (dropped). So the only column read is the unresolved `x`.
+    assert_eq!(reads, vec!["?.x#Unresolved"]);
+}
+
 #[test]
 fn catalog_aware_parity() {
     use crate::catalog::CatalogTable;
