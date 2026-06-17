@@ -45,10 +45,10 @@
 //! - **Diagnostics** ([`diagnostic::TableLevelDiagnostic`] /
 //!   [`diagnostic::ColumnLevelDiagnostic`]) — non-fatal issues surface
 //!   alongside the extraction result rather than failing the whole call.
-//!   Two kinds remain: unsupported statements and suppressed wildcards.
-//!   Per-reference resolution outcomes live on
-//!   [`ColumnRead::resolution`] instead, so the diagnostic stream is
-//!   reserved for tool-side coverage gaps.
+//!   The kinds are tool-side coverage gaps: unsupported statements,
+//!   suppressed wildcards, and over-qualified table names. Per-reference
+//!   resolution outcomes live on [`ColumnRead::resolution`] instead, so
+//!   the diagnostic stream stays reserved for those gaps.
 //!
 //! ## Quick Start
 //!
@@ -133,25 +133,27 @@
 //!   SQL-text-only library. Surfaced as
 //!   [`WildcardSuppressed`](diagnostic::ColumnLevelDiagnosticKind::WildcardSuppressed)
 //!   so consumers can detect incomplete projections.
-//! - **TableFunction schemas stay `Unknown`** (`UNNEST`,
-//!   `generate_series`, `JSON_TABLE`, etc.) — catalog enrichment
-//!   doesn't reach them yet.
-//! - **Recursive CTE bodies** are pre-bound under a stub for
-//!   self-reference. Table-level lineage traces the anchor branch's
-//!   real tables; column-level projection collapse through the
-//!   recursive body is deferred, so a column lineage edge surfaces
-//!   with the CTE binding as the source rather than tracing into the
-//!   underlying table.
+//! - **Table functions are opaque**: `UNNEST` / `generate_series` /
+//!   `JSON_TABLE` / `PIVOT` etc. produce dynamic columns that aren't
+//!   enumerated. Their argument expressions surface as reads, but a
+//!   reference *through* such a relation (`u.col`) is a synthetic
+//!   lineage source named by the alias, not a cataloged real-table read.
+//! - **Recursive CTEs aren't unrolled**: the recursive self-reference
+//!   terminates against the anchor branch's columns (via an active-set),
+//!   so lineage traces through to the anchor's real tables — it doesn't
+//!   enumerate per-iteration contributions.
 //! - **Lineage kind is coarse** (`Passthrough` vs `Transformation`).
 //!   Aggregates, window functions, arithmetic, casts, etc. are all
 //!   `Transformation` — the model deliberately does not sub-classify
 //!   "changed" values (that distinction is lossy for edge cases like
 //!   window aggregates and value-preserving `STRING_AGG`, and not
 //!   needed for the core dependency / impact-analysis use case).
-//! - **Multi-segment qualifiers** (`s.t.col`): only the head `s`
-//!   is matched against in-scope bindings for synthetic-vs-real
-//!   classification — schema- / catalog-qualified shapes resolve
-//!   loosely.
+//! - **Qualifier matching is right-anchored**: a partial qualifier
+//!   (`users.col`) matches a fuller registered path (`mydb.users`),
+//!   and a bare name does not merge into a schema-qualified one. A
+//!   table reference with more than `catalog.schema.name` segments
+//!   can't be represented, so it's dropped and flagged
+//!   [`TooManyTableQualifiers`](diagnostic::ColumnLevelDiagnosticKind::TooManyTableQualifiers).
 //! - **No type checking**: the catalog is an enrichment input,
 //!   not a validator. Type compatibility, coercion, and nullability
 //!   are out of scope.
@@ -165,19 +167,24 @@
 //!   multiple in-scope tables (`SELECT x FROM a JOIN b`) is not
 //!   determinable from the SQL text alone, so it resolves to
 //!   `table: None`. Qualified (`t.col`) and single-table refs resolve
-//!   fine catalog-free. The ambiguous / unresolved-column diagnostics
-//!   that explain those `None`s fire only *with* a catalog; without
-//!   one they are suppressed (every `Unknown` schema could contain
-//!   anything, so flagging would flood the output with noise). With a
-//!   catalog, those diagnostics fire and INSERT positional pairing
-//!   pairs source projections with target columns.
+//!   fine catalog-free. Those `None`s carry their status on
+//!   [`ColumnRead::resolution`] (`Ambiguous` / `Unresolved`), not a
+//!   diagnostic stream — the consumer reads it off the reference. A
+//!   catalog makes resolution strict: a confirmed hit is
+//!   [`ResolutionKind::Cataloged`], a denied ref [`ResolutionKind::Unresolved`],
+//!   and INSERT without an explicit column list pairs source
+//!   projections with the target's catalog columns. Catalog-free, every
+//!   relation is open (anything could belong), so reads are best-effort
+//!   [`ResolutionKind::Inferred`] / [`ResolutionKind::Ambiguous`].
 //! - **Per-statement isolation**: every extractor returns
 //!   `Vec<Result<X, Error>>` so a bad statement in a multi-statement
 //!   batch doesn't take the rest down.
 //! - **Fatal vs non-fatal split**: parser failures and structural
-//!   problems short-circuit as `Err`; semantic issues (unsupported
-//!   statement, ambiguity, suppressed wildcards) surface in the
-//!   per-statement `diagnostics` list instead.
+//!   problems short-circuit as `Err`; tool-side coverage gaps
+//!   (unsupported statement, suppressed wildcards, over-qualified table
+//!   names) surface in the per-statement `diagnostics` list instead.
+//!   Per-reference resolution outcomes (ambiguous / unresolved columns)
+//!   are not diagnostics — they live on [`ColumnRead::resolution`].
 //! - **[`TableReference`] / [`ColumnReference`] are identity-only**.
 //!   No `alias` field — alias is use-site decoration. `HashSet`
 //!   dedup behaves intuitively across statements.
