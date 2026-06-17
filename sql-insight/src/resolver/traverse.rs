@@ -40,7 +40,7 @@ fn collect_reads(op: &Operator, out: &mut Vec<ColumnRead>) {
     // A `With` walks each CTE body once (declarations); a `CteRef` is a leaf.
     if let Operator::With(w) = op {
         for cte in &w.ctes {
-            collect_reads(&cte.plan, out);
+            collect_reads(&cte.body, out);
         }
     }
 }
@@ -126,7 +126,7 @@ fn walk(op: &Operator, f: &mut impl FnMut(&Operator)) {
     }
     if let Operator::With(w) = op {
         for cte in &w.ctes {
-            walk(&cte.plan, f);
+            walk(&cte.body, f);
         }
     }
 }
@@ -469,7 +469,7 @@ fn merge_value_edges<'a>(
 /// and `With`.
 fn output_operands(op: &Operator) -> Vec<(&[NamedExpr], &Operator)> {
     match op {
-        Operator::Project(p) => vec![(&p.exprs, &p.input)],
+        Operator::Projection(p) => vec![(&p.exprs, &p.input)],
         Operator::Sort(s) => output_operands(&s.input),
         Operator::Filter(f) => output_operands(&f.input),
         Operator::With(w) => output_operands(&w.body),
@@ -661,7 +661,7 @@ fn feeding_scans<'a>(op: &'a Operator, ctx: &mut Ctx<'a>, out: &mut Vec<TableRea
             feeding_scans(&j.left, ctx, out);
             feeding_scans(&j.right, ctx, out);
         }
-        Operator::Project(p) => {
+        Operator::Projection(p) => {
             feeding_scans(&p.input, ctx, out);
             for ne in &p.exprs {
                 expr_feeding(&ne.expr, ctx, out);
@@ -695,7 +695,7 @@ fn feeding_scans<'a>(op: &'a Operator, ctx: &mut Ctx<'a>, out: &mut Vec<TableRea
                 .copied()
             {
                 ctx.active.push(r.name.value.clone());
-                feeding_scans(&cte.plan, ctx, out);
+                feeding_scans(&cte.body, ctx, out);
                 ctx.active.pop();
             }
         }
@@ -825,7 +825,7 @@ fn collect_flat(op: &Operator, out: &mut Vec<TableReference>) {
         Operator::With(w) => {
             collect_flat(&w.body, out);
             for cte in &w.ctes {
-                collect_flat(&cte.plan, out);
+                collect_flat(&cte.body, out);
             }
         }
         // A table function is opaque (not a table binding), but a PIVOT-style
@@ -842,7 +842,7 @@ fn collect_flat(op: &Operator, out: &mut Vec<TableReference>) {
         Operator::Filter(_)
         | Operator::Join(_)
         | Operator::Aggregate(_)
-        | Operator::Project(_)
+        | Operator::Projection(_)
         | Operator::Sort(_)
         | Operator::SetOp(_)
         | Operator::SubqueryAlias(_) => {
@@ -947,7 +947,7 @@ fn origins_into<'a>(
     ctx: &mut Ctx<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match op {
-        Operator::Project(p) => match find_named(&p.exprs, name) {
+        Operator::Projection(p) => match find_named(&p.exprs, name) {
             Some(ne) => origins_of_expr(&ne.expr, &p.input, ctx),
             None => Vec::new(),
         },
@@ -1015,19 +1015,19 @@ fn origins_into<'a>(
             };
             // A VALUES-backed CTE has no traceable base columns — the exposed
             // column is a synthetic source (cte.col).
-            if values_backed(&cte.plan) {
+            if values_backed(&cte.body) {
                 return vec![(
                     synthetic_source(&r.name, name),
                     ColumnLineageKind::Passthrough,
                 )];
             }
             ctx.active.push(r.name.value.clone());
-            let o = origins_into(&cte.plan, None, name, ctx);
+            let o = origins_into(&cte.body, None, name, ctx);
             ctx.active.pop();
             o
         }
         // A `Derived` reference resolves at a producer's named output (a
-        // `Project` / `Aggregate` expr), never at a raw `Scan` — a reference to
+        // `Projection` / `Aggregate` expr), never at a raw `Scan` — a reference to
         // a base column is `Binding::Base` and returns directly, not via this
         // traversal. So a `Scan` reached here (e.g. the other side of a join
         // the qualified name doesn't own) contributes nothing.
@@ -1091,9 +1091,9 @@ fn own_exprs(op: &Operator) -> Vec<&Expr> {
     match op {
         Operator::Filter(f) => f.predicate.iter().collect(),
         Operator::Join(j) => j.on.iter().collect(),
-        Operator::Project(p) => p.exprs.iter().map(|ne| &ne.expr).collect(),
+        Operator::Projection(p) => p.exprs.iter().map(|ne| &ne.expr).collect(),
         // The grouping keys are reads (they pick groups, never originate a
-        // value); the aggregate functions live in the enclosing Project.
+        // value); the aggregate functions live in the enclosing Projection.
         Operator::Aggregate(a) => a.group_by.iter().collect(),
         Operator::Sort(s) => s.keys.iter().collect(),
         // A table function's argument expressions are reads.
@@ -1152,7 +1152,7 @@ fn children(op: &Operator) -> Vec<&Operator> {
         Operator::Filter(f) => vec![&f.input],
         Operator::Join(j) => vec![&j.left, &j.right],
         Operator::Aggregate(a) => vec![&a.input],
-        Operator::Project(p) => vec![&p.input],
+        Operator::Projection(p) => vec![&p.input],
         Operator::Sort(s) => vec![&s.input],
         Operator::SetOp(so) => vec![&so.left, &so.right],
         Operator::SubqueryAlias(sa) => vec![&sa.input],

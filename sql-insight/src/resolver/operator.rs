@@ -22,7 +22,7 @@ pub(crate) enum Operator {
     Filter(Filter),
     Join(Join),
     Aggregate(Aggregate),
-    Project(Project),
+    Projection(Projection),
     Sort(Sort),
     SetOp(SetOp),
     SubqueryAlias(SubqueryAlias),
@@ -85,10 +85,10 @@ pub(crate) struct Join {
 }
 
 /// Aggregate (Γ): the `GROUP BY` grouping over its input, sitting below the
-/// [`Project`] in canonical evaluation order (`Scan → WHERE → Aggregate →
-/// HAVING → Project`). `group_by` holds the grouping-key expressions — reads
+/// [`Projection`] in canonical evaluation order (`Scan → WHERE → Aggregate →
+/// HAVING → Projection`). `group_by` holds the grouping-key expressions — reads
 /// that pick the groups, never a value origin (the aggregate functions
-/// themselves, `sum(x)`, are projection expressions counted at the `Project`,
+/// themselves, `sum(x)`, are projection expressions counted at the `Projection`,
 /// so a grouped column referenced both in `SELECT` and `GROUP BY` is counted
 /// at each, occurrence-based). A reference resolves against the FROM scope, not
 /// this node's output, so it stays a base read rather than tracing through.
@@ -101,13 +101,13 @@ pub(crate) struct Aggregate {
 /// Projection (π): the SELECT list — the column-defining operator. Each
 /// output column is a named expression over the input.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Project {
+pub(crate) struct Projection {
     pub(crate) input: Box<Operator>,
     pub(crate) exprs: Vec<NamedExpr>,
 }
 
 /// Sort (ORDER BY): `keys` are reads (row positioning), columns pass
-/// through unchanged. Sits above [`Project`] in canonical order.
+/// through unchanged. Sits above [`Projection`] in canonical order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Sort {
     pub(crate) input: Box<Operator>,
@@ -163,7 +163,7 @@ pub(crate) struct With {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Cte {
     pub(crate) name: Ident,
-    pub(crate) plan: Operator,
+    pub(crate) body: Operator,
 }
 
 /// A FROM-clause reference to an in-scope CTE, by name (the body lives once
@@ -367,7 +367,7 @@ pub(crate) enum Binding {
         table: TableReference,
         resolution: ResolutionKind,
     },
-    /// A CTE / derived-table / computed (Project or Aggregate output) column —
+    /// A CTE / derived-table / computed (Projection or Aggregate output) column —
     /// not a physical read; the origin traversal traces through it.
     Derived,
     /// No candidate owner.

@@ -42,7 +42,9 @@ use sqlparser::ast::{
 };
 use sqlparser::tokenizer::Span;
 
-use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
+use super::operator::{
+    Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Projection, Scan,
+};
 use crate::casing::{CaseFold, IdentifierCasing};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
@@ -350,7 +352,7 @@ impl<'a> Binder<'a> {
 
     /// MySQL `INSERT INTO t SET col = expr, …`: bind the assignment form like a
     /// single-row UPDATE — each assignment is a value column named by its target
-    /// (resolved against the target's own columns), placed in a `Project` so the
+    /// (resolved against the target's own columns), placed in a `Projection` so the
     /// `value → target.col` lineage reuses the relation-lineage machinery.
     fn bind_insert_set(&self, insert: &SqlInsert, target: TableReference) -> Operator {
         let scope = self.target_scope(&target);
@@ -373,7 +375,7 @@ impl<'a> Binder<'a> {
         Operator::Insert(super::operator::Insert {
             target,
             columns,
-            input: Box::new(Operator::Project(Project {
+            input: Box::new(Operator::Projection(Projection {
                 input: Box::new(Operator::Empty),
                 exprs,
             })),
@@ -894,10 +896,10 @@ impl<'a> Binder<'a> {
         let mut env = self.ctes.clone();
         let mut declared = Vec::new();
         for cte in &with.cte_tables {
-            let (entry, plan) = self.bind_cte(cte, &env, with.recursive);
+            let (entry, body) = self.bind_cte(cte, &env, with.recursive);
             declared.push(super::operator::Cte {
                 name: entry.name.clone(),
-                plan,
+                body,
             });
             env.push(entry);
         }
@@ -953,7 +955,7 @@ impl<'a> Binder<'a> {
         // UNION output column — not a real table — is unresolved.
         let set_op_body = matches!(op, Operator::SetOp(_));
         // Pipe operators (`|> WHERE`, `|> SELECT`, …) transform the body in
-        // sequence: an output-producing operator layers a `Project` (evolving
+        // sequence: an output-producing operator layers a `Projection` (evolving
         // the output scope), a filter operator adds reads. They resolve against
         // the body's relations plus the running outputs (relations stay in
         // scope across the chain).
@@ -1007,7 +1009,7 @@ impl<'a> Binder<'a> {
 
     /// Bind one pipe operator on top of `input`, updating `scope.outputs` when
     /// it reshapes the output. An output-producing operator (SELECT / EXTEND /
-    /// SET / AGGREGATE) layers a [`Project`] whose value expressions feed
+    /// SET / AGGREGATE) layers a [`Projection`] whose value expressions feed
     /// `QueryOutput` lineage; a filter operator (WHERE / ORDER BY / LIMIT /
     /// CALL / PIVOT / set-op / JOIN) wraps a non-feeding read [`Filter`]; the
     /// rest (sampling / rename / drop / unpivot) pass through. The match is
@@ -1121,7 +1123,7 @@ impl<'a> Binder<'a> {
             .collect()
     }
 
-    /// Build an output-producing pipe `Project`: the passthrough of `base`
+    /// Build an output-producing pipe `Projection`: the passthrough of `base`
     /// outputs (each re-resolved by name against the base — an identity output
     /// re-reads its real column, a computed output is `Derived` and traced)
     /// plus the `new` value columns.
@@ -1136,7 +1138,7 @@ impl<'a> Binder<'a> {
         exprs.extend(new);
         let outputs = self.output_cols(&exprs);
         (
-            Operator::Project(Project {
+            Operator::Projection(Projection {
                 input: Box::new(input),
                 exprs,
             }),
@@ -1191,7 +1193,7 @@ impl<'a> Binder<'a> {
         }
         let outputs = self.output_cols(&exprs);
         (
-            Operator::Project(Project {
+            Operator::Projection(Projection {
                 input: Box::new(input),
                 exprs,
             }),
@@ -1281,7 +1283,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Bind a SELECT into the canonical operator chain `Scan → WHERE →
-    /// Aggregate (GROUP BY) → HAVING → Project → SORT BY`, returning the
+    /// Aggregate (GROUP BY) → HAVING → Projection → SORT BY`, returning the
     /// operator and its clause scope (FROM relations + projection outputs) for
     /// a trailing ORDER BY to resolve against. The projection resolves against
     /// the FROM scope (so a grouped column is a base read, counted, not traced
@@ -1328,7 +1330,7 @@ impl<'a> Binder<'a> {
                 group_by,
             });
         }
-        // HAVING → a filter on the grouped rows, between Aggregate and Project.
+        // HAVING → a filter on the grouped rows, between Aggregate and Projection.
         if let Some(having) = &select.having {
             node = Operator::Filter(Filter {
                 input: Box::new(node),
@@ -1336,7 +1338,7 @@ impl<'a> Binder<'a> {
             });
         }
         // SELECT: the column-defining projection, on top.
-        node = Operator::Project(Project {
+        node = Operator::Projection(Projection {
             input: Box::new(node),
             exprs,
         });
@@ -2731,14 +2733,14 @@ fn alias_column_names(alias: &TableAlias) -> Vec<Ident> {
 
 /// Rename a (sub)plan's output columns positionally to `names` (an explicit
 /// `AS d(x, y)` column list). A no-op when `names` is empty. Descends through
-/// the clause layers / `With` to the producing `Project`; a `SetOp` renames
+/// the clause layers / `With` to the producing `Projection`; a `SetOp` renames
 /// both operands.
 fn rename_outputs(op: &mut Operator, names: &[Ident]) {
     if names.is_empty() {
         return;
     }
     match op {
-        Operator::Project(p) => {
+        Operator::Projection(p) => {
             for (ne, n) in p.exprs.iter_mut().zip(names) {
                 ne.name = Some(n.clone());
             }
@@ -2858,8 +2860,8 @@ mod tests {
     }
 
     fn only_binding(op: &Operator) -> &Binding {
-        let Operator::Project(p) = op else {
-            panic!("expected Project, got {op:?}")
+        let Operator::Projection(p) = op else {
+            panic!("expected Projection, got {op:?}")
         };
         match &p.exprs[..] {
             [NamedExpr {
