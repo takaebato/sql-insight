@@ -225,14 +225,14 @@ impl TableOperationExtractor {
         // target rows, so it moves no data even though the source is a
         // feeding input — gate it out via `merge_moves_data`.
         let lineage = if moves_data(&statement_kind) && merge_moves_data(statement) {
-            plan.table_lineage()
+            crate::resolver::table_lineage(&plan)
         } else {
             Vec::new()
         };
         Ok(TableOperation {
             statement_kind,
-            reads: plan.table_reads(),
-            writes: plan.table_writes(),
+            reads: crate::resolver::table_reads(&plan),
+            writes: crate::resolver::table_writes(&plan),
             lineage,
             // Table-level diagnostics are the column-level ones projected
             // down (only `UnsupportedStatement` / `TooManyTableQualifiers`

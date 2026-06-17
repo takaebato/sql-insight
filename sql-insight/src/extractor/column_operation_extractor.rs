@@ -298,9 +298,9 @@ impl ColumnOperationExtractor {
         let (plan, diagnostics) = crate::resolver::build(statement, catalog, casing);
         Ok(ColumnOperation {
             statement_kind,
-            reads: plan.reads(),
-            writes: plan.writes(),
-            lineage: plan.column_lineage(),
+            reads: crate::resolver::reads(&plan),
+            writes: crate::resolver::writes(&plan),
+            lineage: crate::resolver::column_lineage(&plan),
             // The bind accumulates `WildcardSuppressed` / `TooManyTableQualifiers`.
             diagnostics,
         })

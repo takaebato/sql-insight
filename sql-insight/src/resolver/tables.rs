@@ -1,11 +1,13 @@
-//! The **write** surfaces of a [`LogicalPlan`] plus the legacy flat table list.
+//! The **write** surfaces over a [`LogicalPlan`] plus the legacy flat table
+//! list. These back the [`crate::resolver`] facade's `writes` / `table_writes`
+//! / `flat_tables` entry points:
 //!
-//! - [`writes`](LogicalPlan::writes) — every column a DML root writes (INSERT
-//!   columns, UPDATE SET targets, CTAS / CREATE VIEW / ALTER columns, MERGE
-//!   WHEN-clause writes), qualified by the target relation.
-//! - [`table_writes`](LogicalPlan::table_writes) — one entry per DML target.
-//! - [`flat_tables`](LogicalPlan::flat_tables) — every table the statement
-//!   references, the legacy un-bucketed table surface.
+//! - `writes` — every column a DML root writes (INSERT columns, UPDATE SET
+//!   targets, CTAS / CREATE VIEW / ALTER columns, MERGE WHEN-clause writes),
+//!   qualified by the target relation.
+//! - `table_writes` — one entry per DML target.
+//! - `flat_tables` — every table the statement references, the legacy
+//!   un-bucketed table surface.
 //!
 //! Write targets are trivially resolved by construction (they come straight
 //! from SQL syntax), so they carry no resolution kind.
@@ -15,32 +17,12 @@ use sqlparser::ast::Ident;
 use super::logical_plan::{children, own_expr_subplans, peel_with, LogicalPlan, MergeClause};
 use crate::reference::{ColumnReference, TableReference};
 
-impl LogicalPlan {
-    /// Every column written — a DML root's target columns.
-    pub(crate) fn writes(&self) -> Vec<ColumnReference> {
-        collect_writes(self)
-    }
-
-    /// Every table written to — one per DML target.
-    pub(crate) fn table_writes(&self) -> Vec<TableReference> {
-        collect_table_writes(self)
-    }
-
-    /// The flat list of every table the statement references — one per
-    /// relation binding (the legacy table surface).
-    pub(crate) fn flat_tables(&self) -> Vec<TableReference> {
-        let mut out = Vec::new();
-        collect_flat(self, &mut out);
-        out
-    }
-}
-
 // ===== writes ============================================================
 
 /// Every column the statement writes — a DML root's target columns, qualified
 /// by the write target. Order follows source order (the public contract). A
-/// leading `WITH` is peeled.
-fn collect_writes(op: &LogicalPlan) -> Vec<ColumnReference> {
+/// leading `WITH` is peeled. Backs [`crate::resolver::writes`].
+pub(super) fn collect_writes(op: &LogicalPlan) -> Vec<ColumnReference> {
     match peel_with(op) {
         // INSERT columns, then any ON CONFLICT DO UPDATE SET targets (extra
         // writes on the same relation).
@@ -102,8 +84,8 @@ fn merge_clause_writes(clause: &MergeClause, target: &TableReference) -> Vec<Col
 }
 
 /// Every table the statement writes to — one per DML target. A leading `WITH`
-/// is peeled.
-fn collect_table_writes(op: &LogicalPlan) -> Vec<TableReference> {
+/// is peeled. Backs [`crate::resolver::table_writes`].
+pub(super) fn collect_table_writes(op: &LogicalPlan) -> Vec<TableReference> {
     match peel_with(op) {
         LogicalPlan::Insert(i) => vec![i.target.clone()],
         LogicalPlan::Update(u) => vec![u.target.clone()],
@@ -131,6 +113,14 @@ fn qualify(columns: &[Ident], target: &TableReference) -> Vec<ColumnReference> {
 }
 
 // ===== flat tables (legacy) ==============================================
+
+/// The flat list of every table the statement references — one per relation
+/// binding (the legacy table surface). Backs [`crate::resolver::flat_tables`].
+pub(super) fn collect_flat_tables(plan: &LogicalPlan) -> Vec<TableReference> {
+    let mut out = Vec::new();
+    collect_flat(plan, &mut out);
+    out
+}
 
 /// Walk the value sub-plans in a DML root's own expressions (a SET / WHEN /
 /// conflict-value scalar subquery's scans bind too, like the resolver counts

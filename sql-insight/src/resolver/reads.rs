@@ -1,5 +1,6 @@
-//! The column / table **read** surfaces of a [`LogicalPlan`]: every physical
-//! base-column reference (occurrence-based) and every base table scanned.
+//! The column / table **read** surfaces over a [`LogicalPlan`]: every physical
+//! base-column reference (occurrence-based) and every base table scanned. These
+//! back the [`crate::resolver`] facade's `reads` / `table_reads` entry points.
 //!
 //! A read is *occurrence-based*: a column referenced in both the projection and
 //! the `WHERE` clause surfaces twice. A `Derived` reference (a CTE / derived /
@@ -11,41 +12,41 @@ use super::logical_plan::{
 };
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableRead};
 
-impl LogicalPlan {
-    /// Every physical base-column read, occurrence-based (a `Derived` ref is
-    /// dropped — its read is counted at the inner producer).
-    pub(crate) fn reads(&self) -> Vec<ColumnRead> {
-        let mut out = Vec::new();
-        collect_reads(self, &mut out);
-        out
-    }
-
-    /// Every base table scanned (read role), occurrence-based.
-    pub(crate) fn table_reads(&self) -> Vec<TableRead> {
-        let mut out = Vec::new();
-        walk(self, &mut |o| {
-            if let LogicalPlan::Scan(s) = o {
-                out.push(TableRead {
-                    reference: s.table.clone(),
-                    resolution: s.resolution,
-                });
-            }
-        });
-        out
-    }
+/// Every physical base-column read, occurrence-based (a `Derived` ref is
+/// dropped — its read is counted at the inner producer). Backs
+/// [`crate::resolver::reads()`].
+pub(super) fn collect_reads(plan: &LogicalPlan) -> Vec<ColumnRead> {
+    let mut out = Vec::new();
+    reads_into(plan, &mut out);
+    out
 }
 
-fn collect_reads(op: &LogicalPlan, out: &mut Vec<ColumnRead>) {
+/// Every base table scanned (read role), occurrence-based. Backs
+/// [`crate::resolver::table_reads`].
+pub(super) fn collect_table_reads(plan: &LogicalPlan) -> Vec<TableRead> {
+    let mut out = Vec::new();
+    walk(plan, &mut |o| {
+        if let LogicalPlan::Scan(s) = o {
+            out.push(TableRead {
+                reference: s.table.clone(),
+                resolution: s.resolution,
+            });
+        }
+    });
+    out
+}
+
+fn reads_into(op: &LogicalPlan, out: &mut Vec<ColumnRead>) {
     for expr in own_exprs(op) {
         expr_reads(expr, out);
     }
     for child in children(op) {
-        collect_reads(child, out);
+        reads_into(child, out);
     }
     // A `With` walks each CTE body once (declarations); a `CteRef` is a leaf.
     if let LogicalPlan::With(w) = op {
         for cte in &w.ctes {
-            collect_reads(&cte.body, out);
+            reads_into(&cte.body, out);
         }
     }
 }
@@ -74,10 +75,10 @@ fn expr_reads(expr: &Expr, out: &mut Vec<ColumnRead>) {
                 .chain(order)
                 .for_each(|e| expr_reads(e, out));
         }
-        Expr::Subquery(plan) | Expr::Exists(plan) => collect_reads(plan, out),
+        Expr::Subquery(plan) | Expr::Exists(plan) => reads_into(plan, out),
         Expr::InSubquery { expr, subquery } => {
             expr_reads(expr, out);
-            collect_reads(subquery, out);
+            reads_into(subquery, out);
         }
         Expr::Filter(exprs) => exprs.iter().for_each(|e| expr_reads(e, out)),
         // A merge-column fan-in: every owning side is a read.

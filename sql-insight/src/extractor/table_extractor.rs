@@ -102,7 +102,7 @@ impl TableExtractor {
         }
         let (plan, column_diagnostics) = crate::resolver::build(statement, None, casing);
         Ok(TableExtraction {
-            tables: plan.flat_tables(),
+            tables: crate::resolver::flat_tables(&plan),
             diagnostics: column_diagnostics
                 .iter()
                 .filter_map(|d| d.to_table_level())

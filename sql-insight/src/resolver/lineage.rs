@@ -1,5 +1,6 @@
-//! The **lineage** surfaces of a [`LogicalPlan`]: directed `source → target`
-//! edges at column and table granularity.
+//! The **lineage** surfaces over a [`LogicalPlan`]: directed `source → target`
+//! edges at column and table granularity. These back the [`crate::resolver`]
+//! facade's `column_lineage` / `table_lineage` entry points.
 //!
 //! Column lineage drives the [`super::origins`] trace — each output column's
 //! value expression is traced to its base columns. A bare query targets
@@ -15,30 +16,16 @@ use super::origins::{conflict_value_origins, enter_withs, origins_of_expr, outpu
 use crate::extractor::{ColumnLineageEdge, ColumnTarget, TableLineageEdge};
 use crate::reference::{ColumnReference, TableRead, TableReference};
 
-impl LogicalPlan {
-    /// The `source → target` column-lineage edges: each output column traced
-    /// to its base columns (`QueryOutput` for a query, `Relation` for a DML
-    /// target).
-    pub(crate) fn column_lineage(&self) -> Vec<ColumnLineageEdge> {
-        collect_column_lineage(self)
-    }
-
-    /// The `source → target` table-lineage edges: the read-role scans that
-    /// feed data into a DML target.
-    pub(crate) fn table_lineage(&self) -> Vec<TableLineageEdge> {
-        collect_table_lineage(self)
-    }
-}
-
 // ===== column lineage ====================================================
 
-/// The column lineage of a statement. A bare query emits `source →
-/// QueryOutput` edges (each output column traced to its base columns); a DML
-/// root pairs the source's output columns positionally with the write
-/// target's columns and emits `source → Relation` edges. A leading `WITH` is
-/// peeled (its CTE bodies feed the root through `CteRef` expansion, they are
-/// not lineage roots).
-fn collect_column_lineage(op: &LogicalPlan) -> Vec<ColumnLineageEdge> {
+/// The column lineage of a statement: `source → target` edges, each output
+/// column traced to its base columns (`QueryOutput` for a query, `Relation` for
+/// a DML target). A bare query emits `source → QueryOutput` edges; a DML root
+/// pairs the source's output columns positionally with the write target's
+/// columns and emits `source → Relation` edges. A leading `WITH` is peeled (its
+/// CTE bodies feed the root through `CteRef` expansion, they are not lineage
+/// roots). Backs [`crate::resolver::column_lineage`].
+pub(super) fn collect_column_lineage(op: &LogicalPlan) -> Vec<ColumnLineageEdge> {
     let mut ctx = Ctx::new(op);
     let mut edges = Vec::new();
     match peel_with(op) {
@@ -237,8 +224,8 @@ fn merge_value_edges<'a>(
 /// scans on the value / data path of the source — FROM / JOIN relations, value
 /// (projection) subqueries, and referenced CTE bodies — never predicate
 /// (filter) subqueries. A bare query, or a statement that moves no data, has
-/// no table lineage.
-fn collect_table_lineage(op: &LogicalPlan) -> Vec<TableLineageEdge> {
+/// no table lineage. Backs [`crate::resolver::table_lineage`].
+pub(super) fn collect_table_lineage(op: &LogicalPlan) -> Vec<TableLineageEdge> {
     // `Ctx::new` peels leading WITHs and keeps their CTE bodies, so a `CteRef`
     // on the feeding path resolves to the body's feeding scans.
     let mut ctx = Ctx::new(op);
@@ -391,6 +378,7 @@ fn expr_feeding<'a>(expr: &'a Expr, ctx: &mut Ctx<'a>, out: &mut Vec<TableRead>)
 #[cfg(test)]
 mod tests {
     use super::super::binder::build_with_diagnostics;
+    use super::super::{column_lineage, reads, table_reads};
     use super::*;
     use crate::casing::IdentifierCasing;
     use crate::extractor::ColumnLineageKind;
@@ -408,8 +396,7 @@ mod tests {
     }
 
     fn read_names(op: &LogicalPlan) -> Vec<String> {
-        let mut v: Vec<String> = op
-            .reads()
+        let mut v: Vec<String> = reads(op)
             .iter()
             .map(|r| match &r.reference.table {
                 Some(t) => format!("{}.{}", t.name.value, r.reference.name.value),
@@ -421,8 +408,7 @@ mod tests {
     }
 
     fn lineage_strs(op: &LogicalPlan) -> Vec<String> {
-        let mut v: Vec<String> = op
-            .column_lineage()
+        let mut v: Vec<String> = column_lineage(op)
             .iter()
             .map(|e| {
                 let src = e
@@ -477,8 +463,7 @@ mod tests {
     #[test]
     fn table_reads_one_per_scan() {
         let op = plan("SELECT t1.x FROM t1 JOIN t2 ON t1.id = t2.id");
-        let mut names: Vec<String> = op
-            .table_reads()
+        let mut names: Vec<String> = table_reads(&op)
             .iter()
             .map(|r| r.reference.name.value.clone())
             .collect();
