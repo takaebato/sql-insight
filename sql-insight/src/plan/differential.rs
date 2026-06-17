@@ -3,18 +3,21 @@
 //! surfaces match. This is the parity net — every later brick extends the
 //! corpus, and a regression shows up as a surface mismatch.
 //!
-//! Compared as multisets (order is non-contractual): all six public surfaces
-//! — `reads`, `column lineage`, `table reads`, `writes`, `table writes`, and
-//! `table lineage`. The corpus grows with coverage (query core → clauses →
-//! derived / CTE / set-op → subqueries → catalog → INSERT). Intentional
-//! divergences (e.g. LATERAL enforcement) are asserted on the new engine
-//! directly rather than against the resolver.
+//! Compared as multisets (order is non-contractual): every public surface —
+//! `reads`, `column lineage`, `table reads`, `writes`, `table writes`, `table
+//! lineage`, the legacy `flat_tables` list, and the column-level `diagnostics`
+//! stream. The corpus grows with coverage (query core → clauses → derived /
+//! CTE / set-op → subqueries → catalog → DML → DDL → MERGE → RETURNING → ON
+//! CONFLICT → table functions → pipe → diagnostics). Intentional divergences
+//! (e.g. LATERAL enforcement) are asserted on the new engine directly rather
+//! than against the resolver.
 
 use sqlparser::dialect::{Dialect, GenericDialect};
 use sqlparser::parser::Parser;
 
 use crate::casing::IdentifierCasing;
 use crate::catalog::Catalog;
+use crate::diagnostic::ColumnLevelDiagnostic;
 use crate::extractor::{ColumnLineageEdge, ColumnTarget, TableLineageEdge};
 use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference};
 
@@ -36,22 +39,24 @@ fn assert_parity_inner(sql: &str, dialect: &dyn Dialect, catalog: Option<&Catalo
     let stmt = &statements[0];
 
     // Current engine (design-B `resolver`).
-    let (cur, _diagnostics) = crate::resolver::build_plan(stmt, catalog, casing);
+    let (cur, cur_diagnostics) = crate::resolver::build_plan(stmt, catalog, casing);
     let cur_reads = crate::resolver::extract_reads(&cur);
     let cur_lineage = crate::resolver::extract_lineage(&cur);
     let cur_table_reads = crate::resolver::extract_table_reads(&cur);
     let cur_writes = crate::resolver::extract_writes(&cur);
     let cur_table_writes = crate::resolver::extract_table_writes(&cur);
     let cur_table_lineage = crate::resolver::extract_table_lineage(&cur);
+    let cur_flat = crate::resolver::extract_flat_tables(&cur);
 
     // Incubating engine (option-a `plan`).
-    let op = super::binder::build(stmt, catalog, casing);
+    let (op, new_diagnostics) = super::binder::build_with_diagnostics(stmt, catalog, casing);
     let new_reads = super::traverse::reads(&op);
     let new_lineage = super::traverse::column_lineage(&op);
     let new_table_reads = super::traverse::table_reads(&op);
     let new_writes = super::traverse::writes(&op);
     let new_table_writes = super::traverse::table_writes(&op);
     let new_table_lineage = super::traverse::table_lineage(&op);
+    let new_flat = super::traverse::flat_tables(&op);
 
     assert_bag_eq(sql, "reads", read_bag(&cur_reads), read_bag(&new_reads));
     assert_bag_eq(
@@ -84,6 +89,25 @@ fn assert_parity_inner(sql: &str, dialect: &dyn Dialect, catalog: Option<&Catalo
         table_lineage_bag(&cur_table_lineage),
         table_lineage_bag(&new_table_lineage),
     );
+    assert_bag_eq(
+        sql,
+        "flat_tables",
+        cur_flat.iter().map(|t| t.name.value.clone()).collect(),
+        new_flat.iter().map(|t| t.name.value.clone()).collect(),
+    );
+    assert_bag_eq(
+        sql,
+        "diagnostics",
+        diag_bag(&cur_diagnostics),
+        diag_bag(&new_diagnostics),
+    );
+}
+
+fn diag_bag(diagnostics: &[ColumnLevelDiagnostic]) -> Vec<String> {
+    diagnostics
+        .iter()
+        .map(|d| format!("{:?}: {} @ {:?}", d.kind, d.message, d.span))
+        .collect()
 }
 
 fn assert_bag_eq(sql: &str, surface: &str, mut current: Vec<String>, mut new: Vec<String>) {
@@ -418,6 +442,33 @@ fn update_catalog_parity() {
     for sql in corpus {
         assert_parity_cat(sql, &catalog);
     }
+}
+
+#[test]
+fn diagnostics_and_flat_tables_parity() {
+    // Wildcard suppression + over-qualified table names raise diagnostics; the
+    // flat table list counts every relation binding. Both must agree.
+    let corpus = [
+        "SELECT * FROM t",
+        "SELECT t.* FROM t",
+        "SELECT a, * FROM t",
+        "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",
+        "SELECT a FROM a.b.c.d.t", // over-qualified (4 segments) → dropped + diagnostic
+        "INSERT INTO t (a) SELECT x FROM s", // flat: t (target) + s (read)
+        "UPDATE t SET a = s.x FROM s WHERE t.id = s.id", // flat: t + s
+        "DELETE FROM t1 USING s WHERE t1.id = s.id", // flat: t1 + s
+        "SELECT x FROM (SELECT a AS x FROM inner_t) d", // flat: inner_t (derived not a binding)
+        "WITH c AS (SELECT a FROM base) SELECT a FROM c", // flat: base
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+    // DELETE where the target is also a FROM read (MySQL) — flat counts it once.
+    assert_parity_inner(
+        "DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id",
+        &sqlparser::dialect::MySqlDialect {},
+        None,
+    );
 }
 
 #[test]

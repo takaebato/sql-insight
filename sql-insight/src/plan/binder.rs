@@ -33,26 +33,45 @@ use sqlparser::ast::{
     Values as SqlValues,
 };
 
+use std::cell::RefCell;
+
+use sqlparser::ast::SelectItemQualifiedWildcardKind;
+use sqlparser::tokenizer::Span;
+
 use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
 use crate::casing::{CaseFold, IdentifierCasing};
 use crate::catalog::{Catalog, CatalogTable};
+use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::reference::{ResolutionKind, TableReference};
 
-/// Bind a statement into an [`Operator`] tree. Statement kinds not yet
-/// modelled (everything but a top-level query, in this brick) yield
-/// [`Operator::Empty`].
+/// Bind a statement into an [`Operator`] tree, discarding diagnostics.
 pub(crate) fn build(
     statement: &Statement,
     catalog: Option<&Catalog>,
     casing: IdentifierCasing,
 ) -> Operator {
-    Binder {
+    build_with_diagnostics(statement, catalog, casing).0
+}
+
+/// Bind a statement into an [`Operator`] tree plus the column-level
+/// diagnostics it raised (unsupported statement, suppressed wildcard,
+/// over-qualified table name). An unmodelled statement yields
+/// [`Operator::Empty`] and an `UnsupportedStatement` diagnostic.
+pub(crate) fn build_with_diagnostics(
+    statement: &Statement,
+    catalog: Option<&Catalog>,
+    casing: IdentifierCasing,
+) -> (Operator, Vec<ColumnLevelDiagnostic>) {
+    let diagnostics = RefCell::new(Vec::new());
+    let op = Binder {
         catalog,
         casing,
         ctes: Vec::new(),
         outer: Vec::new(),
+        diagnostics: &diagnostics,
     }
-    .bind_statement(statement)
+    .bind_statement(statement);
+    (op, diagnostics.into_inner())
 }
 
 /// A CTE in scope: its name and the output column names it exposes (so a
@@ -144,24 +163,28 @@ struct Binder<'a> {
     /// Enclosing queries' relations (the correlation stack, outermost first)
     /// that an inner subquery's references fall through to.
     outer: Vec<Vec<Relation>>,
+    /// Shared diagnostic buffer (child binders for subqueries / CTEs push into
+    /// the same one, so a nested suppressed wildcard surfaces).
+    diagnostics: &'a RefCell<Vec<ColumnLevelDiagnostic>>,
 }
 
-impl Binder<'_> {
+impl<'a> Binder<'a> {
     /// A child binder with a different CTE environment (sharing catalog /
-    /// casing / correlation stack).
-    fn with_ctes(&self, ctes: Vec<CteEnv>) -> Binder<'_> {
+    /// casing / correlation stack / diagnostics).
+    fn with_ctes(&self, ctes: Vec<CteEnv>) -> Binder<'a> {
         Binder {
             catalog: self.catalog,
             casing: self.casing,
             ctes,
             outer: self.outer.clone(),
+            diagnostics: self.diagnostics,
         }
     }
 
     /// A child binder with one more enclosing scope on the correlation stack
     /// (used when descending into a subquery in an expression / a LATERAL
     /// factor).
-    fn with_outer(&self, relations: Vec<Relation>) -> Binder<'_> {
+    fn with_outer(&self, relations: Vec<Relation>) -> Binder<'a> {
         let mut outer = self.outer.clone();
         outer.push(relations);
         Binder {
@@ -169,7 +192,62 @@ impl Binder<'_> {
             casing: self.casing,
             ctes: self.ctes.clone(),
             outer,
+            diagnostics: self.diagnostics,
         }
+    }
+
+    /// Build a table reference from a parsed name, recording a
+    /// `TooManyTableQualifiers` diagnostic and returning `None` when it has
+    /// more identifiers than `catalog.schema.name` (the only conversion
+    /// failure) — so the dropped relation stays observable.
+    fn table_ref(&self, name: &ObjectName) -> Option<TableReference> {
+        match TableReference::try_from_name(name) {
+            Ok(table) => Some(table),
+            Err(_) => {
+                self.record_too_many_table_qualifiers(name);
+                None
+            }
+        }
+    }
+
+    /// Record a `WildcardSuppressed` diagnostic for a projection wildcard
+    /// (`*` / `t.*` / `(expr).*`) left unexpanded, carrying the wildcard
+    /// token's location (a zero-line span is treated as unknown).
+    fn record_wildcard_suppressed(&self, description: &str, span: Span) {
+        let span = (span.start.line != 0).then_some(span);
+        let suffix = match span {
+            Some(s) => format!(" at L{}:C{}", s.start.line, s.start.column),
+            None => String::new(),
+        };
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::WildcardSuppressed,
+            message: format!(
+                "{description}{suffix} left unexpanded — column lineage will be incomplete for this projection"
+            ),
+            span,
+        });
+    }
+
+    /// Record a `TooManyTableQualifiers` diagnostic for an over-qualified table
+    /// name (more than `catalog.schema.name`), carrying its location.
+    fn record_too_many_table_qualifiers(&self, name: &ObjectName) {
+        let span = name
+            .0
+            .first()
+            .and_then(|part| part.as_ident())
+            .map(|ident| ident.span)
+            .filter(|s| s.start.line != 0);
+        let suffix = match span {
+            Some(s) => format!(" at L{}:C{}", s.start.line, s.start.column),
+            None => String::new(),
+        };
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::TooManyTableQualifiers,
+            message: format!(
+                "table reference `{name}`{suffix} has too many qualifiers (max catalog.schema.name) — dropped"
+            ),
+            span,
+        });
     }
 
     fn bind_statement(&self, statement: &Statement) -> Operator {
@@ -198,7 +276,7 @@ impl Binder<'_> {
                 targets: truncate
                     .table_names
                     .iter()
-                    .filter_map(|t| TableReference::try_from_name(&t.name).ok())
+                    .filter_map(|t| self.table_ref(&t.name))
                     .map(|written| self.table_match(&written).table)
                     .collect(),
             }),
@@ -220,7 +298,7 @@ impl Binder<'_> {
             TableObject::TableName(name) => name,
             TableObject::TableFunction(function) => &function.name,
         };
-        let Ok(written) = TableReference::try_from_name(name) else {
+        let Some(written) = self.table_ref(name) else {
             return Operator::Empty;
         };
         let target = self.table_match(&written).table;
@@ -597,7 +675,7 @@ impl Binder<'_> {
     /// in-scope relation), so consult the scope first; otherwise canonicalise
     /// it as written.
     fn resolve_delete_target(&self, name: &ObjectName, scope: &Scope) -> Option<TableReference> {
-        let written = TableReference::try_from_name(name).ok()?;
+        let written = self.table_ref(name)?;
         Some(
             self.scope_target(&written, scope)
                 .unwrap_or_else(|| self.table_match(&written).table),
@@ -683,7 +761,7 @@ impl Binder<'_> {
     /// create — its column definitions aren't writes — so it binds with no
     /// columns / input.
     fn bind_create_table(&self, create: &CreateTable) -> Operator {
-        let Ok(written) = TableReference::try_from_name(&create.name) else {
+        let Some(written) = self.table_ref(&create.name) else {
             return Operator::Empty;
         };
         let target = self.table_match(&written).table;
@@ -710,7 +788,7 @@ impl Binder<'_> {
     /// `CREATE VIEW v AS <query>`: like CTAS — the query's reads paired with
     /// the view's columns (explicit list wins, else source names).
     fn bind_create_view(&self, create: &SqlCreateView) -> Operator {
-        let Ok(written) = TableReference::try_from_name(&create.name) else {
+        let Some(written) = self.table_ref(&create.name) else {
             return Operator::Empty;
         };
         let target = self.table_match(&written).table;
@@ -730,7 +808,7 @@ impl Binder<'_> {
     /// `ALTER VIEW v AS <query>`: a view replacement — bound like
     /// [`bind_create_view`](Self::bind_create_view).
     fn bind_alter_view(&self, name: &ObjectName, columns: &[Ident], query: &Query) -> Operator {
-        let Ok(written) = TableReference::try_from_name(name) else {
+        let Some(written) = self.table_ref(name) else {
             return Operator::Empty;
         };
         let target = self.table_match(&written).table;
@@ -752,7 +830,7 @@ impl Binder<'_> {
     /// CHANGE surface both names). Schema-level ops name no columns. No reads
     /// or lineage — ALTER restructures, it doesn't move row data.
     fn bind_alter_table(&self, alter: &SqlAlterTable) -> Operator {
-        let Ok(written) = TableReference::try_from_name(&alter.name) else {
+        let Some(written) = self.table_ref(&alter.name) else {
             return Operator::Empty;
         };
         let target = self.table_match(&written).table;
@@ -782,7 +860,7 @@ impl Binder<'_> {
         let targets = names
             .iter()
             .chain(table)
-            .filter_map(|name| TableReference::try_from_name(name).ok())
+            .filter_map(|name| self.table_ref(name))
             .map(|written| self.table_match(&written).table)
             .collect();
         Operator::Drop(super::operator::Drop { targets })
@@ -1241,7 +1319,7 @@ impl Binder<'_> {
             TableFactor::Table {
                 name, alias, args, ..
             } => {
-                let Ok(written) = TableReference::try_from_name(name) else {
+                let Some(written) = self.table_ref(name) else {
                     return (Operator::Empty, Scope::default());
                 };
                 let alias_name = alias.as_ref().map(|a| a.name.clone());
@@ -1523,8 +1601,36 @@ impl Binder<'_> {
                 name: Some(alias.clone()),
                 expr: self.bind_expr(expr, scope),
             }),
-            // Wildcards are suppressed (a later brick records the diagnostic).
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
+            // A wildcard isn't expanded (the rigor cost is too high for a
+            // SQL-text-only library); record it so consumers know this
+            // projection's column lineage is incomplete, and skip it.
+            SelectItem::Wildcard(options) => {
+                self.record_wildcard_suppressed("wildcard `*`", options.wildcard_token.0.span);
+                None
+            }
+            SelectItem::QualifiedWildcard(kind, options) => {
+                let description = match kind {
+                    SelectItemQualifiedWildcardKind::Expr(_) => {
+                        "qualified wildcard `(expr).*`".to_string()
+                    }
+                    SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                        format!("qualified wildcard `{name}.*`")
+                    }
+                };
+                self.record_wildcard_suppressed(&description, options.wildcard_token.0.span);
+                // `(expr).*` still projects its base expression as one
+                // Transformation output (a structural field access); `alias.*`
+                // has no inspectable base.
+                match kind {
+                    SelectItemQualifiedWildcardKind::Expr(expr) => Some(NamedExpr {
+                        name: None,
+                        expr: Expr::Call {
+                            args: vec![self.bind_expr(expr, scope)],
+                        },
+                    }),
+                    SelectItemQualifiedWildcardKind::ObjectName(_) => None,
+                }
+            }
         }
     }
 

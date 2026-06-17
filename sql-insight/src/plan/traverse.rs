@@ -742,6 +742,101 @@ fn enter_withs<'a>(op: &'a Operator, ctx: &mut Ctx<'a>) -> &'a Operator {
     node
 }
 
+// ===== flat tables (legacy) ==============================================
+
+/// The flat list of every table the statement references — one entry per
+/// relation *binding* (a table read more than once through separate FROM uses
+/// appears more than once; a table that is both a DML target and a row source
+/// appears once). Every `Scan` plus the DML / DDL write targets (none of which
+/// are scans in this plan), de-duplicating a DELETE target that is also a FROM
+/// scan. Order is the walk's, incidental.
+pub(crate) fn flat_tables(op: &Operator) -> Vec<TableReference> {
+    let mut out = Vec::new();
+    collect_flat(op, &mut out);
+    out
+}
+
+/// Walk the value sub-plans in a DML root's own expressions (a SET / WHEN /
+/// conflict-value scalar subquery's scans bind too, like the resolver counts
+/// them on the write input).
+fn collect_flat_subplans(op: &Operator, out: &mut Vec<TableReference>) {
+    for sub in own_expr_subplans(op) {
+        collect_flat(sub, out);
+    }
+}
+
+fn collect_flat(op: &Operator, out: &mut Vec<TableReference>) {
+    match op {
+        Operator::Scan(s) => out.push(s.table.clone()),
+        // DROP / TRUNCATE relations are bindings with no scan.
+        Operator::Drop(d) => out.extend(d.targets.iter().cloned()),
+        // A write target is external to the input (never a scan here): count it,
+        // then walk the source for its read scans.
+        Operator::Insert(i) => {
+            out.push(i.target.clone());
+            collect_flat(&i.input, out);
+            collect_flat_subplans(op, out);
+        }
+        Operator::Update(u) => {
+            out.push(u.target.clone());
+            collect_flat(&u.input, out);
+            collect_flat_subplans(op, out);
+        }
+        Operator::Merge(m) => {
+            out.push(m.target.clone());
+            collect_flat(&m.source, out);
+            collect_flat_subplans(op, out);
+        }
+        Operator::CreateTableAs(c) => {
+            out.push(c.target.clone());
+            collect_flat(&c.input, out);
+        }
+        Operator::CreateView(c) => {
+            out.push(c.target.clone());
+            collect_flat(&c.input, out);
+        }
+        Operator::AlterTable(a) => out.push(a.target.clone()),
+        // A DELETE target often coincides with a FROM scan already collected;
+        // count only the targets that didn't merge into a row source.
+        Operator::Delete(d) => {
+            let before = out.len();
+            collect_flat(&d.input, out);
+            let from: Vec<TableReference> = out[before..].to_vec();
+            for target in &d.targets {
+                if !from.contains(target) {
+                    out.push(target.clone());
+                }
+            }
+        }
+        Operator::With(w) => {
+            collect_flat(&w.body, out);
+            for cte in &w.ctes {
+                collect_flat(&cte.plan, out);
+            }
+        }
+        // A table function is opaque (not a table binding), but a PIVOT-style
+        // inner table below it is.
+        Operator::TableFunction(tf) => collect_flat(&tf.input, out),
+        Operator::CteRef(_) | Operator::Values(_) | Operator::Empty => {}
+        // Structural query operators: walk children and any expression
+        // sub-plans (a WHERE / scalar subquery's scans bind too).
+        Operator::Filter(_)
+        | Operator::Join(_)
+        | Operator::Aggregate(_)
+        | Operator::Project(_)
+        | Operator::Sort(_)
+        | Operator::SetOp(_)
+        | Operator::SubqueryAlias(_) => {
+            for child in children(op) {
+                collect_flat(child, out);
+            }
+            for sub in own_expr_subplans(op) {
+                collect_flat(sub, out);
+            }
+        }
+    }
+}
+
 // ===== the column-origin traversal =======================================
 
 /// CTE environment for expanding `CteRef`s during a trace, plus the
