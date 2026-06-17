@@ -28,8 +28,9 @@ use sqlparser::ast::{
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier,
     Ident, Insert as SqlInsert, JoinConstraint, JoinOperator, Merge as SqlMerge, MergeAction,
     MergeInsertKind, ObjectName, ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr,
-    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
-    TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
+    OrderByKind, PivotValueSource, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor, TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind,
+    Values as SqlValues,
 };
 
 use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
@@ -108,6 +109,12 @@ enum RelSource {
     /// `Binding::Derived` — the origin traversal traces into the producing
     /// sub-plan (`SubqueryAlias` / `CteRef`).
     Derived { columns: Vec<Ident> },
+    /// An opaque table function / PIVOT / … relation with dynamic columns. A
+    /// bare name is **not** claimed by it (so it stays resolvable against real
+    /// tables); a qualified ref through its alias is `Binding::Derived` — the
+    /// origin traversal reaches the [`Operator::TableFunction`] node and emits
+    /// the synthetic `alias.col` source (a lineage source, dropped from reads).
+    TableFunction,
 }
 
 impl Relation {
@@ -116,7 +123,7 @@ impl Relation {
     fn exposed_name(&self) -> Option<&Ident> {
         self.alias.as_ref().or(match &self.source {
             RelSource::Table { table, .. } => Some(&table.name),
-            RelSource::Derived { .. } => None,
+            RelSource::Derived { .. } | RelSource::TableFunction => None,
         })
     }
 }
@@ -570,7 +577,7 @@ impl Binder<'_> {
                 let target = table.clone();
                 Some((relation, target))
             }
-            RelSource::Derived { .. } => None,
+            RelSource::Derived { .. } | RelSource::TableFunction => None,
         }
     }
 
@@ -618,7 +625,7 @@ impl Binder<'_> {
                     };
                     matches.then(|| table.clone())
                 }
-                RelSource::Derived { .. } => None,
+                RelSource::Derived { .. } | RelSource::TableFunction => None,
             })
     }
 
@@ -1005,7 +1012,9 @@ impl Binder<'_> {
 
     fn bind_table_factor(&self, factor: &TableFactor, left: &[Relation]) -> (Operator, Scope) {
         match factor {
-            TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
                 let Ok(written) = TableReference::try_from_name(name) else {
                     return (Operator::Empty, Scope::default());
                 };
@@ -1053,7 +1062,17 @@ impl Binder<'_> {
                         resolution: m.resolution,
                     },
                 };
-                (scan, scope_of(relation))
+                // A parameterised table reference `foo(args)`: the argument
+                // expressions read against the surrounding (sibling) scope —
+                // attach them as a non-feeding filter over the scan.
+                let node = match args {
+                    Some(args) => Operator::Filter(Filter {
+                        input: Box::new(scan),
+                        predicate: self.bind_function_arg_list(&args.args, &sibling_scope(left)),
+                    }),
+                    None => scan,
+                };
+                (node, scope_of(relation))
             }
             // A derived table `(<subquery>) AS d`: bind the subquery, expose
             // its output columns as a synthetic relation under the alias. A
@@ -1087,8 +1106,184 @@ impl Binder<'_> {
                 };
                 (node, scope_of(relation))
             }
-            // Table functions / nested joins are later bricks.
-            _ => (Operator::Empty, Scope::default()),
+            // A parenthesized join `(a JOIN b …)`: the inner tables bind
+            // directly into the current scope (their refs resolve, their ON
+            // reads surface); the wrapper exposes nothing of its own.
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => self.bind_table_with_joins(table_with_joins, left),
+            // --- opaque table-producing factors (dynamic columns) ---
+            // Bare table functions / UNNEST / JSON_TABLE / XML / semantic views:
+            // the argument expressions read against the surrounding
+            // (LATERAL-visible) `left` scope; no inner table feeds.
+            TableFactor::TableFunction { expr, alias } => {
+                let args = vec![self.bind_expr(expr, &sibling_scope(left))];
+                self.opaque(Operator::Empty, args, alias.as_ref())
+            }
+            TableFactor::Function { args, alias, .. } => {
+                let bound = self.bind_function_arg_list(args, &sibling_scope(left));
+                self.opaque(Operator::Empty, bound, alias.as_ref())
+            }
+            TableFactor::UNNEST {
+                array_exprs, alias, ..
+            } => {
+                let args = self.bind_exprs(array_exprs, &sibling_scope(left));
+                self.opaque(Operator::Empty, args, alias.as_ref())
+            }
+            TableFactor::JsonTable {
+                json_expr, alias, ..
+            }
+            | TableFactor::OpenJsonTable {
+                json_expr, alias, ..
+            } => {
+                let args = vec![self.bind_expr(json_expr, &sibling_scope(left))];
+                self.opaque(Operator::Empty, args, alias.as_ref())
+            }
+            TableFactor::XmlTable {
+                row_expression,
+                passing,
+                alias,
+                ..
+            } => {
+                let scope = sibling_scope(left);
+                let mut args = vec![self.bind_expr(row_expression, &scope)];
+                args.extend(
+                    passing
+                        .arguments
+                        .iter()
+                        .map(|a| self.bind_expr(&a.expr, &scope)),
+                );
+                self.opaque(Operator::Empty, args, alias.as_ref())
+            }
+            TableFactor::SemanticView {
+                dimensions,
+                metrics,
+                facts,
+                where_clause,
+                alias,
+                ..
+            } => {
+                let scope = sibling_scope(left);
+                let mut args = self.bind_exprs(dimensions, &scope);
+                args.extend(self.bind_exprs(metrics, &scope));
+                args.extend(self.bind_exprs(facts, &scope));
+                args.extend(where_clause.iter().map(|e| self.bind_expr(e, &scope)));
+                self.opaque(Operator::Empty, args, alias.as_ref())
+            }
+            // PIVOT / UNPIVOT / MATCH_RECOGNIZE wrap an inner table whose
+            // columns the clause expressions read; the produced relation is
+            // opaque. The inner table feeds (it's a real source).
+            TableFactor::Pivot {
+                table,
+                aggregate_functions,
+                value_column,
+                value_source,
+                default_on_null,
+                alias,
+                ..
+            } => {
+                let (inner, inner_scope) = self.bind_table_factor(table, left);
+                let mut args = aggregate_functions
+                    .iter()
+                    .map(|a| self.bind_expr(&a.expr, &inner_scope))
+                    .collect::<Vec<_>>();
+                args.extend(self.bind_exprs(value_column, &inner_scope));
+                args.extend(self.pivot_value_source_exprs(value_source, &inner_scope));
+                args.extend(
+                    default_on_null
+                        .iter()
+                        .map(|e| self.bind_expr(e, &inner_scope)),
+                );
+                self.opaque(inner, args, alias.as_ref())
+            }
+            TableFactor::Unpivot {
+                table,
+                value,
+                columns,
+                alias,
+                ..
+            } => {
+                let (inner, inner_scope) = self.bind_table_factor(table, left);
+                let mut args = vec![self.bind_expr(value, &inner_scope)];
+                args.extend(
+                    columns
+                        .iter()
+                        .map(|c| self.bind_expr(&c.expr, &inner_scope)),
+                );
+                self.opaque(inner, args, alias.as_ref())
+            }
+            TableFactor::MatchRecognize {
+                table,
+                partition_by,
+                order_by,
+                measures,
+                symbols,
+                alias,
+                ..
+            } => {
+                let (inner, inner_scope) = self.bind_table_factor(table, left);
+                let mut args = self.bind_exprs(partition_by, &inner_scope);
+                args.extend(
+                    order_by
+                        .iter()
+                        .map(|o| self.bind_expr(&o.expr, &inner_scope)),
+                );
+                args.extend(
+                    measures
+                        .iter()
+                        .map(|m| self.bind_expr(&m.expr, &inner_scope)),
+                );
+                args.extend(
+                    symbols
+                        .iter()
+                        .map(|s| self.bind_expr(&s.definition, &inner_scope)),
+                );
+                self.opaque(inner, args, alias.as_ref())
+            }
+        }
+    }
+
+    /// Assemble an opaque table-producing factor: an [`Operator::TableFunction`]
+    /// node carrying the (already-bound) argument reads over `input` (the wrapped
+    /// inner table, or [`Operator::Empty`] for a bare function), exposed as a
+    /// synthetic [`RelSource::TableFunction`] relation under the alias.
+    fn opaque(
+        &self,
+        input: Operator,
+        args: Vec<Expr>,
+        alias: Option<&TableAlias>,
+    ) -> (Operator, Scope) {
+        let alias_name = alias.map(|a| a.name.clone());
+        let node = Operator::TableFunction(super::operator::TableFunction {
+            alias: alias_name.clone(),
+            input: Box::new(input),
+            args,
+        });
+        let scope = match alias_name {
+            Some(name) => scope_of(Relation {
+                alias: Some(name),
+                source: RelSource::TableFunction,
+            }),
+            None => Scope::default(),
+        };
+        (node, scope)
+    }
+
+    /// The value expressions of a PIVOT value source (`IN (list)` / `ANY ORDER
+    /// BY …` / a subquery). The subquery's reads come from binding it.
+    fn pivot_value_source_exprs(&self, source: &PivotValueSource, scope: &Scope) -> Vec<Expr> {
+        match source {
+            PivotValueSource::List(values) => values
+                .iter()
+                .map(|v| self.bind_expr(&v.expr, scope))
+                .collect(),
+            PivotValueSource::Any(order_by) => order_by
+                .iter()
+                .map(|o| self.bind_expr(&o.expr, scope))
+                .collect(),
+            PivotValueSource::Subquery(query) => {
+                vec![Expr::Subquery(Box::new(self.bind_subquery(query, scope)))]
+            }
         }
     }
 
@@ -1150,11 +1345,17 @@ impl Binder<'_> {
     }
 
     fn bind_function_args(&self, function: &Function, scope: &Scope) -> Vec<Expr> {
-        let FunctionArguments::List(list) = &function.args else {
-            return Vec::new();
-        };
-        list.args
-            .iter()
+        match &function.args {
+            FunctionArguments::List(list) => self.bind_function_arg_list(&list.args, scope),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Bind a function-argument list's value expressions (dropping `*` and
+    /// other non-expression args). Shared by scalar functions and table
+    /// functions (`FROM f(args)`).
+    fn bind_function_arg_list(&self, args: &[FunctionArg], scope: &Scope) -> Vec<Expr> {
+        args.iter()
             .filter_map(|arg| match arg {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
                 | FunctionArg::Named {
@@ -1168,6 +1369,11 @@ impl Binder<'_> {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Bind several expressions against `scope`.
+    fn bind_exprs(&self, exprs: &[SqlExpr], scope: &Scope) -> Vec<Expr> {
+        exprs.iter().map(|e| self.bind_expr(e, scope)).collect()
     }
 
     // ===== clauses (GROUP BY / HAVING / ORDER BY) ========================
@@ -1322,6 +1528,9 @@ impl Binder<'_> {
                 binding: Binding::Derived,
                 confirmed: true,
             }),
+            // A table function's columns are opaque — a bare name is not
+            // claimed by it (stays resolvable against real tables).
+            RelSource::TableFunction => None,
         }
     }
 
@@ -1373,6 +1582,13 @@ impl Binder<'_> {
                 confirmed: false,
             }),
             RelSource::Derived { columns } => self.list_has(columns, name).then_some(Candidate {
+                binding: Binding::Derived,
+                confirmed: true,
+            }),
+            // A ref qualified by a table function's alias resolves to it: a
+            // `Derived` binding the traversal turns into the synthetic
+            // `alias.col` lineage source (dropped from reads).
+            RelSource::TableFunction => Some(Candidate {
                 binding: Binding::Derived,
                 confirmed: true,
             }),
@@ -1604,6 +1820,15 @@ fn sort(input: Operator, keys: Vec<Expr>) -> Operator {
 fn scope_of(relation: Relation) -> Scope {
     Scope {
         relations: vec![relation],
+        ..Scope::default()
+    }
+}
+
+/// A resolution scope over the FROM siblings to a factor's left (the
+/// LATERAL-visible relations a table function's arguments read against).
+fn sibling_scope(left: &[Relation]) -> Scope {
+    Scope {
+        relations: left.to_vec(),
         ..Scope::default()
     }
 }

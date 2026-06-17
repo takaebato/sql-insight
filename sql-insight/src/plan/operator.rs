@@ -26,6 +26,7 @@ pub(crate) enum Operator {
     Sort(Sort),
     SetOp(SetOp),
     SubqueryAlias(SubqueryAlias),
+    TableFunction(TableFunction),
     With(With),
     CteRef(CteRef),
     Values(Values),
@@ -126,6 +127,20 @@ pub(crate) struct SetOp {
 pub(crate) struct SubqueryAlias {
     pub(crate) alias: Ident,
     pub(crate) input: Box<Operator>,
+}
+
+/// An opaque table-producing factor: a table function (`f(args)` / `UNNEST` /
+/// `JSON_TABLE` / …), or a `PIVOT` / `UNPIVOT` / `MATCH_RECOGNIZE` wrapping an
+/// inner table. Its produced columns are dynamic, so a reference through its
+/// `alias` is a synthetic lineage source (the alias as table, dropped from
+/// reads). `args` are the clause / argument expressions (reads). `input` is the
+/// wrapped inner table (feeds data, e.g. a PIVOT source) or [`Operator::Empty`]
+/// for a bare function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TableFunction {
+    pub(crate) alias: Option<Ident>,
+    pub(crate) input: Box<Operator>,
+    pub(crate) args: Vec<Expr>,
 }
 
 /// A `WITH` clause: the CTEs it declares (in declaration order) plus the

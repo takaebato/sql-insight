@@ -421,6 +421,32 @@ fn update_catalog_parity() {
 }
 
 #[test]
+fn table_function_and_nested_join_parity() {
+    // Opaque table-producing factors: their argument expressions are reads
+    // (LATERAL-visible), the produced columns are a synthetic lineage source
+    // (alias as table) dropped from reads. Plus NESTED JOIN (inner tables bind
+    // into the current scope).
+    let corpus = [
+        "SELECT u.x FROM t, UNNEST(t.arr) AS u", // arg t.arr read; u.x synthetic
+        "SELECT * FROM UNNEST(ARRAY[1,2,3]) AS u", // wildcard suppressed
+        "SELECT u.v FROM tab, UNNEST(tab.items) AS u(v)", // column list
+        "SELECT a FROM (t1 JOIN t2 ON t1.id = t2.id)", // nested join
+        "SELECT t1.x, t2.y FROM (t1 JOIN t2 ON t1.id = t2.id) WHERE t2.y > 0",
+        "SELECT f.c FROM my_func(1, 2) AS f", // table function call
+        "SELECT g.c FROM t, my_func(t.a) AS g", // correlated arg
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+    // PIVOT (Snowflake) — needs a dialect that parses it.
+    assert_parity_inner(
+        "SELECT * FROM monthly_sales PIVOT(SUM(amount) FOR month IN ('JAN', 'FEB')) AS p",
+        &sqlparser::dialect::SnowflakeDialect {},
+        None,
+    );
+}
+
+#[test]
 fn on_conflict_parity() {
     let pg = sqlparser::dialect::PostgreSqlDialect {};
     // PG / SQLite ON CONFLICT DO UPDATE: EXCLUDED collapses to the source for a

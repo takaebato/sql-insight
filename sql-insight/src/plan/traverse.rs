@@ -409,6 +409,23 @@ fn excluded_source(c: &ColRef) -> ColumnRead {
     }
 }
 
+/// A synthetic single-segment lineage source `table.name` (`Inferred`) — for a
+/// table-function column, whose produced value flows out but has no base
+/// column to collapse to.
+fn synthetic_source(table: &Ident, name: &Ident) -> ColumnRead {
+    ColumnRead {
+        reference: ColumnReference {
+            table: Some(TableReference {
+                catalog: None,
+                schema: None,
+                name: table.clone(),
+            }),
+            name: name.clone(),
+        },
+        resolution: ResolutionKind::Inferred,
+    }
+}
+
 /// Emit the `value → target.column` lineage edges of one MERGE WHEN value, its
 /// origins traced through the `source` relation.
 fn merge_value_edges<'a>(
@@ -639,6 +656,9 @@ fn feeding_scans<'a>(op: &'a Operator, ctx: &mut Ctx<'a>, out: &mut Vec<TableRea
         Operator::Aggregate(a) => feeding_scans(&a.input, ctx, out),
         Operator::Sort(s) => feeding_scans(&s.input, ctx, out),
         Operator::SubqueryAlias(sa) => feeding_scans(&sa.input, ctx, out),
+        // A PIVOT / … feeds from its wrapped inner table; the function args
+        // are filter-position reads and do not feed.
+        Operator::TableFunction(tf) => feeding_scans(&tf.input, ctx, out),
         Operator::SetOp(so) => {
             feeding_scans(&so.left, ctx, out);
             feeding_scans(&so.right, ctx, out);
@@ -822,6 +842,18 @@ fn origins_into<'a>(
                 Vec::new()
             }
         }
+        // An opaque table function: its produced columns are dynamic, so a ref
+        // through its alias is a synthetic lineage source (the alias as table)
+        // — not collapsible to a base column.
+        Operator::TableFunction(tf) => match &tf.alias {
+            Some(alias) if qualifier.is_none_or(|q| idents_eq(q, alias)) => {
+                vec![(
+                    synthetic_source(alias, name),
+                    ColumnLineageKind::Passthrough,
+                )]
+            }
+            _ => Vec::new(),
+        },
         Operator::SetOp(so) => {
             let mut o = origins_into(&so.left, qualifier, name, ctx);
             o.extend(origins_into(&so.right, qualifier, name, ctx));
@@ -922,6 +954,8 @@ fn own_exprs(op: &Operator) -> Vec<&Expr> {
             .map(|ne| &ne.expr)
             .collect(),
         Operator::Sort(s) => s.keys.iter().collect(),
+        // A table function's argument expressions are reads.
+        Operator::TableFunction(tf) => tf.args.iter().collect(),
         Operator::Values(v) => v.rows.iter().flatten().collect(),
         // RETURNING items, conflict-action SET values, and the conflict
         // predicate are all reads (an `EXCLUDED` ref within them is `Derived`,
@@ -980,6 +1014,9 @@ fn children(op: &Operator) -> Vec<&Operator> {
         Operator::Sort(s) => vec![&s.input],
         Operator::SetOp(so) => vec![&so.left, &so.right],
         Operator::SubqueryAlias(sa) => vec![&sa.input],
+        // The inner (wrapped) table of a PIVOT / … is a child; the function
+        // args are own expressions.
+        Operator::TableFunction(tf) => vec![&tf.input],
         Operator::With(w) => vec![&w.body],
         Operator::Insert(i) => vec![&i.input],
         Operator::Update(u) => vec![&u.input],
