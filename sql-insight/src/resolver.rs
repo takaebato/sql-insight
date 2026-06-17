@@ -1,4 +1,4 @@
-//! The analysis engine: a **standard logical plan** ([`operator::LogicalPlan`])
+//! The analysis engine: a **standard logical plan** ([`logical_plan::LogicalPlan`])
 //! built by the [`binder`] and walked by a column-origin [`traverse`]al for the
 //! extraction surfaces. It is **not** an execution plan — nothing optimises or
 //! runs SQL.
@@ -16,7 +16,7 @@
 //! `lineage` / `flat_tables`). The [`crate::extractor`] layer drives them and
 //! packages the public `*Operation` types.
 //!
-//! - [`operator`] — the bound operator-tree types.
+//! - [`logical_plan`] — the bound logical-plan operator types.
 //! - [`binder`] — the bind pass (AST → resolved `LogicalPlan` + diagnostics);
 //!   resolution is folded in (catalog match, casing, the candidate tiebreaker,
 //!   the value/filter split, USING fan-in, clause-alias visibility).
@@ -24,7 +24,7 @@
 //!   each output column's value expression to its base columns.
 
 mod binder;
-mod operator;
+mod logical_plan;
 mod traverse;
 
 // The crate-internal surface the extractors drive: `build_plan` (AST → bound

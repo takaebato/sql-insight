@@ -42,7 +42,7 @@ use sqlparser::ast::{
 };
 use sqlparser::tokenizer::Span;
 
-use super::operator::{
+use super::logical_plan::{
     Binding, ColRef, Columns, Expr, Filter, LogicalPlan, NamedExpr, Projection, Scan,
 };
 use crate::casing::{CaseFold, IdentifierCasing};
@@ -275,14 +275,14 @@ impl<'a> Binder<'a> {
             // `CREATE VIRTUAL TABLE t USING module(…)`: a new table with no
             // inspectable source — a target-only create.
             Statement::CreateVirtualTable { name, .. } => match self.table_ref(name) {
-                Some(written) => LogicalPlan::CreateTableAs(super::operator::CreateTableAs {
+                Some(written) => LogicalPlan::CreateTableAs(super::logical_plan::CreateTableAs {
                     target: self.table_match(&written).table,
                     columns: Vec::new(),
                     input: Box::new(LogicalPlan::Empty),
                 }),
                 None => LogicalPlan::Empty,
             },
-            Statement::Truncate(truncate) => LogicalPlan::Drop(super::operator::Drop {
+            Statement::Truncate(truncate) => LogicalPlan::Drop(super::logical_plan::Drop {
                 targets: truncate
                     .table_names
                     .iter()
@@ -340,7 +340,7 @@ impl<'a> Binder<'a> {
         // RETURNING resolves against the target alone (the source query's
         // scope is already popped).
         let returning = self.bind_returning(&insert.returning, &self.target_scope(&target));
-        LogicalPlan::Insert(super::operator::Insert {
+        LogicalPlan::Insert(super::logical_plan::Insert {
             target,
             columns,
             input: Box::new(input),
@@ -372,7 +372,7 @@ impl<'a> Binder<'a> {
             None => (Vec::new(), Vec::new()),
         };
         let returning = self.bind_returning(&insert.returning, &scope);
-        LogicalPlan::Insert(super::operator::Insert {
+        LogicalPlan::Insert(super::logical_plan::Insert {
             target,
             columns,
             input: Box::new(LogicalPlan::Projection(Projection {
@@ -397,7 +397,7 @@ impl<'a> Binder<'a> {
         on: &OnInsert,
         target: &TableReference,
         columns: &[Ident],
-    ) -> (Vec<super::operator::Assignment>, Vec<Expr>) {
+    ) -> (Vec<super::logical_plan::Assignment>, Vec<Expr>) {
         let (scope, assignments, selection) = match on {
             OnInsert::DuplicateKeyUpdate(assignments) => {
                 (self.target_scope(target), assignments.as_slice(), None)
@@ -429,7 +429,7 @@ impl<'a> Binder<'a> {
                     .into_iter()
                     .map(move |column| (column, &a.value))
             })
-            .map(|(column, value)| super::operator::Assignment {
+            .map(|(column, value)| super::logical_plan::Assignment {
                 target: column,
                 value: self.bind_expr(value, &scope),
             })
@@ -492,14 +492,14 @@ impl<'a> Binder<'a> {
                     .into_iter()
                     .map(move |column| (column, &a.value))
             })
-            .map(|(column, value)| super::operator::Assignment {
+            .map(|(column, value)| super::logical_plan::Assignment {
                 target: column,
                 value: self.bind_expr(value, &scope),
             })
             .collect();
         // RETURNING resolves against the statement scope (target + FROM).
         let returning = self.bind_returning(&update.returning, &scope);
-        LogicalPlan::Update(super::operator::Update {
+        LogicalPlan::Update(super::logical_plan::Update {
             target,
             assignments,
             input: Box::new(input),
@@ -569,7 +569,7 @@ impl<'a> Binder<'a> {
         // RETURNING resolves against the FROM / USING scope (which holds the
         // target).
         let returning = self.bind_returning(&delete.returning, &scope);
-        LogicalPlan::Delete(super::operator::Delete {
+        LogicalPlan::Delete(super::logical_plan::Delete {
             targets,
             input: Box::new(input),
             returning,
@@ -620,7 +620,7 @@ impl<'a> Binder<'a> {
                             .flatten()
                             .map(|e| self.bind_expr(e, &scope))
                             .collect();
-                        clauses.push(super::operator::MergeClause::Insert {
+                        clauses.push(super::logical_plan::MergeClause::Insert {
                             columns,
                             values: row,
                         });
@@ -641,19 +641,19 @@ impl<'a> Binder<'a> {
                                 .into_iter()
                                 .map(move |column| (column, &a.value))
                         })
-                        .map(|(column, value)| super::operator::Assignment {
+                        .map(|(column, value)| super::logical_plan::Assignment {
                             target: column,
                             value: self.bind_expr(value, &scope),
                         })
                         .collect();
-                    clauses.push(super::operator::MergeClause::Update { assignments });
+                    clauses.push(super::logical_plan::MergeClause::Update { assignments });
                 }
                 MergeAction::Delete { .. } => {
-                    clauses.push(super::operator::MergeClause::Delete);
+                    clauses.push(super::logical_plan::MergeClause::Delete);
                 }
             }
         }
-        LogicalPlan::Merge(super::operator::Merge {
+        LogicalPlan::Merge(super::logical_plan::Merge {
             target,
             source: Box::new(source),
             on,
@@ -784,7 +784,7 @@ impl<'a> Binder<'a> {
         };
         let target = self.table_match(&written).table;
         let Some(query) = create.query.as_ref() else {
-            return LogicalPlan::CreateTableAs(super::operator::CreateTableAs {
+            return LogicalPlan::CreateTableAs(super::logical_plan::CreateTableAs {
                 target,
                 columns: Vec::new(),
                 input: Box::new(LogicalPlan::Empty),
@@ -796,7 +796,7 @@ impl<'a> Binder<'a> {
         } else {
             create.columns.iter().map(|c| c.name.clone()).collect()
         };
-        LogicalPlan::CreateTableAs(super::operator::CreateTableAs {
+        LogicalPlan::CreateTableAs(super::logical_plan::CreateTableAs {
             target,
             columns,
             input: Box::new(input),
@@ -816,7 +816,7 @@ impl<'a> Binder<'a> {
         } else {
             create.columns.iter().map(|c| c.name.clone()).collect()
         };
-        LogicalPlan::CreateView(super::operator::CreateView {
+        LogicalPlan::CreateView(super::logical_plan::CreateView {
             target,
             columns,
             input: Box::new(input),
@@ -836,7 +836,7 @@ impl<'a> Binder<'a> {
         } else {
             columns.to_vec()
         };
-        LogicalPlan::CreateView(super::operator::CreateView {
+        LogicalPlan::CreateView(super::logical_plan::CreateView {
             target,
             columns,
             input: Box::new(input),
@@ -857,7 +857,7 @@ impl<'a> Binder<'a> {
             .iter()
             .flat_map(alter_table_op_target_columns)
             .collect();
-        LogicalPlan::AlterTable(super::operator::AlterTable { target, columns })
+        LogicalPlan::AlterTable(super::logical_plan::AlterTable { target, columns })
     }
 
     /// `DROP TABLE/VIEW/MATERIALIZED VIEW a, b`: the dropped relations are
@@ -881,7 +881,7 @@ impl<'a> Binder<'a> {
             .filter_map(|name| self.table_ref(name))
             .map(|written| self.table_match(&written).table)
             .collect();
-        LogicalPlan::Drop(super::operator::Drop { targets })
+        LogicalPlan::Drop(super::logical_plan::Drop { targets })
     }
 
     /// Bind a query, returning the operator and its output scope (relations +
@@ -897,7 +897,7 @@ impl<'a> Binder<'a> {
         let mut declared = Vec::new();
         for cte in &with.cte_tables {
             let (entry, body) = self.bind_cte(cte, &env, with.recursive);
-            declared.push(super::operator::Cte {
+            declared.push(super::logical_plan::Cte {
                 name: entry.name.clone(),
                 body,
             });
@@ -905,7 +905,7 @@ impl<'a> Binder<'a> {
         }
         let (body, scope) = self.with_ctes(env).bind_query_body(query);
         (
-            LogicalPlan::With(super::operator::With {
+            LogicalPlan::With(super::logical_plan::With {
                 ctes: declared,
                 body: Box::new(body),
             }),
@@ -1238,7 +1238,7 @@ impl<'a> Binder<'a> {
                 let (l, scope) = self.bind_set_expr(left);
                 let (r, _) = self.bind_set_expr(right);
                 (
-                    LogicalPlan::SetOp(super::operator::SetOp {
+                    LogicalPlan::SetOp(super::logical_plan::SetOp {
                         left: Box::new(l),
                         right: Box::new(r),
                     }),
@@ -1273,7 +1273,7 @@ impl<'a> Binder<'a> {
             })
             .collect();
         (
-            LogicalPlan::Values(super::operator::Values { rows }),
+            LogicalPlan::Values(super::logical_plan::Values { rows }),
             Scope {
                 relations: Vec::new(),
                 outputs,
@@ -1325,7 +1325,7 @@ impl<'a> Binder<'a> {
         // GROUP BY → an `Aggregate` over the filtered rows; its keys are reads.
         let group_by = self.group_by_keys(&select.group_by, &clause_scope);
         if !group_by.is_empty() {
-            node = LogicalPlan::Aggregate(super::operator::Aggregate {
+            node = LogicalPlan::Aggregate(super::logical_plan::Aggregate {
                 input: Box::new(node),
                 group_by,
             });
@@ -1351,7 +1351,7 @@ impl<'a> Binder<'a> {
         // — wrap the projection as the create source so `t` is a write target.
         if let Some(into) = &select.into {
             if let Some(written) = self.table_ref(&into.name) {
-                node = LogicalPlan::CreateTableAs(super::operator::CreateTableAs {
+                node = LogicalPlan::CreateTableAs(super::logical_plan::CreateTableAs {
                     target: self.table_match(&written).table,
                     columns: Vec::new(),
                     input: Box::new(node),
@@ -1462,7 +1462,7 @@ impl<'a> Binder<'a> {
                             },
                         };
                         return (
-                            LogicalPlan::CteRef(super::operator::CteRef {
+                            LogicalPlan::CteRef(super::logical_plan::CteRef {
                                 name: cte.name.clone(),
                             }),
                             scope_of(relation),
@@ -1505,7 +1505,7 @@ impl<'a> Binder<'a> {
                 let node = match alias {
                     Some(a) => {
                         rename_outputs(&mut op, &alias_column_names(a));
-                        LogicalPlan::SubqueryAlias(super::operator::SubqueryAlias {
+                        LogicalPlan::SubqueryAlias(super::logical_plan::SubqueryAlias {
                             alias: a.name.clone(),
                             input: Box::new(op),
                         })
@@ -1662,7 +1662,7 @@ impl<'a> Binder<'a> {
         alias: Option<&TableAlias>,
     ) -> (LogicalPlan, Scope) {
         let alias_name = alias.map(|a| a.name.clone());
-        let node = LogicalPlan::TableFunction(super::operator::TableFunction {
+        let node = LogicalPlan::TableFunction(super::logical_plan::TableFunction {
             alias: alias_name.clone(),
             input: Box::new(input),
             args,
@@ -2649,7 +2649,7 @@ fn downgrade(binding: Binding) -> Binding {
 }
 
 fn join(left: LogicalPlan, right: LogicalPlan, on: Vec<Expr>) -> LogicalPlan {
-    LogicalPlan::Join(super::operator::Join {
+    LogicalPlan::Join(super::logical_plan::Join {
         left: Box::new(left),
         right: Box::new(right),
         on,
@@ -2707,7 +2707,7 @@ fn alter_table_op_target_columns(op: &AlterTableOperation) -> Vec<Ident> {
 }
 
 fn sort(input: LogicalPlan, keys: Vec<Expr>) -> LogicalPlan {
-    LogicalPlan::Sort(super::operator::Sort {
+    LogicalPlan::Sort(super::logical_plan::Sort {
         input: Box::new(input),
         keys,
     })

@@ -17,7 +17,7 @@
 
 use sqlparser::ast::Ident;
 
-use super::operator::{Binding, ColRef, Cte, Expr, LogicalPlan, MergeClause, NamedExpr};
+use super::logical_plan::{Binding, ColRef, Cte, Expr, LogicalPlan, MergeClause, NamedExpr};
 use crate::extractor::{ColumnLineageEdge, ColumnLineageKind, ColumnTarget, TableLineageEdge};
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableRead, TableReference};
 
