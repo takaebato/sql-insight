@@ -362,6 +362,65 @@ fn insert_parity() {
 }
 
 #[test]
+fn update_parity() {
+    // UPDATE (catalog-free): the SET value path vs the WHERE filter, FROM
+    // relations, joins, and value subqueries.
+    let corpus = [
+        "UPDATE t SET a = b",                    // self-column RHS, no table lineage
+        "UPDATE t SET a = b, c = d WHERE e > 0", // multiple SET + WHERE
+        "UPDATE t SET a = b + c WHERE d < 1",    // transformation RHS
+        "UPDATE t SET a = s.x FROM s WHERE t.id = s.id", // FROM feeds
+        "UPDATE t SET a = 5 FROM s WHERE t.id = s.id", // FROM feeds even with literal RHS
+        "UPDATE t SET a = (SELECT max(v) FROM u)", // scalar value subquery feeds
+        "UPDATE t SET a = b WHERE c IN (SELECT id FROM u)", // filter subquery: read, not feeder
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+}
+
+#[test]
+fn delete_parity() {
+    // DELETE (catalog-free): the FROM-is-target vs USING / explicit-list
+    // shapes. No column writes / lineage — only target writes and table reads.
+    let corpus = [
+        "DELETE FROM t",                               // FROM is the target
+        "DELETE FROM t WHERE a > 0",                   // target in scope for predicate
+        "DELETE FROM t1 USING s WHERE t1.id = s.id",   // USING is a read
+        "DELETE FROM t1, t2 USING s WHERE t1.k = s.k", // multi-target
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+    // `DELETE t1 FROM …` (explicit-list shape, FROM relations are reads) needs
+    // the MySQL dialect to parse.
+    let mysql = sqlparser::dialect::MySqlDialect {};
+    for sql in [
+        "DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id WHERE t2.x > 0",
+        "DELETE t1, t2 FROM t1 JOIN t2 ON t1.id = t2.id",
+    ] {
+        assert_parity_inner(sql, &mysql, None);
+    }
+}
+
+#[test]
+fn update_catalog_parity() {
+    use crate::catalog::CatalogTable;
+    let catalog = Catalog::new()
+        .table(CatalogTable::new("public", "users").columns(["id", "name"]))
+        .table(CatalogTable::new("public", "staging").columns(["id", "name"]));
+    let corpus = [
+        "UPDATE users SET name = 'x' WHERE id > 0",
+        "UPDATE users SET name = staging.name FROM staging WHERE users.id = staging.id",
+        "DELETE FROM users WHERE id > 0",
+        "DELETE FROM users USING staging WHERE users.id = staging.id",
+    ];
+    for sql in corpus {
+        assert_parity_cat(sql, &catalog);
+    }
+}
+
+#[test]
 fn insert_catalog_parity() {
     use crate::catalog::CatalogTable;
     let catalog = Catalog::new()

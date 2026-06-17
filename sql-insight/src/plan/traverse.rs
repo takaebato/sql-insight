@@ -190,6 +190,27 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
             let src = enter_withs(&i.input, &mut ctx);
             relation_lineage(&i.columns, &i.target, src, &mut ctx, &mut edges);
         }
+        // UPDATE … SET col = expr: each assignment's RHS value traces to its
+        // target column (`Relation` edge). A `Derived` RHS ref (a column of a
+        // FROM derived table) traces through `input`.
+        Operator::Update(u) => {
+            for a in &u.assignments {
+                let target = ColumnTarget::Relation(ColumnReference {
+                    table: Some(u.target.clone()),
+                    name: a.target.clone(),
+                });
+                for (source, kind) in origins_of_expr(&a.value, &u.input, &mut ctx) {
+                    edges.push(ColumnLineageEdge {
+                        source,
+                        target: target.clone(),
+                        kind,
+                    });
+                }
+            }
+        }
+        // DELETE moves no data (rows go wholesale) — no column lineage (only a
+        // RETURNING projection would, a later brick).
+        Operator::Delete(_) => {}
         // A bare query (or unmodelled root): one `QueryOutput` group per
         // projection (a set operation has one per branch — positions restart
         // per branch, mirroring the resolver).
@@ -273,6 +294,15 @@ fn output_operands(op: &Operator) -> Vec<(&[NamedExpr], &Operator)> {
 pub(crate) fn writes(op: &Operator) -> Vec<ColumnReference> {
     match peel_with(op) {
         Operator::Insert(i) => qualify(&i.columns, &i.target),
+        // Each SET assignment writes its target column.
+        Operator::Update(u) => u
+            .assignments
+            .iter()
+            .map(|a| ColumnReference {
+                table: Some(u.target.clone()),
+                name: a.target.clone(),
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -282,6 +312,9 @@ pub(crate) fn writes(op: &Operator) -> Vec<ColumnReference> {
 pub(crate) fn table_writes(op: &Operator) -> Vec<TableReference> {
     match peel_with(op) {
         Operator::Insert(i) => vec![i.target.clone()],
+        Operator::Update(u) => vec![u.target.clone()],
+        // A DELETE removes rows from each of its targets.
+        Operator::Delete(d) => d.targets.clone(),
         _ => Vec::new(),
     }
 }
@@ -296,12 +329,24 @@ pub(crate) fn table_lineage(op: &Operator) -> Vec<TableLineageEdge> {
     // `Ctx::new` peels leading WITHs and keeps their CTE bodies, so a `CteRef`
     // on the feeding path resolves to the body's feeding scans.
     let mut ctx = Ctx::new(op);
-    let (target, input) = match peel_with(op) {
-        Operator::Insert(i) => (&i.target, &i.input),
+    let mut sources = Vec::new();
+    let target = match peel_with(op) {
+        Operator::Insert(i) => {
+            feeding_scans(&i.input, &mut ctx, &mut sources);
+            &i.target
+        }
+        // UPDATE feeds from the FROM relations (the read `input`) AND any value
+        // subquery in a SET RHS; the WHERE predicate / a self-reference to the
+        // target do not feed.
+        Operator::Update(u) => {
+            feeding_scans(&u.input, &mut ctx, &mut sources);
+            for a in &u.assignments {
+                expr_feeding(&a.value, &mut ctx, &mut sources);
+            }
+            &u.target
+        }
         _ => return Vec::new(),
     };
-    let mut sources = Vec::new();
-    feeding_scans(input, &mut ctx, &mut sources);
     sources
         .into_iter()
         .map(|source| TableLineageEdge {

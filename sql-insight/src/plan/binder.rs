@@ -13,14 +13,21 @@
 //! together with the projection outputs (clause-alias visibility): an
 //! introduced alias becomes `Derived` (dropped from reads), an identity
 //! passthrough falls through to the real column. Their reads ride on a filter /
-//! sort above the projection. DML and the remaining breadth are later bricks —
-//! unhandled constructs fall to [`Operator::Empty`].
+//! sort above the projection.
+//!
+//! Brick ⑥ adds the DML roots: INSERT (SELECT / VALUES source), UPDATE, and
+//! DELETE. A DML target is in scope for resolving SET / WHERE but is the
+//! **write target** named on the root, never a read scan — so the root's
+//! `input` carries only the read relations and the predicate. The remaining
+//! breadth (MERGE / DDL / RETURNING / ON CONFLICT / diagnostics) is later
+//! bricks; unhandled constructs fall to [`Operator::Empty`].
 
 use sqlparser::ast::{
-    Cte as SqlCte, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, GroupByWithModifier, Ident, Insert as SqlInsert, JoinConstraint, JoinOperator,
-    OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
-    TableFactor, TableObject, TableWithJoins, Values as SqlValues,
+    AssignmentTarget, Cte as SqlCte, Delete as SqlDelete, Expr as SqlExpr, FromTable, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident,
+    Insert as SqlInsert, JoinConstraint, JoinOperator, ObjectName, OrderBy, OrderByExpr,
+    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
+    TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
 };
 
 use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
@@ -159,6 +166,8 @@ impl Binder<'_> {
         match statement {
             Statement::Query(query) => self.bind_query(query).0,
             Statement::Insert(insert) => self.bind_insert(insert),
+            Statement::Update(update) => self.bind_update(update),
+            Statement::Delete(delete) => self.bind_delete(delete),
             _ => Operator::Empty,
         }
     }
@@ -201,6 +210,207 @@ impl Binder<'_> {
             returning: Vec::new(),
             on_conflict: Vec::new(),
         })
+    }
+
+    /// `UPDATE target SET col = expr [FROM src] WHERE pred`: the target is in
+    /// scope for resolving SET / WHERE but is the **write target** (named on
+    /// `Update.target`), not a read scan — so `input` carries only the read
+    /// relations (the target-clause joins and the `FROM` relations) plus the
+    /// WHERE predicate as a `Filter`. The SET assignments are the value path
+    /// (each `RHS → target.col` for lineage / writes). RETURNING / the MySQL
+    /// multi-table form's exotic shapes are later bricks.
+    fn bind_update(&self, update: &SqlUpdate) -> Operator {
+        let Some((target_relation, target)) = self.target_relation(&update.table.relation) else {
+            return Operator::Empty;
+        };
+        let mut scope = scope_of(target_relation);
+        let mut input = Operator::Empty;
+        // Joins on the UPDATE target clause are read relations.
+        for j in &update.table.joins {
+            let (node, jscope) = self.bind_table_factor(&j.relation, &scope.relations);
+            scope.relations.extend(jscope.relations);
+            let on = join_on(&j.join_operator)
+                .map(|e| self.bind_expr(e, &scope))
+                .into_iter()
+                .collect();
+            input = join(input, node, on);
+        }
+        // FROM relations are reads (resolved against the target + joins so far).
+        if let Some(from) = &update.from {
+            let tables = match from {
+                UpdateTableFromKind::BeforeSet(t) | UpdateTableFromKind::AfterSet(t) => t,
+            };
+            for twj in tables {
+                let (node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
+                scope.relations.extend(fscope.relations);
+                input = combine(input, node);
+            }
+        }
+        // WHERE: a filter over the read input (picks which rows update; its
+        // reads / subqueries do not feed the new value).
+        if let Some(predicate) = &update.selection {
+            input = Operator::Filter(Filter {
+                input: Box::new(input),
+                predicate: vec![self.bind_expr(predicate, &scope)],
+            });
+        }
+        // SET assignments resolve against the target + FROM scope.
+        let assignments = update
+            .assignments
+            .iter()
+            .flat_map(|a| {
+                assignment_target_columns(&a.target)
+                    .into_iter()
+                    .map(move |column| (column, &a.value))
+            })
+            .map(|(column, value)| super::operator::Assignment {
+                target: column,
+                value: self.bind_expr(value, &scope),
+            })
+            .collect();
+        Operator::Update(super::operator::Update {
+            target,
+            assignments,
+            input: Box::new(input),
+            returning: Vec::new(),
+        })
+    }
+
+    /// `DELETE`: the deletion targets, plus the consulted read relations and
+    /// the predicate as the `input`. The FROM clause's role depends on the
+    /// shape (mirroring the resolver):
+    ///   `DELETE FROM t`                → FROM is the (write) target
+    ///   `DELETE FROM t1, t2 USING src` → FROM are targets, USING are reads
+    ///   `DELETE t1, t2 FROM src`       → FROM are reads, the list are targets
+    /// A target is in scope for the predicate but never scanned (so it isn't a
+    /// read). There are no column writes / lineage — rows go wholesale.
+    fn bind_delete(&self, delete: &SqlDelete) -> Operator {
+        let from_tables = match &delete.from {
+            FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+        };
+        let from_is_target = delete.tables.is_empty();
+        let mut scope = Scope::default();
+        let mut input = Operator::Empty;
+        let mut targets = Vec::new();
+        // USING relations are always reads. Bind first so an explicit target
+        // alias can resolve against them.
+        for twj in delete.using.iter().flatten() {
+            let (node, uscope) = self.bind_table_with_joins(twj, &scope.relations);
+            scope.relations.extend(uscope.relations);
+            input = combine(input, node);
+        }
+        for twj in from_tables {
+            if from_is_target {
+                // The FROM relations are the deletion targets: in scope for the
+                // predicate, but not read.
+                let (_node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
+                targets.extend(self.twj_table_targets(twj));
+                scope.relations.extend(fscope.relations);
+            } else {
+                let (node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
+                scope.relations.extend(fscope.relations);
+                input = combine(input, node);
+            }
+        }
+        // An explicit `DELETE t1, … FROM …` list names the targets (each may be
+        // a FROM alias, resolved through the scope).
+        for name in &delete.tables {
+            if let Some(target) = self.resolve_delete_target(name, &scope) {
+                targets.push(target);
+            }
+        }
+        if let Some(predicate) = &delete.selection {
+            input = Operator::Filter(Filter {
+                input: Box::new(input),
+                predicate: vec![self.bind_expr(predicate, &scope)],
+            });
+        }
+        Operator::Delete(super::operator::Delete {
+            targets,
+            input: Box::new(input),
+            returning: Vec::new(),
+        })
+    }
+
+    /// Resolve a DML target table factor into its scope relation (for
+    /// resolving SET / WHERE against the target's columns) and its canonical
+    /// write-target identity. Returns `None` for a non-table factor.
+    fn target_relation(&self, factor: &TableFactor) -> Option<(Relation, TableReference)> {
+        // Reuse the table-factor binder for catalog matching / column
+        // knowledge, then discard the scan — the target is named on the DML
+        // root, not read.
+        let (_scan, scope) = self.bind_table_factor(factor, &[]);
+        let relation = scope.relations.into_iter().next()?;
+        match &relation.source {
+            RelSource::Table { table, .. } => {
+                let target = table.clone();
+                Some((relation, target))
+            }
+            RelSource::Derived { .. } => None,
+        }
+    }
+
+    /// The plain-table deletion targets of a FROM `TableWithJoins` (its
+    /// relation plus any joined relations), catalog-canonicalised.
+    fn twj_table_targets(&self, twj: &TableWithJoins) -> Vec<TableReference> {
+        std::iter::once(&twj.relation)
+            .chain(twj.joins.iter().map(|join| &join.relation))
+            .filter_map(|factor| TableReference::try_from(factor).ok())
+            .map(|written| self.table_match(&written).table)
+            .collect()
+    }
+
+    /// Resolve an explicit `DELETE` target name to its real table: a
+    /// single-segment name may be a FROM alias (or the bare name of an
+    /// in-scope relation), so consult the scope first; otherwise canonicalise
+    /// it as written.
+    fn resolve_delete_target(&self, name: &ObjectName, scope: &Scope) -> Option<TableReference> {
+        let written = TableReference::try_from_name(name).ok()?;
+        Some(
+            self.scope_target(&written, scope)
+                .unwrap_or_else(|| self.table_match(&written).table),
+        )
+    }
+
+    /// If a `written` DELETE-target name matches an in-scope real-table
+    /// relation by **merge identity**, return that relation's real table. An
+    /// aliased relation matches a single-segment name against its alias; a
+    /// non-aliased relation matches its full `catalog.schema.name` path exactly
+    /// (so a bare `t1` merges with FROM `t1` but not FROM `mydb.t1`).
+    fn scope_target(&self, written: &TableReference, scope: &Scope) -> Option<TableReference> {
+        let canonical = self.table_match(written).table;
+        scope
+            .relations
+            .iter()
+            .find_map(|relation| match &relation.source {
+                RelSource::Table { table, .. } => {
+                    let matches = match &relation.alias {
+                        Some(alias) => {
+                            written.schema.is_none()
+                                && written.catalog.is_none()
+                                && self.eq(self.casing.table_alias, alias, &written.name)
+                        }
+                        None => self.table_identity_eq(&canonical, table),
+                    };
+                    matches.then(|| table.clone())
+                }
+                RelSource::Derived { .. } => None,
+            })
+    }
+
+    /// Exact (not right-anchored) identity match of two table references under
+    /// the dialect's table casing — every present segment must agree and a
+    /// missing segment matches only a missing one.
+    fn table_identity_eq(&self, a: &TableReference, b: &TableReference) -> bool {
+        let fold = self.casing.table;
+        let seg_eq = |x: Option<&Ident>, y: Option<&Ident>| match (x, y) {
+            (Some(p), Some(q)) => self.eq(fold, p, q),
+            (None, None) => true,
+            _ => false,
+        };
+        self.eq(fold, &a.name, &b.name)
+            && seg_eq(a.schema.as_ref(), b.schema.as_ref())
+            && seg_eq(a.catalog.as_ref(), b.catalog.as_ref())
     }
 
     /// Bind a query, returning the operator and its output scope (relations +
@@ -965,6 +1175,33 @@ fn join(left: Operator, right: Operator, on: Vec<Expr>) -> Operator {
         on,
         lateral: false,
     })
+}
+
+/// Cross-join `right` onto `left`, but if `left` is the empty placeholder
+/// just take `right` (so a single read relation isn't wrapped in a join with
+/// nothing). Used to accumulate a DML statement's read relations.
+fn combine(left: Operator, right: Operator) -> Operator {
+    if matches!(left, Operator::Empty) {
+        right
+    } else {
+        join(left, right, Vec::new())
+    }
+}
+
+/// The column(s) a SET assignment writes: a `col` up to
+/// `catalog.schema.table.col` (≤ 4 segments) contributes its last identifier;
+/// a tuple target `(a, b) = …` or a deeper qualifier contributes nothing
+/// (not column-paired).
+fn assignment_target_columns(target: &AssignmentTarget) -> Vec<Ident> {
+    match target {
+        AssignmentTarget::ColumnName(name) if name.0.len() <= 4 => name
+            .0
+            .last()
+            .and_then(|p| p.as_ident().cloned())
+            .into_iter()
+            .collect(),
+        AssignmentTarget::ColumnName(_) | AssignmentTarget::Tuple(_) => Vec::new(),
+    }
 }
 
 fn sort(input: Operator, keys: Vec<Expr>) -> Operator {
