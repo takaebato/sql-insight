@@ -1,141 +1,2935 @@
-//! The binder: lowers a `sqlparser` AST into the bound [`Plan`] IR,
-//! resolving every column reference bottom-up.
+//! The binder: lowers a `sqlparser` AST into the bound [`Operator`] tree,
+//! resolving every column reference against the bind-time scope.
 //!
-//! Resolution runs against a [`Scope`] threaded up through the bind (the
-//! relations visible at the current node). The scope is bind-time
-//! *scratch* — never stored on the [`Plan`], which keeps only resolved
-//! provenance / reads. With a [`Catalog`] a relation's columns are
-//! `Known` (resolution becomes strict — `Cataloged` hits, `Unresolved`
-//! denials, narrowed candidates); catalog-free they are `Open` and
-//! resolution is best-effort (`Inferred` / `Ambiguous`). Catalog matching
-//! is right-anchored and dialect-cased (via [`crate::casing`]).
+//! Bricks ③–⑤: catalog-aware SELECT / FROM / JOIN / WHERE / projection,
+//! GROUP BY / HAVING / ORDER BY, derived tables, CTEs, and set operations.
+//! A table factor is matched against the catalog (right-anchored,
+//! dialect-cased) into a canonical identity with its `Known` columns and
+//! table-level [`ResolutionKind`], or `Open` (catalog-free / miss / ambiguous).
+//! Column resolution ranks the in-scope relations: a Known-witness over an Open
+//! suspect downgrades to `Inferred`, several owners give `Ambiguous`, none
+//! `Unresolved`, and a derived / CTE relation that exposes the column gives
+//! `Derived`. GROUP BY / HAVING / ORDER BY resolve against the FROM relations
+//! together with the projection outputs (clause-alias visibility): an
+//! introduced alias becomes `Derived` (dropped from reads), an identity
+//! passthrough falls through to the real column. Their reads ride on a filter /
+//! sort above the projection.
+//!
+//! Brick ⑥ adds the DML roots: INSERT (SELECT / VALUES source), UPDATE, and
+//! DELETE. A DML target is in scope for resolving SET / WHERE but is the
+//! **write target** named on the root, never a read scan — so the root's
+//! `input` carries only the read relations and the predicate. The remaining
+//! breadth (MERGE / DDL / RETURNING / ON CONFLICT / diagnostics) is later
+//! bricks; unhandled constructs fall to [`Operator::Empty`].
 
 use sqlparser::ast::{
-    AccessExpr, AlterTable, AlterTableOperation, Array, ConnectByKind, CreateTable, CreateView,
-    Cte, Delete, DictionaryField, Distinct, Expr, FromTable, Function, FunctionArg,
-    FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
-    GroupByWithModifier, Ident, Insert, Join, JoinConstraint, JoinOperator, LimitClause,
-    ListAggOnOverflow, Map, Merge, MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName,
-    ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator, Query,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript, Table,
-    TableAlias, TableFactor, TableObject, TableWithJoins, TopQuantity, Update, UpdateTableFromKind,
-    Values, WindowFrameBound, WindowSpec, WindowType,
+    AlterTable as SqlAlterTable, AlterTableOperation, AssignmentTarget, CreateTable,
+    CreateView as SqlCreateView, Cte as SqlCte, Delete as SqlDelete, Expr as SqlExpr, FromTable,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier,
+    Ident, Insert as SqlInsert, JoinConstraint, JoinOperator, Merge as SqlMerge, MergeAction,
+    MergeInsertKind, ObjectName, ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr,
+    OrderByKind, PipeOperator, PivotValueSource, Query, Select, SelectItem, SetExpr, Statement,
+    TableAlias, TableFactor, TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind,
+    Values as SqlValues,
 };
 
 use std::cell::RefCell;
 
-// Bind-time vocabulary and scratch (types + their helpers).
-mod catalog_match;
-mod collect;
-mod helpers;
-mod scope;
-
-// The bind engine, split by clause family. Each is an `impl Binder<'_>`
-// block over `use super::*;`; this root keeps only the shared context
-// (the `Binder` struct, its constructors, and the entry points).
-mod expr;
-mod query;
-mod resolve;
-mod statement;
-
-use self::catalog_match::{canonical_ref, catalog_table_matches, fill_query_defaults, TableMatch};
-use self::collect::{BoundValue, ExprCollector};
-use self::helpers::{
-    ambiguous, assignment_target_columns, object_name_last_ident, passthrough, read, unresolved,
-    wrap_reads,
+use sqlparser::ast::{
+    AccessExpr, ConnectByKind, Distinct, FunctionArgumentClause, LimitClause, ListAggOnOverflow,
+    NamedWindowExpr, SelectItemQualifiedWildcardKind, Subscript, TopQuantity, WindowFrameBound,
+    WindowSpec, WindowType,
 };
-use self::scope::{CteRelation, Relation, RelationColumns, RelationSource, Scope};
-use super::ir::{
-    BoundColumn, CtePlan, CteRef, DeletePlan, PassThrough, Plan, Project, ProvenanceSource, Scan,
-    ScanRole, SetOp, With, Write,
-};
-use crate::casing::IdentifierCasing;
-use crate::catalog::Catalog;
-use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
-use crate::extractor::ColumnLineageKind;
-use crate::reference::{ColumnRead, ResolutionKind, TableReference};
 use sqlparser::tokenizer::Span;
 
-/// Bind one statement into a [`Plan`] (or `None` for statement kinds not
-/// modelled — queries and the data-moving DML / DDL are; other DDL and
-/// session statements aren't), returning the column-level diagnostics the
-/// bind accumulated (currently `WildcardSuppressed` for each suppressed
-/// projection wildcard). The diagnostics buffer is shared across child
-/// binders (CTE bodies, subqueries), so nested wildcards are reported too.
-/// The top-level scope is discarded — callers consume the resolved tree.
+use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
+use crate::casing::{CaseFold, IdentifierCasing};
+use crate::catalog::{Catalog, CatalogTable};
+use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
+use crate::reference::{ResolutionKind, TableReference};
+
+/// Bind a statement into an [`Operator`] tree plus the column-level
+/// diagnostics it raised (unsupported statement, suppressed wildcard,
+/// over-qualified table name). An unmodelled statement yields
+/// [`Operator::Empty`] and an `UnsupportedStatement` diagnostic.
 pub(crate) fn build_with_diagnostics(
     statement: &Statement,
     catalog: Option<&Catalog>,
     casing: IdentifierCasing,
-) -> (Option<Plan>, Vec<ColumnLevelDiagnostic>) {
+) -> (Operator, Vec<ColumnLevelDiagnostic>) {
     let diagnostics = RefCell::new(Vec::new());
-    let binder = Binder {
+    let op = Binder {
         catalog,
         casing,
         ctes: Vec::new(),
-        outer_scopes: Vec::new(),
+        outer: Vec::new(),
         diagnostics: &diagnostics,
-    };
-    let plan = binder.bind_statement(statement);
-    (plan, diagnostics.into_inner())
+    }
+    .bind_statement(statement);
+    (op, diagnostics.into_inner())
 }
 
-/// Like [`build_with_diagnostics`] but folds an unbound statement (a
-/// supported but structure-only kind, or one that fails to bind) to an
-/// empty [`Plan::OpaqueLeaf`], so callers always get a walkable plan
-/// without handling `None` or naming the IR. The extractors assemble the
-/// public operations from this.
-pub(crate) fn build_plan(
-    statement: &Statement,
-    catalog: Option<&Catalog>,
-    casing: IdentifierCasing,
-) -> (Plan, Vec<ColumnLevelDiagnostic>) {
-    let (plan, diagnostics) = build_with_diagnostics(statement, catalog, casing);
-    (plan.unwrap_or(Plan::OpaqueLeaf), diagnostics)
+/// A CTE in scope: its name and the output column names it exposes (so a
+/// `FROM cte` reference resolves through them). The body lives once on the
+/// owning `With` node; a reference is a lightweight `CteRef`.
+#[derive(Clone)]
+struct CteEnv {
+    name: Ident,
+    columns: Vec<Ident>,
 }
 
-/// Carries the bind-time context: the optional catalog, the dialect
-/// casing, the common table expressions in scope (accumulated in
-/// declaration order, innermost `WITH` last), and the enclosing queries'
-/// relations (the correlation stack, outermost first) that an inner
-/// subquery's references fall through to.
+// ===== bind-time scope (scratch, relation-grouped) =======================
+
+/// The relations visible at a point in the bind. Scratch — never stored on
+/// the [`Operator`] tree.
+#[derive(Default)]
+struct Scope {
+    relations: Vec<Relation>,
+    /// The enclosing SELECT's output columns, visible to its own GROUP BY /
+    /// HAVING / ORDER BY (clause-alias visibility). Empty at FROM-level
+    /// resolution (WHERE / projection).
+    outputs: Vec<OutputCol>,
+    /// `JOIN … USING (col)` merge-column names: an unqualified reference to one
+    /// fans in to every joined relation that could own it.
+    merge_columns: Vec<Ident>,
+}
+
+/// A projection output column, for clause-alias resolution. `identity` marks a
+/// bare passthrough (`SELECT a`): a clause reference to it falls through to
+/// the real column (a read); a non-identity (introduced) alias resolves to the
+/// output itself (`Binding::Derived`, dropped from reads).
+#[derive(Clone)]
+struct OutputCol {
+    name: Option<Ident>,
+    identity: bool,
+}
+
+/// A relation in scope: its use-site alias (if any) and where its columns
+/// come from. Cloned onto the correlation stack so an inner subquery can
+/// resolve against enclosing relations.
+#[derive(Clone)]
+struct Relation {
+    alias: Option<Ident>,
+    source: RelSource,
+}
+
+#[derive(Clone)]
+enum RelSource {
+    /// A real table: its canonical identity and catalog column knowledge.
+    /// (The table-level resolution kind lives on the `Scan`; here the `columns`
+    /// — `Known` vs `Open` — drive a column reference's resolution.)
+    Table {
+        table: TableReference,
+        columns: Columns,
+    },
+    /// A derived table / CTE reference: a synthetic relation exposing the named
+    /// output columns of an inner query. A reference through it is
+    /// `Binding::Derived` — the origin traversal traces into the producing
+    /// sub-plan (`SubqueryAlias` / `CteRef`).
+    Derived { columns: Vec<Ident> },
+    /// An opaque table function / PIVOT / … relation with dynamic columns. A
+    /// bare name is **not** claimed by it (so it stays resolvable against real
+    /// tables); a qualified ref through its alias is `Binding::Derived` — the
+    /// origin traversal reaches the [`Operator::TableFunction`] node and emits
+    /// the synthetic `alias.col` source (a lineage source, dropped from reads).
+    TableFunction,
+}
+
+impl Relation {
+    /// The name this relation answers to in a qualifier: its alias, else a
+    /// real table's bare name. A derived relation answers only to its alias.
+    fn exposed_name(&self) -> Option<&Ident> {
+        self.alias.as_ref().or(match &self.source {
+            RelSource::Table { table, .. } => Some(&table.name),
+            RelSource::Derived { .. } | RelSource::TableFunction => None,
+        })
+    }
+}
+
+/// One candidate owner of a column reference, with the binding it would
+/// contribute and whether it's a confirmed (catalog-listed) witness.
+struct Candidate {
+    binding: Binding,
+    confirmed: bool,
+}
+
 struct Binder<'a> {
     catalog: Option<&'a Catalog>,
     casing: IdentifierCasing,
-    ctes: Vec<CteRelation>,
-    outer_scopes: Vec<Vec<Relation>>,
-    /// Column-level diagnostics accumulated during the bind, shared across
-    /// child binders (CTE bodies / subqueries) so nested ones surface too.
+    /// CTEs in scope (declaration order, innermost `WITH` last).
+    ctes: Vec<CteEnv>,
+    /// Enclosing queries' relations (the correlation stack, outermost first)
+    /// that an inner subquery's references fall through to.
+    outer: Vec<Vec<Relation>>,
+    /// Shared diagnostic buffer (child binders for subqueries / CTEs push into
+    /// the same one, so a nested suppressed wildcard surfaces).
     diagnostics: &'a RefCell<Vec<ColumnLevelDiagnostic>>,
 }
 
-impl Binder<'_> {
-    /// A child binder sharing this one's catalog / casing, with the given
-    /// CTE environment and correlation stack.
-    fn child(&self, ctes: Vec<CteRelation>, outer_scopes: Vec<Vec<Relation>>) -> Binder<'_> {
+impl<'a> Binder<'a> {
+    /// A child binder with a different CTE environment (sharing catalog /
+    /// casing / correlation stack / diagnostics).
+    fn with_ctes(&self, ctes: Vec<CteEnv>) -> Binder<'a> {
         Binder {
             catalog: self.catalog,
             casing: self.casing,
             ctes,
-            outer_scopes,
+            outer: self.outer.clone(),
             diagnostics: self.diagnostics,
         }
     }
 
-    /// A child binder with a different CTE environment (extending scope
-    /// across a `WITH`); the correlation stack carries over unchanged.
-    fn with_ctes(&self, ctes: Vec<CteRelation>) -> Binder<'_> {
-        self.child(ctes, self.outer_scopes.clone())
+    /// A child binder with one more enclosing scope on the correlation stack
+    /// (used when descending into a subquery in an expression / a LATERAL
+    /// factor).
+    fn with_outer(&self, relations: Vec<Relation>) -> Binder<'a> {
+        let mut outer = self.outer.clone();
+        outer.push(relations);
+        Binder {
+            catalog: self.catalog,
+            casing: self.casing,
+            ctes: self.ctes.clone(),
+            outer,
+            diagnostics: self.diagnostics,
+        }
     }
 
-    /// A child binder with one more enclosing scope on the correlation
-    /// stack (used when descending into a subquery in an expression).
-    fn with_outer_scope(&self, relations: Vec<Relation>) -> Binder<'_> {
-        let mut outer_scopes = self.outer_scopes.clone();
-        outer_scopes.push(relations);
-        self.child(self.ctes.clone(), outer_scopes)
+    /// Build a table reference from a parsed name, recording a
+    /// `TooManyTableQualifiers` diagnostic and returning `None` when it has
+    /// more identifiers than `catalog.schema.name` (the only conversion
+    /// failure) — so the dropped relation stays observable.
+    fn table_ref(&self, name: &ObjectName) -> Option<TableReference> {
+        match TableReference::try_from_name(name) {
+            Ok(table) => Some(table),
+            Err(_) => {
+                self.record_too_many_table_qualifiers(name);
+                None
+            }
+        }
+    }
+
+    /// Record a `WildcardSuppressed` diagnostic for a projection wildcard
+    /// (`*` / `t.*` / `(expr).*`) left unexpanded, carrying the wildcard
+    /// token's location (a zero-line span is treated as unknown).
+    fn record_wildcard_suppressed(&self, description: &str, span: Span) {
+        let span = (span.start.line != 0).then_some(span);
+        let suffix = match span {
+            Some(s) => format!(" at L{}:C{}", s.start.line, s.start.column),
+            None => String::new(),
+        };
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::WildcardSuppressed,
+            message: format!(
+                "{description}{suffix} left unexpanded — column lineage will be incomplete for this projection"
+            ),
+            span,
+        });
+    }
+
+    /// Record a `TooManyTableQualifiers` diagnostic for an over-qualified table
+    /// name (more than `catalog.schema.name`), carrying its location.
+    fn record_too_many_table_qualifiers(&self, name: &ObjectName) {
+        let span = name
+            .0
+            .first()
+            .and_then(|part| part.as_ident())
+            .map(|ident| ident.span)
+            .filter(|s| s.start.line != 0);
+        let suffix = match span {
+            Some(s) => format!(" at L{}:C{}", s.start.line, s.start.column),
+            None => String::new(),
+        };
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::TooManyTableQualifiers,
+            message: format!(
+                "table reference `{name}`{suffix} has too many qualifiers (max catalog.schema.name) — dropped"
+            ),
+            span,
+        });
+    }
+
+    fn bind_statement(&self, statement: &Statement) -> Operator {
+        match statement {
+            Statement::Query(query) => self.bind_query(query).0,
+            Statement::Insert(insert) => self.bind_insert(insert),
+            Statement::Update(update) => self.bind_update(update),
+            Statement::Delete(delete) => self.bind_delete(delete),
+            Statement::Merge(merge) => self.bind_merge(merge),
+            Statement::CreateTable(create) => self.bind_create_table(create),
+            Statement::CreateView(create) => self.bind_create_view(create),
+            Statement::AlterView {
+                name,
+                columns,
+                query,
+                ..
+            } => self.bind_alter_view(name, columns, query),
+            Statement::AlterTable(alter) => self.bind_alter_table(alter),
+            Statement::Drop {
+                object_type,
+                names,
+                table,
+                ..
+            } => self.bind_drop(object_type, names, table.as_ref()),
+            // `CREATE VIRTUAL TABLE t USING module(…)`: a new table with no
+            // inspectable source — a target-only create.
+            Statement::CreateVirtualTable { name, .. } => match self.table_ref(name) {
+                Some(written) => Operator::CreateTableAs(super::operator::CreateTableAs {
+                    target: self.table_match(&written).table,
+                    columns: Vec::new(),
+                    input: Box::new(Operator::Empty),
+                }),
+                None => Operator::Empty,
+            },
+            Statement::Truncate(truncate) => Operator::Drop(super::operator::Drop {
+                targets: truncate
+                    .table_names
+                    .iter()
+                    .filter_map(|t| self.table_ref(&t.name))
+                    .map(|written| self.table_match(&written).table)
+                    .collect(),
+            }),
+            _ => Operator::Empty,
+        }
+    }
+
+    /// `INSERT INTO target (columns) <source>`: the source query's plan is the
+    /// read-carrying `input`, whose output columns pair positionally with the
+    /// target columns for relation lineage. An explicit column list wins;
+    /// otherwise the target's catalog columns fill in, truncated to the
+    /// source's arity (so a column-less `INSERT … SELECT a, b` writes the
+    /// target's first two columns). A `VALUES` source binds to
+    /// [`Operator::Values`] (the rows are reads, but synthesise no traceable
+    /// output, so there is no column lineage). RETURNING / ON CONFLICT / the
+    /// MySQL `SET` form are later bricks.
+    fn bind_insert(&self, insert: &SqlInsert) -> Operator {
+        let name = match &insert.table {
+            TableObject::TableName(name) => name,
+            TableObject::TableFunction(function) => &function.name,
+        };
+        let Some(written) = self.table_ref(name) else {
+            return Operator::Empty;
+        };
+        let target = self.table_match(&written).table;
+        // MySQL `INSERT INTO t SET col = expr, …`: the assignment form (no
+        // VALUES / SELECT source) — each assignment is a value column named by
+        // its target, like a single-row UPDATE.
+        if insert.source.is_none() && !insert.assignments.is_empty() {
+            return self.bind_insert_set(insert, target);
+        }
+        let (input, scope) = match &insert.source {
+            Some(source) => self.bind_query(source),
+            None => (Operator::Empty, Scope::default()),
+        };
+        let columns = if insert.columns.is_empty() {
+            self.catalog_columns(&target)
+                .into_iter()
+                .take(scope.outputs.len())
+                .collect()
+        } else {
+            insert.columns.clone()
+        };
+        // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: extra writes + their
+        // `value → target.col` lineage, plus the optional `DO UPDATE … WHERE`
+        // (filter reads).
+        let (on_conflict, conflict_predicate) = match &insert.on {
+            Some(on) => self.bind_conflict(on, &target, &columns),
+            None => (Vec::new(), Vec::new()),
+        };
+        // RETURNING resolves against the target alone (the source query's
+        // scope is already popped).
+        let returning = self.bind_returning(&insert.returning, &self.target_scope(&target));
+        Operator::Insert(super::operator::Insert {
+            target,
+            columns,
+            input: Box::new(input),
+            returning,
+            on_conflict,
+            conflict_predicate,
+        })
+    }
+
+    /// MySQL `INSERT INTO t SET col = expr, …`: bind the assignment form like a
+    /// single-row UPDATE — each assignment is a value column named by its target
+    /// (resolved against the target's own columns), placed in a `Project` so the
+    /// `value → target.col` lineage reuses the relation-lineage machinery.
+    fn bind_insert_set(&self, insert: &SqlInsert, target: TableReference) -> Operator {
+        let scope = self.target_scope(&target);
+        let mut columns = Vec::new();
+        let mut exprs = Vec::new();
+        for assignment in &insert.assignments {
+            for column in assignment_target_columns(&assignment.target) {
+                exprs.push(NamedExpr {
+                    name: Some(column.clone()),
+                    expr: self.bind_expr(&assignment.value, &scope),
+                });
+                columns.push(column);
+            }
+        }
+        let (on_conflict, conflict_predicate) = match &insert.on {
+            Some(on) => self.bind_conflict(on, &target, &columns),
+            None => (Vec::new(), Vec::new()),
+        };
+        let returning = self.bind_returning(&insert.returning, &scope);
+        Operator::Insert(super::operator::Insert {
+            target,
+            columns,
+            input: Box::new(Operator::Project(Project {
+                input: Box::new(Operator::Empty),
+                exprs,
+            })),
+            returning,
+            on_conflict,
+            conflict_predicate,
+        })
+    }
+
+    /// Bind an INSERT's conflict action. PG / SQLite `ON CONFLICT DO UPDATE`
+    /// puts the `EXCLUDED` pseudo-table in scope — a synthetic relation
+    /// exposing the target columns, so `EXCLUDED.col` resolves to a `Derived`
+    /// ref the traversal maps back to the source's like-positioned output.
+    /// MySQL `ON DUPLICATE KEY UPDATE` has no EXCLUDED (its `VALUES(col)`
+    /// self-references the target). Returns the conflict assignments (extra
+    /// writes + lineage) and the optional `DO UPDATE … WHERE` (filter reads).
+    fn bind_conflict(
+        &self,
+        on: &OnInsert,
+        target: &TableReference,
+        columns: &[Ident],
+    ) -> (Vec<super::operator::Assignment>, Vec<Expr>) {
+        let (scope, assignments, selection) = match on {
+            OnInsert::DuplicateKeyUpdate(assignments) => {
+                (self.target_scope(target), assignments.as_slice(), None)
+            }
+            OnInsert::OnConflict(on_conflict) => match &on_conflict.action {
+                OnConflictAction::DoUpdate(do_update) => {
+                    let mut scope = self.target_scope(target);
+                    scope.relations.push(Relation {
+                        alias: Some(Ident::new("excluded")),
+                        source: RelSource::Derived {
+                            columns: columns.to_vec(),
+                        },
+                    });
+                    (
+                        scope,
+                        do_update.assignments.as_slice(),
+                        do_update.selection.as_ref(),
+                    )
+                }
+                OnConflictAction::DoNothing => return (Vec::new(), Vec::new()),
+            },
+            // `OnInsert` is non-exhaustive; an unmodelled action is a no-op.
+            _ => return (Vec::new(), Vec::new()),
+        };
+        let bound = assignments
+            .iter()
+            .flat_map(|a| {
+                assignment_target_columns(&a.target)
+                    .into_iter()
+                    .map(move |column| (column, &a.value))
+            })
+            .map(|(column, value)| super::operator::Assignment {
+                target: column,
+                value: self.bind_expr(value, &scope),
+            })
+            .collect();
+        let predicate = selection
+            .map(|s| self.bind_expr(s, &scope))
+            .into_iter()
+            .collect();
+        (bound, predicate)
+    }
+
+    /// `UPDATE target SET col = expr [FROM src] WHERE pred`: the target is in
+    /// scope for resolving SET / WHERE but is the **write target** (named on
+    /// `Update.target`), not a read scan — so `input` carries only the read
+    /// relations (the target-clause joins and the `FROM` relations) plus the
+    /// WHERE predicate as a `Filter`. The SET assignments are the value path
+    /// (each `RHS → target.col` for lineage / writes). RETURNING / the MySQL
+    /// multi-table form's exotic shapes are later bricks.
+    fn bind_update(&self, update: &SqlUpdate) -> Operator {
+        let Some((target_relation, target)) = self.target_relation(&update.table.relation) else {
+            return Operator::Empty;
+        };
+        let mut scope = scope_of(target_relation);
+        let mut input = Operator::Empty;
+        // Joins on the UPDATE target clause are read relations.
+        for j in &update.table.joins {
+            let (node, jscope) = self.bind_table_factor(&j.relation, &scope.relations);
+            scope.relations.extend(jscope.relations);
+            let on = join_on(&j.join_operator)
+                .map(|e| self.bind_expr(e, &scope))
+                .into_iter()
+                .collect();
+            input = join(input, node, on);
+        }
+        // FROM relations are reads (resolved against the target + joins so far).
+        if let Some(from) = &update.from {
+            let tables = match from {
+                UpdateTableFromKind::BeforeSet(t) | UpdateTableFromKind::AfterSet(t) => t,
+            };
+            for twj in tables {
+                let (node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
+                scope.relations.extend(fscope.relations);
+                input = combine(input, node);
+            }
+        }
+        // WHERE: a filter over the read input (picks which rows update; its
+        // reads / subqueries do not feed the new value).
+        if let Some(predicate) = &update.selection {
+            input = Operator::Filter(Filter {
+                input: Box::new(input),
+                predicate: vec![self.bind_expr(predicate, &scope)],
+            });
+        }
+        // SET assignments resolve against the target + FROM scope.
+        let assignments = update
+            .assignments
+            .iter()
+            .flat_map(|a| {
+                assignment_target_columns(&a.target)
+                    .into_iter()
+                    .map(move |column| (column, &a.value))
+            })
+            .map(|(column, value)| super::operator::Assignment {
+                target: column,
+                value: self.bind_expr(value, &scope),
+            })
+            .collect();
+        // RETURNING resolves against the statement scope (target + FROM).
+        let returning = self.bind_returning(&update.returning, &scope);
+        Operator::Update(super::operator::Update {
+            target,
+            assignments,
+            input: Box::new(input),
+            returning,
+        })
+    }
+
+    /// `DELETE`: the deletion targets, plus the consulted read relations and
+    /// the predicate as the `input`. The FROM clause's role depends on the
+    /// shape (mirroring the resolver):
+    ///   `DELETE FROM t`                → FROM is the (write) target
+    ///   `DELETE FROM t1, t2 USING src` → FROM are targets, USING are reads
+    ///   `DELETE t1, t2 FROM src`       → FROM are reads, the list are targets
+    /// A target is in scope for the predicate but never scanned (so it isn't a
+    /// read). There are no column writes / lineage — rows go wholesale.
+    fn bind_delete(&self, delete: &SqlDelete) -> Operator {
+        let from_tables = match &delete.from {
+            FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+        };
+        let from_is_target = delete.tables.is_empty();
+        let mut scope = Scope::default();
+        let mut input = Operator::Empty;
+        let mut targets = Vec::new();
+        // USING relations are always reads. Bind first so an explicit target
+        // alias can resolve against them.
+        for twj in delete.using.iter().flatten() {
+            let (node, uscope) = self.bind_table_with_joins(twj, &scope.relations);
+            scope.relations.extend(uscope.relations);
+            input = combine(input, node);
+        }
+        for twj in from_tables {
+            if from_is_target {
+                // The FROM relations are the deletion targets, in scope for the
+                // predicate but not read. A target may be an alias into a USING
+                // relation already bound above (`DELETE FROM t_alias USING real
+                // AS t_alias`) — resolve it through the scope and don't re-bind;
+                // otherwise it's a fresh target table.
+                let resolved = TableReference::try_from(&twj.relation)
+                    .ok()
+                    .and_then(|written| self.scope_target(&written, &scope));
+                if let Some(target) = resolved {
+                    targets.push(target);
+                } else {
+                    let (_node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
+                    targets.extend(self.twj_table_targets(twj));
+                    scope.relations.extend(fscope.relations);
+                }
+            } else {
+                let (node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
+                scope.relations.extend(fscope.relations);
+                input = combine(input, node);
+            }
+        }
+        // An explicit `DELETE t1, … FROM …` list names the targets (each may be
+        // a FROM alias, resolved through the scope).
+        for name in &delete.tables {
+            if let Some(target) = self.resolve_delete_target(name, &scope) {
+                targets.push(target);
+            }
+        }
+        if let Some(predicate) = &delete.selection {
+            input = Operator::Filter(Filter {
+                input: Box::new(input),
+                predicate: vec![self.bind_expr(predicate, &scope)],
+            });
+        }
+        // RETURNING resolves against the FROM / USING scope (which holds the
+        // target).
+        let returning = self.bind_returning(&delete.returning, &scope);
+        Operator::Delete(super::operator::Delete {
+            targets,
+            input: Box::new(input),
+            returning,
+        })
+    }
+
+    /// `MERGE INTO target USING source ON pred WHEN … THEN …`: the target
+    /// (write, in scope but not scanned) and source (read) form the scope. The
+    /// ON predicate and every per-clause / INSERT predicate are filter reads
+    /// (non-feeding), folded onto `on`. Each WHEN action keeps its structure as
+    /// a `MergeClause`: an UPDATE SET's `RHS → target.col` and an INSERT's
+    /// `value → target.col` drive writes / lineage. A column-less INSERT fills
+    /// from the catalog (empty without one — the values are then reads only).
+    fn bind_merge(&self, merge: &SqlMerge) -> Operator {
+        let Some((target_relation, target)) = self.target_relation(&merge.table) else {
+            return Operator::Empty;
+        };
+        let mut scope = scope_of(target_relation);
+        let (source, source_scope) = self.bind_table_factor(&merge.source, &scope.relations);
+        scope.relations.extend(source_scope.relations);
+
+        let mut on = vec![self.bind_expr(&merge.on, &scope)];
+        let mut clauses = Vec::new();
+        for clause in &merge.clauses {
+            if let Some(predicate) = &clause.predicate {
+                on.push(self.bind_expr(predicate, &scope));
+            }
+            match &clause.action {
+                MergeAction::Insert(insert) => {
+                    if let Some(predicate) = &insert.insert_predicate {
+                        on.push(self.bind_expr(predicate, &scope));
+                    }
+                    if let MergeInsertKind::Values(values) = &insert.kind {
+                        let explicit: Vec<Ident> = insert
+                            .columns
+                            .iter()
+                            .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
+                            .collect();
+                        let columns = if explicit.is_empty() {
+                            self.catalog_columns(&target)
+                        } else {
+                            explicit
+                        };
+                        // A MERGE INSERT is a single VALUES row.
+                        let row = values
+                            .rows
+                            .iter()
+                            .flatten()
+                            .map(|e| self.bind_expr(e, &scope))
+                            .collect();
+                        clauses.push(super::operator::MergeClause::Insert {
+                            columns,
+                            values: row,
+                        });
+                    }
+                }
+                MergeAction::Update(update) => {
+                    for predicate in [&update.update_predicate, &update.delete_predicate]
+                        .into_iter()
+                        .flatten()
+                    {
+                        on.push(self.bind_expr(predicate, &scope));
+                    }
+                    let assignments = update
+                        .assignments
+                        .iter()
+                        .flat_map(|a| {
+                            assignment_target_columns(&a.target)
+                                .into_iter()
+                                .map(move |column| (column, &a.value))
+                        })
+                        .map(|(column, value)| super::operator::Assignment {
+                            target: column,
+                            value: self.bind_expr(value, &scope),
+                        })
+                        .collect();
+                    clauses.push(super::operator::MergeClause::Update { assignments });
+                }
+                MergeAction::Delete { .. } => {
+                    clauses.push(super::operator::MergeClause::Delete);
+                }
+            }
+        }
+        Operator::Merge(super::operator::Merge {
+            target,
+            source: Box::new(source),
+            on,
+            clauses,
+        })
+    }
+
+    /// Resolve a DML target table factor into its scope relation (for
+    /// resolving SET / WHERE against the target's columns) and its canonical
+    /// write-target identity. Returns `None` for a non-table factor.
+    fn target_relation(&self, factor: &TableFactor) -> Option<(Relation, TableReference)> {
+        // Reuse the table-factor binder for catalog matching / column
+        // knowledge, then discard the scan — the target is named on the DML
+        // root, not read.
+        let (_scan, scope) = self.bind_table_factor(factor, &[]);
+        let relation = scope.relations.into_iter().next()?;
+        match &relation.source {
+            RelSource::Table { table, .. } => {
+                let target = table.clone();
+                Some((relation, target))
+            }
+            RelSource::Derived { .. } | RelSource::TableFunction => None,
+        }
+    }
+
+    /// The plain-table deletion targets of a FROM `TableWithJoins` (its
+    /// relation plus any joined relations), catalog-canonicalised.
+    fn twj_table_targets(&self, twj: &TableWithJoins) -> Vec<TableReference> {
+        std::iter::once(&twj.relation)
+            .chain(twj.joins.iter().map(|join| &join.relation))
+            .filter_map(|factor| TableReference::try_from(factor).ok())
+            .map(|written| self.table_match(&written).table)
+            .collect()
+    }
+
+    /// Resolve an explicit `DELETE` target name to its real table: a
+    /// single-segment name may be a FROM alias (or the bare name of an
+    /// in-scope relation), so consult the scope first; otherwise canonicalise
+    /// it as written.
+    fn resolve_delete_target(&self, name: &ObjectName, scope: &Scope) -> Option<TableReference> {
+        let written = self.table_ref(name)?;
+        Some(
+            self.scope_target(&written, scope)
+                .unwrap_or_else(|| self.table_match(&written).table),
+        )
+    }
+
+    /// If a `written` DELETE-target name matches an in-scope real-table
+    /// relation by **merge identity**, return that relation's real table. An
+    /// aliased relation matches a single-segment name against its alias; a
+    /// non-aliased relation matches its full `catalog.schema.name` path exactly
+    /// (so a bare `t1` merges with FROM `t1` but not FROM `mydb.t1`).
+    fn scope_target(&self, written: &TableReference, scope: &Scope) -> Option<TableReference> {
+        let canonical = self.table_match(written).table;
+        scope
+            .relations
+            .iter()
+            .find_map(|relation| match &relation.source {
+                RelSource::Table { table, .. } => {
+                    let matches = match &relation.alias {
+                        Some(alias) => {
+                            written.schema.is_none()
+                                && written.catalog.is_none()
+                                && self.eq(self.casing.table_alias, alias, &written.name)
+                        }
+                        None => self.table_identity_eq(&canonical, table),
+                    };
+                    matches.then(|| table.clone())
+                }
+                RelSource::Derived { .. } | RelSource::TableFunction => None,
+            })
+    }
+
+    /// Exact (not right-anchored) identity match of two table references under
+    /// the dialect's table casing — every present segment must agree and a
+    /// missing segment matches only a missing one.
+    fn table_identity_eq(&self, a: &TableReference, b: &TableReference) -> bool {
+        let fold = self.casing.table;
+        let seg_eq = |x: Option<&Ident>, y: Option<&Ident>| match (x, y) {
+            (Some(p), Some(q)) => self.eq(fold, p, q),
+            (None, None) => true,
+            _ => false,
+        };
+        self.eq(fold, &a.name, &b.name)
+            && seg_eq(a.schema.as_ref(), b.schema.as_ref())
+            && seg_eq(a.catalog.as_ref(), b.catalog.as_ref())
+    }
+
+    /// A resolution scope holding just a write target (for `INSERT … RETURNING`,
+    /// whose references resolve against the target alone — the source query's
+    /// scope is already popped).
+    fn target_scope(&self, target: &TableReference) -> Scope {
+        let m = self.table_match(target);
+        let columns = if m.columns.is_empty() {
+            Columns::Open
+        } else {
+            Columns::Known(m.columns)
+        };
+        scope_of(Relation {
+            alias: None,
+            source: RelSource::Table {
+                table: m.table,
+                columns,
+            },
+        })
+    }
+
+    /// Bind a `RETURNING` clause's projected columns against `scope` — a value
+    /// projection over the written relation, like a SELECT list, so each item
+    /// contributes target reads and a `QueryOutput` lineage edge. A wildcard is
+    /// suppressed (its diagnostic is a later brick).
+    fn bind_returning(&self, returning: &Option<Vec<SelectItem>>, scope: &Scope) -> Vec<NamedExpr> {
+        returning
+            .iter()
+            .flatten()
+            .filter_map(|item| self.bind_select_item(item, scope))
+            .collect()
+    }
+
+    /// `CREATE TABLE dst AS <query>` (CTAS): the source query's reads, paired
+    /// with the new table's columns (explicit defs win, else the source output
+    /// names). A plain `CREATE TABLE t (cols)` (no query) is a target-only
+    /// create — its column definitions aren't writes — so it binds with no
+    /// columns / input.
+    fn bind_create_table(&self, create: &CreateTable) -> Operator {
+        let Some(written) = self.table_ref(&create.name) else {
+            return Operator::Empty;
+        };
+        let target = self.table_match(&written).table;
+        let Some(query) = create.query.as_ref() else {
+            return Operator::CreateTableAs(super::operator::CreateTableAs {
+                target,
+                columns: Vec::new(),
+                input: Box::new(Operator::Empty),
+            });
+        };
+        let (input, scope) = self.bind_query(query);
+        let columns = if create.columns.is_empty() {
+            exposed_columns(&scope.outputs, None)
+        } else {
+            create.columns.iter().map(|c| c.name.clone()).collect()
+        };
+        Operator::CreateTableAs(super::operator::CreateTableAs {
+            target,
+            columns,
+            input: Box::new(input),
+        })
+    }
+
+    /// `CREATE VIEW v AS <query>`: like CTAS — the query's reads paired with
+    /// the view's columns (explicit list wins, else source names).
+    fn bind_create_view(&self, create: &SqlCreateView) -> Operator {
+        let Some(written) = self.table_ref(&create.name) else {
+            return Operator::Empty;
+        };
+        let target = self.table_match(&written).table;
+        let (input, scope) = self.bind_query(&create.query);
+        let columns = if create.columns.is_empty() {
+            exposed_columns(&scope.outputs, None)
+        } else {
+            create.columns.iter().map(|c| c.name.clone()).collect()
+        };
+        Operator::CreateView(super::operator::CreateView {
+            target,
+            columns,
+            input: Box::new(input),
+        })
+    }
+
+    /// `ALTER VIEW v AS <query>`: a view replacement — bound like
+    /// [`bind_create_view`](Self::bind_create_view).
+    fn bind_alter_view(&self, name: &ObjectName, columns: &[Ident], query: &Query) -> Operator {
+        let Some(written) = self.table_ref(name) else {
+            return Operator::Empty;
+        };
+        let target = self.table_match(&written).table;
+        let (input, scope) = self.bind_query(query);
+        let columns = if columns.is_empty() {
+            exposed_columns(&scope.outputs, None)
+        } else {
+            columns.to_vec()
+        };
+        Operator::CreateView(super::operator::CreateView {
+            target,
+            columns,
+            input: Box::new(input),
+        })
+    }
+
+    /// `ALTER TABLE t <ops>`: the altered table is a write target; each
+    /// column-naming operation contributes its column(s) as writes (RENAME /
+    /// CHANGE surface both names). Schema-level ops name no columns. No reads
+    /// or lineage — ALTER restructures, it doesn't move row data.
+    fn bind_alter_table(&self, alter: &SqlAlterTable) -> Operator {
+        let Some(written) = self.table_ref(&alter.name) else {
+            return Operator::Empty;
+        };
+        let target = self.table_match(&written).table;
+        let columns = alter
+            .operations
+            .iter()
+            .flat_map(alter_table_op_target_columns)
+            .collect();
+        Operator::AlterTable(super::operator::AlterTable { target, columns })
+    }
+
+    /// `DROP TABLE/VIEW/MATERIALIZED VIEW a, b`: the dropped relations are
+    /// write targets. Other object types (index / schema / …) name no
+    /// relations — unbound (`Operator::Empty`).
+    fn bind_drop(
+        &self,
+        object_type: &ObjectType,
+        names: &[ObjectName],
+        table: Option<&ObjectName>,
+    ) -> Operator {
+        if !matches!(
+            object_type,
+            ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
+        ) {
+            return Operator::Empty;
+        }
+        let targets = names
+            .iter()
+            .chain(table)
+            .filter_map(|name| self.table_ref(name))
+            .map(|written| self.table_match(&written).table)
+            .collect();
+        Operator::Drop(super::operator::Drop { targets })
+    }
+
+    /// Bind a query, returning the operator and its output scope (relations +
+    /// outputs). A leading `WITH` is peeled first: each CTE binds in
+    /// declaration order into an environment the later CTEs and the body
+    /// resolve against; the bodies are owned by a `With` node, references are
+    /// `CteRef`s.
+    fn bind_query(&self, query: &Query) -> (Operator, Scope) {
+        let Some(with) = &query.with else {
+            return self.bind_query_body(query);
+        };
+        let mut env = self.ctes.clone();
+        let mut declared = Vec::new();
+        for cte in &with.cte_tables {
+            let (entry, plan) = self.bind_cte(cte, &env, with.recursive);
+            declared.push(super::operator::Cte {
+                name: entry.name.clone(),
+                plan,
+            });
+            env.push(entry);
+        }
+        let (body, scope) = self.with_ctes(env).bind_query_body(query);
+        (
+            Operator::With(super::operator::With {
+                ctes: declared,
+                body: Box::new(body),
+            }),
+            scope,
+        )
+    }
+
+    /// Bind one declared CTE against the environment of the earlier CTEs,
+    /// returning its scope entry (name + exposed columns) and its bound body.
+    /// A `RECURSIVE` CTE registers its name provisionally first so the body's
+    /// self-reference resolves: a set-operation body learns its column shape
+    /// from the anchor (the left branch); any other body registers with no
+    /// known columns (so a self-reference is still a `CteRef`, not a phantom).
+    fn bind_cte(&self, cte: &SqlCte, env: &[CteEnv], recursive: bool) -> (CteEnv, Operator) {
+        let name = cte.alias.name.clone();
+        let inner_env = if recursive {
+            let provisional = match cte.query.body.as_ref() {
+                SetExpr::SetOperation { left, .. } => exposed_columns(
+                    &self.with_ctes(env.to_vec()).bind_set_expr(left).1.outputs,
+                    Some(&cte.alias),
+                ),
+                _ => Vec::new(),
+            };
+            let mut e = env.to_vec();
+            e.push(CteEnv {
+                name: name.clone(),
+                columns: provisional,
+            });
+            e
+        } else {
+            env.to_vec()
+        };
+        let (mut plan, scope) = self.with_ctes(inner_env).bind_query(&cte.query);
+        let columns = exposed_columns(&scope.outputs, Some(&cte.alias));
+        // An explicit `c (x, y)` column list renames the body's output columns
+        // so a reference through the CTE traces to them.
+        rename_outputs(&mut plan, &alias_column_names(&cte.alias));
+        (CteEnv { name, columns }, plan)
+    }
+
+    /// Bind a query's body, its pipe-operator chain, and trailing ORDER BY (the
+    /// `WITH` is already in scope via `self.ctes`).
+    fn bind_query_body(&self, query: &Query) -> (Operator, Scope) {
+        let (mut op, mut scope) = self.bind_set_expr(&query.body);
+        // A trailing ORDER BY / LIMIT over a set operation resolves in the
+        // outer scope (both branch scopes are popped), so a reference to a
+        // UNION output column — not a real table — is unresolved.
+        let set_op_body = matches!(op, Operator::SetOp(_));
+        // Pipe operators (`|> WHERE`, `|> SELECT`, …) transform the body in
+        // sequence: an output-producing operator layers a `Project` (evolving
+        // the output scope), a filter operator adds reads. They resolve against
+        // the body's relations plus the running outputs (relations stay in
+        // scope across the chain).
+        if !query.pipe_operators.is_empty() {
+            let mut pipe_scope = match &op {
+                // A set-op body exposes no single relation scope for refs.
+                Operator::SetOp(_) => Scope {
+                    relations: Vec::new(),
+                    outputs: std::mem::take(&mut scope.outputs),
+                    merge_columns: Vec::new(),
+                },
+                _ => scope,
+            };
+            for pipe_op in &query.pipe_operators {
+                op = self.bind_pipe(pipe_op, op, &mut pipe_scope);
+            }
+            scope = pipe_scope;
+        }
+        // Trailing clauses see the body's output scope — except over a set
+        // operation, where there's no single relation to resolve against.
+        let empty = Scope::default();
+        let tail_scope = if set_op_body { &empty } else { &scope };
+        if let Some(order_by) = &query.order_by {
+            let keys = self.order_by_keys(order_by, tail_scope);
+            if !keys.is_empty() {
+                op = sort(op, keys);
+            }
+        }
+        // LIMIT / OFFSET / LIMIT BY (row-count bounds) and ClickHouse
+        // `SETTINGS key = expr` are filter reads above the (possibly piped)
+        // body.
+        let mut tail_reads = Vec::new();
+        if let Some(limit) = &query.limit_clause {
+            tail_reads.extend(self.limit_reads(limit, tail_scope));
+        }
+        if let Some(settings) = &query.settings {
+            tail_reads.extend(
+                settings
+                    .iter()
+                    .map(|s| self.bind_expr(&s.value, tail_scope)),
+            );
+        }
+        if !tail_reads.is_empty() {
+            op = Operator::Filter(Filter {
+                input: Box::new(op),
+                predicate: tail_reads,
+            });
+        }
+        (op, scope)
+    }
+
+    /// Bind one pipe operator on top of `input`, updating `scope.outputs` when
+    /// it reshapes the output. An output-producing operator (SELECT / EXTEND /
+    /// SET / AGGREGATE) layers a [`Project`] whose value expressions feed
+    /// `QueryOutput` lineage; a filter operator (WHERE / ORDER BY / LIMIT /
+    /// CALL / PIVOT / set-op / JOIN) wraps a non-feeding read [`Filter`]; the
+    /// rest (sampling / rename / drop / unpivot) pass through. The match is
+    /// exhaustive so a new pipe operator is reviewed here.
+    fn bind_pipe(&self, op: &PipeOperator, input: Operator, scope: &mut Scope) -> Operator {
+        match op {
+            PipeOperator::Select { exprs } => {
+                let new = self.bind_output_items(exprs, scope);
+                let (node, outputs) = self.pipe_project(input, &[], new, &scope.relations);
+                scope.outputs = outputs;
+                node
+            }
+            PipeOperator::Extend { exprs } => {
+                // The new columns see the running outputs; then they append.
+                let new = self.bind_output_items(exprs, scope);
+                let base = std::mem::take(&mut scope.outputs);
+                let (node, outputs) = self.pipe_project(input, &base, new, &scope.relations);
+                scope.outputs = outputs;
+                node
+            }
+            PipeOperator::Set { assignments } => {
+                let base = std::mem::take(&mut scope.outputs);
+                let (node, outputs) = self.pipe_set(input, base, assignments, scope);
+                scope.outputs = outputs;
+                node
+            }
+            PipeOperator::Aggregate {
+                full_table_exprs,
+                group_by_expr,
+            } => {
+                let new = full_table_exprs
+                    .iter()
+                    .chain(group_by_expr)
+                    .map(|e| NamedExpr {
+                        name: e.expr.alias.clone().or_else(|| inferred_name(&e.expr.expr)),
+                        expr: self.bind_expr(&e.expr.expr, scope),
+                    })
+                    .collect();
+                let (node, outputs) = self.pipe_project(input, &[], new, &scope.relations);
+                scope.outputs = outputs;
+                node
+            }
+            PipeOperator::Where { expr } => {
+                self.pipe_filter(input, vec![self.bind_expr(expr, scope)])
+            }
+            PipeOperator::Limit { expr, offset } => {
+                let mut reads = vec![self.bind_expr(expr, scope)];
+                reads.extend(offset.iter().map(|o| self.bind_expr(o, scope)));
+                self.pipe_filter(input, reads)
+            }
+            PipeOperator::OrderBy { exprs } => self.pipe_filter(
+                input,
+                exprs
+                    .iter()
+                    .map(|o| self.bind_expr(&o.expr, scope))
+                    .collect(),
+            ),
+            PipeOperator::Call { function, .. } => {
+                self.pipe_filter(input, self.bind_function_args(function, scope))
+            }
+            PipeOperator::Pivot {
+                aggregate_functions,
+                value_source,
+                ..
+            } => {
+                let mut reads: Vec<Expr> = aggregate_functions
+                    .iter()
+                    .map(|a| self.bind_expr(&a.expr, scope))
+                    .collect();
+                reads.extend(self.pivot_value_source_exprs(value_source, scope));
+                self.pipe_filter(input, reads)
+            }
+            PipeOperator::Union { queries, .. }
+            | PipeOperator::Intersect { queries, .. }
+            | PipeOperator::Except { queries, .. } => {
+                // Each set-op query's reads surface (non-feeding) — model as a
+                // filter-position subquery.
+                let reads = queries
+                    .iter()
+                    .map(|q| Expr::Exists(Box::new(self.bind_subquery(q, scope))))
+                    .collect();
+                self.pipe_filter(input, reads)
+            }
+            // `|> JOIN t ON …`: the joined table's scan surfaces (a table read),
+            // but — matching the resolver's loose pipe scoping — it is NOT added
+            // to the scope, so the ON predicate's references to it are
+            // unresolved (only the running relations resolve).
+            PipeOperator::Join(j) => {
+                let (right, _scope) = self.bind_table_factor(&j.relation, &scope.relations);
+                let on = join_on(&j.join_operator)
+                    .map(|e| self.bind_expr(e, scope))
+                    .into_iter()
+                    .collect();
+                join(input, right, on)
+            }
+            // No inspectable column expressions: a sampling clause, rename,
+            // drop, or unpivot.
+            PipeOperator::TableSample { .. }
+            | PipeOperator::Drop { .. }
+            | PipeOperator::As { .. }
+            | PipeOperator::Rename { .. }
+            | PipeOperator::Unpivot { .. } => input,
+        }
+    }
+
+    /// Bind a list of output items (SELECT / EXTEND projection items).
+    fn bind_output_items(&self, items: &[SelectItem], scope: &Scope) -> Vec<NamedExpr> {
+        items
+            .iter()
+            .filter_map(|i| self.bind_select_item(i, scope))
+            .collect()
+    }
+
+    /// Build an output-producing pipe `Project`: the passthrough of `base`
+    /// outputs (each re-resolved by name against the base — an identity output
+    /// re-reads its real column, a computed output is `Derived` and traced)
+    /// plus the `new` value columns.
+    fn pipe_project(
+        &self,
+        input: Operator,
+        base: &[OutputCol],
+        new: Vec<NamedExpr>,
+        relations: &[Relation],
+    ) -> (Operator, Vec<OutputCol>) {
+        let mut exprs = self.passthrough_exprs(base, relations);
+        exprs.extend(new);
+        let outputs = self.output_cols(&exprs);
+        (
+            Operator::Project(Project {
+                input: Box::new(input),
+                exprs,
+            }),
+            outputs,
+        )
+    }
+
+    /// Re-resolve each named `base` output as a passthrough projection item
+    /// (clause-alias resolution against the base, so an identity output
+    /// re-reads its real column while a computed output stays `Derived`).
+    fn passthrough_exprs(&self, base: &[OutputCol], relations: &[Relation]) -> Vec<NamedExpr> {
+        let pass_scope = Scope {
+            relations: relations.to_vec(),
+            outputs: base.to_vec(),
+            merge_columns: Vec::new(),
+        };
+        base.iter()
+            .filter_map(|o| o.name.clone())
+            .map(|name| NamedExpr {
+                expr: Expr::Column(Box::new(
+                    self.resolve(std::slice::from_ref(&name), &pass_scope),
+                )),
+                name: Some(name),
+            })
+            .collect()
+    }
+
+    /// `|> SET col = expr`: each assignment replaces a same-named base output in
+    /// place (else appends), so a SET after a SELECT rewrites that column.
+    fn pipe_set(
+        &self,
+        input: Operator,
+        base: Vec<OutputCol>,
+        assignments: &[sqlparser::ast::Assignment],
+        scope: &Scope,
+    ) -> (Operator, Vec<OutputCol>) {
+        let mut exprs = self.passthrough_exprs(&base, &scope.relations);
+        for a in assignments {
+            for column in assignment_target_columns(&a.target) {
+                let ne = NamedExpr {
+                    name: Some(column.clone()),
+                    expr: self.bind_expr(&a.value, scope),
+                };
+                match exprs
+                    .iter_mut()
+                    .find(|e| e.name.as_ref().is_some_and(|n| n.value == column.value))
+                {
+                    Some(slot) => *slot = ne,
+                    None => exprs.push(ne),
+                }
+            }
+        }
+        let outputs = self.output_cols(&exprs);
+        (
+            Operator::Project(Project {
+                input: Box::new(input),
+                exprs,
+            }),
+            outputs,
+        )
+    }
+
+    /// Wrap `input` in a non-feeding read [`Filter`] for a filter pipe operator
+    /// (empty predicate → unchanged).
+    fn pipe_filter(&self, input: Operator, predicate: Vec<Expr>) -> Operator {
+        if predicate.is_empty() {
+            input
+        } else {
+            Operator::Filter(Filter {
+                input: Box::new(input),
+                predicate,
+            })
+        }
+    }
+
+    fn bind_set_expr(&self, body: &SetExpr) -> (Operator, Scope) {
+        match body {
+            SetExpr::Select(select) => self.bind_select(select),
+            SetExpr::Query(query) => self.bind_query(query),
+            SetExpr::Values(values) => self.bind_values(values),
+            // `TABLE foo`: a whole-table query body (e.g. the source of
+            // `CREATE TABLE t AS TABLE foo`). Bind it as a read scan.
+            SetExpr::Table(table) => match table_set_expr_ref(table) {
+                Some(written) => self.bind_named_table(&written, None),
+                None => (Operator::Empty, Scope::default()),
+            },
+            // `WITH … INSERT/UPDATE/DELETE/MERGE …`: the DML statement is the
+            // query body (the parser wraps a CTE-prefixed DML this way). Bind it
+            // to its DML root; it exposes no output scope to an enclosing query.
+            SetExpr::Insert(statement)
+            | SetExpr::Update(statement)
+            | SetExpr::Delete(statement)
+            | SetExpr::Merge(statement) => (self.bind_statement(statement), Scope::default()),
+            // A set operation: result columns are the left operand's (names
+            // from the left, positional merge).
+            SetExpr::SetOperation { left, right, .. } => {
+                let (l, scope) = self.bind_set_expr(left);
+                let (r, _) = self.bind_set_expr(right);
+                (
+                    Operator::SetOp(super::operator::SetOp {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    }),
+                    scope,
+                )
+            }
+        }
+    }
+
+    /// Bind a `VALUES (…), (…)` row set into [`Operator::Values`]: one
+    /// anonymous output per column position (synthesised rows have no base
+    /// columns, so a reference to a `(VALUES …) AS v(x)` column is `Derived`
+    /// and traces to nothing — there is no column lineage). The row
+    /// expressions are reads, resolved against the empty current scope and
+    /// falling through to the correlation stack (a `(VALUES (t.a)) AS v` reads
+    /// the enclosing / sibling `t.a` like a derived subquery's body).
+    fn bind_values(&self, values: &SqlValues) -> (Operator, Scope) {
+        let width = values.rows.iter().map(Vec::len).max().unwrap_or(0);
+        let rows: Vec<Vec<Expr>> = values
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|expr| self.bind_expr(expr, &Scope::default()))
+                    .collect()
+            })
+            .collect();
+        let outputs = (0..width)
+            .map(|_| OutputCol {
+                name: None,
+                identity: false,
+            })
+            .collect();
+        (
+            Operator::Values(super::operator::Values { rows }),
+            Scope {
+                relations: Vec::new(),
+                outputs,
+                merge_columns: Vec::new(),
+            },
+        )
+    }
+
+    /// Bind a SELECT into the canonical operator chain `Scan → WHERE →
+    /// Aggregate (GROUP BY) → HAVING → Project → SORT BY`, returning the
+    /// operator and its clause scope (FROM relations + projection outputs) for
+    /// a trailing ORDER BY to resolve against. The projection resolves against
+    /// the FROM scope (so a grouped column is a base read, counted, not traced
+    /// through the `Aggregate`); the grouping / HAVING / SORT clauses resolve
+    /// against the FROM relations *plus* the projection outputs (clause-alias
+    /// visibility) — a resolution-scope rule, independent of tree position.
+    fn bind_select(&self, select: &Select) -> (Operator, Scope) {
+        let (from, scope) = self.bind_from(&select.from);
+        // WHERE + the WHERE-family auxiliary clauses (DISTINCT ON / TOP /
+        // LATERAL VIEW / PREWHERE / QUALIFY / CONNECT BY / CLUSTER BY / named
+        // WINDOW) filter rows before grouping — a filter over the FROM (no
+        // output aliases visible).
+        let mut where_reads: Vec<Expr> = select
+            .selection
+            .iter()
+            .map(|predicate| self.bind_expr(predicate, &scope))
+            .collect();
+        where_reads.extend(self.select_clause_reads(select, &scope));
+        let mut node = if where_reads.is_empty() {
+            from
+        } else {
+            Operator::Filter(Filter {
+                input: Box::new(from),
+                predicate: where_reads,
+            })
+        };
+        // The projection resolves against the FROM scope (base reads).
+        let exprs: Vec<NamedExpr> = select
+            .projection
+            .iter()
+            .filter_map(|item| self.bind_select_item(item, &scope))
+            .collect();
+        let outputs = self.output_cols(&exprs);
+        let clause_scope = Scope {
+            relations: scope.relations,
+            outputs,
+            merge_columns: scope.merge_columns,
+        };
+        // GROUP BY → an `Aggregate` over the filtered rows; its keys are reads.
+        let group_by = self.group_by_keys(&select.group_by, &clause_scope);
+        if !group_by.is_empty() {
+            node = Operator::Aggregate(super::operator::Aggregate {
+                input: Box::new(node),
+                group_by,
+            });
+        }
+        // HAVING → a filter on the grouped rows, between Aggregate and Project.
+        if let Some(having) = &select.having {
+            node = Operator::Filter(Filter {
+                input: Box::new(node),
+                predicate: vec![self.bind_expr(having, &clause_scope)],
+            });
+        }
+        // SELECT: the column-defining projection, on top.
+        node = Operator::Project(Project {
+            input: Box::new(node),
+            exprs,
+        });
+        // SORT BY (Hive) sees the outputs, like a trailing ORDER BY.
+        let sort_keys = self.order_by_expr_keys(&select.sort_by, &clause_scope);
+        if !sort_keys.is_empty() {
+            node = sort(node, sort_keys);
+        }
+        // `SELECT … INTO t` (MsSql / Postgres): the query also creates table `t`
+        // — wrap the projection as the create source so `t` is a write target.
+        if let Some(into) = &select.into {
+            if let Some(written) = self.table_ref(&into.name) {
+                node = Operator::CreateTableAs(super::operator::CreateTableAs {
+                    target: self.table_match(&written).table,
+                    columns: Vec::new(),
+                    input: Box::new(node),
+                });
+            }
+        }
+        (node, clause_scope)
+    }
+
+    fn bind_from(&self, items: &[TableWithJoins]) -> (Operator, Scope) {
+        let mut iter = items.iter();
+        let Some(first) = iter.next() else {
+            return (Operator::Empty, Scope::default());
+        };
+        let (mut node, mut scope) = self.bind_table_with_joins(first, &[]);
+        // Comma-separated FROM items are a cross join; a later item sees the
+        // earlier ones only if it is LATERAL.
+        for twj in iter {
+            let (right, right_scope) = self.bind_table_with_joins(twj, &scope.relations);
+            scope.relations.extend(right_scope.relations);
+            scope.merge_columns.extend(right_scope.merge_columns);
+            node = join(node, right, Vec::new());
+        }
+        (node, scope)
+    }
+
+    /// `left` are the FROM siblings to this item's left, visible to a LATERAL
+    /// factor (and to a joined factor, after the preceding join inputs).
+    fn bind_table_with_joins(&self, twj: &TableWithJoins, left: &[Relation]) -> (Operator, Scope) {
+        let (mut node, mut scope) = self.bind_table_factor(&twj.relation, left);
+        for j in &twj.joins {
+            // A joined LATERAL factor sees the left siblings plus the join
+            // inputs accumulated so far.
+            let visible: Vec<Relation> = left.iter().chain(&scope.relations).cloned().collect();
+            let (right, right_scope) = self.bind_table_factor(&j.relation, &visible);
+            scope.relations.extend(right_scope.relations);
+            scope.merge_columns.extend(right_scope.merge_columns);
+            // A `USING (col)` join records its merge columns: an unqualified
+            // reference to one fans in to both sides.
+            scope.merge_columns.extend(join_using(&j.join_operator));
+            // The ON predicate resolves against both sides' columns.
+            let on = join_on(&j.join_operator)
+                .map(|e| self.bind_expr(e, &scope))
+                .into_iter()
+                .collect();
+            node = join(node, right, on);
+        }
+        (node, scope)
+    }
+
+    /// Bind a bare named table into a read `Scan` plus a single-relation scope
+    /// (a unique catalog hit canonicalises + supplies columns + `Cataloged`;
+    /// else open + `Inferred` / `Ambiguous`). Shared by the table factor and a
+    /// `TABLE foo` query body.
+    fn bind_named_table(
+        &self,
+        written: &TableReference,
+        alias: Option<Ident>,
+    ) -> (Operator, Scope) {
+        let m = self.table_match(written);
+        let columns = if m.columns.is_empty() {
+            Columns::Open
+        } else {
+            Columns::Known(m.columns)
+        };
+        let scan = Operator::Scan(Scan {
+            table: m.table.clone(),
+            columns: columns.clone(),
+            resolution: m.resolution,
+        });
+        let relation = Relation {
+            alias,
+            source: RelSource::Table {
+                table: m.table,
+                columns,
+            },
+        };
+        (scan, scope_of(relation))
+    }
+
+    fn bind_table_factor(&self, factor: &TableFactor, left: &[Relation]) -> (Operator, Scope) {
+        match factor {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
+                let Some(written) = self.table_ref(name) else {
+                    return (Operator::Empty, Scope::default());
+                };
+                let alias_name = alias.as_ref().map(|a| a.name.clone());
+                // A bare name matching an in-scope CTE resolves to a `CteRef`
+                // (the body lives once on the owning `With`) exposing the CTE's
+                // output columns as a synthetic relation.
+                if written.schema.is_none() && written.catalog.is_none() {
+                    if let Some(cte) = self
+                        .ctes
+                        .iter()
+                        .rev()
+                        .find(|c| self.eq(self.casing.table_alias, &c.name, &written.name))
+                    {
+                        let relation = Relation {
+                            alias: alias_name.or_else(|| Some(cte.name.clone())),
+                            source: RelSource::Derived {
+                                columns: cte.columns.clone(),
+                            },
+                        };
+                        return (
+                            Operator::CteRef(super::operator::CteRef {
+                                name: cte.name.clone(),
+                            }),
+                            scope_of(relation),
+                        );
+                    }
+                }
+                let (scan, scope) = self.bind_named_table(&written, alias_name);
+                // A parameterised table reference `foo(args)`: the argument
+                // expressions read against the surrounding (sibling) scope —
+                // attach them as a non-feeding filter over the scan.
+                let node = match args {
+                    Some(args) => Operator::Filter(Filter {
+                        input: Box::new(scan),
+                        predicate: self.bind_function_arg_list(&args.args, &sibling_scope(left)),
+                    }),
+                    None => scan,
+                };
+                (node, scope)
+            }
+            // A derived table `(<subquery>) AS d`: bind the subquery, expose
+            // its output columns as a synthetic relation under the alias. A
+            // LATERAL derived table sees the left siblings (pushed onto the
+            // correlation stack); a non-lateral one does not.
+            TableFactor::Derived {
+                lateral,
+                subquery,
+                alias,
+                ..
+            } => {
+                let (mut op, sub_scope) = if *lateral {
+                    self.with_outer(left.to_vec()).bind_query(subquery)
+                } else {
+                    self.bind_query(subquery)
+                };
+                let columns = exposed_columns(&sub_scope.outputs, alias.as_ref());
+                let relation = Relation {
+                    alias: alias.as_ref().map(|a| a.name.clone()),
+                    source: RelSource::Derived { columns },
+                };
+                let node = match alias {
+                    Some(a) => {
+                        rename_outputs(&mut op, &alias_column_names(a));
+                        Operator::SubqueryAlias(super::operator::SubqueryAlias {
+                            alias: a.name.clone(),
+                            input: Box::new(op),
+                        })
+                    }
+                    None => op,
+                };
+                (node, scope_of(relation))
+            }
+            // A parenthesized join `(a JOIN b …)`: the inner tables bind
+            // directly into the current scope (their refs resolve, their ON
+            // reads surface); the wrapper exposes nothing of its own.
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => self.bind_table_with_joins(table_with_joins, left),
+            // --- opaque table-producing factors (dynamic columns) ---
+            // Bare table functions / UNNEST / JSON_TABLE / XML / semantic views:
+            // the argument expressions read against the surrounding
+            // (LATERAL-visible) `left` scope; no inner table feeds.
+            TableFactor::TableFunction { expr, alias } => {
+                let args = vec![self.bind_expr(expr, &sibling_scope(left))];
+                self.opaque(Operator::Empty, args, alias.as_ref())
+            }
+            TableFactor::Function { args, alias, .. } => {
+                let bound = self.bind_function_arg_list(args, &sibling_scope(left));
+                self.opaque(Operator::Empty, bound, alias.as_ref())
+            }
+            TableFactor::UNNEST {
+                array_exprs, alias, ..
+            } => {
+                let args = self.bind_exprs(array_exprs, &sibling_scope(left));
+                self.opaque(Operator::Empty, args, alias.as_ref())
+            }
+            TableFactor::JsonTable {
+                json_expr, alias, ..
+            }
+            | TableFactor::OpenJsonTable {
+                json_expr, alias, ..
+            } => {
+                let args = vec![self.bind_expr(json_expr, &sibling_scope(left))];
+                self.opaque(Operator::Empty, args, alias.as_ref())
+            }
+            TableFactor::XmlTable {
+                row_expression,
+                passing,
+                alias,
+                ..
+            } => {
+                let scope = sibling_scope(left);
+                let mut args = vec![self.bind_expr(row_expression, &scope)];
+                args.extend(
+                    passing
+                        .arguments
+                        .iter()
+                        .map(|a| self.bind_expr(&a.expr, &scope)),
+                );
+                self.opaque(Operator::Empty, args, alias.as_ref())
+            }
+            TableFactor::SemanticView {
+                dimensions,
+                metrics,
+                facts,
+                where_clause,
+                alias,
+                ..
+            } => {
+                let scope = sibling_scope(left);
+                let mut args = self.bind_exprs(dimensions, &scope);
+                args.extend(self.bind_exprs(metrics, &scope));
+                args.extend(self.bind_exprs(facts, &scope));
+                args.extend(where_clause.iter().map(|e| self.bind_expr(e, &scope)));
+                self.opaque(Operator::Empty, args, alias.as_ref())
+            }
+            // PIVOT / UNPIVOT / MATCH_RECOGNIZE wrap an inner table whose
+            // columns the clause expressions read; the produced relation is
+            // opaque. The inner table feeds (it's a real source).
+            TableFactor::Pivot {
+                table,
+                aggregate_functions,
+                value_column,
+                value_source,
+                default_on_null,
+                alias,
+                ..
+            } => {
+                let (inner, inner_scope) = self.bind_table_factor(table, left);
+                let mut args = aggregate_functions
+                    .iter()
+                    .map(|a| self.bind_expr(&a.expr, &inner_scope))
+                    .collect::<Vec<_>>();
+                args.extend(self.bind_exprs(value_column, &inner_scope));
+                args.extend(self.pivot_value_source_exprs(value_source, &inner_scope));
+                args.extend(
+                    default_on_null
+                        .iter()
+                        .map(|e| self.bind_expr(e, &inner_scope)),
+                );
+                self.opaque(inner, args, alias.as_ref())
+            }
+            TableFactor::Unpivot {
+                table,
+                value,
+                columns,
+                alias,
+                ..
+            } => {
+                let (inner, inner_scope) = self.bind_table_factor(table, left);
+                let mut args = vec![self.bind_expr(value, &inner_scope)];
+                args.extend(
+                    columns
+                        .iter()
+                        .map(|c| self.bind_expr(&c.expr, &inner_scope)),
+                );
+                self.opaque(inner, args, alias.as_ref())
+            }
+            TableFactor::MatchRecognize {
+                table,
+                partition_by,
+                order_by,
+                measures,
+                symbols,
+                alias,
+                ..
+            } => {
+                let (inner, inner_scope) = self.bind_table_factor(table, left);
+                let mut args = self.bind_exprs(partition_by, &inner_scope);
+                args.extend(
+                    order_by
+                        .iter()
+                        .map(|o| self.bind_expr(&o.expr, &inner_scope)),
+                );
+                args.extend(
+                    measures
+                        .iter()
+                        .map(|m| self.bind_expr(&m.expr, &inner_scope)),
+                );
+                args.extend(
+                    symbols
+                        .iter()
+                        .map(|s| self.bind_expr(&s.definition, &inner_scope)),
+                );
+                self.opaque(inner, args, alias.as_ref())
+            }
+        }
+    }
+
+    /// Assemble an opaque table-producing factor: an [`Operator::TableFunction`]
+    /// node carrying the (already-bound) argument reads over `input` (the wrapped
+    /// inner table, or [`Operator::Empty`] for a bare function), exposed as a
+    /// synthetic [`RelSource::TableFunction`] relation under the alias.
+    fn opaque(
+        &self,
+        input: Operator,
+        args: Vec<Expr>,
+        alias: Option<&TableAlias>,
+    ) -> (Operator, Scope) {
+        let alias_name = alias.map(|a| a.name.clone());
+        let node = Operator::TableFunction(super::operator::TableFunction {
+            alias: alias_name.clone(),
+            input: Box::new(input),
+            args,
+        });
+        let scope = match alias_name {
+            Some(name) => scope_of(Relation {
+                alias: Some(name),
+                source: RelSource::TableFunction,
+            }),
+            None => Scope::default(),
+        };
+        (node, scope)
+    }
+
+    /// The value expressions of a PIVOT value source (`IN (list)` / `ANY ORDER
+    /// BY …` / a subquery). The subquery's reads come from binding it.
+    fn pivot_value_source_exprs(&self, source: &PivotValueSource, scope: &Scope) -> Vec<Expr> {
+        match source {
+            PivotValueSource::List(values) => values
+                .iter()
+                .map(|v| self.bind_expr(&v.expr, scope))
+                .collect(),
+            PivotValueSource::Any(order_by) => order_by
+                .iter()
+                .map(|o| self.bind_expr(&o.expr, scope))
+                .collect(),
+            PivotValueSource::Subquery(query) => {
+                vec![Expr::Subquery(Box::new(self.bind_subquery(query, scope)))]
+            }
+        }
+    }
+
+    fn bind_select_item(&self, item: &SelectItem, scope: &Scope) -> Option<NamedExpr> {
+        match item {
+            SelectItem::UnnamedExpr(expr) => Some(NamedExpr {
+                name: inferred_name(expr),
+                expr: self.bind_expr(expr, scope),
+            }),
+            SelectItem::ExprWithAlias { expr, alias } => Some(NamedExpr {
+                name: Some(alias.clone()),
+                expr: self.bind_expr(expr, scope),
+            }),
+            // A wildcard isn't expanded (the rigor cost is too high for a
+            // SQL-text-only library); record it so consumers know this
+            // projection's column lineage is incomplete, and skip it.
+            SelectItem::Wildcard(options) => {
+                self.record_wildcard_suppressed("wildcard `*`", options.wildcard_token.0.span);
+                None
+            }
+            SelectItem::QualifiedWildcard(kind, options) => {
+                let description = match kind {
+                    SelectItemQualifiedWildcardKind::Expr(_) => {
+                        "qualified wildcard `(expr).*`".to_string()
+                    }
+                    SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                        format!("qualified wildcard `{name}.*`")
+                    }
+                };
+                self.record_wildcard_suppressed(&description, options.wildcard_token.0.span);
+                // `(expr).*` still projects its base expression as one
+                // Transformation output (a structural field access); `alias.*`
+                // has no inspectable base.
+                match kind {
+                    SelectItemQualifiedWildcardKind::Expr(expr) => Some(NamedExpr {
+                        name: None,
+                        expr: Expr::Call {
+                            args: vec![self.bind_expr(expr, scope)],
+                        },
+                    }),
+                    SelectItemQualifiedWildcardKind::ObjectName(_) => None,
+                }
+            }
+        }
+    }
+
+    /// Resolve a `sqlparser` expression into a bound [`Expr`], mirroring the
+    /// resolver's `collect_expr`. A bare column reference is the only
+    /// [`Passthrough`](crate::extractor::ColumnLineageKind::Passthrough) shape
+    /// ([`Expr::Column`]);
+    /// every other construct is a transformation over its value operands
+    /// ([`Expr::Call`]), with the predicate / row-positioning parts in a filter
+    /// position ([`Expr::Filter`] / [`Expr::Case`] / [`Expr::Exists`] /
+    /// [`Expr::InSubquery`]) so they read but never originate a value.
+    fn bind_expr(&self, expr: &SqlExpr, scope: &Scope) -> Expr {
+        match expr {
+            SqlExpr::Identifier(id) => self.resolve_expr(std::slice::from_ref(id), scope),
+            SqlExpr::CompoundIdentifier(parts) => self.resolve_expr(parts, scope),
+            // Both operands flow / filter with the surrounding position.
+            SqlExpr::BinaryOp { left, right, .. }
+            | SqlExpr::IsDistinctFrom(left, right)
+            | SqlExpr::IsNotDistinctFrom(left, right) => {
+                self.call([left.as_ref(), right.as_ref()], scope)
+            }
+            // ANY / ALL: the LHS keeps the surrounding position; the RHS is a
+            // shape test (suppressed).
+            SqlExpr::AnyOp { left, right, .. } | SqlExpr::AllOp { left, right, .. } => Expr::Call {
+                args: vec![
+                    self.bind_expr(left, scope),
+                    self.suppress([right.as_ref()], scope),
+                ],
+            },
+            // Single-operand transformations / unwrapped forms.
+            SqlExpr::UnaryOp { expr, .. }
+            | SqlExpr::Nested(expr)
+            | SqlExpr::OuterJoin(expr)
+            | SqlExpr::Prior(expr)
+            | SqlExpr::IsFalse(expr)
+            | SqlExpr::IsNotFalse(expr)
+            | SqlExpr::IsTrue(expr)
+            | SqlExpr::IsNotTrue(expr)
+            | SqlExpr::IsNull(expr)
+            | SqlExpr::IsNotNull(expr)
+            | SqlExpr::IsUnknown(expr)
+            | SqlExpr::IsNotUnknown(expr)
+            | SqlExpr::Cast { expr, .. }
+            | SqlExpr::IsNormalized { expr, .. }
+            | SqlExpr::Extract { expr, .. }
+            | SqlExpr::Ceil { expr, .. }
+            | SqlExpr::Floor { expr, .. }
+            | SqlExpr::Collate { expr, .. }
+            | SqlExpr::Prefixed { value: expr, .. }
+            | SqlExpr::Named { expr, .. }
+            | SqlExpr::JsonAccess { value: expr, .. } => self.call([expr.as_ref()], scope),
+            SqlExpr::CompoundFieldAccess { root, access_chain } => {
+                let mut args = vec![self.bind_expr(root, scope)];
+                for access in access_chain {
+                    args.extend(self.bind_access(access, scope));
+                }
+                Expr::Call { args }
+            }
+            SqlExpr::InList { expr, list, .. } => Expr::Call {
+                args: std::iter::once(self.bind_expr(expr, scope))
+                    .chain(list.iter().map(|e| self.bind_expr(e, scope)))
+                    .collect(),
+            },
+            SqlExpr::InUnnest {
+                expr, array_expr, ..
+            } => self.call([expr.as_ref(), array_expr.as_ref()], scope),
+            SqlExpr::Between {
+                expr, low, high, ..
+            } => self.call([expr.as_ref(), low.as_ref(), high.as_ref()], scope),
+            SqlExpr::Like { expr, pattern, .. }
+            | SqlExpr::ILike { expr, pattern, .. }
+            | SqlExpr::SimilarTo { expr, pattern, .. }
+            | SqlExpr::RLike { expr, pattern, .. } => {
+                self.call([expr.as_ref(), pattern.as_ref()], scope)
+            }
+            SqlExpr::Convert { expr, styles, .. } => Expr::Call {
+                args: std::iter::once(self.bind_expr(expr, scope))
+                    .chain(styles.iter().map(|e| self.bind_expr(e, scope)))
+                    .collect(),
+            },
+            SqlExpr::AtTimeZone {
+                timestamp,
+                time_zone,
+            } => self.call([timestamp.as_ref(), time_zone.as_ref()], scope),
+            SqlExpr::Position { expr, r#in } => self.call([expr.as_ref(), r#in.as_ref()], scope),
+            SqlExpr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => Expr::Call {
+                args: std::iter::once(self.bind_expr(expr, scope))
+                    .chain(
+                        [substring_from, substring_for]
+                            .into_iter()
+                            .flatten()
+                            .map(|e| self.bind_expr(e, scope)),
+                    )
+                    .collect(),
+            },
+            SqlExpr::Trim {
+                expr,
+                trim_what,
+                trim_characters,
+                ..
+            } => {
+                let mut args = vec![self.bind_expr(expr, scope)];
+                args.extend(trim_what.iter().map(|e| self.bind_expr(e, scope)));
+                if let Some(chars) = trim_characters {
+                    args.extend(chars.iter().map(|e| self.bind_expr(e, scope)));
+                }
+                Expr::Call { args }
+            }
+            SqlExpr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => {
+                let mut args = vec![
+                    self.bind_expr(expr, scope),
+                    self.bind_expr(overlay_what, scope),
+                    self.bind_expr(overlay_from, scope),
+                ];
+                args.extend(overlay_for.iter().map(|e| self.bind_expr(e, scope)));
+                Expr::Call { args }
+            }
+            // CASE: the operand and WHEN conditions are predicates (filter);
+            // the THEN / ELSE results are the values that flow.
+            SqlExpr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                let mut when: Vec<Expr> =
+                    operand.iter().map(|e| self.bind_expr(e, scope)).collect();
+                let mut then = Vec::new();
+                for condition in conditions {
+                    when.push(self.bind_expr(&condition.condition, scope));
+                    then.push(self.bind_expr(&condition.result, scope));
+                }
+                Expr::Case {
+                    when,
+                    then,
+                    else_: else_result
+                        .as_ref()
+                        .map(|e| Box::new(self.bind_expr(e, scope))),
+                }
+            }
+            SqlExpr::Rollup(sets) | SqlExpr::Cube(sets) | SqlExpr::GroupingSets(sets) => {
+                Expr::Call {
+                    args: sets
+                        .iter()
+                        .flatten()
+                        .map(|e| self.bind_expr(e, scope))
+                        .collect(),
+                }
+            }
+            SqlExpr::Tuple(exprs) | SqlExpr::Struct { values: exprs, .. } => Expr::Call {
+                args: self.bind_exprs(exprs, scope),
+            },
+            SqlExpr::Function(function) => self.bind_function(function, scope),
+            SqlExpr::Dictionary(fields) => Expr::Call {
+                args: fields
+                    .iter()
+                    .map(|f| self.bind_expr(&f.value, scope))
+                    .collect(),
+            },
+            SqlExpr::Map(map) => Expr::Call {
+                args: map
+                    .entries
+                    .iter()
+                    .flat_map(|e| {
+                        [
+                            self.bind_expr(&e.key, scope),
+                            self.bind_expr(&e.value, scope),
+                        ]
+                    })
+                    .collect(),
+            },
+            SqlExpr::Array(array) => Expr::Call {
+                args: self.bind_exprs(&array.elem, scope),
+            },
+            SqlExpr::Interval(interval) => self.call([interval.value.as_ref()], scope),
+            SqlExpr::Lambda(lambda) => self.call([lambda.body.as_ref()], scope),
+            SqlExpr::MemberOf(member_of) => {
+                self.call([member_of.value.as_ref(), member_of.array.as_ref()], scope)
+            }
+            // A scalar subquery (value position): its output flows in.
+            SqlExpr::Subquery(query) => Expr::Subquery(Box::new(self.bind_subquery(query, scope))),
+            // Tests (filter position): columns read, never an origin.
+            SqlExpr::Exists { subquery, .. } => {
+                Expr::Exists(Box::new(self.bind_subquery(subquery, scope)))
+            }
+            SqlExpr::InSubquery { expr, subquery, .. } => Expr::InSubquery {
+                expr: Box::new(self.bind_expr(expr, scope)),
+                subquery: Box::new(self.bind_subquery(subquery, scope)),
+            },
+            // Literals and forms with no column references.
+            SqlExpr::Value(_)
+            | SqlExpr::TypedString(_)
+            | SqlExpr::MatchAgainst { .. }
+            | SqlExpr::Wildcard(_)
+            | SqlExpr::QualifiedWildcard(_, _) => Expr::Call { args: Vec::new() },
+        }
+    }
+
+    /// Resolve a column reference into an `Expr`: an unqualified `JOIN … USING
+    /// (col)` merge column with several owners fans in to all of them
+    /// (`Expr::Fanin`); everything else is a single `Expr::Column`.
+    fn resolve_expr(&self, parts: &[Ident], scope: &Scope) -> Expr {
+        if parts.len() == 1 {
+            if let Some(fanin) = self.merge_fanin(&parts[0], scope) {
+                return fanin;
+            }
+        }
+        Expr::Column(Box::new(self.resolve(parts, scope)))
+    }
+
+    /// If `name` is a `USING` merge column with two or more owners in scope,
+    /// the fan-in (one `Passthrough` ref per owning relation). A single owner
+    /// falls through to normal resolution; a catalog narrows the owners to the
+    /// relations that declare the column (`Cataloged`), catalog-free reaches
+    /// every joined relation (`Inferred`).
+    fn merge_fanin(&self, name: &Ident, scope: &Scope) -> Option<Expr> {
+        if !scope
+            .merge_columns
+            .iter()
+            .any(|m| self.eq(self.casing.column, m, name))
+        {
+            return None;
+        }
+        let refs: Vec<ColRef> = scope
+            .relations
+            .iter()
+            .filter_map(|rel| self.fanin_owner(rel, name))
+            .collect();
+        (refs.len() >= 2).then_some(Expr::Fanin(refs))
+    }
+
+    /// A relation's contribution to a merge-column fan-in: a real table owns
+    /// the column if `Open` (catalog-free → `Inferred`) or its `Known` schema
+    /// lists it (`Cataloged`); a derived / function relation doesn't.
+    fn fanin_owner(&self, rel: &Relation, name: &Ident) -> Option<ColRef> {
+        let (table, resolution) = match &rel.source {
+            RelSource::Table {
+                table,
+                columns: Columns::Open,
+                ..
+            } => (table, ResolutionKind::Inferred),
+            RelSource::Table {
+                table,
+                columns: Columns::Known(cols),
+                ..
+            } if self.list_has(cols, name) => (table, ResolutionKind::Cataloged),
+            _ => return None,
+        };
+        Some(ColRef {
+            qualifier: None,
+            name: name.clone(),
+            binding: base(table, resolution),
+        })
+    }
+
+    /// A transformation over the given value operands (`Expr::Call`).
+    fn call<'e>(&self, exprs: impl IntoIterator<Item = &'e SqlExpr>, scope: &Scope) -> Expr {
+        Expr::Call {
+            args: exprs
+                .into_iter()
+                .map(|e| self.bind_expr(e, scope))
+                .collect(),
+        }
+    }
+
+    /// A filter-position bucket over the given operands (`Expr::Filter`): read
+    /// but never a value origin.
+    fn suppress<'e>(&self, exprs: impl IntoIterator<Item = &'e SqlExpr>, scope: &Scope) -> Expr {
+        Expr::Filter(
+            exprs
+                .into_iter()
+                .map(|e| self.bind_expr(e, scope))
+                .collect(),
+        )
+    }
+
+    /// Bind a field-access step's value expressions (a `.field` / subscript
+    /// index / slice bounds).
+    fn bind_access(&self, access: &AccessExpr, scope: &Scope) -> Vec<Expr> {
+        match access {
+            AccessExpr::Dot(expr) => vec![self.bind_expr(expr, scope)],
+            AccessExpr::Subscript(Subscript::Index { index }) => vec![self.bind_expr(index, scope)],
+            AccessExpr::Subscript(Subscript::Slice {
+                lower_bound,
+                upper_bound,
+                stride,
+            }) => [lower_bound, upper_bound, stride]
+                .into_iter()
+                .flatten()
+                .map(|e| self.bind_expr(e, scope))
+                .collect(),
+        }
+    }
+
+    /// Bind a function call: the value arguments (parameters + args) plus the
+    /// suppressed parts (an aggregate `FILTER` / `WITHIN GROUP`, a window
+    /// `OVER (…)` spec's partition / order / frame keys — all row-positioning,
+    /// never value sources) gathered into one [`Expr::Filter`].
+    fn bind_function(&self, function: &Function, scope: &Scope) -> Expr {
+        let mut args = Vec::new();
+        if let FunctionArguments::List(list) = &function.parameters {
+            args.extend(self.bind_function_arg_list(&list.args, scope));
+        }
+        let mut suppressed = Vec::new();
+        if let FunctionArguments::List(list) = &function.args {
+            args.extend(self.bind_function_arg_list(&list.args, scope));
+            for clause in &list.clauses {
+                match clause {
+                    FunctionArgumentClause::OrderBy(order_by) => {
+                        suppressed.extend(order_by.iter().map(|o| self.bind_expr(&o.expr, scope)));
+                    }
+                    FunctionArgumentClause::Limit(expr) => {
+                        suppressed.push(self.bind_expr(expr, scope));
+                    }
+                    FunctionArgumentClause::Having(bound) => {
+                        suppressed.push(self.bind_expr(&bound.1, scope));
+                    }
+                    FunctionArgumentClause::OnOverflow(ListAggOnOverflow::Truncate {
+                        filler: Some(filler),
+                        ..
+                    }) => args.push(self.bind_expr(filler, scope)),
+                    FunctionArgumentClause::OnOverflow(_)
+                    | FunctionArgumentClause::IgnoreOrRespectNulls(_)
+                    | FunctionArgumentClause::Separator(_)
+                    | FunctionArgumentClause::JsonNullClause(_)
+                    | FunctionArgumentClause::JsonReturningClause(_) => {}
+                }
+            }
+        } else if let FunctionArguments::Subquery(query) = &function.args {
+            args.push(Expr::Subquery(Box::new(self.bind_subquery(query, scope))));
+        }
+        if let Some(filter) = &function.filter {
+            suppressed.push(self.bind_expr(filter, scope));
+        }
+        suppressed.extend(
+            function
+                .within_group
+                .iter()
+                .map(|o| self.bind_expr(&o.expr, scope)),
+        );
+        // A window function `f(args) OVER (…)` is an `Expr::Window`: the value
+        // arguments flow (a transformation), the PARTITION BY / ORDER BY keys
+        // (+ frame bounds) and any FILTER / WITHIN GROUP are row-positioning
+        // (filter — reads, never origins).
+        match &function.over {
+            Some(WindowType::WindowSpec(spec)) => {
+                let partition = spec
+                    .partition_by
+                    .iter()
+                    .map(|e| self.bind_expr(e, scope))
+                    .collect();
+                let mut order: Vec<Expr> = spec
+                    .order_by
+                    .iter()
+                    .map(|o| self.bind_expr(&o.expr, scope))
+                    .collect();
+                if let Some(frame) = &spec.window_frame {
+                    for bound in [Some(&frame.start_bound), frame.end_bound.as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let WindowFrameBound::Preceding(Some(e))
+                        | WindowFrameBound::Following(Some(e)) = bound
+                        {
+                            order.push(self.bind_expr(e, scope));
+                        }
+                    }
+                }
+                order.extend(suppressed);
+                Expr::Window {
+                    arg: Box::new(Expr::Call { args }),
+                    partition,
+                    order,
+                }
+            }
+            // A named window `OVER w`: the spec is in the SELECT's WINDOW clause
+            // (read there); here the arg is the value, no inline keys.
+            Some(_) => Expr::Window {
+                arg: Box::new(Expr::Call { args }),
+                partition: Vec::new(),
+                order: suppressed,
+            },
+            None => {
+                if !suppressed.is_empty() {
+                    args.push(Expr::Filter(suppressed));
+                }
+                Expr::Call { args }
+            }
+        }
+    }
+
+    /// Bind a subquery nested in an expression: its references resolve against
+    /// its own FROM plus the containing scope's relations (pushed onto the
+    /// correlation stack), so a correlated reference reaches outward.
+    fn bind_subquery(&self, query: &Query, scope: &Scope) -> Operator {
+        self.with_outer(scope.relations.clone()).bind_query(query).0
+    }
+
+    fn bind_function_args(&self, function: &Function, scope: &Scope) -> Vec<Expr> {
+        match &function.args {
+            FunctionArguments::List(list) => self.bind_function_arg_list(&list.args, scope),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Bind a function-argument list's value expressions (dropping `*` and
+    /// other non-expression args). Shared by scalar functions and table
+    /// functions (`FROM f(args)`).
+    fn bind_function_arg_list(&self, args: &[FunctionArg], scope: &Scope) -> Vec<Expr> {
+        args.iter()
+            .filter_map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                | FunctionArg::Named {
+                    arg: FunctionArgExpr::Expr(e),
+                    ..
+                }
+                | FunctionArg::ExprNamed {
+                    arg: FunctionArgExpr::Expr(e),
+                    ..
+                } => Some(self.bind_expr(e, scope)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Bind several expressions against `scope`.
+    fn bind_exprs(&self, exprs: &[SqlExpr], scope: &Scope) -> Vec<Expr> {
+        exprs.iter().map(|e| self.bind_expr(e, scope)).collect()
+    }
+
+    /// Filter-position reads from a SELECT's auxiliary clauses (`DISTINCT ON`
+    /// keys, `TOP n`, Hive `LATERAL VIEW`, `PREWHERE`, `QUALIFY`, `CONNECT BY`
+    /// / `START WITH`, `CLUSTER BY` / `DISTRIBUTE BY`, named `WINDOW` specs),
+    /// resolved against the FROM scope. None feed values.
+    fn select_clause_reads(&self, select: &Select, scope: &Scope) -> Vec<Expr> {
+        let mut reads = Vec::new();
+        if let Some(Distinct::On(exprs)) = &select.distinct {
+            reads.extend(self.bind_exprs(exprs, scope));
+        }
+        if let Some(top) = &select.top {
+            if let Some(TopQuantity::Expr(expr)) = &top.quantity {
+                reads.push(self.bind_expr(expr, scope));
+            }
+        }
+        for lateral_view in &select.lateral_views {
+            reads.push(self.bind_expr(&lateral_view.lateral_view, scope));
+        }
+        reads.extend(select.prewhere.iter().map(|e| self.bind_expr(e, scope)));
+        reads.extend(select.qualify.iter().map(|e| self.bind_expr(e, scope)));
+        for connect_by in &select.connect_by {
+            match connect_by {
+                ConnectByKind::ConnectBy { relationships, .. } => {
+                    reads.extend(self.bind_exprs(relationships, scope));
+                }
+                ConnectByKind::StartWith { condition, .. } => {
+                    reads.push(self.bind_expr(condition, scope));
+                }
+            }
+        }
+        for expr in select.cluster_by.iter().chain(&select.distribute_by) {
+            reads.push(self.bind_expr(expr, scope));
+        }
+        for window in &select.named_window {
+            if let NamedWindowExpr::WindowSpec(spec) = &window.1 {
+                reads.extend(self.window_spec_reads(spec, scope));
+            }
+        }
+        reads
+    }
+
+    /// A window `OVER (…)` spec's reads (PARTITION BY / ORDER BY keys + frame
+    /// bounds) — all row-positioning, never value sources.
+    fn window_spec_reads(&self, spec: &WindowSpec, scope: &Scope) -> Vec<Expr> {
+        let mut reads = self.bind_exprs(&spec.partition_by, scope);
+        reads.extend(spec.order_by.iter().map(|o| self.bind_expr(&o.expr, scope)));
+        if let Some(frame) = &spec.window_frame {
+            for bound in [Some(&frame.start_bound), frame.end_bound.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let WindowFrameBound::Preceding(Some(e)) | WindowFrameBound::Following(Some(e)) =
+                    bound
+                {
+                    reads.push(self.bind_expr(e, scope));
+                }
+            }
+        }
+        reads
+    }
+
+    /// Filter-position reads from a query's `LIMIT` / `OFFSET` / `LIMIT BY`.
+    fn limit_reads(&self, limit: &LimitClause, scope: &Scope) -> Vec<Expr> {
+        let mut reads = Vec::new();
+        match limit {
+            LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            } => {
+                reads.extend(
+                    limit
+                        .iter()
+                        .chain(limit_by)
+                        .map(|e| self.bind_expr(e, scope)),
+                );
+                reads.extend(offset.iter().map(|o| self.bind_expr(&o.value, scope)));
+            }
+            LimitClause::OffsetCommaLimit { offset, limit } => {
+                reads.push(self.bind_expr(offset, scope));
+                reads.push(self.bind_expr(limit, scope));
+            }
+        }
+        reads
+    }
+
+    // ===== clauses (GROUP BY / HAVING / ORDER BY) ========================
+
+    /// The GROUP BY key expressions (plain + GROUPING SETS members), resolved
+    /// against the clause scope. These are reads, not lineage origins.
+    fn group_by_keys(&self, group_by: &GroupByExpr, scope: &Scope) -> Vec<Expr> {
+        let mut keys = Vec::new();
+        if let GroupByExpr::Expressions(exprs, modifiers) = group_by {
+            let members = exprs.iter().chain(modifiers.iter().filter_map(|m| match m {
+                GroupByWithModifier::GroupingSets(expr) => Some(expr),
+                _ => None,
+            }));
+            for expr in members {
+                keys.push(self.bind_expr(expr, scope));
+            }
+        }
+        keys
+    }
+
+    /// The ORDER BY key expressions (a trailing `query.order_by`).
+    fn order_by_keys(&self, order_by: &OrderBy, scope: &Scope) -> Vec<Expr> {
+        let OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return Vec::new();
+        };
+        self.order_by_expr_keys(exprs, scope)
+    }
+
+    /// Bind a list of order-by expressions (`query.order_by` members or a
+    /// `SELECT … SORT BY` list) as clause reads.
+    fn order_by_expr_keys(&self, exprs: &[OrderByExpr], scope: &Scope) -> Vec<Expr> {
+        exprs
+            .iter()
+            .map(|e| self.bind_expr(&e.expr, scope))
+            .collect()
+    }
+
+    /// Summarise the projection outputs for clause-alias resolution. An output
+    /// is *identity* iff it is a bare column under its own name.
+    fn output_cols(&self, exprs: &[NamedExpr]) -> Vec<OutputCol> {
+        exprs
+            .iter()
+            .map(|ne| {
+                let identity = match &ne.expr {
+                    Expr::Column(c) => ne
+                        .name
+                        .as_ref()
+                        .is_some_and(|n| self.eq(self.casing.column, n, &c.name)),
+                    _ => false,
+                };
+                OutputCol {
+                    name: ne.name.clone(),
+                    identity,
+                }
+            })
+            .collect()
+    }
+
+    // ===== column resolution =============================================
+
+    /// Resolve a dotted reference (`parts`) against the scope. Unqualified
+    /// ranks every relation; qualified matches the qualifier first. Collapsed
+    /// by [`pick`](Self::pick).
+    fn resolve(&self, parts: &[Ident], scope: &Scope) -> ColRef {
+        let name = parts.last().expect("a reference has at least one segment");
+        // Clause-alias visibility (GROUP BY / HAVING / ORDER BY): a bare ref
+        // naming an *introduced* output alias resolves to that output
+        // (`Derived`, dropped from reads — the real dependency is at the
+        // projection). An *identity* passthrough falls through to the real
+        // column. (Empty `outputs` at FROM-level, so this is a no-op there.)
+        if parts.len() == 1 {
+            if let Some(out) = scope.outputs.iter().find(|o| {
+                o.name
+                    .as_ref()
+                    .is_some_and(|n| self.eq(self.casing.column, n, name))
+            }) {
+                if !out.identity {
+                    return ColRef {
+                        qualifier: None,
+                        name: name.clone(),
+                        binding: Binding::Derived,
+                    };
+                }
+            }
+        }
+        // Resolve against the current scope, then fall through the enclosing
+        // scopes (correlation), innermost first, before giving up.
+        let binding = self
+            .resolve_in(parts, &scope.relations)
+            .or_else(|| {
+                self.outer
+                    .iter()
+                    .rev()
+                    .find_map(|relations| self.resolve_in(parts, relations))
+            })
+            .unwrap_or(Binding::Unresolved);
+        ColRef {
+            qualifier: (parts.len() >= 2).then(|| parts[parts.len() - 2].clone()),
+            name: name.clone(),
+            binding,
+        }
+    }
+
+    /// Resolve `parts` against one set of relations, returning `None` when none
+    /// could own the column (so the caller falls through to an enclosing
+    /// scope) and `Some(binding)` once at least one is a candidate (even if
+    /// that collapses to `Ambiguous` — a name owned here doesn't escape).
+    fn resolve_in(&self, parts: &[Ident], relations: &[Relation]) -> Option<Binding> {
+        let name = parts.last()?;
+        let candidates: Vec<Candidate> = if parts.len() == 1 {
+            relations
+                .iter()
+                .filter_map(|rel| self.unqualified_candidate(rel, name))
+                .collect()
+        } else {
+            let qualifier_parts = &parts[..parts.len() - 1];
+            let qualifier_ref = TableReference::try_from_parts(qualifier_parts);
+            relations
+                .iter()
+                .filter_map(|rel| {
+                    self.qualified_candidate(rel, qualifier_parts, qualifier_ref.as_ref(), name)
+                })
+                .collect()
+        };
+        (!candidates.is_empty()).then(|| self.pick(candidates))
+    }
+
+    /// A relation is an unqualified candidate iff it could own `name`: a
+    /// `Known` schema must list it (confirmed witness); an `Open` table always
+    /// could (suspect).
+    fn unqualified_candidate(&self, rel: &Relation, name: &Ident) -> Option<Candidate> {
+        match &rel.source {
+            RelSource::Table {
+                table,
+                columns: Columns::Known(cols),
+                ..
+            } => self.list_has(cols, name).then(|| Candidate {
+                binding: base(table, ResolutionKind::Cataloged),
+                confirmed: true,
+            }),
+            RelSource::Table {
+                table,
+                columns: Columns::Open,
+                ..
+            } => Some(Candidate {
+                binding: base(table, ResolutionKind::Inferred),
+                confirmed: false,
+            }),
+            // A derived relation owns the column iff it exposes it (confirmed
+            // witness, like a Known table); the origin traversal collapses it.
+            RelSource::Derived { columns } => self.list_has(columns, name).then_some(Candidate {
+                binding: Binding::Derived,
+                confirmed: true,
+            }),
+            // A table function's columns are opaque — a bare name is not
+            // claimed by it (stays resolvable against real tables).
+            RelSource::TableFunction => None,
+        }
+    }
+
+    /// A relation is a qualified candidate iff the qualifier matches it: a
+    /// non-aliased real table by right-anchored path, anything else by its
+    /// single exposed (alias) name. A `Known` table that doesn't list the
+    /// column still resolves (`Inferred`) — the qualifier pins it.
+    fn qualified_candidate(
+        &self,
+        rel: &Relation,
+        qualifier_parts: &[Ident],
+        qualifier_ref: Option<&TableReference>,
+        name: &Ident,
+    ) -> Option<Candidate> {
+        let qualifier_ok = match &rel.source {
+            RelSource::Table { table, .. } if rel.alias.is_none() => {
+                qualifier_ref.is_some_and(|q| self.qualifier_matches_table(q, table))
+            }
+            _ => rel.exposed_name().is_some_and(|exposed| {
+                matches!(qualifier_parts, [only] if self.eq(self.casing.table_alias, only, exposed))
+            }),
+        };
+        if !qualifier_ok {
+            return None;
+        }
+        match &rel.source {
+            RelSource::Table {
+                table,
+                columns: Columns::Known(cols),
+                ..
+            } => {
+                let confirmed = self.list_has(cols, name);
+                let resolution = if confirmed {
+                    ResolutionKind::Cataloged
+                } else {
+                    ResolutionKind::Inferred
+                };
+                Some(Candidate {
+                    binding: base(table, resolution),
+                    confirmed,
+                })
+            }
+            RelSource::Table {
+                table,
+                columns: Columns::Open,
+                ..
+            } => Some(Candidate {
+                binding: base(table, ResolutionKind::Inferred),
+                confirmed: false,
+            }),
+            RelSource::Derived { columns } => self.list_has(columns, name).then_some(Candidate {
+                binding: Binding::Derived,
+                confirmed: true,
+            }),
+            // A ref qualified by a table function's alias resolves to it: a
+            // `Derived` binding the traversal turns into the synthetic
+            // `alias.col` lineage source (dropped from reads).
+            RelSource::TableFunction => Some(Candidate {
+                binding: Binding::Derived,
+                confirmed: true,
+            }),
+        }
+    }
+
+    /// Collapse candidates to a [`Binding`]: none → `Unresolved`; one → its
+    /// binding verbatim; several with exactly one confirmed witness → that
+    /// witness, downgraded to `Inferred` (Known-witness-over-Open); otherwise
+    /// `Ambiguous`.
+    fn pick(&self, candidates: Vec<Candidate>) -> Binding {
+        match candidates.len() {
+            0 => Binding::Unresolved,
+            1 => candidates.into_iter().next().unwrap().binding,
+            _ => {
+                let mut confirmed = candidates.into_iter().filter(|c| c.confirmed);
+                match (confirmed.next(), confirmed.next()) {
+                    (Some(witness), None) => downgrade(witness.binding),
+                    _ => Binding::Ambiguous,
+                }
+            }
+        }
+    }
+
+    /// Match a written table reference against the catalog (after default-fill,
+    /// right-anchored, dialect-cased). Unique hit → canonical identity + Known
+    /// columns + `Cataloged`; several → written ref + `Ambiguous`; no catalog
+    /// or no hit → written ref + `Inferred`.
+    fn table_match(&self, written: &TableReference) -> TableMatch {
+        let no_hit = |resolution| TableMatch {
+            table: written.clone(),
+            resolution,
+            columns: Vec::new(),
+        };
+        let Some(catalog) = self.catalog else {
+            return no_hit(ResolutionKind::Inferred);
+        };
+        let filled = fill_query_defaults(written, catalog);
+        let fold = self.casing.table;
+        let mut hits = catalog
+            .tables()
+            .iter()
+            .filter(|t| catalog_table_matches(&filled, t, fold));
+        let Some(first) = hits.next() else {
+            return no_hit(ResolutionKind::Inferred);
+        };
+        if hits.next().is_some() {
+            return no_hit(ResolutionKind::Ambiguous);
+        }
+        let columns = first
+            .column_names()
+            .iter()
+            .map(|c| Ident::with_quote('"', c))
+            .collect();
+        TableMatch {
+            table: canonical_ref(first),
+            resolution: ResolutionKind::Cataloged,
+            columns,
+        }
+    }
+
+    /// Right-anchored match of a decoded qualifier against a real table's
+    /// `catalog.schema.name`, under the dialect's table casing (an omitted
+    /// qualifier segment is a wildcard).
+    fn qualifier_matches_table(&self, qualifier: &TableReference, table: &TableReference) -> bool {
+        let fold = self.casing.table;
+        let opt_eq = |a: Option<&Ident>, b: Option<&Ident>| match (a, b) {
+            (Some(x), Some(y)) => fold.normalize(x) == fold.normalize(y),
+            _ => true,
+        };
+        fold.normalize(&qualifier.name) == fold.normalize(&table.name)
+            && opt_eq(qualifier.schema.as_ref(), table.schema.as_ref())
+            && opt_eq(qualifier.catalog.as_ref(), table.catalog.as_ref())
+    }
+
+    fn list_has(&self, columns: &[Ident], name: &Ident) -> bool {
+        columns.iter().any(|c| self.eq(self.casing.column, c, name))
+    }
+
+    /// The target table's catalog column names (unquoted), for filling in a
+    /// column-less `INSERT` / `MERGE … INSERT`. Empty without a unique catalog
+    /// hit. (The matched columns are quote-wrapped for case-folded resolution;
+    /// the written column list takes the plain identifier.)
+    fn catalog_columns(&self, target: &TableReference) -> Vec<Ident> {
+        self.table_match(target)
+            .columns
+            .iter()
+            .map(|c| Ident::new(&c.value))
+            .collect()
+    }
+
+    fn eq(&self, fold: CaseFold, a: &Ident, b: &Ident) -> bool {
+        fold.normalize(a) == fold.normalize(b)
+    }
+}
+
+// ===== catalog matching ==================================================
+
+/// The outcome of matching a written table reference against the catalog.
+struct TableMatch {
+    table: TableReference,
+    resolution: ResolutionKind,
+    columns: Vec<Ident>,
+}
+
+/// Fill a query reference's missing prefix segments from the catalog's
+/// defaults (bare → schema then catalog).
+fn fill_query_defaults(written: &TableReference, catalog: &Catalog) -> TableReference {
+    let mut filled = written.clone();
+    if filled.schema.is_none() {
+        if let Some(schema) = catalog.default_schema_segment() {
+            filled.schema = Some(Ident::with_quote('"', schema));
+        }
+    }
+    if filled.catalog.is_none() && filled.schema.is_some() {
+        if let Some(catalog_segment) = catalog.default_catalog_segment() {
+            filled.catalog = Some(Ident::with_quote('"', catalog_segment));
+        }
+    }
+    filled
+}
+
+/// Right-anchored, dialect-cased match of a (default-filled) query reference
+/// against a registered table.
+fn catalog_table_matches(query: &TableReference, table: &CatalogTable, fold: CaseFold) -> bool {
+    if fold.normalize(&query.name) != normalize_catalog(table.name_segment(), fold) {
+        return false;
+    }
+    if let Some(schema) = &query.schema {
+        if fold.normalize(schema) != normalize_catalog(table.schema_segment(), fold) {
+            return false;
+        }
+    }
+    match (&query.catalog, table.catalog_segment()) {
+        (Some(query_catalog), Some(table_catalog)) => {
+            fold.normalize(query_catalog) == normalize_catalog(table_catalog, fold)
+        }
+        _ => true,
+    }
+}
+
+fn normalize_catalog(segment: &str, fold: CaseFold) -> String {
+    fold.normalize(&Ident::with_quote('"', segment))
+}
+
+/// The surfaced canonical identity of a matched table: plain (unquoted) idents.
+fn canonical_ref(table: &CatalogTable) -> TableReference {
+    TableReference {
+        catalog: table.catalog_segment().map(Ident::new),
+        schema: Some(Ident::new(table.schema_segment())),
+        name: Ident::new(table.name_segment()),
+    }
+}
+
+// ===== small helpers =====================================================
+
+fn base(table: &TableReference, resolution: ResolutionKind) -> Binding {
+    Binding::Base {
+        table: table.clone(),
+        resolution,
+    }
+}
+
+/// Downgrade a winning real-table witness to `Inferred` — adopted over Open
+/// suspects without firm evidence.
+fn downgrade(binding: Binding) -> Binding {
+    match binding {
+        Binding::Base { table, .. } => Binding::Base {
+            table,
+            resolution: ResolutionKind::Inferred,
+        },
+        other => other,
+    }
+}
+
+fn join(left: Operator, right: Operator, on: Vec<Expr>) -> Operator {
+    Operator::Join(super::operator::Join {
+        left: Box::new(left),
+        right: Box::new(right),
+        on,
+        lateral: false,
+    })
+}
+
+/// Cross-join `right` onto `left`, but if `left` is the empty placeholder
+/// just take `right` (so a single read relation isn't wrapped in a join with
+/// nothing). Used to accumulate a DML statement's read relations.
+fn combine(left: Operator, right: Operator) -> Operator {
+    if matches!(left, Operator::Empty) {
+        right
+    } else {
+        join(left, right, Vec::new())
+    }
+}
+
+/// The column(s) a SET assignment writes: a `col` up to
+/// `catalog.schema.table.col` (≤ 4 segments) contributes its last identifier;
+/// a tuple target `(a, b) = …` or a deeper qualifier contributes nothing
+/// (not column-paired).
+fn assignment_target_columns(target: &AssignmentTarget) -> Vec<Ident> {
+    match target {
+        AssignmentTarget::ColumnName(name) if name.0.len() <= 4 => name
+            .0
+            .last()
+            .and_then(|p| p.as_ident().cloned())
+            .into_iter()
+            .collect(),
+        AssignmentTarget::ColumnName(_) | AssignmentTarget::Tuple(_) => Vec::new(),
+    }
+}
+
+/// The column name(s) an `ALTER TABLE` operation writes to. Column-naming ops
+/// (ADD / DROP / RENAME / CHANGE / MODIFY / ALTER COLUMN) name their column(s);
+/// RENAME / CHANGE surface both old and new names. Schema-level ops
+/// (constraints, partitions, RENAME TABLE) name no columns.
+fn alter_table_op_target_columns(op: &AlterTableOperation) -> Vec<Ident> {
+    match op {
+        AlterTableOperation::AddColumn { column_def, .. } => vec![column_def.name.clone()],
+        AlterTableOperation::DropColumn { column_names, .. } => column_names.clone(),
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => vec![old_column_name.clone(), new_column_name.clone()],
+        AlterTableOperation::ChangeColumn {
+            old_name, new_name, ..
+        } if old_name != new_name => vec![old_name.clone(), new_name.clone()],
+        AlterTableOperation::ChangeColumn { old_name, .. } => vec![old_name.clone()],
+        AlterTableOperation::ModifyColumn { col_name, .. } => vec![col_name.clone()],
+        AlterTableOperation::AlterColumn { column_name, .. } => vec![column_name.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn sort(input: Operator, keys: Vec<Expr>) -> Operator {
+    Operator::Sort(super::operator::Sort {
+        input: Box::new(input),
+        keys,
+    })
+}
+
+fn scope_of(relation: Relation) -> Scope {
+    Scope {
+        relations: vec![relation],
+        ..Scope::default()
+    }
+}
+
+/// A resolution scope over the FROM siblings to a factor's left (the
+/// LATERAL-visible relations a table function's arguments read against).
+fn sibling_scope(left: &[Relation]) -> Scope {
+    Scope {
+        relations: left.to_vec(),
+        ..Scope::default()
+    }
+}
+
+/// The names of a table alias's explicit column list (`AS d(x, y)`), empty if
+/// none.
+fn alias_column_names(alias: &TableAlias) -> Vec<Ident> {
+    alias.columns.iter().map(|c| c.name.clone()).collect()
+}
+
+/// Rename a (sub)plan's output columns positionally to `names` (an explicit
+/// `AS d(x, y)` column list). A no-op when `names` is empty. Descends through
+/// the clause layers / `With` to the producing `Project`; a `SetOp` renames
+/// both operands.
+fn rename_outputs(op: &mut Operator, names: &[Ident]) {
+    if names.is_empty() {
+        return;
+    }
+    match op {
+        Operator::Project(p) => {
+            for (ne, n) in p.exprs.iter_mut().zip(names) {
+                ne.name = Some(n.clone());
+            }
+        }
+        Operator::Sort(s) => rename_outputs(&mut s.input, names),
+        Operator::Filter(f) => rename_outputs(&mut f.input, names),
+        Operator::With(w) => rename_outputs(&mut w.body, names),
+        Operator::SetOp(so) => {
+            rename_outputs(&mut so.left, names);
+            rename_outputs(&mut so.right, names);
+        }
+        _ => {}
+    }
+}
+
+/// The output column names a derived table / CTE exposes: an explicit column
+/// alias list (`AS d(x, y)`) renames positionally; otherwise each output keeps
+/// its own inferred name (anonymous outputs with no alias are unnameable, so
+/// dropped — they can't be referenced).
+fn exposed_columns(outputs: &[OutputCol], alias: Option<&TableAlias>) -> Vec<Ident> {
+    let alias_columns: Vec<&Ident> = alias
+        .map(|a| a.columns.iter().map(|c| &c.name).collect())
+        .unwrap_or_default();
+    outputs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| {
+            alias_columns
+                .get(i)
+                .map(|n| (*n).clone())
+                .or_else(|| o.name.clone())
+        })
+        .collect()
+}
+
+/// The name SQL infers for an unaliased projection item: a bare column keeps
+/// its own name; anything else is anonymous.
+fn inferred_name(expr: &SqlExpr) -> Option<Ident> {
+    match expr {
+        SqlExpr::Identifier(id) => Some(id.clone()),
+        SqlExpr::CompoundIdentifier(parts) => parts.last().cloned(),
+        _ => None,
+    }
+}
+
+/// The `ON` predicate of a join operator, if any.
+/// The constraint of any constraint-carrying join operator (everything but
+/// `CROSS APPLY` / `OUTER APPLY`).
+fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
+    match op {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c) => Some(c),
+        JoinOperator::AsOf { constraint, .. } => Some(constraint),
+        JoinOperator::CrossApply | JoinOperator::OuterApply => None,
+    }
+}
+
+/// The table reference of a `TABLE foo` query body (`SetExpr::Table`), whose
+/// parts are plain strings rather than identifiers.
+fn table_set_expr_ref(table: &sqlparser::ast::Table) -> Option<TableReference> {
+    let name = table.table_name.as_ref()?;
+    let mut parts = Vec::new();
+    if let Some(schema) = &table.schema_name {
+        parts.push(Ident::new(schema));
+    }
+    parts.push(Ident::new(name));
+    TableReference::try_from_parts(&parts)
+}
+
+/// The `ON` predicate of a join operator, if any.
+fn join_on(op: &JoinOperator) -> Option<&SqlExpr> {
+    match join_constraint(op) {
+        Some(JoinConstraint::On(expr)) => Some(expr),
+        _ => None,
+    }
+}
+
+/// The `USING (col, …)` merge-column names of a join operator, if any.
+fn join_using(op: &JoinOperator) -> Vec<Ident> {
+    match join_constraint(op) {
+        Some(JoinConstraint::Using(names)) => names
+            .iter()
+            .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::catalog::{Catalog, CatalogTable};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn bind(sql: &str) -> Operator {
+        bind_cat(sql, None)
+    }
+
+    fn bind_cat(sql: &str, catalog: Option<&Catalog>) -> Operator {
+        let statements = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let casing = IdentifierCasing::for_dialect(&GenericDialect {});
+        build_with_diagnostics(&statements[0], catalog, casing).0
+    }
+
+    fn only_binding(op: &Operator) -> &Binding {
+        let Operator::Project(p) = op else {
+            panic!("expected Project, got {op:?}")
+        };
+        match &p.exprs[..] {
+            [NamedExpr {
+                expr: Expr::Column(c),
+                ..
+            }] => &c.binding,
+            other => panic!("expected one column expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_free_single_table_is_inferred() {
+        assert!(matches!(only_binding(&bind("SELECT a FROM t")),
+            Binding::Base { table, resolution }
+            if table.name.value == "t" && *resolution == ResolutionKind::Inferred));
+    }
+
+    #[test]
+    fn catalog_known_hit_is_cataloged_and_canonical() {
+        let cat =
+            Catalog::new().table(CatalogTable::new("public", "users").columns(["id", "name"]));
+        let op = bind_cat("SELECT name FROM users", Some(&cat));
+        match only_binding(&op) {
+            Binding::Base { table, resolution } => {
+                assert_eq!(table.name.value, "users");
+                assert_eq!(table.schema.as_ref().unwrap().value, "public"); // canonicalized
+                assert_eq!(*resolution, ResolutionKind::Cataloged);
+            }
+            other => panic!("expected Base Cataloged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_known_miss_is_unresolved() {
+        let cat =
+            Catalog::new().table(CatalogTable::new("public", "users").columns(["id", "name"]));
+        assert!(matches!(
+            only_binding(&bind_cat("SELECT nonexistent FROM users", Some(&cat))),
+            Binding::Unresolved
+        ));
+    }
+
+    #[test]
+    fn known_witness_over_open_downgrades_to_inferred() {
+        // `known_t` lists `a`; `open_t` is not in the catalog → Open suspect.
+        let cat = Catalog::new().table(CatalogTable::new("public", "known_t").columns(["a", "b"]));
+        let op = bind_cat(
+            "SELECT a FROM known_t JOIN open_t ON known_t.b = open_t.k",
+            Some(&cat),
+        );
+        match only_binding(&op) {
+            Binding::Base { table, resolution } => {
+                assert_eq!(table.name.value, "known_t");
+                assert_eq!(*resolution, ResolutionKind::Inferred); // downgraded
+            }
+            other => panic!("expected Base Inferred (downgraded), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_known_owners_is_ambiguous() {
+        let cat = Catalog::new()
+            .table(CatalogTable::new("public", "t1").columns(["id"]))
+            .table(CatalogTable::new("public", "t2").columns(["id"]));
+        assert!(matches!(
+            only_binding(&bind_cat(
+                "SELECT id FROM t1 JOIN t2 ON t1.id = t2.id",
+                Some(&cat)
+            )),
+            Binding::Ambiguous
+        ));
+    }
+}

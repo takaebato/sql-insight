@@ -74,6 +74,9 @@ fn expr_reads(expr: &Expr, out: &mut Vec<ColumnRead>) {
             expr_reads(expr, out);
             collect_reads(subquery, out);
         }
+        Expr::Filter(exprs) => exprs.iter().for_each(|e| expr_reads(e, out)),
+        // A merge-column fan-in: every owning side is a read.
+        Expr::Fanin(refs) => out.extend(refs.iter().filter_map(column_read)),
     }
 }
 
@@ -167,6 +170,8 @@ fn collect_subplans<'a>(expr: &'a Expr, out: &mut Vec<&'a Operator>) {
             collect_subplans(expr, out);
             out.push(subquery);
         }
+        Expr::Filter(exprs) => exprs.iter().for_each(|e| collect_subplans(e, out)),
+        Expr::Fanin(_) => {}
     }
 }
 
@@ -356,19 +361,24 @@ fn conflict_value_origins<'a>(
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match value {
         // A `Derived` ref here is `EXCLUDED.col` (the only synthetic relation in
-        // a conflict scope). Map it to the source's `col`-positioned output.
+        // a conflict scope). Map it to the source's `col`-positioned output —
+        // fanning out to every set-operation branch. A source with no
+        // inspectable projection (VALUES) keeps the `EXCLUDED.col` pseudo-source.
         Expr::Column(c) if matches!(c.binding, Binding::Derived) => {
-            match columns.iter().position(|t| idents_eq(t, &c.name)) {
-                Some(i) => match output_operands(source).first() {
-                    Some((outputs, input)) if outputs.len() > i => {
-                        origins_of_expr(&outputs[i].expr, input, ctx)
-                    }
-                    // No inspectable projection (VALUES): EXCLUDED.col stays a
-                    // synthetic pseudo-source.
-                    _ => vec![(excluded_source(c), ColumnLineageKind::Passthrough)],
-                },
-                None => Vec::new(),
+            let Some(i) = columns.iter().position(|t| idents_eq(t, &c.name)) else {
+                return Vec::new();
+            };
+            let operands = output_operands(source);
+            if operands.is_empty() {
+                return vec![(excluded_source(c), ColumnLineageKind::Passthrough)];
             }
+            let mut out = Vec::new();
+            for (outputs, input) in operands {
+                if let Some(ne) = outputs.get(i) {
+                    out.extend(origins_of_expr(&ne.expr, input, ctx));
+                }
+            }
+            out
         }
         // A non-EXCLUDED ref (a target column, MySQL `VALUES(col)` inner, …)
         // and the structural variants trace like any value.
@@ -389,7 +399,11 @@ fn conflict_value_origins<'a>(
         }
         Expr::Window { arg, .. } => transform(conflict_value_origins(arg, columns, source, ctx)),
         Expr::Subquery(plan) => transform(query_col0_origins(plan, ctx)),
-        Expr::Exists(_) | Expr::InSubquery { .. } => Vec::new(),
+        Expr::Fanin(refs) => refs
+            .iter()
+            .filter_map(|c| column_read(c).map(|r| (r, ColumnLineageKind::Passthrough)))
+            .collect(),
+        Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Filter(_) => Vec::new(),
     }
 }
 
@@ -715,7 +729,7 @@ fn expr_feeding<'a>(expr: &'a Expr, ctx: &mut Ctx<'a>, out: &mut Vec<TableRead>)
         }
         Expr::Window { arg, .. } => expr_feeding(arg, ctx, out),
         Expr::Subquery(plan) => feeding_scans(plan, ctx, out),
-        Expr::Exists(_) | Expr::InSubquery { .. } => {}
+        Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Filter(_) | Expr::Fanin(_) => {}
     }
 }
 
@@ -815,9 +829,14 @@ fn collect_flat(op: &Operator, out: &mut Vec<TableReference>) {
             }
         }
         // A table function is opaque (not a table binding), but a PIVOT-style
-        // inner table below it is.
-        Operator::TableFunction(tf) => collect_flat(&tf.input, out),
-        Operator::CteRef(_) | Operator::Values(_) | Operator::Empty => {}
+        // inner table below it and any scan in an argument subquery bind.
+        Operator::TableFunction(tf) => {
+            collect_flat(&tf.input, out);
+            collect_flat_subplans(op, out);
+        }
+        // A `VALUES` row's expressions can hold a subquery whose scans bind.
+        Operator::Values(_) => collect_flat_subplans(op, out),
+        Operator::CteRef(_) | Operator::Empty => {}
         // Structural query operators: walk children and any expression
         // sub-plans (a WHERE / scalar subquery's scans bind too).
         Operator::Filter(_)
@@ -896,8 +915,26 @@ fn origins_of_expr<'a>(
         Expr::Window { arg, .. } => transform(origins_of_expr(arg, input, ctx)),
         // A scalar subquery's first output column flows as a transformation.
         Expr::Subquery(plan) => transform(query_col0_origins(plan, ctx)),
-        // Tests contribute no value origin (their columns are reads only).
-        Expr::Exists(_) | Expr::InSubquery { .. } => Vec::new(),
+        // A merge-column fan-in: each owning side is a `Passthrough` origin.
+        Expr::Fanin(refs) => refs
+            .iter()
+            .filter_map(|c| column_read(c).map(|r| (r, ColumnLineageKind::Passthrough)))
+            .collect(),
+        // Tests / suppressed operands contribute no value origin (reads only).
+        Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Filter(_) => Vec::new(),
+    }
+}
+
+/// Whether a (sub)plan's rows are synthesised by `VALUES` (peeling the clause
+/// layers / a leading `With`): a column of such a relation has no base column
+/// to collapse to, so a reference to it is a synthetic source.
+fn values_backed(op: &Operator) -> bool {
+    match op {
+        Operator::Values(_) => true,
+        Operator::Sort(s) => values_backed(&s.input),
+        Operator::Filter(f) => values_backed(&f.input),
+        Operator::With(w) => values_backed(&w.body),
+        _ => false,
     }
 }
 
@@ -914,15 +951,10 @@ fn origins_into<'a>(
             Some(ne) => origins_of_expr(&ne.expr, &p.input, ctx),
             None => Vec::new(),
         },
-        Operator::Aggregate(a) => {
-            if let Some(ne) = find_named(&a.group_by, name) {
-                origins_of_expr(&ne.expr, &a.input, ctx)
-            } else if let Some(ne) = find_named(&a.aggregates, name) {
-                transform(origins_of_expr(&ne.expr, &a.input, ctx))
-            } else {
-                Vec::new()
-            }
-        }
+        // The projection resolves against the FROM scope, so a column is a
+        // base ref that returns directly, not a named `Aggregate` output —
+        // a `Derived` ref tracing down just passes through to the input.
+        Operator::Aggregate(a) => origins_into(&a.input, qualifier, name, ctx),
         Operator::Filter(f) => origins_into(&f.input, qualifier, name, ctx),
         Operator::Sort(s) => origins_into(&s.input, qualifier, name, ctx),
         Operator::Join(j) => {
@@ -931,10 +963,17 @@ fn origins_into<'a>(
             o
         }
         Operator::SubqueryAlias(sa) => {
-            if qualifier.is_none_or(|q| idents_eq(q, &sa.alias)) {
-                origins_into(&sa.input, None, name, ctx)
-            } else {
+            if !qualifier.is_none_or(|q| idents_eq(q, &sa.alias)) {
                 Vec::new()
+            } else if values_backed(&sa.input) {
+                // A `(VALUES …) AS t(x)` relation synthesises rows with no base
+                // columns, so the exposed column is a synthetic source (t.x).
+                vec![(
+                    synthetic_source(&sa.alias, name),
+                    ColumnLineageKind::Passthrough,
+                )]
+            } else {
+                origins_into(&sa.input, None, name, ctx)
             }
         }
         // An opaque table function: its produced columns are dynamic, so a ref
@@ -974,6 +1013,14 @@ fn origins_into<'a>(
             else {
                 return Vec::new();
             };
+            // A VALUES-backed CTE has no traceable base columns — the exposed
+            // column is a synthetic source (cte.col).
+            if values_backed(&cte.plan) {
+                return vec![(
+                    synthetic_source(&r.name, name),
+                    ColumnLineageKind::Passthrough,
+                )];
+            }
             ctx.active.push(r.name.value.clone());
             let o = origins_into(&cte.plan, None, name, ctx);
             ctx.active.pop();
@@ -1029,11 +1076,14 @@ fn find_named<'a>(exprs: &'a [NamedExpr], name: &Ident) -> Option<&'a NamedExpr>
         .find(|ne| ne.name.as_ref().is_some_and(|n| idents_eq(n, name)))
 }
 
-/// Case-sensitive identifier equality. The traversal follows bindings the
-/// binder already resolved (case-folded), so it matches output names exactly;
-/// a dialect fold is not needed here.
+/// Identifier equality for matching a resolved reference against a producer's
+/// output / relation name. The binder already resolved the reference with the
+/// dialect's column / alias fold, and no dialect treats column or alias names
+/// case-*sensitively* (they fold Upper / Lower / Insensitive), so an ASCII
+/// case-insensitive compare matches every policy without threading the casing
+/// into the walk.
 fn idents_eq(a: &Ident, b: &Ident) -> bool {
-    a.value == b.value
+    a.value.eq_ignore_ascii_case(&b.value)
 }
 
 /// This operator's own expressions (not its children's).
@@ -1042,12 +1092,9 @@ fn own_exprs(op: &Operator) -> Vec<&Expr> {
         Operator::Filter(f) => f.predicate.iter().collect(),
         Operator::Join(j) => j.on.iter().collect(),
         Operator::Project(p) => p.exprs.iter().map(|ne| &ne.expr).collect(),
-        Operator::Aggregate(a) => a
-            .group_by
-            .iter()
-            .chain(&a.aggregates)
-            .map(|ne| &ne.expr)
-            .collect(),
+        // The grouping keys are reads (they pick groups, never originate a
+        // value); the aggregate functions live in the enclosing Project.
+        Operator::Aggregate(a) => a.group_by.iter().collect(),
         Operator::Sort(s) => s.keys.iter().collect(),
         // A table function's argument expressions are reads.
         Operator::TableFunction(tf) => tf.args.iter().collect(),
@@ -1130,7 +1177,7 @@ fn children(op: &Operator) -> Vec<&Operator> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::binder::build;
+    use super::super::binder::build_with_diagnostics;
     use super::*;
     use crate::casing::IdentifierCasing;
     use sqlparser::dialect::GenericDialect;
@@ -1138,11 +1185,12 @@ mod tests {
 
     fn plan(sql: &str) -> Operator {
         let statements = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        build(
+        build_with_diagnostics(
             &statements[0],
             None,
             IdentifierCasing::for_dialect(&GenericDialect {}),
         )
+        .0
     }
 
     fn read_names(op: &Operator) -> Vec<String> {

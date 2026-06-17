@@ -200,16 +200,10 @@ pub mod extractor;
 pub mod formatter;
 pub mod normalizer;
 
-// The analysis engine (design "B"): binds a `Statement` into a
-// materialized, full-stack bound logical-plan tree (`Plan`) and walks it
-// for the extraction surfaces. Backs every public extractor.
+// The analysis engine: binds a `Statement` into a standard bound logical
+// plan (`Operator`) and walks it with a column-origin traversal for the
+// extraction surfaces. Backs every public extractor.
 mod resolver;
-
-// INCUBATING (not wired): the option-(a) redesign — a standard logical
-// plan (`Operator`) + a column-origin traversal, built alongside
-// `resolver` and switched in at differential parity, then renamed to
-// `resolver`. See memory `project_operator_redesign`.
-mod plan;
 
 // Dialect-aware identifier casing (case folding for table / alias /
 // column matching). Threaded into the binder and the extractors.

@@ -2444,22 +2444,19 @@ mod collapse {
 
     #[test]
     fn recursive_cte_traces_through_to_the_real_table() {
-        // The plan collapses a recursive CTE through to the anchor's real
-        // table: both UNION branches resolve `id` to `t1.id` (the recursive
-        // self-reference sees the anchor's columns), so lineage traces to
-        // `t1.id` rather than stopping at the CTE binding `r.id` (an
-        // improvement over the resolver). Reads still surface `t1.id` once;
-        // no infinite recursion.
+        // A recursive CTE collapses through to the anchor's real table: the
+        // outer `id` traces into the CTE body's set operation — the anchor
+        // branch resolves `id` to `t1.id`, the recursive self-reference is
+        // terminated by the active-set (it adds no new source). So lineage is a
+        // single `t1.id → id` edge, and `t1.id` is read once (no infinite
+        // recursion, no duplicate self-reference edge).
         assert_column_ops(
             "WITH RECURSIVE r AS (SELECT id FROM t1 UNION SELECT id FROM r) SELECT id FROM r",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t1", "id")],
                 writes: vec![],
-                lineage: vec![
-                    passthrough(read("t1", "id"), out("id", 0)),
-                    passthrough(read("t1", "id"), out("id", 0)),
-                ],
+                lineage: vec![passthrough(read("t1", "id"), out("id", 0))],
                 diagnostics: vec![],
             },
         );
@@ -2906,21 +2903,20 @@ mod lateral_and_correlation {
     }
 
     #[test]
-    fn non_lateral_derived_also_resolves_outer_ref_permissively() {
-        // The resolver doesn't distinguish LATERAL from non-LATERAL
-        // — both walk the scope chain identically. This is more
-        // lenient than strict SQL semantics (where this should be
-        // an error), but reasonable for lineage purposes: a
-        // best-effort resolution is more useful than silently
-        // dropping the reference.
+    fn non_lateral_derived_does_not_resolve_a_sibling_ref() {
+        // LATERAL is enforced: a non-LATERAL derived table can't see its FROM
+        // siblings, so `t1.a` inside it doesn't resolve (it's `Unresolved`,
+        // surfaced with `table: None`) — an improvement over a permissive
+        // scope-chain walk that would mis-bind it to the sibling `t1`. Its own
+        // FROM column `t2.b` resolves normally.
         assert_column_ops(
             "SELECT sub.x FROM t1, (SELECT t1.a + t2.b AS x FROM t2) sub",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![read("t1", "a"), read("t2", "b")],
+                reads: vec![unresolved("a"), read("t2", "b")],
                 writes: vec![],
                 lineage: vec![
-                    transformation(col("t1", "a"), out("x", 0)),
+                    transformation(unresolved("a"), out("x", 0)),
                     transformation(col("t2", "b"), out("x", 0)),
                 ],
                 diagnostics: vec![],
@@ -3260,16 +3256,16 @@ mod values_as_relation {
     }
 
     #[test]
-    fn values_with_column_ref_in_row_picks_up_outer_ref() {
-        // A column ref inside a VALUES row (rare in practice but
-        // syntactically valid) does get walked and surfaces in
-        // reads — the outer table `t1` is in scope of the derived
-        // table per the resolver's permissive scope-chain rule.
+    fn values_with_column_ref_in_row_does_not_resolve_a_sibling() {
+        // A column ref inside a non-LATERAL `VALUES` row is walked (it surfaces
+        // in reads) but, with LATERAL enforced, can't see the FROM sibling
+        // `t1`, so `t1.a` is `Unresolved`. The derived column `v.x` is a
+        // synthetic source (VALUES rows have no base columns).
         assert_column_ops(
             "SELECT v.x FROM t1, (VALUES (t1.a)) AS v(x)",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![read("t1", "a")],
+                reads: vec![unresolved("a")],
                 writes: vec![],
                 lineage: vec![passthrough(read("v", "x"), out("x", 0))],
                 diagnostics: vec![],

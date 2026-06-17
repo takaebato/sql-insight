@@ -84,14 +84,18 @@ pub(crate) struct Join {
     pub(crate) lateral: bool,
 }
 
-/// Aggregate (Γ): groups its input by `group_by`, producing the group keys
-/// plus the `aggregates`. Output columns = group keys ++ aggregates. Sits
-/// below [`Project`] in canonical order.
+/// Aggregate (Γ): the `GROUP BY` grouping over its input, sitting below the
+/// [`Project`] in canonical evaluation order (`Scan → WHERE → Aggregate →
+/// HAVING → Project`). `group_by` holds the grouping-key expressions — reads
+/// that pick the groups, never a value origin (the aggregate functions
+/// themselves, `sum(x)`, are projection expressions counted at the `Project`,
+/// so a grouped column referenced both in `SELECT` and `GROUP BY` is counted
+/// at each, occurrence-based). A reference resolves against the FROM scope, not
+/// this node's output, so it stays a base read rather than tracing through.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Aggregate {
     pub(crate) input: Box<Operator>,
-    pub(crate) group_by: Vec<NamedExpr>,
-    pub(crate) aggregates: Vec<NamedExpr>,
+    pub(crate) group_by: Vec<Expr>,
 }
 
 /// Projection (π): the SELECT list — the column-defining operator. Each
@@ -312,6 +316,16 @@ pub(crate) enum Expr {
         expr: Box<Expr>,
         subquery: Box<Operator>,
     },
+    /// Filter-position operands that are reads but never value origins — for
+    /// the suppressed parts a construct-specific variant doesn't already cover
+    /// (an `ANY` / `ALL` right operand, an aggregate `FILTER` / `ORDER BY`
+    /// key). `reads` walks them; `origins` skips them.
+    Filter(Vec<Expr>),
+    /// A `JOIN … USING (col)` merge column referenced unqualified: it has no
+    /// single owner, so it fans in to every joined relation that could own it
+    /// — each a `Passthrough` read / origin (one per side, not an ambiguous
+    /// `table: None`).
+    Fanin(Vec<ColRef>),
 }
 
 /// A named output expression — a projection item, an aggregate, a group key,
