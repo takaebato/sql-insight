@@ -211,6 +211,16 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
         // DELETE moves no data (rows go wholesale) — no column lineage (only a
         // RETURNING projection would, a later brick).
         Operator::Delete(_) => {}
+        // CTAS / CREATE VIEW move data like INSERT: pair the source's outputs
+        // with the new relation's columns.
+        Operator::CreateTableAs(c) => {
+            let src = enter_withs(&c.input, &mut ctx);
+            relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
+        }
+        Operator::CreateView(c) => {
+            let src = enter_withs(&c.input, &mut ctx);
+            relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
+        }
         // A bare query (or unmodelled root): one `QueryOutput` group per
         // projection (a set operation has one per branch — positions restart
         // per branch, mirroring the resolver).
@@ -303,6 +313,11 @@ pub(crate) fn writes(op: &Operator) -> Vec<ColumnReference> {
                 name: a.target.clone(),
             })
             .collect(),
+        // CTAS / CREATE VIEW write the new relation's columns; ALTER TABLE
+        // writes its column-naming operations' columns.
+        Operator::CreateTableAs(c) => qualify(&c.columns, &c.target),
+        Operator::CreateView(c) => qualify(&c.columns, &c.target),
+        Operator::AlterTable(a) => qualify(&a.columns, &a.target),
         _ => Vec::new(),
     }
 }
@@ -315,6 +330,11 @@ pub(crate) fn table_writes(op: &Operator) -> Vec<TableReference> {
         Operator::Update(u) => vec![u.target.clone()],
         // A DELETE removes rows from each of its targets.
         Operator::Delete(d) => d.targets.clone(),
+        Operator::CreateTableAs(c) => vec![c.target.clone()],
+        Operator::CreateView(c) => vec![c.target.clone()],
+        Operator::AlterTable(a) => vec![a.target.clone()],
+        // DROP / TRUNCATE name their relations directly as write targets.
+        Operator::Drop(d) => d.targets.clone(),
         _ => Vec::new(),
     }
 }
@@ -344,6 +364,15 @@ pub(crate) fn table_lineage(op: &Operator) -> Vec<TableLineageEdge> {
                 expr_feeding(&a.value, &mut ctx, &mut sources);
             }
             &u.target
+        }
+        // CTAS / CREATE VIEW move data like INSERT; ALTER / DROP do not.
+        Operator::CreateTableAs(c) => {
+            feeding_scans(&c.input, &mut ctx, &mut sources);
+            &c.target
+        }
+        Operator::CreateView(c) => {
+            feeding_scans(&c.input, &mut ctx, &mut sources);
+            &c.target
         }
         _ => return Vec::new(),
     };

@@ -23,11 +23,13 @@
 //! bricks; unhandled constructs fall to [`Operator::Empty`].
 
 use sqlparser::ast::{
-    AssignmentTarget, Cte as SqlCte, Delete as SqlDelete, Expr as SqlExpr, FromTable, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident,
-    Insert as SqlInsert, JoinConstraint, JoinOperator, ObjectName, OrderBy, OrderByExpr,
-    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
-    TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
+    AlterTable as SqlAlterTable, AlterTableOperation, AssignmentTarget, CreateTable,
+    CreateView as SqlCreateView, Cte as SqlCte, Delete as SqlDelete, Expr as SqlExpr, FromTable,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier,
+    Ident, Insert as SqlInsert, JoinConstraint, JoinOperator, ObjectName, ObjectType, OrderBy,
+    OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor, TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind,
+    Values as SqlValues,
 };
 
 use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
@@ -168,6 +170,29 @@ impl Binder<'_> {
             Statement::Insert(insert) => self.bind_insert(insert),
             Statement::Update(update) => self.bind_update(update),
             Statement::Delete(delete) => self.bind_delete(delete),
+            Statement::CreateTable(create) => self.bind_create_table(create),
+            Statement::CreateView(create) => self.bind_create_view(create),
+            Statement::AlterView {
+                name,
+                columns,
+                query,
+                ..
+            } => self.bind_alter_view(name, columns, query),
+            Statement::AlterTable(alter) => self.bind_alter_table(alter),
+            Statement::Drop {
+                object_type,
+                names,
+                table,
+                ..
+            } => self.bind_drop(object_type, names, table.as_ref()),
+            Statement::Truncate(truncate) => Operator::Drop(super::operator::Drop {
+                targets: truncate
+                    .table_names
+                    .iter()
+                    .filter_map(|t| TableReference::try_from_name(&t.name).ok())
+                    .map(|written| self.table_match(&written).table)
+                    .collect(),
+            }),
             _ => Operator::Empty,
         }
     }
@@ -411,6 +436,117 @@ impl Binder<'_> {
         self.eq(fold, &a.name, &b.name)
             && seg_eq(a.schema.as_ref(), b.schema.as_ref())
             && seg_eq(a.catalog.as_ref(), b.catalog.as_ref())
+    }
+
+    /// `CREATE TABLE dst AS <query>` (CTAS): the source query's reads, paired
+    /// with the new table's columns (explicit defs win, else the source output
+    /// names). A plain `CREATE TABLE t (cols)` (no query) is a target-only
+    /// create — its column definitions aren't writes — so it binds with no
+    /// columns / input.
+    fn bind_create_table(&self, create: &CreateTable) -> Operator {
+        let Ok(written) = TableReference::try_from_name(&create.name) else {
+            return Operator::Empty;
+        };
+        let target = self.table_match(&written).table;
+        let Some(query) = create.query.as_ref() else {
+            return Operator::CreateTableAs(super::operator::CreateTableAs {
+                target,
+                columns: Vec::new(),
+                input: Box::new(Operator::Empty),
+            });
+        };
+        let (input, scope) = self.bind_query(query);
+        let columns = if create.columns.is_empty() {
+            exposed_columns(&scope.outputs, None)
+        } else {
+            create.columns.iter().map(|c| c.name.clone()).collect()
+        };
+        Operator::CreateTableAs(super::operator::CreateTableAs {
+            target,
+            columns,
+            input: Box::new(input),
+        })
+    }
+
+    /// `CREATE VIEW v AS <query>`: like CTAS — the query's reads paired with
+    /// the view's columns (explicit list wins, else source names).
+    fn bind_create_view(&self, create: &SqlCreateView) -> Operator {
+        let Ok(written) = TableReference::try_from_name(&create.name) else {
+            return Operator::Empty;
+        };
+        let target = self.table_match(&written).table;
+        let (input, scope) = self.bind_query(&create.query);
+        let columns = if create.columns.is_empty() {
+            exposed_columns(&scope.outputs, None)
+        } else {
+            create.columns.iter().map(|c| c.name.clone()).collect()
+        };
+        Operator::CreateView(super::operator::CreateView {
+            target,
+            columns,
+            input: Box::new(input),
+        })
+    }
+
+    /// `ALTER VIEW v AS <query>`: a view replacement — bound like
+    /// [`bind_create_view`](Self::bind_create_view).
+    fn bind_alter_view(&self, name: &ObjectName, columns: &[Ident], query: &Query) -> Operator {
+        let Ok(written) = TableReference::try_from_name(name) else {
+            return Operator::Empty;
+        };
+        let target = self.table_match(&written).table;
+        let (input, scope) = self.bind_query(query);
+        let columns = if columns.is_empty() {
+            exposed_columns(&scope.outputs, None)
+        } else {
+            columns.to_vec()
+        };
+        Operator::CreateView(super::operator::CreateView {
+            target,
+            columns,
+            input: Box::new(input),
+        })
+    }
+
+    /// `ALTER TABLE t <ops>`: the altered table is a write target; each
+    /// column-naming operation contributes its column(s) as writes (RENAME /
+    /// CHANGE surface both names). Schema-level ops name no columns. No reads
+    /// or lineage — ALTER restructures, it doesn't move row data.
+    fn bind_alter_table(&self, alter: &SqlAlterTable) -> Operator {
+        let Ok(written) = TableReference::try_from_name(&alter.name) else {
+            return Operator::Empty;
+        };
+        let target = self.table_match(&written).table;
+        let columns = alter
+            .operations
+            .iter()
+            .flat_map(alter_table_op_target_columns)
+            .collect();
+        Operator::AlterTable(super::operator::AlterTable { target, columns })
+    }
+
+    /// `DROP TABLE/VIEW/MATERIALIZED VIEW a, b`: the dropped relations are
+    /// write targets. Other object types (index / schema / …) name no
+    /// relations — unbound (`Operator::Empty`).
+    fn bind_drop(
+        &self,
+        object_type: &ObjectType,
+        names: &[ObjectName],
+        table: Option<&ObjectName>,
+    ) -> Operator {
+        if !matches!(
+            object_type,
+            ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
+        ) {
+            return Operator::Empty;
+        }
+        let targets = names
+            .iter()
+            .chain(table)
+            .filter_map(|name| TableReference::try_from_name(name).ok())
+            .map(|written| self.table_match(&written).table)
+            .collect();
+        Operator::Drop(super::operator::Drop { targets })
     }
 
     /// Bind a query, returning the operator and its output scope (relations +
@@ -1201,6 +1337,28 @@ fn assignment_target_columns(target: &AssignmentTarget) -> Vec<Ident> {
             .into_iter()
             .collect(),
         AssignmentTarget::ColumnName(_) | AssignmentTarget::Tuple(_) => Vec::new(),
+    }
+}
+
+/// The column name(s) an `ALTER TABLE` operation writes to. Column-naming ops
+/// (ADD / DROP / RENAME / CHANGE / MODIFY / ALTER COLUMN) name their column(s);
+/// RENAME / CHANGE surface both old and new names. Schema-level ops
+/// (constraints, partitions, RENAME TABLE) name no columns.
+fn alter_table_op_target_columns(op: &AlterTableOperation) -> Vec<Ident> {
+    match op {
+        AlterTableOperation::AddColumn { column_def, .. } => vec![column_def.name.clone()],
+        AlterTableOperation::DropColumn { column_names, .. } => column_names.clone(),
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => vec![old_column_name.clone(), new_column_name.clone()],
+        AlterTableOperation::ChangeColumn {
+            old_name, new_name, ..
+        } if old_name != new_name => vec![old_name.clone(), new_name.clone()],
+        AlterTableOperation::ChangeColumn { old_name, .. } => vec![old_name.clone()],
+        AlterTableOperation::ModifyColumn { col_name, .. } => vec![col_name.clone()],
+        AlterTableOperation::AlterColumn { column_name, .. } => vec![column_name.clone()],
+        _ => Vec::new(),
     }
 }
 

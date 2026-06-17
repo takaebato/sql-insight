@@ -421,6 +421,51 @@ fn update_catalog_parity() {
 }
 
 #[test]
+fn ddl_parity() {
+    // CTAS / CREATE VIEW (data movers, like INSERT) + ALTER TABLE / DROP /
+    // TRUNCATE (target / column writes, no lineage). Catalog-free.
+    let corpus = [
+        "CREATE TABLE dst AS SELECT a, b FROM s",
+        "CREATE TABLE t (a INT, b INT)", // plain create: target only, no writes
+        "CREATE VIEW v AS SELECT a FROM s",
+        "CREATE VIEW v (x) AS SELECT a FROM s WHERE a > 0",
+        "CREATE TABLE dst AS SELECT a FROM s1 UNION SELECT b FROM s2",
+        "ALTER TABLE t ADD COLUMN c INT",
+        "ALTER TABLE t DROP COLUMN c",
+        "ALTER TABLE t RENAME COLUMN a TO b",
+        "DROP TABLE t",
+        "DROP TABLE a, b",
+        "DROP VIEW v",
+        "TRUNCATE TABLE t",
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+    // An explicit CREATE VIEW column list (names come from the statement, not
+    // the source) — covers the `columns` non-empty bind branch.
+    assert_parity_inner(
+        "CREATE VIEW v (x, y) AS SELECT a, b FROM s",
+        &sqlparser::dialect::PostgreSqlDialect {},
+        None,
+    );
+}
+
+#[test]
+fn ddl_catalog_parity() {
+    use crate::catalog::CatalogTable;
+    let catalog =
+        Catalog::new().table(CatalogTable::new("public", "staging").columns(["id", "name"]));
+    let corpus = [
+        "CREATE TABLE public.dst AS SELECT id, name FROM staging",
+        "CREATE VIEW public.v AS SELECT id FROM staging",
+        "DROP TABLE staging",
+    ];
+    for sql in corpus {
+        assert_parity_cat(sql, &catalog);
+    }
+}
+
+#[test]
 fn insert_catalog_parity() {
     use crate::catalog::CatalogTable;
     let catalog = Catalog::new()
