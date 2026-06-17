@@ -3,18 +3,23 @@
 //! - [`reads`] — every physical base-column reference (occurrence-based; a
 //!   `Derived` ref is dropped, its read counted at the inner producer).
 //! - [`table_reads`] — every base table scanned.
-//! - [`column_lineage`] — `source → QueryOutput` edges, by tracing each
-//!   output column's value expression to its base columns ([`origins_of_expr`]
-//!   / [`origins_into`], the `getColumnOrigins`-style traversal). A predicate's
+//! - [`column_lineage`] — `source → target` edges, by tracing each output
+//!   column's value expression to its base columns ([`origins_of_expr`] /
+//!   [`origins_into`], the `getColumnOrigins`-style traversal). A predicate's
 //!   columns are reads but never origins, so value/filter falls out for free.
-//!
-//! DML lineage / writes and table lineage arrive with the DML bricks.
+//!   A bare query targets `QueryOutput`; a DML root pairs the source's output
+//!   columns positionally with the write target's columns (`Relation`).
+//! - [`writes`] — every column written (DML target columns).
+//! - [`table_writes`] — every table written to.
+//! - [`table_lineage`] — `source → target` table edges: the read-role scans
+//!   that **feed data** into a DML target (value path only — predicate
+//!   subqueries do not feed).
 
 use sqlparser::ast::Ident;
 
 use super::operator::{Binding, ColRef, Cte, Expr, NamedExpr, Operator};
-use crate::extractor::{ColumnLineageEdge, ColumnLineageKind, ColumnTarget};
-use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableRead};
+use crate::extractor::{ColumnLineageEdge, ColumnLineageKind, ColumnTarget, TableLineageEdge};
+use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableRead, TableReference};
 
 // ===== reads =============================================================
 
@@ -167,21 +172,44 @@ fn collect_subplans<'a>(expr: &'a Expr, out: &mut Vec<&'a Operator>) {
 
 // ===== column lineage ====================================================
 
-/// The `source → QueryOutput` lineage of a top-level query: each output
-/// column traced to its base columns. (DML targets are a later brick.)
+/// The column lineage of a statement. A bare query emits `source →
+/// QueryOutput` edges (each output column traced to its base columns); a DML
+/// root pairs the source's output columns positionally with the write
+/// target's columns and emits `source → Relation` edges. A leading `WITH` is
+/// peeled (its CTE bodies feed the root through `CteRef` expansion, they are
+/// not lineage roots).
 pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
     let mut ctx = Ctx::new(op);
     let mut edges = Vec::new();
-    // One operand per query (a set operation has one per branch — positions
-    // restart at zero per branch, mirroring the resolver).
+    match peel_with(op) {
+        // INSERT … <source>: pair the source's outputs with the target columns.
+        // A statement-level `WITH` rides on the source (the parser attaches it
+        // there, so the `With` is *inside* `input`, not above the `Insert`);
+        // `enter_withs` pushes its CTEs into the ctx so a `CteRef` resolves.
+        Operator::Insert(i) => {
+            let src = enter_withs(&i.input, &mut ctx);
+            relation_lineage(&i.columns, &i.target, src, &mut ctx, &mut edges);
+        }
+        // A bare query (or unmodelled root): one `QueryOutput` group per
+        // projection (a set operation has one per branch — positions restart
+        // per branch, mirroring the resolver).
+        _ => query_output_lineage(op, &mut ctx, &mut edges),
+    }
+    edges
+}
+
+/// Bare-query lineage: each output column becomes a `QueryOutput` target at
+/// its position, one edge per traced origin. `output_operands` peels the
+/// clause layers and `With`, and yields one operand per set-operation branch.
+fn query_output_lineage<'a>(op: &'a Operator, ctx: &mut Ctx<'a>, out: &mut Vec<ColumnLineageEdge>) {
     for (outputs, input) in output_operands(op) {
         for (position, ne) in outputs.iter().enumerate() {
             let target = ColumnTarget::QueryOutput {
                 name: ne.name.clone(),
                 position,
             };
-            for (source, kind) in origins_of_expr(&ne.expr, input, &mut ctx) {
-                edges.push(ColumnLineageEdge {
+            for (source, kind) in origins_of_expr(&ne.expr, input, ctx) {
+                out.push(ColumnLineageEdge {
                     source,
                     target: target.clone(),
                     kind,
@@ -189,7 +217,33 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
             }
         }
     }
-    edges
+}
+
+/// DML relation lineage: pair each source output operand's columns positionally
+/// with the target `columns` (so a UNION-sourced INSERT pairs every branch) and
+/// emit one `Relation` edge per traced origin.
+fn relation_lineage<'a>(
+    columns: &[Ident],
+    target: &TableReference,
+    input: &'a Operator,
+    ctx: &mut Ctx<'a>,
+    out: &mut Vec<ColumnLineageEdge>,
+) {
+    for (outputs, src_input) in output_operands(input) {
+        for (target_column, ne) in columns.iter().zip(outputs) {
+            let tgt = ColumnTarget::Relation(ColumnReference {
+                table: Some(target.clone()),
+                name: target_column.clone(),
+            });
+            for (source, kind) in origins_of_expr(&ne.expr, src_input, ctx) {
+                out.push(ColumnLineageEdge {
+                    source,
+                    target: tgt.clone(),
+                    kind,
+                });
+            }
+        }
+    }
 }
 
 /// A query's output operands: one `(output columns, producing input)` per
@@ -209,6 +263,171 @@ fn output_operands(op: &Operator) -> Vec<(&[NamedExpr], &Operator)> {
         }
         _ => Vec::new(),
     }
+}
+
+// ===== writes / table writes / table lineage =============================
+
+/// Every column the statement writes — a DML root's target columns, qualified
+/// by the write target. Order follows source order (the public contract). A
+/// leading `WITH` is peeled.
+pub(crate) fn writes(op: &Operator) -> Vec<ColumnReference> {
+    match peel_with(op) {
+        Operator::Insert(i) => qualify(&i.columns, &i.target),
+        _ => Vec::new(),
+    }
+}
+
+/// Every table the statement writes to — one per DML target. A leading `WITH`
+/// is peeled.
+pub(crate) fn table_writes(op: &Operator) -> Vec<TableReference> {
+    match peel_with(op) {
+        Operator::Insert(i) => vec![i.target.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Table-level lineage: one `source → target` edge per read-role scan that
+/// **feeds data** into a DML target, occurrence-based. Feeding sources are the
+/// scans on the value / data path of the source — FROM / JOIN relations, value
+/// (projection) subqueries, and referenced CTE bodies — never predicate
+/// (filter) subqueries. A bare query, or a statement that moves no data, has
+/// no table lineage.
+pub(crate) fn table_lineage(op: &Operator) -> Vec<TableLineageEdge> {
+    // `Ctx::new` peels leading WITHs and keeps their CTE bodies, so a `CteRef`
+    // on the feeding path resolves to the body's feeding scans.
+    let mut ctx = Ctx::new(op);
+    let (target, input) = match peel_with(op) {
+        Operator::Insert(i) => (&i.target, &i.input),
+        _ => return Vec::new(),
+    };
+    let mut sources = Vec::new();
+    feeding_scans(input, &mut ctx, &mut sources);
+    sources
+        .into_iter()
+        .map(|source| TableLineageEdge {
+            source,
+            target: target.clone(),
+        })
+        .collect()
+}
+
+/// Qualify bare written column names with the write target.
+fn qualify(columns: &[Ident], target: &TableReference) -> Vec<ColumnReference> {
+    columns
+        .iter()
+        .map(|name| ColumnReference {
+            table: Some(target.clone()),
+            name: name.clone(),
+        })
+        .collect()
+}
+
+/// Collect the read-role scans that feed data up through `op` (a value / data
+/// path): a join feeds both sides, a filter passes only its input (its
+/// predicate subqueries do not feed), a projection also pulls its value
+/// subqueries. A `CteRef` resolves to the referenced CTE body's feeding scans;
+/// the `Ctx` active-set terminates a recursive self-reference.
+fn feeding_scans<'a>(op: &'a Operator, ctx: &mut Ctx<'a>, out: &mut Vec<TableRead>) {
+    match op {
+        Operator::Scan(s) => out.push(TableRead {
+            reference: s.table.clone(),
+            resolution: s.resolution,
+        }),
+        Operator::Filter(f) => feeding_scans(&f.input, ctx, out),
+        Operator::Join(j) => {
+            feeding_scans(&j.left, ctx, out);
+            feeding_scans(&j.right, ctx, out);
+        }
+        Operator::Project(p) => {
+            feeding_scans(&p.input, ctx, out);
+            for ne in &p.exprs {
+                expr_feeding(&ne.expr, ctx, out);
+            }
+        }
+        Operator::Aggregate(a) => feeding_scans(&a.input, ctx, out),
+        Operator::Sort(s) => feeding_scans(&s.input, ctx, out),
+        Operator::SubqueryAlias(sa) => feeding_scans(&sa.input, ctx, out),
+        Operator::SetOp(so) => {
+            feeding_scans(&so.left, ctx, out);
+            feeding_scans(&so.right, ctx, out);
+        }
+        Operator::With(w) => {
+            let added = w.ctes.len();
+            w.ctes.iter().for_each(|c| ctx.ctes.push(c));
+            feeding_scans(&w.body, ctx, out);
+            ctx.ctes.truncate(ctx.ctes.len() - added);
+        }
+        Operator::CteRef(r) => {
+            if ctx.active.iter().any(|n| n == &r.name.value) {
+                return; // recursive self-reference — terminate
+            }
+            if let Some(cte) = ctx
+                .ctes
+                .iter()
+                .rev()
+                .find(|c| idents_eq(&c.name, &r.name))
+                .copied()
+            {
+                ctx.active.push(r.name.value.clone());
+                feeding_scans(&cte.plan, ctx, out);
+                ctx.active.pop();
+            }
+        }
+        // A nested data-mover feeds through its source; DELETE / DROP / ALTER /
+        // VALUES move no row data into a feeding path.
+        Operator::Insert(i) => feeding_scans(&i.input, ctx, out),
+        Operator::Update(u) => feeding_scans(&u.input, ctx, out),
+        Operator::CreateTableAs(c) => feeding_scans(&c.input, ctx, out),
+        Operator::CreateView(c) => feeding_scans(&c.input, ctx, out),
+        Operator::Merge(m) => feeding_scans(&m.source, ctx, out),
+        Operator::Delete(_)
+        | Operator::Drop(_)
+        | Operator::AlterTable(_)
+        | Operator::Values(_)
+        | Operator::Empty => {}
+    }
+}
+
+/// The value-position subqueries of an expression feed table lineage (a scalar
+/// projection subquery), mirroring `origins_of_expr`: `when` conditions, window
+/// keys, and EXISTS / IN tests are filter position and do not feed.
+fn expr_feeding<'a>(expr: &'a Expr, ctx: &mut Ctx<'a>, out: &mut Vec<TableRead>) {
+    match expr {
+        Expr::Column(_) => {}
+        Expr::Call { args } => args.iter().for_each(|e| expr_feeding(e, ctx, out)),
+        Expr::Case { then, else_, .. } => {
+            then.iter().for_each(|e| expr_feeding(e, ctx, out));
+            if let Some(e) = else_ {
+                expr_feeding(e, ctx, out);
+            }
+        }
+        Expr::Window { arg, .. } => expr_feeding(arg, ctx, out),
+        Expr::Subquery(plan) => feeding_scans(plan, ctx, out),
+        Expr::Exists(_) | Expr::InSubquery { .. } => {}
+    }
+}
+
+/// Peel leading `With` nodes to the wrapped root (a query or DML root).
+fn peel_with(op: &Operator) -> &Operator {
+    let mut node = op;
+    while let Operator::With(w) = node {
+        node = &w.body;
+    }
+    node
+}
+
+/// Peel leading `With` nodes off `op`, pushing their CTE declarations into
+/// `ctx` so a `CteRef` below resolves during the trace, and return the peeled
+/// root. (`Ctx::new` already does this for a query's leading `WITH`; a DML
+/// source carries its own `WITH`, reached only here.) The push is not popped —
+/// the ctx is per-statement scratch, discarded after the walk.
+fn enter_withs<'a>(op: &'a Operator, ctx: &mut Ctx<'a>) -> &'a Operator {
+    let mut node = op;
+    while let Operator::With(w) = node {
+        w.ctes.iter().for_each(|c| ctx.ctes.push(c));
+        node = &w.body;
+    }
+    node
 }
 
 // ===== the column-origin traversal =======================================

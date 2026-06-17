@@ -3,19 +3,20 @@
 //! surfaces match. This is the parity net — every later brick extends the
 //! corpus, and a regression shows up as a surface mismatch.
 //!
-//! Compared as multisets (order is non-contractual): `reads`, `column
-//! lineage`, `table reads`. The corpus grows with coverage; brick ② holds
-//! the catalog-free query core (SELECT / FROM / JOIN / WHERE / projection).
-//! Intentional divergences (e.g. LATERAL enforcement) will move to an
-//! allow-list as their bricks land.
+//! Compared as multisets (order is non-contractual): all six public surfaces
+//! — `reads`, `column lineage`, `table reads`, `writes`, `table writes`, and
+//! `table lineage`. The corpus grows with coverage (query core → clauses →
+//! derived / CTE / set-op → subqueries → catalog → INSERT). Intentional
+//! divergences (e.g. LATERAL enforcement) are asserted on the new engine
+//! directly rather than against the resolver.
 
 use sqlparser::dialect::{Dialect, GenericDialect};
 use sqlparser::parser::Parser;
 
 use crate::casing::IdentifierCasing;
 use crate::catalog::Catalog;
-use crate::extractor::{ColumnLineageEdge, ColumnTarget};
-use crate::reference::{ColumnRead, TableRead};
+use crate::extractor::{ColumnLineageEdge, ColumnTarget, TableLineageEdge};
+use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference};
 
 /// Assert the two engines agree on every surface for `sql` (GenericDialect,
 /// catalog-free).
@@ -39,12 +40,18 @@ fn assert_parity_inner(sql: &str, dialect: &dyn Dialect, catalog: Option<&Catalo
     let cur_reads = crate::resolver::extract_reads(&cur);
     let cur_lineage = crate::resolver::extract_lineage(&cur);
     let cur_table_reads = crate::resolver::extract_table_reads(&cur);
+    let cur_writes = crate::resolver::extract_writes(&cur);
+    let cur_table_writes = crate::resolver::extract_table_writes(&cur);
+    let cur_table_lineage = crate::resolver::extract_table_lineage(&cur);
 
     // Incubating engine (option-a `plan`).
     let op = super::binder::build(stmt, catalog, casing);
     let new_reads = super::traverse::reads(&op);
     let new_lineage = super::traverse::column_lineage(&op);
     let new_table_reads = super::traverse::table_reads(&op);
+    let new_writes = super::traverse::writes(&op);
+    let new_table_writes = super::traverse::table_writes(&op);
+    let new_table_lineage = super::traverse::table_lineage(&op);
 
     assert_bag_eq(sql, "reads", read_bag(&cur_reads), read_bag(&new_reads));
     assert_bag_eq(
@@ -58,6 +65,24 @@ fn assert_parity_inner(sql: &str, dialect: &dyn Dialect, catalog: Option<&Catalo
         "table_reads",
         table_read_bag(&cur_table_reads),
         table_read_bag(&new_table_reads),
+    );
+    assert_bag_eq(
+        sql,
+        "writes",
+        write_bag(&cur_writes),
+        write_bag(&new_writes),
+    );
+    assert_bag_eq(
+        sql,
+        "table_writes",
+        table_write_bag(&cur_table_writes),
+        table_write_bag(&new_table_writes),
+    );
+    assert_bag_eq(
+        sql,
+        "table_lineage",
+        table_lineage_bag(&cur_table_lineage),
+        table_lineage_bag(&new_table_lineage),
     );
 }
 
@@ -119,6 +144,35 @@ fn table_read_bag(reads: &[TableRead]) -> Vec<String> {
     reads
         .iter()
         .map(|r| format!("{}#{:?}", r.reference.name.value, r.resolution))
+        .collect()
+}
+
+fn write_bag(writes: &[ColumnReference]) -> Vec<String> {
+    writes
+        .iter()
+        .map(|w| {
+            let t = w
+                .table
+                .as_ref()
+                .map_or_else(|| "?".to_string(), |t| t.name.value.clone());
+            format!("{t}.{}", w.name.value)
+        })
+        .collect()
+}
+
+fn table_write_bag(writes: &[TableReference]) -> Vec<String> {
+    writes.iter().map(|w| w.name.value.clone()).collect()
+}
+
+fn table_lineage_bag(edges: &[TableLineageEdge]) -> Vec<String> {
+    edges
+        .iter()
+        .map(|e| {
+            format!(
+                "{}#{:?} -> {}",
+                e.source.reference.name.value, e.source.resolution, e.target.name.value
+            )
+        })
         .collect()
 }
 
@@ -278,6 +332,45 @@ fn catalog_aware_parity() {
         "SELECT name, amount FROM users JOIN orders ON users.id = orders.user_id",
         "SELECT a FROM known_t JOIN other ON known_t.b = other.k", // Known-witness over Open → Inferred
         "SELECT users.name FROM users WHERE users.id > 0",
+    ];
+    for sql in corpus {
+        assert_parity_cat(sql, &catalog);
+    }
+}
+
+#[test]
+fn insert_parity() {
+    // INSERT (catalog-free): SELECT / VALUES / UNION / JOIN sources, the
+    // value-vs-filter feeding split, and a statement-level WITH. Both engines
+    // must agree on reads / column lineage / table reads / writes / table
+    // writes / table lineage.
+    let corpus = [
+        "INSERT INTO t (a, b) SELECT x, y FROM s",
+        "INSERT INTO t (a) SELECT x FROM s WHERE x > 0", // predicate not a feeder
+        "INSERT INTO t VALUES (1, 2)",                   // VALUES: target write, no lineage
+        "INSERT INTO t (a, b) VALUES (1, 2)",            // explicit cols, no column lineage
+        "INSERT INTO t SELECT x FROM s", // column-less, no catalog → table lineage only
+        "INSERT INTO t (a) SELECT x FROM s1 UNION SELECT y FROM s2", // each branch pairs
+        "INSERT INTO t (a, b) SELECT x, y FROM s JOIN s2 ON s.id = s2.id", // join feeds both
+        "INSERT INTO t (a) SELECT (SELECT max(v) FROM u) FROM s", // scalar value subquery feeds
+        "INSERT INTO t (a) SELECT x FROM s WHERE x IN (SELECT id FROM u)", // filter subquery: read, not feeder
+        "WITH c AS (SELECT x FROM s) INSERT INTO t (a) SELECT x FROM c",   // statement-level WITH
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+}
+
+#[test]
+fn insert_catalog_parity() {
+    use crate::catalog::CatalogTable;
+    let catalog = Catalog::new()
+        .table(CatalogTable::new("public", "users").columns(["id", "name"]))
+        .table(CatalogTable::new("public", "staging").columns(["id", "name"]));
+    let corpus = [
+        "INSERT INTO users (id, name) SELECT id, name FROM staging", // explicit, both cataloged
+        "INSERT INTO users SELECT id, name FROM staging",            // column-less → catalog-fill
+        "INSERT INTO users (id) SELECT id FROM staging WHERE name > 'a'",
     ];
     for sql in corpus {
         assert_parity_cat(sql, &catalog);

@@ -18,9 +18,9 @@
 
 use sqlparser::ast::{
     Cte as SqlCte, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, GroupByWithModifier, Ident, JoinConstraint, JoinOperator, OrderBy, OrderByExpr,
-    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
-    TableWithJoins,
+    GroupByExpr, GroupByWithModifier, Ident, Insert as SqlInsert, JoinConstraint, JoinOperator,
+    OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor, TableObject, TableWithJoins, Values as SqlValues,
 };
 
 use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
@@ -158,8 +158,49 @@ impl Binder<'_> {
     fn bind_statement(&self, statement: &Statement) -> Operator {
         match statement {
             Statement::Query(query) => self.bind_query(query).0,
+            Statement::Insert(insert) => self.bind_insert(insert),
             _ => Operator::Empty,
         }
+    }
+
+    /// `INSERT INTO target (columns) <source>`: the source query's plan is the
+    /// read-carrying `input`, whose output columns pair positionally with the
+    /// target columns for relation lineage. An explicit column list wins;
+    /// otherwise the target's catalog columns fill in, truncated to the
+    /// source's arity (so a column-less `INSERT … SELECT a, b` writes the
+    /// target's first two columns). A `VALUES` source binds to
+    /// [`Operator::Values`] (the rows are reads, but synthesise no traceable
+    /// output, so there is no column lineage). RETURNING / ON CONFLICT / the
+    /// MySQL `SET` form are later bricks.
+    fn bind_insert(&self, insert: &SqlInsert) -> Operator {
+        let name = match &insert.table {
+            TableObject::TableName(name) => name,
+            TableObject::TableFunction(function) => &function.name,
+        };
+        let Ok(written) = TableReference::try_from_name(name) else {
+            return Operator::Empty;
+        };
+        let target = self.table_match(&written).table;
+        let (input, scope) = match &insert.source {
+            Some(source) => self.bind_query(source),
+            None => (Operator::Empty, Scope::default()),
+        };
+        let columns = if insert.columns.is_empty() {
+            self.table_match(&target)
+                .columns
+                .into_iter()
+                .take(scope.outputs.len())
+                .collect()
+        } else {
+            insert.columns.clone()
+        };
+        Operator::Insert(super::operator::Insert {
+            target,
+            columns,
+            input: Box::new(input),
+            returning: Vec::new(),
+            on_conflict: Vec::new(),
+        })
     }
 
     /// Bind a query, returning the operator and its output scope (relations +
@@ -241,6 +282,13 @@ impl Binder<'_> {
         match body {
             SetExpr::Select(select) => self.bind_select(select),
             SetExpr::Query(query) => self.bind_query(query),
+            SetExpr::Values(values) => self.bind_values(values),
+            // `WITH … INSERT/UPDATE/DELETE/MERGE …`: the DML statement is the
+            // query body (the parser wraps a CTE-prefixed DML this way). Bind it
+            // to its DML root; it exposes no output scope to an enclosing query.
+            SetExpr::Insert(statement)
+            | SetExpr::Update(statement)
+            | SetExpr::Delete(statement) => (self.bind_statement(statement), Scope::default()),
             // A set operation: result columns are the left operand's (names
             // from the left, positional merge).
             SetExpr::SetOperation { left, right, .. } => {
@@ -256,6 +304,39 @@ impl Binder<'_> {
             }
             _ => (Operator::Empty, Scope::default()),
         }
+    }
+
+    /// Bind a `VALUES (…), (…)` row set into [`Operator::Values`]: one
+    /// anonymous output per column position (synthesised rows have no base
+    /// columns, so a reference to a `(VALUES …) AS v(x)` column is `Derived`
+    /// and traces to nothing — there is no column lineage). The row
+    /// expressions are reads, resolved against the empty current scope and
+    /// falling through to the correlation stack (a `(VALUES (t.a)) AS v` reads
+    /// the enclosing / sibling `t.a` like a derived subquery's body).
+    fn bind_values(&self, values: &SqlValues) -> (Operator, Scope) {
+        let width = values.rows.iter().map(Vec::len).max().unwrap_or(0);
+        let rows: Vec<Vec<Expr>> = values
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|expr| self.bind_expr(expr, &Scope::default()))
+                    .collect()
+            })
+            .collect();
+        let outputs = (0..width)
+            .map(|_| OutputCol {
+                name: None,
+                identity: false,
+            })
+            .collect();
+        (
+            Operator::Values(super::operator::Values { rows }),
+            Scope {
+                relations: Vec::new(),
+                outputs,
+            },
+        )
     }
 
     /// Bind a SELECT, returning the operator and its clause scope (FROM
