@@ -1,4 +1,4 @@
-//! The analysis engine: a **standard logical plan** ([`operator::Operator`])
+//! The analysis engine: a **standard logical plan** ([`operator::LogicalPlan`])
 //! built by the [`binder`] and walked by a column-origin [`traverse`]al for the
 //! extraction surfaces. It is **not** an execution plan — nothing optimises or
 //! runs SQL.
@@ -12,15 +12,15 @@
 //! traversal rather than bespoke pre-collapsed provenance.
 //!
 //! The crate-internal surface is two halves: [`build_plan`] (AST → bound
-//! `Operator` + diagnostics) and the `extract_*` walkers (`reads` / `writes` /
+//! `LogicalPlan` + diagnostics) and the `extract_*` walkers (`reads` / `writes` /
 //! `lineage` / `flat_tables`). The [`crate::extractor`] layer drives them and
 //! packages the public `*Operation` types.
 //!
 //! - [`operator`] — the bound operator-tree types.
-//! - [`binder`] — the bind pass (AST → resolved `Operator` + diagnostics);
+//! - [`binder`] — the bind pass (AST → resolved `LogicalPlan` + diagnostics);
 //!   resolution is folded in (catalog match, casing, the candidate tiebreaker,
 //!   the value/filter split, USING fan-in, clause-alias visibility).
-//! - [`traverse`] — walk an `Operator` for the extraction surfaces, tracing
+//! - [`traverse`] — walk an `LogicalPlan` for the extraction surfaces, tracing
 //!   each output column's value expression to its base columns.
 
 mod binder;
@@ -28,9 +28,9 @@ mod operator;
 mod traverse;
 
 // The crate-internal surface the extractors drive: `build_plan` (AST → bound
-// `Operator` + diagnostics) and the `extract_*` walkers.
+// `LogicalPlan` + diagnostics) and the `extract_*` walkers.
 // `build_with_diagnostics` already folds an unmodelled statement to
-// `Operator::Empty`, so it doubles as `build_plan`.
+// `LogicalPlan::Empty`, so it doubles as `build_plan`.
 pub(crate) use binder::build_with_diagnostics as build_plan;
 pub(crate) use traverse::{
     column_lineage as extract_lineage, flat_tables as extract_flat_tables, reads as extract_reads,

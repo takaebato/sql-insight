@@ -1,4 +1,4 @@
-//! The binder: lowers a `sqlparser` AST into the bound [`Operator`] tree,
+//! The binder: lowers a `sqlparser` AST into the bound [`LogicalPlan`] tree,
 //! resolving every column reference against the bind-time scope.
 //!
 //! Bricks ③–⑤: catalog-aware SELECT / FROM / JOIN / WHERE / projection,
@@ -20,7 +20,7 @@
 //! **write target** named on the root, never a read scan — so the root's
 //! `input` carries only the read relations and the predicate. The remaining
 //! breadth (MERGE / DDL / RETURNING / ON CONFLICT / diagnostics) is later
-//! bricks; unhandled constructs fall to [`Operator::Empty`].
+//! bricks; unhandled constructs fall to [`LogicalPlan::Empty`].
 
 use sqlparser::ast::{
     AlterTable as SqlAlterTable, AlterTableOperation, AssignmentTarget, CreateTable,
@@ -43,22 +43,22 @@ use sqlparser::ast::{
 use sqlparser::tokenizer::Span;
 
 use super::operator::{
-    Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Projection, Scan,
+    Binding, ColRef, Columns, Expr, Filter, LogicalPlan, NamedExpr, Projection, Scan,
 };
 use crate::casing::{CaseFold, IdentifierCasing};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::reference::{ResolutionKind, TableReference};
 
-/// Bind a statement into an [`Operator`] tree plus the column-level
+/// Bind a statement into an [`LogicalPlan`] tree plus the column-level
 /// diagnostics it raised (unsupported statement, suppressed wildcard,
 /// over-qualified table name). An unmodelled statement yields
-/// [`Operator::Empty`] and an `UnsupportedStatement` diagnostic.
+/// [`LogicalPlan::Empty`] and an `UnsupportedStatement` diagnostic.
 pub(crate) fn build_with_diagnostics(
     statement: &Statement,
     catalog: Option<&Catalog>,
     casing: IdentifierCasing,
-) -> (Operator, Vec<ColumnLevelDiagnostic>) {
+) -> (LogicalPlan, Vec<ColumnLevelDiagnostic>) {
     let diagnostics = RefCell::new(Vec::new());
     let op = Binder {
         catalog,
@@ -83,7 +83,7 @@ struct CteEnv {
 // ===== bind-time scope (scratch, relation-grouped) =======================
 
 /// The relations visible at a point in the bind. Scratch — never stored on
-/// the [`Operator`] tree.
+/// the [`LogicalPlan`] tree.
 #[derive(Default)]
 struct Scope {
     relations: Vec<Relation>,
@@ -132,7 +132,7 @@ enum RelSource {
     /// An opaque table function / PIVOT / … relation with dynamic columns. A
     /// bare name is **not** claimed by it (so it stays resolvable against real
     /// tables); a qualified ref through its alias is `Binding::Derived` — the
-    /// origin traversal reaches the [`Operator::TableFunction`] node and emits
+    /// origin traversal reaches the [`LogicalPlan::TableFunction`] node and emits
     /// the synthetic `alias.col` source (a lineage source, dropped from reads).
     TableFunction,
 }
@@ -250,7 +250,7 @@ impl<'a> Binder<'a> {
         });
     }
 
-    fn bind_statement(&self, statement: &Statement) -> Operator {
+    fn bind_statement(&self, statement: &Statement) -> LogicalPlan {
         match statement {
             Statement::Query(query) => self.bind_query(query).0,
             Statement::Insert(insert) => self.bind_insert(insert),
@@ -275,14 +275,14 @@ impl<'a> Binder<'a> {
             // `CREATE VIRTUAL TABLE t USING module(…)`: a new table with no
             // inspectable source — a target-only create.
             Statement::CreateVirtualTable { name, .. } => match self.table_ref(name) {
-                Some(written) => Operator::CreateTableAs(super::operator::CreateTableAs {
+                Some(written) => LogicalPlan::CreateTableAs(super::operator::CreateTableAs {
                     target: self.table_match(&written).table,
                     columns: Vec::new(),
-                    input: Box::new(Operator::Empty),
+                    input: Box::new(LogicalPlan::Empty),
                 }),
-                None => Operator::Empty,
+                None => LogicalPlan::Empty,
             },
-            Statement::Truncate(truncate) => Operator::Drop(super::operator::Drop {
+            Statement::Truncate(truncate) => LogicalPlan::Drop(super::operator::Drop {
                 targets: truncate
                     .table_names
                     .iter()
@@ -290,7 +290,7 @@ impl<'a> Binder<'a> {
                     .map(|written| self.table_match(&written).table)
                     .collect(),
             }),
-            _ => Operator::Empty,
+            _ => LogicalPlan::Empty,
         }
     }
 
@@ -300,16 +300,16 @@ impl<'a> Binder<'a> {
     /// otherwise the target's catalog columns fill in, truncated to the
     /// source's arity (so a column-less `INSERT … SELECT a, b` writes the
     /// target's first two columns). A `VALUES` source binds to
-    /// [`Operator::Values`] (the rows are reads, but synthesise no traceable
+    /// [`LogicalPlan::Values`] (the rows are reads, but synthesise no traceable
     /// output, so there is no column lineage). RETURNING / ON CONFLICT / the
     /// MySQL `SET` form are later bricks.
-    fn bind_insert(&self, insert: &SqlInsert) -> Operator {
+    fn bind_insert(&self, insert: &SqlInsert) -> LogicalPlan {
         let name = match &insert.table {
             TableObject::TableName(name) => name,
             TableObject::TableFunction(function) => &function.name,
         };
         let Some(written) = self.table_ref(name) else {
-            return Operator::Empty;
+            return LogicalPlan::Empty;
         };
         let target = self.table_match(&written).table;
         // MySQL `INSERT INTO t SET col = expr, …`: the assignment form (no
@@ -320,7 +320,7 @@ impl<'a> Binder<'a> {
         }
         let (input, scope) = match &insert.source {
             Some(source) => self.bind_query(source),
-            None => (Operator::Empty, Scope::default()),
+            None => (LogicalPlan::Empty, Scope::default()),
         };
         let columns = if insert.columns.is_empty() {
             self.catalog_columns(&target)
@@ -340,7 +340,7 @@ impl<'a> Binder<'a> {
         // RETURNING resolves against the target alone (the source query's
         // scope is already popped).
         let returning = self.bind_returning(&insert.returning, &self.target_scope(&target));
-        Operator::Insert(super::operator::Insert {
+        LogicalPlan::Insert(super::operator::Insert {
             target,
             columns,
             input: Box::new(input),
@@ -354,7 +354,7 @@ impl<'a> Binder<'a> {
     /// single-row UPDATE — each assignment is a value column named by its target
     /// (resolved against the target's own columns), placed in a `Projection` so the
     /// `value → target.col` lineage reuses the relation-lineage machinery.
-    fn bind_insert_set(&self, insert: &SqlInsert, target: TableReference) -> Operator {
+    fn bind_insert_set(&self, insert: &SqlInsert, target: TableReference) -> LogicalPlan {
         let scope = self.target_scope(&target);
         let mut columns = Vec::new();
         let mut exprs = Vec::new();
@@ -372,11 +372,11 @@ impl<'a> Binder<'a> {
             None => (Vec::new(), Vec::new()),
         };
         let returning = self.bind_returning(&insert.returning, &scope);
-        Operator::Insert(super::operator::Insert {
+        LogicalPlan::Insert(super::operator::Insert {
             target,
             columns,
-            input: Box::new(Operator::Projection(Projection {
-                input: Box::new(Operator::Empty),
+            input: Box::new(LogicalPlan::Projection(Projection {
+                input: Box::new(LogicalPlan::Empty),
                 exprs,
             })),
             returning,
@@ -448,12 +448,12 @@ impl<'a> Binder<'a> {
     /// WHERE predicate as a `Filter`. The SET assignments are the value path
     /// (each `RHS → target.col` for lineage / writes). RETURNING / the MySQL
     /// multi-table form's exotic shapes are later bricks.
-    fn bind_update(&self, update: &SqlUpdate) -> Operator {
+    fn bind_update(&self, update: &SqlUpdate) -> LogicalPlan {
         let Some((target_relation, target)) = self.target_relation(&update.table.relation) else {
-            return Operator::Empty;
+            return LogicalPlan::Empty;
         };
         let mut scope = scope_of(target_relation);
-        let mut input = Operator::Empty;
+        let mut input = LogicalPlan::Empty;
         // Joins on the UPDATE target clause are read relations.
         for j in &update.table.joins {
             let (node, jscope) = self.bind_table_factor(&j.relation, &scope.relations);
@@ -478,7 +478,7 @@ impl<'a> Binder<'a> {
         // WHERE: a filter over the read input (picks which rows update; its
         // reads / subqueries do not feed the new value).
         if let Some(predicate) = &update.selection {
-            input = Operator::Filter(Filter {
+            input = LogicalPlan::Filter(Filter {
                 input: Box::new(input),
                 predicate: vec![self.bind_expr(predicate, &scope)],
             });
@@ -499,7 +499,7 @@ impl<'a> Binder<'a> {
             .collect();
         // RETURNING resolves against the statement scope (target + FROM).
         let returning = self.bind_returning(&update.returning, &scope);
-        Operator::Update(super::operator::Update {
+        LogicalPlan::Update(super::operator::Update {
             target,
             assignments,
             input: Box::new(input),
@@ -515,13 +515,13 @@ impl<'a> Binder<'a> {
     ///   `DELETE t1, t2 FROM src`       → FROM are reads, the list are targets
     /// A target is in scope for the predicate but never scanned (so it isn't a
     /// read). There are no column writes / lineage — rows go wholesale.
-    fn bind_delete(&self, delete: &SqlDelete) -> Operator {
+    fn bind_delete(&self, delete: &SqlDelete) -> LogicalPlan {
         let from_tables = match &delete.from {
             FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
         };
         let from_is_target = delete.tables.is_empty();
         let mut scope = Scope::default();
-        let mut input = Operator::Empty;
+        let mut input = LogicalPlan::Empty;
         let mut targets = Vec::new();
         // USING relations are always reads. Bind first so an explicit target
         // alias can resolve against them.
@@ -561,7 +561,7 @@ impl<'a> Binder<'a> {
             }
         }
         if let Some(predicate) = &delete.selection {
-            input = Operator::Filter(Filter {
+            input = LogicalPlan::Filter(Filter {
                 input: Box::new(input),
                 predicate: vec![self.bind_expr(predicate, &scope)],
             });
@@ -569,7 +569,7 @@ impl<'a> Binder<'a> {
         // RETURNING resolves against the FROM / USING scope (which holds the
         // target).
         let returning = self.bind_returning(&delete.returning, &scope);
-        Operator::Delete(super::operator::Delete {
+        LogicalPlan::Delete(super::operator::Delete {
             targets,
             input: Box::new(input),
             returning,
@@ -583,9 +583,9 @@ impl<'a> Binder<'a> {
     /// a `MergeClause`: an UPDATE SET's `RHS → target.col` and an INSERT's
     /// `value → target.col` drive writes / lineage. A column-less INSERT fills
     /// from the catalog (empty without one — the values are then reads only).
-    fn bind_merge(&self, merge: &SqlMerge) -> Operator {
+    fn bind_merge(&self, merge: &SqlMerge) -> LogicalPlan {
         let Some((target_relation, target)) = self.target_relation(&merge.table) else {
-            return Operator::Empty;
+            return LogicalPlan::Empty;
         };
         let mut scope = scope_of(target_relation);
         let (source, source_scope) = self.bind_table_factor(&merge.source, &scope.relations);
@@ -653,7 +653,7 @@ impl<'a> Binder<'a> {
                 }
             }
         }
-        Operator::Merge(super::operator::Merge {
+        LogicalPlan::Merge(super::operator::Merge {
             target,
             source: Box::new(source),
             on,
@@ -778,16 +778,16 @@ impl<'a> Binder<'a> {
     /// names). A plain `CREATE TABLE t (cols)` (no query) is a target-only
     /// create — its column definitions aren't writes — so it binds with no
     /// columns / input.
-    fn bind_create_table(&self, create: &CreateTable) -> Operator {
+    fn bind_create_table(&self, create: &CreateTable) -> LogicalPlan {
         let Some(written) = self.table_ref(&create.name) else {
-            return Operator::Empty;
+            return LogicalPlan::Empty;
         };
         let target = self.table_match(&written).table;
         let Some(query) = create.query.as_ref() else {
-            return Operator::CreateTableAs(super::operator::CreateTableAs {
+            return LogicalPlan::CreateTableAs(super::operator::CreateTableAs {
                 target,
                 columns: Vec::new(),
-                input: Box::new(Operator::Empty),
+                input: Box::new(LogicalPlan::Empty),
             });
         };
         let (input, scope) = self.bind_query(query);
@@ -796,7 +796,7 @@ impl<'a> Binder<'a> {
         } else {
             create.columns.iter().map(|c| c.name.clone()).collect()
         };
-        Operator::CreateTableAs(super::operator::CreateTableAs {
+        LogicalPlan::CreateTableAs(super::operator::CreateTableAs {
             target,
             columns,
             input: Box::new(input),
@@ -805,9 +805,9 @@ impl<'a> Binder<'a> {
 
     /// `CREATE VIEW v AS <query>`: like CTAS — the query's reads paired with
     /// the view's columns (explicit list wins, else source names).
-    fn bind_create_view(&self, create: &SqlCreateView) -> Operator {
+    fn bind_create_view(&self, create: &SqlCreateView) -> LogicalPlan {
         let Some(written) = self.table_ref(&create.name) else {
-            return Operator::Empty;
+            return LogicalPlan::Empty;
         };
         let target = self.table_match(&written).table;
         let (input, scope) = self.bind_query(&create.query);
@@ -816,7 +816,7 @@ impl<'a> Binder<'a> {
         } else {
             create.columns.iter().map(|c| c.name.clone()).collect()
         };
-        Operator::CreateView(super::operator::CreateView {
+        LogicalPlan::CreateView(super::operator::CreateView {
             target,
             columns,
             input: Box::new(input),
@@ -825,9 +825,9 @@ impl<'a> Binder<'a> {
 
     /// `ALTER VIEW v AS <query>`: a view replacement — bound like
     /// [`bind_create_view`](Self::bind_create_view).
-    fn bind_alter_view(&self, name: &ObjectName, columns: &[Ident], query: &Query) -> Operator {
+    fn bind_alter_view(&self, name: &ObjectName, columns: &[Ident], query: &Query) -> LogicalPlan {
         let Some(written) = self.table_ref(name) else {
-            return Operator::Empty;
+            return LogicalPlan::Empty;
         };
         let target = self.table_match(&written).table;
         let (input, scope) = self.bind_query(query);
@@ -836,7 +836,7 @@ impl<'a> Binder<'a> {
         } else {
             columns.to_vec()
         };
-        Operator::CreateView(super::operator::CreateView {
+        LogicalPlan::CreateView(super::operator::CreateView {
             target,
             columns,
             input: Box::new(input),
@@ -847,9 +847,9 @@ impl<'a> Binder<'a> {
     /// column-naming operation contributes its column(s) as writes (RENAME /
     /// CHANGE surface both names). Schema-level ops name no columns. No reads
     /// or lineage — ALTER restructures, it doesn't move row data.
-    fn bind_alter_table(&self, alter: &SqlAlterTable) -> Operator {
+    fn bind_alter_table(&self, alter: &SqlAlterTable) -> LogicalPlan {
         let Some(written) = self.table_ref(&alter.name) else {
-            return Operator::Empty;
+            return LogicalPlan::Empty;
         };
         let target = self.table_match(&written).table;
         let columns = alter
@@ -857,23 +857,23 @@ impl<'a> Binder<'a> {
             .iter()
             .flat_map(alter_table_op_target_columns)
             .collect();
-        Operator::AlterTable(super::operator::AlterTable { target, columns })
+        LogicalPlan::AlterTable(super::operator::AlterTable { target, columns })
     }
 
     /// `DROP TABLE/VIEW/MATERIALIZED VIEW a, b`: the dropped relations are
     /// write targets. Other object types (index / schema / …) name no
-    /// relations — unbound (`Operator::Empty`).
+    /// relations — unbound (`LogicalPlan::Empty`).
     fn bind_drop(
         &self,
         object_type: &ObjectType,
         names: &[ObjectName],
         table: Option<&ObjectName>,
-    ) -> Operator {
+    ) -> LogicalPlan {
         if !matches!(
             object_type,
             ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
         ) {
-            return Operator::Empty;
+            return LogicalPlan::Empty;
         }
         let targets = names
             .iter()
@@ -881,7 +881,7 @@ impl<'a> Binder<'a> {
             .filter_map(|name| self.table_ref(name))
             .map(|written| self.table_match(&written).table)
             .collect();
-        Operator::Drop(super::operator::Drop { targets })
+        LogicalPlan::Drop(super::operator::Drop { targets })
     }
 
     /// Bind a query, returning the operator and its output scope (relations +
@@ -889,7 +889,7 @@ impl<'a> Binder<'a> {
     /// declaration order into an environment the later CTEs and the body
     /// resolve against; the bodies are owned by a `With` node, references are
     /// `CteRef`s.
-    fn bind_query(&self, query: &Query) -> (Operator, Scope) {
+    fn bind_query(&self, query: &Query) -> (LogicalPlan, Scope) {
         let Some(with) = &query.with else {
             return self.bind_query_body(query);
         };
@@ -905,7 +905,7 @@ impl<'a> Binder<'a> {
         }
         let (body, scope) = self.with_ctes(env).bind_query_body(query);
         (
-            Operator::With(super::operator::With {
+            LogicalPlan::With(super::operator::With {
                 ctes: declared,
                 body: Box::new(body),
             }),
@@ -919,7 +919,7 @@ impl<'a> Binder<'a> {
     /// self-reference resolves: a set-operation body learns its column shape
     /// from the anchor (the left branch); any other body registers with no
     /// known columns (so a self-reference is still a `CteRef`, not a phantom).
-    fn bind_cte(&self, cte: &SqlCte, env: &[CteEnv], recursive: bool) -> (CteEnv, Operator) {
+    fn bind_cte(&self, cte: &SqlCte, env: &[CteEnv], recursive: bool) -> (CteEnv, LogicalPlan) {
         let name = cte.alias.name.clone();
         let inner_env = if recursive {
             let provisional = match cte.query.body.as_ref() {
@@ -948,12 +948,12 @@ impl<'a> Binder<'a> {
 
     /// Bind a query's body, its pipe-operator chain, and trailing ORDER BY (the
     /// `WITH` is already in scope via `self.ctes`).
-    fn bind_query_body(&self, query: &Query) -> (Operator, Scope) {
+    fn bind_query_body(&self, query: &Query) -> (LogicalPlan, Scope) {
         let (mut op, mut scope) = self.bind_set_expr(&query.body);
         // A trailing ORDER BY / LIMIT over a set operation resolves in the
         // outer scope (both branch scopes are popped), so a reference to a
         // UNION output column — not a real table — is unresolved.
-        let set_op_body = matches!(op, Operator::SetOp(_));
+        let set_op_body = matches!(op, LogicalPlan::SetOp(_));
         // Pipe operators (`|> WHERE`, `|> SELECT`, …) transform the body in
         // sequence: an output-producing operator layers a `Projection` (evolving
         // the output scope), a filter operator adds reads. They resolve against
@@ -962,7 +962,7 @@ impl<'a> Binder<'a> {
         if !query.pipe_operators.is_empty() {
             let mut pipe_scope = match &op {
                 // A set-op body exposes no single relation scope for refs.
-                Operator::SetOp(_) => Scope {
+                LogicalPlan::SetOp(_) => Scope {
                     relations: Vec::new(),
                     outputs: std::mem::take(&mut scope.outputs),
                     merge_columns: Vec::new(),
@@ -999,7 +999,7 @@ impl<'a> Binder<'a> {
             );
         }
         if !tail_reads.is_empty() {
-            op = Operator::Filter(Filter {
+            op = LogicalPlan::Filter(Filter {
                 input: Box::new(op),
                 predicate: tail_reads,
             });
@@ -1014,7 +1014,7 @@ impl<'a> Binder<'a> {
     /// CALL / PIVOT / set-op / JOIN) wraps a non-feeding read [`Filter`]; the
     /// rest (sampling / rename / drop / unpivot) pass through. The match is
     /// exhaustive so a new pipe operator is reviewed here.
-    fn bind_pipe(&self, op: &PipeOperator, input: Operator, scope: &mut Scope) -> Operator {
+    fn bind_pipe(&self, op: &PipeOperator, input: LogicalPlan, scope: &mut Scope) -> LogicalPlan {
         match op {
             PipeOperator::Select { exprs } => {
                 let new = self.bind_output_items(exprs, scope);
@@ -1129,16 +1129,16 @@ impl<'a> Binder<'a> {
     /// plus the `new` value columns.
     fn pipe_project(
         &self,
-        input: Operator,
+        input: LogicalPlan,
         base: &[OutputCol],
         new: Vec<NamedExpr>,
         relations: &[Relation],
-    ) -> (Operator, Vec<OutputCol>) {
+    ) -> (LogicalPlan, Vec<OutputCol>) {
         let mut exprs = self.passthrough_exprs(base, relations);
         exprs.extend(new);
         let outputs = self.output_cols(&exprs);
         (
-            Operator::Projection(Projection {
+            LogicalPlan::Projection(Projection {
                 input: Box::new(input),
                 exprs,
             }),
@@ -1170,11 +1170,11 @@ impl<'a> Binder<'a> {
     /// place (else appends), so a SET after a SELECT rewrites that column.
     fn pipe_set(
         &self,
-        input: Operator,
+        input: LogicalPlan,
         base: Vec<OutputCol>,
         assignments: &[sqlparser::ast::Assignment],
         scope: &Scope,
-    ) -> (Operator, Vec<OutputCol>) {
+    ) -> (LogicalPlan, Vec<OutputCol>) {
         let mut exprs = self.passthrough_exprs(&base, &scope.relations);
         for a in assignments {
             for column in assignment_target_columns(&a.target) {
@@ -1193,7 +1193,7 @@ impl<'a> Binder<'a> {
         }
         let outputs = self.output_cols(&exprs);
         (
-            Operator::Projection(Projection {
+            LogicalPlan::Projection(Projection {
                 input: Box::new(input),
                 exprs,
             }),
@@ -1203,18 +1203,18 @@ impl<'a> Binder<'a> {
 
     /// Wrap `input` in a non-feeding read [`Filter`] for a filter pipe operator
     /// (empty predicate → unchanged).
-    fn pipe_filter(&self, input: Operator, predicate: Vec<Expr>) -> Operator {
+    fn pipe_filter(&self, input: LogicalPlan, predicate: Vec<Expr>) -> LogicalPlan {
         if predicate.is_empty() {
             input
         } else {
-            Operator::Filter(Filter {
+            LogicalPlan::Filter(Filter {
                 input: Box::new(input),
                 predicate,
             })
         }
     }
 
-    fn bind_set_expr(&self, body: &SetExpr) -> (Operator, Scope) {
+    fn bind_set_expr(&self, body: &SetExpr) -> (LogicalPlan, Scope) {
         match body {
             SetExpr::Select(select) => self.bind_select(select),
             SetExpr::Query(query) => self.bind_query(query),
@@ -1223,7 +1223,7 @@ impl<'a> Binder<'a> {
             // `CREATE TABLE t AS TABLE foo`). Bind it as a read scan.
             SetExpr::Table(table) => match table_set_expr_ref(table) {
                 Some(written) => self.bind_named_table(&written, None),
-                None => (Operator::Empty, Scope::default()),
+                None => (LogicalPlan::Empty, Scope::default()),
             },
             // `WITH … INSERT/UPDATE/DELETE/MERGE …`: the DML statement is the
             // query body (the parser wraps a CTE-prefixed DML this way). Bind it
@@ -1238,7 +1238,7 @@ impl<'a> Binder<'a> {
                 let (l, scope) = self.bind_set_expr(left);
                 let (r, _) = self.bind_set_expr(right);
                 (
-                    Operator::SetOp(super::operator::SetOp {
+                    LogicalPlan::SetOp(super::operator::SetOp {
                         left: Box::new(l),
                         right: Box::new(r),
                     }),
@@ -1248,14 +1248,14 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Bind a `VALUES (…), (…)` row set into [`Operator::Values`]: one
+    /// Bind a `VALUES (…), (…)` row set into [`LogicalPlan::Values`]: one
     /// anonymous output per column position (synthesised rows have no base
     /// columns, so a reference to a `(VALUES …) AS v(x)` column is `Derived`
     /// and traces to nothing — there is no column lineage). The row
     /// expressions are reads, resolved against the empty current scope and
     /// falling through to the correlation stack (a `(VALUES (t.a)) AS v` reads
     /// the enclosing / sibling `t.a` like a derived subquery's body).
-    fn bind_values(&self, values: &SqlValues) -> (Operator, Scope) {
+    fn bind_values(&self, values: &SqlValues) -> (LogicalPlan, Scope) {
         let width = values.rows.iter().map(Vec::len).max().unwrap_or(0);
         let rows: Vec<Vec<Expr>> = values
             .rows
@@ -1273,7 +1273,7 @@ impl<'a> Binder<'a> {
             })
             .collect();
         (
-            Operator::Values(super::operator::Values { rows }),
+            LogicalPlan::Values(super::operator::Values { rows }),
             Scope {
                 relations: Vec::new(),
                 outputs,
@@ -1290,7 +1290,7 @@ impl<'a> Binder<'a> {
     /// through the `Aggregate`); the grouping / HAVING / SORT clauses resolve
     /// against the FROM relations *plus* the projection outputs (clause-alias
     /// visibility) — a resolution-scope rule, independent of tree position.
-    fn bind_select(&self, select: &Select) -> (Operator, Scope) {
+    fn bind_select(&self, select: &Select) -> (LogicalPlan, Scope) {
         let (from, scope) = self.bind_from(&select.from);
         // WHERE + the WHERE-family auxiliary clauses (DISTINCT ON / TOP /
         // LATERAL VIEW / PREWHERE / QUALIFY / CONNECT BY / CLUSTER BY / named
@@ -1305,7 +1305,7 @@ impl<'a> Binder<'a> {
         let mut node = if where_reads.is_empty() {
             from
         } else {
-            Operator::Filter(Filter {
+            LogicalPlan::Filter(Filter {
                 input: Box::new(from),
                 predicate: where_reads,
             })
@@ -1325,20 +1325,20 @@ impl<'a> Binder<'a> {
         // GROUP BY → an `Aggregate` over the filtered rows; its keys are reads.
         let group_by = self.group_by_keys(&select.group_by, &clause_scope);
         if !group_by.is_empty() {
-            node = Operator::Aggregate(super::operator::Aggregate {
+            node = LogicalPlan::Aggregate(super::operator::Aggregate {
                 input: Box::new(node),
                 group_by,
             });
         }
         // HAVING → a filter on the grouped rows, between Aggregate and Projection.
         if let Some(having) = &select.having {
-            node = Operator::Filter(Filter {
+            node = LogicalPlan::Filter(Filter {
                 input: Box::new(node),
                 predicate: vec![self.bind_expr(having, &clause_scope)],
             });
         }
         // SELECT: the column-defining projection, on top.
-        node = Operator::Projection(Projection {
+        node = LogicalPlan::Projection(Projection {
             input: Box::new(node),
             exprs,
         });
@@ -1351,7 +1351,7 @@ impl<'a> Binder<'a> {
         // — wrap the projection as the create source so `t` is a write target.
         if let Some(into) = &select.into {
             if let Some(written) = self.table_ref(&into.name) {
-                node = Operator::CreateTableAs(super::operator::CreateTableAs {
+                node = LogicalPlan::CreateTableAs(super::operator::CreateTableAs {
                     target: self.table_match(&written).table,
                     columns: Vec::new(),
                     input: Box::new(node),
@@ -1361,10 +1361,10 @@ impl<'a> Binder<'a> {
         (node, clause_scope)
     }
 
-    fn bind_from(&self, items: &[TableWithJoins]) -> (Operator, Scope) {
+    fn bind_from(&self, items: &[TableWithJoins]) -> (LogicalPlan, Scope) {
         let mut iter = items.iter();
         let Some(first) = iter.next() else {
-            return (Operator::Empty, Scope::default());
+            return (LogicalPlan::Empty, Scope::default());
         };
         let (mut node, mut scope) = self.bind_table_with_joins(first, &[]);
         // Comma-separated FROM items are a cross join; a later item sees the
@@ -1380,7 +1380,11 @@ impl<'a> Binder<'a> {
 
     /// `left` are the FROM siblings to this item's left, visible to a LATERAL
     /// factor (and to a joined factor, after the preceding join inputs).
-    fn bind_table_with_joins(&self, twj: &TableWithJoins, left: &[Relation]) -> (Operator, Scope) {
+    fn bind_table_with_joins(
+        &self,
+        twj: &TableWithJoins,
+        left: &[Relation],
+    ) -> (LogicalPlan, Scope) {
         let (mut node, mut scope) = self.bind_table_factor(&twj.relation, left);
         for j in &twj.joins {
             // A joined LATERAL factor sees the left siblings plus the join
@@ -1410,14 +1414,14 @@ impl<'a> Binder<'a> {
         &self,
         written: &TableReference,
         alias: Option<Ident>,
-    ) -> (Operator, Scope) {
+    ) -> (LogicalPlan, Scope) {
         let m = self.table_match(written);
         let columns = if m.columns.is_empty() {
             Columns::Open
         } else {
             Columns::Known(m.columns)
         };
-        let scan = Operator::Scan(Scan {
+        let scan = LogicalPlan::Scan(Scan {
             table: m.table.clone(),
             columns: columns.clone(),
             resolution: m.resolution,
@@ -1432,13 +1436,13 @@ impl<'a> Binder<'a> {
         (scan, scope_of(relation))
     }
 
-    fn bind_table_factor(&self, factor: &TableFactor, left: &[Relation]) -> (Operator, Scope) {
+    fn bind_table_factor(&self, factor: &TableFactor, left: &[Relation]) -> (LogicalPlan, Scope) {
         match factor {
             TableFactor::Table {
                 name, alias, args, ..
             } => {
                 let Some(written) = self.table_ref(name) else {
-                    return (Operator::Empty, Scope::default());
+                    return (LogicalPlan::Empty, Scope::default());
                 };
                 let alias_name = alias.as_ref().map(|a| a.name.clone());
                 // A bare name matching an in-scope CTE resolves to a `CteRef`
@@ -1458,7 +1462,7 @@ impl<'a> Binder<'a> {
                             },
                         };
                         return (
-                            Operator::CteRef(super::operator::CteRef {
+                            LogicalPlan::CteRef(super::operator::CteRef {
                                 name: cte.name.clone(),
                             }),
                             scope_of(relation),
@@ -1470,7 +1474,7 @@ impl<'a> Binder<'a> {
                 // expressions read against the surrounding (sibling) scope —
                 // attach them as a non-feeding filter over the scan.
                 let node = match args {
-                    Some(args) => Operator::Filter(Filter {
+                    Some(args) => LogicalPlan::Filter(Filter {
                         input: Box::new(scan),
                         predicate: self.bind_function_arg_list(&args.args, &sibling_scope(left)),
                     }),
@@ -1501,7 +1505,7 @@ impl<'a> Binder<'a> {
                 let node = match alias {
                     Some(a) => {
                         rename_outputs(&mut op, &alias_column_names(a));
-                        Operator::SubqueryAlias(super::operator::SubqueryAlias {
+                        LogicalPlan::SubqueryAlias(super::operator::SubqueryAlias {
                             alias: a.name.clone(),
                             input: Box::new(op),
                         })
@@ -1522,17 +1526,17 @@ impl<'a> Binder<'a> {
             // (LATERAL-visible) `left` scope; no inner table feeds.
             TableFactor::TableFunction { expr, alias } => {
                 let args = vec![self.bind_expr(expr, &sibling_scope(left))];
-                self.opaque(Operator::Empty, args, alias.as_ref())
+                self.opaque(LogicalPlan::Empty, args, alias.as_ref())
             }
             TableFactor::Function { args, alias, .. } => {
                 let bound = self.bind_function_arg_list(args, &sibling_scope(left));
-                self.opaque(Operator::Empty, bound, alias.as_ref())
+                self.opaque(LogicalPlan::Empty, bound, alias.as_ref())
             }
             TableFactor::UNNEST {
                 array_exprs, alias, ..
             } => {
                 let args = self.bind_exprs(array_exprs, &sibling_scope(left));
-                self.opaque(Operator::Empty, args, alias.as_ref())
+                self.opaque(LogicalPlan::Empty, args, alias.as_ref())
             }
             TableFactor::JsonTable {
                 json_expr, alias, ..
@@ -1541,7 +1545,7 @@ impl<'a> Binder<'a> {
                 json_expr, alias, ..
             } => {
                 let args = vec![self.bind_expr(json_expr, &sibling_scope(left))];
-                self.opaque(Operator::Empty, args, alias.as_ref())
+                self.opaque(LogicalPlan::Empty, args, alias.as_ref())
             }
             TableFactor::XmlTable {
                 row_expression,
@@ -1557,7 +1561,7 @@ impl<'a> Binder<'a> {
                         .iter()
                         .map(|a| self.bind_expr(&a.expr, &scope)),
                 );
-                self.opaque(Operator::Empty, args, alias.as_ref())
+                self.opaque(LogicalPlan::Empty, args, alias.as_ref())
             }
             TableFactor::SemanticView {
                 dimensions,
@@ -1572,7 +1576,7 @@ impl<'a> Binder<'a> {
                 args.extend(self.bind_exprs(metrics, &scope));
                 args.extend(self.bind_exprs(facts, &scope));
                 args.extend(where_clause.iter().map(|e| self.bind_expr(e, &scope)));
-                self.opaque(Operator::Empty, args, alias.as_ref())
+                self.opaque(LogicalPlan::Empty, args, alias.as_ref())
             }
             // PIVOT / UNPIVOT / MATCH_RECOGNIZE wrap an inner table whose
             // columns the clause expressions read; the produced relation is
@@ -1647,18 +1651,18 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Assemble an opaque table-producing factor: an [`Operator::TableFunction`]
+    /// Assemble an opaque table-producing factor: an [`LogicalPlan::TableFunction`]
     /// node carrying the (already-bound) argument reads over `input` (the wrapped
-    /// inner table, or [`Operator::Empty`] for a bare function), exposed as a
+    /// inner table, or [`LogicalPlan::Empty`] for a bare function), exposed as a
     /// synthetic [`RelSource::TableFunction`] relation under the alias.
     fn opaque(
         &self,
-        input: Operator,
+        input: LogicalPlan,
         args: Vec<Expr>,
         alias: Option<&TableAlias>,
-    ) -> (Operator, Scope) {
+    ) -> (LogicalPlan, Scope) {
         let alias_name = alias.map(|a| a.name.clone());
-        let node = Operator::TableFunction(super::operator::TableFunction {
+        let node = LogicalPlan::TableFunction(super::operator::TableFunction {
             alias: alias_name.clone(),
             input: Box::new(input),
             args,
@@ -2135,7 +2139,7 @@ impl<'a> Binder<'a> {
     /// Bind a subquery nested in an expression: its references resolve against
     /// its own FROM plus the containing scope's relations (pushed onto the
     /// correlation stack), so a correlated reference reaches outward.
-    fn bind_subquery(&self, query: &Query, scope: &Scope) -> Operator {
+    fn bind_subquery(&self, query: &Query, scope: &Scope) -> LogicalPlan {
         self.with_outer(scope.relations.clone()).bind_query(query).0
     }
 
@@ -2644,8 +2648,8 @@ fn downgrade(binding: Binding) -> Binding {
     }
 }
 
-fn join(left: Operator, right: Operator, on: Vec<Expr>) -> Operator {
-    Operator::Join(super::operator::Join {
+fn join(left: LogicalPlan, right: LogicalPlan, on: Vec<Expr>) -> LogicalPlan {
+    LogicalPlan::Join(super::operator::Join {
         left: Box::new(left),
         right: Box::new(right),
         on,
@@ -2656,8 +2660,8 @@ fn join(left: Operator, right: Operator, on: Vec<Expr>) -> Operator {
 /// Cross-join `right` onto `left`, but if `left` is the empty placeholder
 /// just take `right` (so a single read relation isn't wrapped in a join with
 /// nothing). Used to accumulate a DML statement's read relations.
-fn combine(left: Operator, right: Operator) -> Operator {
-    if matches!(left, Operator::Empty) {
+fn combine(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
+    if matches!(left, LogicalPlan::Empty) {
         right
     } else {
         join(left, right, Vec::new())
@@ -2702,8 +2706,8 @@ fn alter_table_op_target_columns(op: &AlterTableOperation) -> Vec<Ident> {
     }
 }
 
-fn sort(input: Operator, keys: Vec<Expr>) -> Operator {
-    Operator::Sort(super::operator::Sort {
+fn sort(input: LogicalPlan, keys: Vec<Expr>) -> LogicalPlan {
+    LogicalPlan::Sort(super::operator::Sort {
         input: Box::new(input),
         keys,
     })
@@ -2735,20 +2739,20 @@ fn alias_column_names(alias: &TableAlias) -> Vec<Ident> {
 /// `AS d(x, y)` column list). A no-op when `names` is empty. Descends through
 /// the clause layers / `With` to the producing `Projection`; a `SetOp` renames
 /// both operands.
-fn rename_outputs(op: &mut Operator, names: &[Ident]) {
+fn rename_outputs(op: &mut LogicalPlan, names: &[Ident]) {
     if names.is_empty() {
         return;
     }
     match op {
-        Operator::Projection(p) => {
+        LogicalPlan::Projection(p) => {
             for (ne, n) in p.exprs.iter_mut().zip(names) {
                 ne.name = Some(n.clone());
             }
         }
-        Operator::Sort(s) => rename_outputs(&mut s.input, names),
-        Operator::Filter(f) => rename_outputs(&mut f.input, names),
-        Operator::With(w) => rename_outputs(&mut w.body, names),
-        Operator::SetOp(so) => {
+        LogicalPlan::Sort(s) => rename_outputs(&mut s.input, names),
+        LogicalPlan::Filter(f) => rename_outputs(&mut f.input, names),
+        LogicalPlan::With(w) => rename_outputs(&mut w.body, names),
+        LogicalPlan::SetOp(so) => {
             rename_outputs(&mut so.left, names);
             rename_outputs(&mut so.right, names);
         }
@@ -2849,18 +2853,18 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    fn bind(sql: &str) -> Operator {
+    fn bind(sql: &str) -> LogicalPlan {
         bind_cat(sql, None)
     }
 
-    fn bind_cat(sql: &str, catalog: Option<&Catalog>) -> Operator {
+    fn bind_cat(sql: &str, catalog: Option<&Catalog>) -> LogicalPlan {
         let statements = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
         let casing = IdentifierCasing::for_dialect(&GenericDialect {});
         build_with_diagnostics(&statements[0], catalog, casing).0
     }
 
-    fn only_binding(op: &Operator) -> &Binding {
-        let Operator::Projection(p) = op else {
+    fn only_binding(op: &LogicalPlan) -> &Binding {
+        let LogicalPlan::Projection(p) = op else {
             panic!("expected Projection, got {op:?}")
         };
         match &p.exprs[..] {

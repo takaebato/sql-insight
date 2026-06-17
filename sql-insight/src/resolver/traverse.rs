@@ -1,4 +1,4 @@
-//! Walking the bound [`Operator`] tree for the extraction surfaces.
+//! Walking the bound [`LogicalPlan`] tree for the extraction surfaces.
 //!
 //! - [`reads`] — every physical base-column reference (occurrence-based; a
 //!   `Derived` ref is dropped, its read counted at the inner producer).
@@ -17,20 +17,20 @@
 
 use sqlparser::ast::Ident;
 
-use super::operator::{Binding, ColRef, Cte, Expr, MergeClause, NamedExpr, Operator};
+use super::operator::{Binding, ColRef, Cte, Expr, LogicalPlan, MergeClause, NamedExpr};
 use crate::extractor::{ColumnLineageEdge, ColumnLineageKind, ColumnTarget, TableLineageEdge};
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableRead, TableReference};
 
 // ===== reads =============================================================
 
 /// Every physical base-column read the plan expresses, occurrence-based.
-pub(crate) fn reads(op: &Operator) -> Vec<ColumnRead> {
+pub(crate) fn reads(op: &LogicalPlan) -> Vec<ColumnRead> {
     let mut out = Vec::new();
     collect_reads(op, &mut out);
     out
 }
 
-fn collect_reads(op: &Operator, out: &mut Vec<ColumnRead>) {
+fn collect_reads(op: &LogicalPlan, out: &mut Vec<ColumnRead>) {
     for expr in own_exprs(op) {
         expr_reads(expr, out);
     }
@@ -38,7 +38,7 @@ fn collect_reads(op: &Operator, out: &mut Vec<ColumnRead>) {
         collect_reads(child, out);
     }
     // A `With` walks each CTE body once (declarations); a `CteRef` is a leaf.
-    if let Operator::With(w) = op {
+    if let LogicalPlan::With(w) = op {
         for cte in &w.ctes {
             collect_reads(&cte.body, out);
         }
@@ -101,10 +101,10 @@ fn column_read(c: &ColRef) -> Option<ColumnRead> {
 // ===== table reads =======================================================
 
 /// Every base table scanned (read role), occurrence-based.
-pub(crate) fn table_reads(op: &Operator) -> Vec<TableRead> {
+pub(crate) fn table_reads(op: &LogicalPlan) -> Vec<TableRead> {
     let mut out = Vec::new();
     walk(op, &mut |o| {
-        if let Operator::Scan(s) = o {
+        if let LogicalPlan::Scan(s) = o {
             out.push(TableRead {
                 reference: s.table.clone(),
                 resolution: s.resolution,
@@ -114,7 +114,7 @@ pub(crate) fn table_reads(op: &Operator) -> Vec<TableRead> {
     out
 }
 
-fn walk(op: &Operator, f: &mut impl FnMut(&Operator)) {
+fn walk(op: &LogicalPlan, f: &mut impl FnMut(&LogicalPlan)) {
     f(op);
     for child in children(op) {
         walk(child, f);
@@ -124,7 +124,7 @@ fn walk(op: &Operator, f: &mut impl FnMut(&Operator)) {
     for sub in own_expr_subplans(op) {
         walk(sub, f);
     }
-    if let Operator::With(w) = op {
+    if let LogicalPlan::With(w) = op {
         for cte in &w.ctes {
             walk(&cte.body, f);
         }
@@ -134,7 +134,7 @@ fn walk(op: &Operator, f: &mut impl FnMut(&Operator)) {
 /// The sub-plans appearing in this node's *own* expressions (not its
 /// children's). `walk` recurses into them; `collect_reads` reaches them via
 /// `expr_reads`.
-fn own_expr_subplans(op: &Operator) -> Vec<&Operator> {
+fn own_expr_subplans(op: &LogicalPlan) -> Vec<&LogicalPlan> {
     let mut out = Vec::new();
     for expr in own_exprs(op) {
         collect_subplans(expr, &mut out);
@@ -142,7 +142,7 @@ fn own_expr_subplans(op: &Operator) -> Vec<&Operator> {
     out
 }
 
-fn collect_subplans<'a>(expr: &'a Expr, out: &mut Vec<&'a Operator>) {
+fn collect_subplans<'a>(expr: &'a Expr, out: &mut Vec<&'a LogicalPlan>) {
     match expr {
         Expr::Column(_) => {}
         Expr::Call { args } => args.iter().for_each(|e| collect_subplans(e, out)),
@@ -183,7 +183,7 @@ fn collect_subplans<'a>(expr: &'a Expr, out: &mut Vec<&'a Operator>) {
 /// target's columns and emits `source → Relation` edges. A leading `WITH` is
 /// peeled (its CTE bodies feed the root through `CteRef` expansion, they are
 /// not lineage roots).
-pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
+pub(crate) fn column_lineage(op: &LogicalPlan) -> Vec<ColumnLineageEdge> {
     let mut ctx = Ctx::new(op);
     let mut edges = Vec::new();
     match peel_with(op) {
@@ -191,7 +191,7 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
         // A statement-level `WITH` rides on the source (the parser attaches it
         // there, so the `With` is *inside* `input`, not above the `Insert`);
         // `enter_withs` pushes its CTEs into the ctx so a `CteRef` resolves.
-        Operator::Insert(i) => {
+        LogicalPlan::Insert(i) => {
             let src = enter_withs(&i.input, &mut ctx);
             relation_lineage(&i.columns, &i.target, src, &mut ctx, &mut edges);
             // ON CONFLICT DO UPDATE SET col = value: each `value → target.col`,
@@ -214,7 +214,7 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
         // UPDATE … SET col = expr: each assignment's RHS value traces to its
         // target column (`Relation` edge). A `Derived` RHS ref (a column of a
         // FROM derived table) traces through `input`.
-        Operator::Update(u) => {
+        LogicalPlan::Update(u) => {
             for a in &u.assignments {
                 let target = ColumnTarget::Relation(ColumnReference {
                     table: Some(u.target.clone()),
@@ -232,14 +232,14 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
         }
         // DELETE moves no data (rows go wholesale) — its only lineage is a
         // RETURNING projection of the deleted rows.
-        Operator::Delete(d) => returning_lineage(&d.returning, &d.input, &mut ctx, &mut edges),
+        LogicalPlan::Delete(d) => returning_lineage(&d.returning, &d.input, &mut ctx, &mut edges),
         // CTAS / CREATE VIEW move data like INSERT: pair the source's outputs
         // with the new relation's columns.
-        Operator::CreateTableAs(c) => {
+        LogicalPlan::CreateTableAs(c) => {
             let src = enter_withs(&c.input, &mut ctx);
             relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
         }
-        Operator::CreateView(c) => {
+        LogicalPlan::CreateView(c) => {
             let src = enter_withs(&c.input, &mut ctx);
             relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
         }
@@ -247,7 +247,7 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
         // UPDATE SET `RHS → target.col`; an INSERT `value → target.col`). A
         // `Derived` source ref traces through the source relation. DELETE
         // moves no value.
-        Operator::Merge(m) => {
+        LogicalPlan::Merge(m) => {
             for clause in &m.clauses {
                 match clause {
                     MergeClause::Update { assignments } => {
@@ -279,7 +279,11 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
 /// Bare-query lineage: each output column becomes a `QueryOutput` target at
 /// its position, one edge per traced origin. `output_operands` peels the
 /// clause layers and `With`, and yields one operand per set-operation branch.
-fn query_output_lineage<'a>(op: &'a Operator, ctx: &mut Ctx<'a>, out: &mut Vec<ColumnLineageEdge>) {
+fn query_output_lineage<'a>(
+    op: &'a LogicalPlan,
+    ctx: &mut Ctx<'a>,
+    out: &mut Vec<ColumnLineageEdge>,
+) {
     for (outputs, input) in output_operands(op) {
         for (position, ne) in outputs.iter().enumerate() {
             let target = ColumnTarget::QueryOutput {
@@ -303,7 +307,7 @@ fn query_output_lineage<'a>(op: &'a Operator, ctx: &mut Ctx<'a>, out: &mut Vec<C
 fn relation_lineage<'a>(
     columns: &[Ident],
     target: &TableReference,
-    input: &'a Operator,
+    input: &'a LogicalPlan,
     ctx: &mut Ctx<'a>,
     out: &mut Vec<ColumnLineageEdge>,
 ) {
@@ -329,7 +333,7 @@ fn relation_lineage<'a>(
 /// traced through `input` (the written relation / FROM scope).
 fn returning_lineage<'a>(
     returning: &'a [NamedExpr],
-    input: &'a Operator,
+    input: &'a LogicalPlan,
     ctx: &mut Ctx<'a>,
     out: &mut Vec<ColumnLineageEdge>,
 ) {
@@ -356,7 +360,7 @@ fn returning_lineage<'a>(
 fn conflict_value_origins<'a>(
     value: &'a Expr,
     columns: &[Ident],
-    source: &'a Operator,
+    source: &'a LogicalPlan,
     ctx: &mut Ctx<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match value {
@@ -446,7 +450,7 @@ fn merge_value_edges<'a>(
     column: &Ident,
     value: &'a Expr,
     target: &TableReference,
-    source: &'a Operator,
+    source: &'a LogicalPlan,
     ctx: &mut Ctx<'a>,
     out: &mut Vec<ColumnLineageEdge>,
 ) {
@@ -467,13 +471,13 @@ fn merge_value_edges<'a>(
 /// set-operation branch (a plain query has a single operand). Peels the clause
 /// layers above the projection (GROUP BY / HAVING `Filter`, ORDER BY `Sort`)
 /// and `With`.
-fn output_operands(op: &Operator) -> Vec<(&[NamedExpr], &Operator)> {
+fn output_operands(op: &LogicalPlan) -> Vec<(&[NamedExpr], &LogicalPlan)> {
     match op {
-        Operator::Projection(p) => vec![(&p.exprs, &p.input)],
-        Operator::Sort(s) => output_operands(&s.input),
-        Operator::Filter(f) => output_operands(&f.input),
-        Operator::With(w) => output_operands(&w.body),
-        Operator::SetOp(so) => {
+        LogicalPlan::Projection(p) => vec![(&p.exprs, &p.input)],
+        LogicalPlan::Sort(s) => output_operands(&s.input),
+        LogicalPlan::Filter(f) => output_operands(&f.input),
+        LogicalPlan::With(w) => output_operands(&w.body),
+        LogicalPlan::SetOp(so) => {
             let mut operands = output_operands(&so.left);
             operands.extend(output_operands(&so.right));
             operands
@@ -487,11 +491,11 @@ fn output_operands(op: &Operator) -> Vec<(&[NamedExpr], &Operator)> {
 /// Every column the statement writes — a DML root's target columns, qualified
 /// by the write target. Order follows source order (the public contract). A
 /// leading `WITH` is peeled.
-pub(crate) fn writes(op: &Operator) -> Vec<ColumnReference> {
+pub(crate) fn writes(op: &LogicalPlan) -> Vec<ColumnReference> {
     match peel_with(op) {
         // INSERT columns, then any ON CONFLICT DO UPDATE SET targets (extra
         // writes on the same relation).
-        Operator::Insert(i) => {
+        LogicalPlan::Insert(i) => {
             let mut w = qualify(&i.columns, &i.target);
             w.extend(i.on_conflict.iter().map(|a| ColumnReference {
                 table: Some(i.target.clone()),
@@ -500,7 +504,7 @@ pub(crate) fn writes(op: &Operator) -> Vec<ColumnReference> {
             w
         }
         // Each SET assignment writes its target column.
-        Operator::Update(u) => u
+        LogicalPlan::Update(u) => u
             .assignments
             .iter()
             .map(|a| ColumnReference {
@@ -510,12 +514,12 @@ pub(crate) fn writes(op: &Operator) -> Vec<ColumnReference> {
             .collect(),
         // CTAS / CREATE VIEW write the new relation's columns; ALTER TABLE
         // writes its column-naming operations' columns.
-        Operator::CreateTableAs(c) => qualify(&c.columns, &c.target),
-        Operator::CreateView(c) => qualify(&c.columns, &c.target),
-        Operator::AlterTable(a) => qualify(&a.columns, &a.target),
+        LogicalPlan::CreateTableAs(c) => qualify(&c.columns, &c.target),
+        LogicalPlan::CreateView(c) => qualify(&c.columns, &c.target),
+        LogicalPlan::AlterTable(a) => qualify(&a.columns, &a.target),
         // MERGE writes each WHEN action's target columns (UPDATE SET targets;
         // INSERT columns paired with values).
-        Operator::Merge(m) => m
+        LogicalPlan::Merge(m) => m
             .clauses
             .iter()
             .flat_map(|clause| merge_clause_writes(clause, &m.target))
@@ -550,18 +554,18 @@ fn merge_clause_writes(clause: &MergeClause, target: &TableReference) -> Vec<Col
 
 /// Every table the statement writes to — one per DML target. A leading `WITH`
 /// is peeled.
-pub(crate) fn table_writes(op: &Operator) -> Vec<TableReference> {
+pub(crate) fn table_writes(op: &LogicalPlan) -> Vec<TableReference> {
     match peel_with(op) {
-        Operator::Insert(i) => vec![i.target.clone()],
-        Operator::Update(u) => vec![u.target.clone()],
+        LogicalPlan::Insert(i) => vec![i.target.clone()],
+        LogicalPlan::Update(u) => vec![u.target.clone()],
         // A DELETE removes rows from each of its targets.
-        Operator::Delete(d) => d.targets.clone(),
-        Operator::CreateTableAs(c) => vec![c.target.clone()],
-        Operator::CreateView(c) => vec![c.target.clone()],
-        Operator::AlterTable(a) => vec![a.target.clone()],
-        Operator::Merge(m) => vec![m.target.clone()],
+        LogicalPlan::Delete(d) => d.targets.clone(),
+        LogicalPlan::CreateTableAs(c) => vec![c.target.clone()],
+        LogicalPlan::CreateView(c) => vec![c.target.clone()],
+        LogicalPlan::AlterTable(a) => vec![a.target.clone()],
+        LogicalPlan::Merge(m) => vec![m.target.clone()],
         // DROP / TRUNCATE name their relations directly as write targets.
-        Operator::Drop(d) => d.targets.clone(),
+        LogicalPlan::Drop(d) => d.targets.clone(),
         _ => Vec::new(),
     }
 }
@@ -572,20 +576,20 @@ pub(crate) fn table_writes(op: &Operator) -> Vec<TableReference> {
 /// (projection) subqueries, and referenced CTE bodies — never predicate
 /// (filter) subqueries. A bare query, or a statement that moves no data, has
 /// no table lineage.
-pub(crate) fn table_lineage(op: &Operator) -> Vec<TableLineageEdge> {
+pub(crate) fn table_lineage(op: &LogicalPlan) -> Vec<TableLineageEdge> {
     // `Ctx::new` peels leading WITHs and keeps their CTE bodies, so a `CteRef`
     // on the feeding path resolves to the body's feeding scans.
     let mut ctx = Ctx::new(op);
     let mut sources = Vec::new();
     let target = match peel_with(op) {
-        Operator::Insert(i) => {
+        LogicalPlan::Insert(i) => {
             feeding_scans(&i.input, &mut ctx, &mut sources);
             &i.target
         }
         // UPDATE feeds from the FROM relations (the read `input`) AND any value
         // subquery in a SET RHS; the WHERE predicate / a self-reference to the
         // target do not feed.
-        Operator::Update(u) => {
+        LogicalPlan::Update(u) => {
             feeding_scans(&u.input, &mut ctx, &mut sources);
             for a in &u.assignments {
                 expr_feeding(&a.value, &mut ctx, &mut sources);
@@ -593,18 +597,18 @@ pub(crate) fn table_lineage(op: &Operator) -> Vec<TableLineageEdge> {
             &u.target
         }
         // CTAS / CREATE VIEW move data like INSERT; ALTER / DROP do not.
-        Operator::CreateTableAs(c) => {
+        LogicalPlan::CreateTableAs(c) => {
             feeding_scans(&c.input, &mut ctx, &mut sources);
             &c.target
         }
-        Operator::CreateView(c) => {
+        LogicalPlan::CreateView(c) => {
             feeding_scans(&c.input, &mut ctx, &mut sources);
             &c.target
         }
         // MERGE feeds from the source relation plus each *written* WHEN value
         // (an UPDATE SET RHS; an INSERT value paired with a column). The ON /
         // predicate reads and an unpaired INSERT value do not feed.
-        Operator::Merge(m) => {
+        LogicalPlan::Merge(m) => {
             feeding_scans(&m.source, &mut ctx, &mut sources);
             for clause in &m.clauses {
                 match clause {
@@ -650,40 +654,40 @@ fn qualify(columns: &[Ident], target: &TableReference) -> Vec<ColumnReference> {
 /// predicate subqueries do not feed), a projection also pulls its value
 /// subqueries. A `CteRef` resolves to the referenced CTE body's feeding scans;
 /// the `Ctx` active-set terminates a recursive self-reference.
-fn feeding_scans<'a>(op: &'a Operator, ctx: &mut Ctx<'a>, out: &mut Vec<TableRead>) {
+fn feeding_scans<'a>(op: &'a LogicalPlan, ctx: &mut Ctx<'a>, out: &mut Vec<TableRead>) {
     match op {
-        Operator::Scan(s) => out.push(TableRead {
+        LogicalPlan::Scan(s) => out.push(TableRead {
             reference: s.table.clone(),
             resolution: s.resolution,
         }),
-        Operator::Filter(f) => feeding_scans(&f.input, ctx, out),
-        Operator::Join(j) => {
+        LogicalPlan::Filter(f) => feeding_scans(&f.input, ctx, out),
+        LogicalPlan::Join(j) => {
             feeding_scans(&j.left, ctx, out);
             feeding_scans(&j.right, ctx, out);
         }
-        Operator::Projection(p) => {
+        LogicalPlan::Projection(p) => {
             feeding_scans(&p.input, ctx, out);
             for ne in &p.exprs {
                 expr_feeding(&ne.expr, ctx, out);
             }
         }
-        Operator::Aggregate(a) => feeding_scans(&a.input, ctx, out),
-        Operator::Sort(s) => feeding_scans(&s.input, ctx, out),
-        Operator::SubqueryAlias(sa) => feeding_scans(&sa.input, ctx, out),
+        LogicalPlan::Aggregate(a) => feeding_scans(&a.input, ctx, out),
+        LogicalPlan::Sort(s) => feeding_scans(&s.input, ctx, out),
+        LogicalPlan::SubqueryAlias(sa) => feeding_scans(&sa.input, ctx, out),
         // A PIVOT / … feeds from its wrapped inner table; the function args
         // are filter-position reads and do not feed.
-        Operator::TableFunction(tf) => feeding_scans(&tf.input, ctx, out),
-        Operator::SetOp(so) => {
+        LogicalPlan::TableFunction(tf) => feeding_scans(&tf.input, ctx, out),
+        LogicalPlan::SetOp(so) => {
             feeding_scans(&so.left, ctx, out);
             feeding_scans(&so.right, ctx, out);
         }
-        Operator::With(w) => {
+        LogicalPlan::With(w) => {
             let added = w.ctes.len();
             w.ctes.iter().for_each(|c| ctx.ctes.push(c));
             feeding_scans(&w.body, ctx, out);
             ctx.ctes.truncate(ctx.ctes.len() - added);
         }
-        Operator::CteRef(r) => {
+        LogicalPlan::CteRef(r) => {
             if ctx.active.iter().any(|n| n == &r.name.value) {
                 return; // recursive self-reference — terminate
             }
@@ -701,16 +705,16 @@ fn feeding_scans<'a>(op: &'a Operator, ctx: &mut Ctx<'a>, out: &mut Vec<TableRea
         }
         // A nested data-mover feeds through its source; DELETE / DROP / ALTER /
         // VALUES move no row data into a feeding path.
-        Operator::Insert(i) => feeding_scans(&i.input, ctx, out),
-        Operator::Update(u) => feeding_scans(&u.input, ctx, out),
-        Operator::CreateTableAs(c) => feeding_scans(&c.input, ctx, out),
-        Operator::CreateView(c) => feeding_scans(&c.input, ctx, out),
-        Operator::Merge(m) => feeding_scans(&m.source, ctx, out),
-        Operator::Delete(_)
-        | Operator::Drop(_)
-        | Operator::AlterTable(_)
-        | Operator::Values(_)
-        | Operator::Empty => {}
+        LogicalPlan::Insert(i) => feeding_scans(&i.input, ctx, out),
+        LogicalPlan::Update(u) => feeding_scans(&u.input, ctx, out),
+        LogicalPlan::CreateTableAs(c) => feeding_scans(&c.input, ctx, out),
+        LogicalPlan::CreateView(c) => feeding_scans(&c.input, ctx, out),
+        LogicalPlan::Merge(m) => feeding_scans(&m.source, ctx, out),
+        LogicalPlan::Delete(_)
+        | LogicalPlan::Drop(_)
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty => {}
     }
 }
 
@@ -734,9 +738,9 @@ fn expr_feeding<'a>(expr: &'a Expr, ctx: &mut Ctx<'a>, out: &mut Vec<TableRead>)
 }
 
 /// Peel leading `With` nodes to the wrapped root (a query or DML root).
-fn peel_with(op: &Operator) -> &Operator {
+fn peel_with(op: &LogicalPlan) -> &LogicalPlan {
     let mut node = op;
-    while let Operator::With(w) = node {
+    while let LogicalPlan::With(w) = node {
         node = &w.body;
     }
     node
@@ -747,9 +751,9 @@ fn peel_with(op: &Operator) -> &Operator {
 /// root. (`Ctx::new` already does this for a query's leading `WITH`; a DML
 /// source carries its own `WITH`, reached only here.) The push is not popped —
 /// the ctx is per-statement scratch, discarded after the walk.
-fn enter_withs<'a>(op: &'a Operator, ctx: &mut Ctx<'a>) -> &'a Operator {
+fn enter_withs<'a>(op: &'a LogicalPlan, ctx: &mut Ctx<'a>) -> &'a LogicalPlan {
     let mut node = op;
-    while let Operator::With(w) = node {
+    while let LogicalPlan::With(w) = node {
         w.ctes.iter().for_each(|c| ctx.ctes.push(c));
         node = &w.body;
     }
@@ -764,7 +768,7 @@ fn enter_withs<'a>(op: &'a Operator, ctx: &mut Ctx<'a>) -> &'a Operator {
 /// appears once). Every `Scan` plus the DML / DDL write targets (none of which
 /// are scans in this plan), de-duplicating a DELETE target that is also a FROM
 /// scan. Order is the walk's, incidental.
-pub(crate) fn flat_tables(op: &Operator) -> Vec<TableReference> {
+pub(crate) fn flat_tables(op: &LogicalPlan) -> Vec<TableReference> {
     let mut out = Vec::new();
     collect_flat(op, &mut out);
     out
@@ -773,46 +777,46 @@ pub(crate) fn flat_tables(op: &Operator) -> Vec<TableReference> {
 /// Walk the value sub-plans in a DML root's own expressions (a SET / WHEN /
 /// conflict-value scalar subquery's scans bind too, like the resolver counts
 /// them on the write input).
-fn collect_flat_subplans(op: &Operator, out: &mut Vec<TableReference>) {
+fn collect_flat_subplans(op: &LogicalPlan, out: &mut Vec<TableReference>) {
     for sub in own_expr_subplans(op) {
         collect_flat(sub, out);
     }
 }
 
-fn collect_flat(op: &Operator, out: &mut Vec<TableReference>) {
+fn collect_flat(op: &LogicalPlan, out: &mut Vec<TableReference>) {
     match op {
-        Operator::Scan(s) => out.push(s.table.clone()),
+        LogicalPlan::Scan(s) => out.push(s.table.clone()),
         // DROP / TRUNCATE relations are bindings with no scan.
-        Operator::Drop(d) => out.extend(d.targets.iter().cloned()),
+        LogicalPlan::Drop(d) => out.extend(d.targets.iter().cloned()),
         // A write target is external to the input (never a scan here): count it,
         // then walk the source for its read scans.
-        Operator::Insert(i) => {
+        LogicalPlan::Insert(i) => {
             out.push(i.target.clone());
             collect_flat(&i.input, out);
             collect_flat_subplans(op, out);
         }
-        Operator::Update(u) => {
+        LogicalPlan::Update(u) => {
             out.push(u.target.clone());
             collect_flat(&u.input, out);
             collect_flat_subplans(op, out);
         }
-        Operator::Merge(m) => {
+        LogicalPlan::Merge(m) => {
             out.push(m.target.clone());
             collect_flat(&m.source, out);
             collect_flat_subplans(op, out);
         }
-        Operator::CreateTableAs(c) => {
+        LogicalPlan::CreateTableAs(c) => {
             out.push(c.target.clone());
             collect_flat(&c.input, out);
         }
-        Operator::CreateView(c) => {
+        LogicalPlan::CreateView(c) => {
             out.push(c.target.clone());
             collect_flat(&c.input, out);
         }
-        Operator::AlterTable(a) => out.push(a.target.clone()),
+        LogicalPlan::AlterTable(a) => out.push(a.target.clone()),
         // A DELETE target often coincides with a FROM scan already collected;
         // count only the targets that didn't merge into a row source.
-        Operator::Delete(d) => {
+        LogicalPlan::Delete(d) => {
             let before = out.len();
             collect_flat(&d.input, out);
             let from: Vec<TableReference> = out[before..].to_vec();
@@ -822,7 +826,7 @@ fn collect_flat(op: &Operator, out: &mut Vec<TableReference>) {
                 }
             }
         }
-        Operator::With(w) => {
+        LogicalPlan::With(w) => {
             collect_flat(&w.body, out);
             for cte in &w.ctes {
                 collect_flat(&cte.body, out);
@@ -830,22 +834,22 @@ fn collect_flat(op: &Operator, out: &mut Vec<TableReference>) {
         }
         // A table function is opaque (not a table binding), but a PIVOT-style
         // inner table below it and any scan in an argument subquery bind.
-        Operator::TableFunction(tf) => {
+        LogicalPlan::TableFunction(tf) => {
             collect_flat(&tf.input, out);
             collect_flat_subplans(op, out);
         }
         // A `VALUES` row's expressions can hold a subquery whose scans bind.
-        Operator::Values(_) => collect_flat_subplans(op, out),
-        Operator::CteRef(_) | Operator::Empty => {}
+        LogicalPlan::Values(_) => collect_flat_subplans(op, out),
+        LogicalPlan::CteRef(_) | LogicalPlan::Empty => {}
         // Structural query operators: walk children and any expression
         // sub-plans (a WHERE / scalar subquery's scans bind too).
-        Operator::Filter(_)
-        | Operator::Join(_)
-        | Operator::Aggregate(_)
-        | Operator::Projection(_)
-        | Operator::Sort(_)
-        | Operator::SetOp(_)
-        | Operator::SubqueryAlias(_) => {
+        LogicalPlan::Filter(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Projection(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::SetOp(_)
+        | LogicalPlan::SubqueryAlias(_) => {
             for child in children(op) {
                 collect_flat(child, out);
             }
@@ -866,12 +870,12 @@ struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    fn new(op: &'a Operator) -> Self {
+    fn new(op: &'a LogicalPlan) -> Self {
         // Collect leading `With` declarations so a `CteRef` on a traced path
         // resolves to its body.
         let mut ctes = Vec::new();
         let mut node = op;
-        while let Operator::With(w) = node {
+        while let LogicalPlan::With(w) = node {
             ctes.extend(w.ctes.iter());
             node = &w.body;
         }
@@ -887,7 +891,7 @@ impl<'a> Ctx<'a> {
 /// keys, EXISTS / IN tests) are not traced — they are reads, not origins.
 fn origins_of_expr<'a>(
     expr: &'a Expr,
-    input: &'a Operator,
+    input: &'a LogicalPlan,
     ctx: &mut Ctx<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match expr {
@@ -928,12 +932,12 @@ fn origins_of_expr<'a>(
 /// Whether a (sub)plan's rows are synthesised by `VALUES` (peeling the clause
 /// layers / a leading `With`): a column of such a relation has no base column
 /// to collapse to, so a reference to it is a synthetic source.
-fn values_backed(op: &Operator) -> bool {
+fn values_backed(op: &LogicalPlan) -> bool {
     match op {
-        Operator::Values(_) => true,
-        Operator::Sort(s) => values_backed(&s.input),
-        Operator::Filter(f) => values_backed(&f.input),
-        Operator::With(w) => values_backed(&w.body),
+        LogicalPlan::Values(_) => true,
+        LogicalPlan::Sort(s) => values_backed(&s.input),
+        LogicalPlan::Filter(f) => values_backed(&f.input),
+        LogicalPlan::With(w) => values_backed(&w.body),
         _ => false,
     }
 }
@@ -941,28 +945,28 @@ fn values_backed(op: &Operator) -> bool {
 /// Trace the named output column of `op` down to its base origins (used to
 /// expand a `Derived` reference through its producing operator).
 fn origins_into<'a>(
-    op: &'a Operator,
+    op: &'a LogicalPlan,
     qualifier: Option<&Ident>,
     name: &Ident,
     ctx: &mut Ctx<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match op {
-        Operator::Projection(p) => match find_named(&p.exprs, name) {
+        LogicalPlan::Projection(p) => match find_named(&p.exprs, name) {
             Some(ne) => origins_of_expr(&ne.expr, &p.input, ctx),
             None => Vec::new(),
         },
         // The projection resolves against the FROM scope, so a column is a
         // base ref that returns directly, not a named `Aggregate` output —
         // a `Derived` ref tracing down just passes through to the input.
-        Operator::Aggregate(a) => origins_into(&a.input, qualifier, name, ctx),
-        Operator::Filter(f) => origins_into(&f.input, qualifier, name, ctx),
-        Operator::Sort(s) => origins_into(&s.input, qualifier, name, ctx),
-        Operator::Join(j) => {
+        LogicalPlan::Aggregate(a) => origins_into(&a.input, qualifier, name, ctx),
+        LogicalPlan::Filter(f) => origins_into(&f.input, qualifier, name, ctx),
+        LogicalPlan::Sort(s) => origins_into(&s.input, qualifier, name, ctx),
+        LogicalPlan::Join(j) => {
             let mut o = origins_into(&j.left, qualifier, name, ctx);
             o.extend(origins_into(&j.right, qualifier, name, ctx));
             o
         }
-        Operator::SubqueryAlias(sa) => {
+        LogicalPlan::SubqueryAlias(sa) => {
             if !qualifier.is_none_or(|q| idents_eq(q, &sa.alias)) {
                 Vec::new()
             } else if values_backed(&sa.input) {
@@ -979,7 +983,7 @@ fn origins_into<'a>(
         // An opaque table function: its produced columns are dynamic, so a ref
         // through its alias is a synthetic lineage source (the alias as table)
         // — not collapsible to a base column.
-        Operator::TableFunction(tf) => match &tf.alias {
+        LogicalPlan::TableFunction(tf) => match &tf.alias {
             Some(alias) if qualifier.is_none_or(|q| idents_eq(q, alias)) => {
                 vec![(
                     synthetic_source(alias, name),
@@ -988,19 +992,19 @@ fn origins_into<'a>(
             }
             _ => Vec::new(),
         },
-        Operator::SetOp(so) => {
+        LogicalPlan::SetOp(so) => {
             let mut o = origins_into(&so.left, qualifier, name, ctx);
             o.extend(origins_into(&so.right, qualifier, name, ctx));
             o
         }
-        Operator::With(w) => {
+        LogicalPlan::With(w) => {
             let added = w.ctes.len();
             w.ctes.iter().for_each(|c| ctx.ctes.push(c));
             let o = origins_into(&w.body, qualifier, name, ctx);
             ctx.ctes.truncate(ctx.ctes.len() - added);
             o
         }
-        Operator::CteRef(r) => {
+        LogicalPlan::CteRef(r) => {
             if ctx.active.iter().any(|n| n == &r.name.value) {
                 return Vec::new(); // recursive self-reference — terminate
             }
@@ -1031,23 +1035,23 @@ fn origins_into<'a>(
         // a base column is `Binding::Base` and returns directly, not via this
         // traversal. So a `Scan` reached here (e.g. the other side of a join
         // the qualified name doesn't own) contributes nothing.
-        Operator::Scan(_) | Operator::Values(_) | Operator::Empty => Vec::new(),
+        LogicalPlan::Scan(_) | LogicalPlan::Values(_) | LogicalPlan::Empty => Vec::new(),
         // DML/DDL roots are not column producers traced into here.
-        Operator::Insert(_)
-        | Operator::Update(_)
-        | Operator::Delete(_)
-        | Operator::Merge(_)
-        | Operator::CreateTableAs(_)
-        | Operator::CreateView(_)
-        | Operator::AlterTable(_)
-        | Operator::Drop(_) => Vec::new(),
+        LogicalPlan::Insert(_)
+        | LogicalPlan::Update(_)
+        | LogicalPlan::Delete(_)
+        | LogicalPlan::Merge(_)
+        | LogicalPlan::CreateTableAs(_)
+        | LogicalPlan::CreateView(_)
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => Vec::new(),
     }
 }
 
 /// The origins of a (sub)query's first output column (a scalar subquery's
 /// value).
 fn query_col0_origins<'a>(
-    op: &'a Operator,
+    op: &'a LogicalPlan,
     ctx: &mut Ctx<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match output_operands(op).first() {
@@ -1087,38 +1091,38 @@ fn idents_eq(a: &Ident, b: &Ident) -> bool {
 }
 
 /// This operator's own expressions (not its children's).
-fn own_exprs(op: &Operator) -> Vec<&Expr> {
+fn own_exprs(op: &LogicalPlan) -> Vec<&Expr> {
     match op {
-        Operator::Filter(f) => f.predicate.iter().collect(),
-        Operator::Join(j) => j.on.iter().collect(),
-        Operator::Projection(p) => p.exprs.iter().map(|ne| &ne.expr).collect(),
+        LogicalPlan::Filter(f) => f.predicate.iter().collect(),
+        LogicalPlan::Join(j) => j.on.iter().collect(),
+        LogicalPlan::Projection(p) => p.exprs.iter().map(|ne| &ne.expr).collect(),
         // The grouping keys are reads (they pick groups, never originate a
         // value); the aggregate functions live in the enclosing Projection.
-        Operator::Aggregate(a) => a.group_by.iter().collect(),
-        Operator::Sort(s) => s.keys.iter().collect(),
+        LogicalPlan::Aggregate(a) => a.group_by.iter().collect(),
+        LogicalPlan::Sort(s) => s.keys.iter().collect(),
         // A table function's argument expressions are reads.
-        Operator::TableFunction(tf) => tf.args.iter().collect(),
-        Operator::Values(v) => v.rows.iter().flatten().collect(),
+        LogicalPlan::TableFunction(tf) => tf.args.iter().collect(),
+        LogicalPlan::Values(v) => v.rows.iter().flatten().collect(),
         // RETURNING items, conflict-action SET values, and the conflict
         // predicate are all reads (an `EXCLUDED` ref within them is `Derived`,
         // so dropped).
-        Operator::Insert(i) => i
+        LogicalPlan::Insert(i) => i
             .returning
             .iter()
             .map(|ne| &ne.expr)
             .chain(i.on_conflict.iter().map(|a| &a.value))
             .chain(i.conflict_predicate.iter())
             .collect(),
-        Operator::Update(u) => u
+        LogicalPlan::Update(u) => u
             .assignments
             .iter()
             .map(|a| &a.value)
             .chain(u.returning.iter().map(|ne| &ne.expr))
             .collect(),
-        Operator::Delete(d) => d.returning.iter().map(|ne| &ne.expr).collect(),
+        LogicalPlan::Delete(d) => d.returning.iter().map(|ne| &ne.expr).collect(),
         // MERGE: the ON / per-clause predicates (filter reads) plus each WHEN
         // action's value expressions (SET RHS / INSERT values).
-        Operator::Merge(m) => {
+        LogicalPlan::Merge(m) => {
             let mut exprs: Vec<&Expr> = m.on.iter().collect();
             for clause in &m.clauses {
                 match clause {
@@ -1131,47 +1135,47 @@ fn own_exprs(op: &Operator) -> Vec<&Expr> {
             }
             exprs
         }
-        Operator::Scan(_)
-        | Operator::SubqueryAlias(_)
-        | Operator::SetOp(_)
-        | Operator::With(_)
-        | Operator::CteRef(_)
-        | Operator::Empty
-        | Operator::CreateTableAs(_)
-        | Operator::CreateView(_)
-        | Operator::AlterTable(_)
-        | Operator::Drop(_) => Vec::new(),
+        LogicalPlan::Scan(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::SetOp(_)
+        | LogicalPlan::With(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::CreateTableAs(_)
+        | LogicalPlan::CreateView(_)
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => Vec::new(),
     }
 }
 
 /// This operator's structural child operators (not those nested in
 /// expressions — those are walked by `expr_reads`; not CTE bodies — `walk` /
 /// `collect_reads` handle `With` specially).
-fn children(op: &Operator) -> Vec<&Operator> {
+fn children(op: &LogicalPlan) -> Vec<&LogicalPlan> {
     match op {
-        Operator::Filter(f) => vec![&f.input],
-        Operator::Join(j) => vec![&j.left, &j.right],
-        Operator::Aggregate(a) => vec![&a.input],
-        Operator::Projection(p) => vec![&p.input],
-        Operator::Sort(s) => vec![&s.input],
-        Operator::SetOp(so) => vec![&so.left, &so.right],
-        Operator::SubqueryAlias(sa) => vec![&sa.input],
+        LogicalPlan::Filter(f) => vec![&f.input],
+        LogicalPlan::Join(j) => vec![&j.left, &j.right],
+        LogicalPlan::Aggregate(a) => vec![&a.input],
+        LogicalPlan::Projection(p) => vec![&p.input],
+        LogicalPlan::Sort(s) => vec![&s.input],
+        LogicalPlan::SetOp(so) => vec![&so.left, &so.right],
+        LogicalPlan::SubqueryAlias(sa) => vec![&sa.input],
         // The inner (wrapped) table of a PIVOT / … is a child; the function
         // args are own expressions.
-        Operator::TableFunction(tf) => vec![&tf.input],
-        Operator::With(w) => vec![&w.body],
-        Operator::Insert(i) => vec![&i.input],
-        Operator::Update(u) => vec![&u.input],
-        Operator::Delete(d) => vec![&d.input],
-        Operator::Merge(m) => vec![&m.source],
-        Operator::CreateTableAs(c) => vec![&c.input],
-        Operator::CreateView(c) => vec![&c.input],
-        Operator::Scan(_)
-        | Operator::CteRef(_)
-        | Operator::Values(_)
-        | Operator::Empty
-        | Operator::AlterTable(_)
-        | Operator::Drop(_) => Vec::new(),
+        LogicalPlan::TableFunction(tf) => vec![&tf.input],
+        LogicalPlan::With(w) => vec![&w.body],
+        LogicalPlan::Insert(i) => vec![&i.input],
+        LogicalPlan::Update(u) => vec![&u.input],
+        LogicalPlan::Delete(d) => vec![&d.input],
+        LogicalPlan::Merge(m) => vec![&m.source],
+        LogicalPlan::CreateTableAs(c) => vec![&c.input],
+        LogicalPlan::CreateView(c) => vec![&c.input],
+        LogicalPlan::Scan(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => Vec::new(),
     }
 }
 
@@ -1183,7 +1187,7 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    fn plan(sql: &str) -> Operator {
+    fn plan(sql: &str) -> LogicalPlan {
         let statements = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
         build_with_diagnostics(
             &statements[0],
@@ -1193,7 +1197,7 @@ mod tests {
         .0
     }
 
-    fn read_names(op: &Operator) -> Vec<String> {
+    fn read_names(op: &LogicalPlan) -> Vec<String> {
         let mut v: Vec<String> = reads(op)
             .iter()
             .map(|r| match &r.reference.table {
@@ -1205,7 +1209,7 @@ mod tests {
         v
     }
 
-    fn lineage_strs(op: &Operator) -> Vec<String> {
+    fn lineage_strs(op: &LogicalPlan) -> Vec<String> {
         let mut v: Vec<String> = column_lineage(op)
             .iter()
             .map(|e| {

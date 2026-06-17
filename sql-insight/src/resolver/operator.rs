@@ -1,4 +1,4 @@
-//! The bound logical plan: a tree of relational [`Operator`]s with resolved
+//! The bound logical plan: a tree of relational operators with resolved
 //! column references ([`ColRef`] / [`Binding`]) and expressions ([`Expr`]).
 //!
 //! Each node is a textbook relational operator (or a DML / DDL root). The
@@ -10,13 +10,15 @@ use sqlparser::ast::Ident;
 
 use crate::reference::{ResolutionKind, TableReference};
 
-// ===== the operator tree =================================================
+// ===== the logical plan ==================================================
 
-/// One node in the bound logical plan: a relational operator, or a DML / DDL
-/// root. Children are owned `Box<Operator>`; CTE sharing and recursion use a
-/// symbolic [`CteRef`] (by name), so the tree stays acyclic and `Eq`-able.
+/// A node of the bound logical plan — a relational operator, or a DML / DDL
+/// root. The enum is recursive, so a value is both a node and the subtree it
+/// roots (hence the type name `LogicalPlan` for the whole tree). Children are
+/// owned `Box<LogicalPlan>`; CTE sharing and recursion use a symbolic
+/// [`CteRef`] (by name), so the tree stays acyclic and `Eq`-able.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Operator {
+pub(crate) enum LogicalPlan {
     // --- relational (query) operators ---
     Scan(Scan),
     Filter(Filter),
@@ -69,7 +71,7 @@ pub(crate) enum Columns {
 /// position, and `origins` never traces here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Filter {
-    pub(crate) input: Box<Operator>,
+    pub(crate) input: Box<LogicalPlan>,
     pub(crate) predicate: Vec<Expr>,
 }
 
@@ -78,8 +80,8 @@ pub(crate) struct Filter {
 /// resolves against the left (only then can the right reference left columns).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Join {
-    pub(crate) left: Box<Operator>,
-    pub(crate) right: Box<Operator>,
+    pub(crate) left: Box<LogicalPlan>,
+    pub(crate) right: Box<LogicalPlan>,
     pub(crate) on: Vec<Expr>,
     pub(crate) lateral: bool,
 }
@@ -94,7 +96,7 @@ pub(crate) struct Join {
 /// this node's output, so it stays a base read rather than tracing through.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Aggregate {
-    pub(crate) input: Box<Operator>,
+    pub(crate) input: Box<LogicalPlan>,
     pub(crate) group_by: Vec<Expr>,
 }
 
@@ -102,7 +104,7 @@ pub(crate) struct Aggregate {
 /// output column is a named expression over the input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Projection {
-    pub(crate) input: Box<Operator>,
+    pub(crate) input: Box<LogicalPlan>,
     pub(crate) exprs: Vec<NamedExpr>,
 }
 
@@ -110,7 +112,7 @@ pub(crate) struct Projection {
 /// through unchanged. Sits above [`Projection`] in canonical order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Sort {
-    pub(crate) input: Box<Operator>,
+    pub(crate) input: Box<LogicalPlan>,
     pub(crate) keys: Vec<Expr>,
 }
 
@@ -119,8 +121,8 @@ pub(crate) struct Sort {
 /// (`a UNION b UNION c` = `SetOp(SetOp(a, b), c)`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SetOp {
-    pub(crate) left: Box<Operator>,
-    pub(crate) right: Box<Operator>,
+    pub(crate) left: Box<LogicalPlan>,
+    pub(crate) right: Box<LogicalPlan>,
 }
 
 /// A derived table / aliased subquery (`(<subquery>) AS d`): exposes the
@@ -130,7 +132,7 @@ pub(crate) struct SetOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SubqueryAlias {
     pub(crate) alias: Ident,
-    pub(crate) input: Box<Operator>,
+    pub(crate) input: Box<LogicalPlan>,
 }
 
 /// An opaque table-producing factor: a table function (`f(args)` / `UNNEST` /
@@ -138,12 +140,12 @@ pub(crate) struct SubqueryAlias {
 /// inner table. Its produced columns are dynamic, so a reference through its
 /// `alias` is a synthetic lineage source (the alias as table, dropped from
 /// reads). `args` are the clause / argument expressions (reads). `input` is the
-/// wrapped inner table (feeds data, e.g. a PIVOT source) or [`Operator::Empty`]
+/// wrapped inner table (feeds data, e.g. a PIVOT source) or [`LogicalPlan::Empty`]
 /// for a bare function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TableFunction {
     pub(crate) alias: Option<Ident>,
-    pub(crate) input: Box<Operator>,
+    pub(crate) input: Box<LogicalPlan>,
     pub(crate) args: Vec<Expr>,
 }
 
@@ -155,7 +157,7 @@ pub(crate) struct TableFunction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct With {
     pub(crate) ctes: Vec<Cte>,
-    pub(crate) body: Box<Operator>,
+    pub(crate) body: Box<LogicalPlan>,
 }
 
 /// One declared CTE: its name paired with its bound body. The name links it
@@ -163,7 +165,7 @@ pub(crate) struct With {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Cte {
     pub(crate) name: Ident,
-    pub(crate) body: Operator,
+    pub(crate) body: LogicalPlan,
 }
 
 /// A FROM-clause reference to an in-scope CTE, by name (the body lives once
@@ -195,7 +197,7 @@ pub(crate) struct Values {
 pub(crate) struct Insert {
     pub(crate) target: TableReference,
     pub(crate) columns: Vec<Ident>,
-    pub(crate) input: Box<Operator>,
+    pub(crate) input: Box<LogicalPlan>,
     pub(crate) returning: Vec<NamedExpr>,
     pub(crate) on_conflict: Vec<Assignment>,
     pub(crate) conflict_predicate: Vec<Expr>,
@@ -208,7 +210,7 @@ pub(crate) struct Insert {
 pub(crate) struct Update {
     pub(crate) target: TableReference,
     pub(crate) assignments: Vec<Assignment>,
-    pub(crate) input: Box<Operator>,
+    pub(crate) input: Box<LogicalPlan>,
     pub(crate) returning: Vec<NamedExpr>,
 }
 
@@ -218,7 +220,7 @@ pub(crate) struct Update {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Delete {
     pub(crate) targets: Vec<TableReference>,
-    pub(crate) input: Box<Operator>,
+    pub(crate) input: Box<LogicalPlan>,
     pub(crate) returning: Vec<NamedExpr>,
 }
 
@@ -227,7 +229,7 @@ pub(crate) struct Delete {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Merge {
     pub(crate) target: TableReference,
-    pub(crate) source: Box<Operator>,
+    pub(crate) source: Box<LogicalPlan>,
     pub(crate) on: Vec<Expr>,
     pub(crate) clauses: Vec<MergeClause>,
 }
@@ -252,7 +254,7 @@ pub(crate) enum MergeClause {
 pub(crate) struct CreateTableAs {
     pub(crate) target: TableReference,
     pub(crate) columns: Vec<Ident>,
-    pub(crate) input: Box<Operator>,
+    pub(crate) input: Box<LogicalPlan>,
 }
 
 /// `CREATE VIEW target (columns) AS <input>`.
@@ -260,7 +262,7 @@ pub(crate) struct CreateTableAs {
 pub(crate) struct CreateView {
     pub(crate) target: TableReference,
     pub(crate) columns: Vec<Ident>,
-    pub(crate) input: Box<Operator>,
+    pub(crate) input: Box<LogicalPlan>,
 }
 
 /// `ALTER TABLE target ...`: the column-naming operations' `columns` are
@@ -308,13 +310,13 @@ pub(crate) enum Expr {
     },
     /// A scalar subquery (value position): its first output column's origins
     /// flow into the enclosing value (as a `Transformation`).
-    Subquery(Box<Operator>),
+    Subquery(Box<LogicalPlan>),
     /// `EXISTS (subquery)` (filter position): a test, never a value origin.
-    Exists(Box<Operator>),
+    Exists(Box<LogicalPlan>),
     /// `expr IN (subquery)` (filter position).
     InSubquery {
         expr: Box<Expr>,
-        subquery: Box<Operator>,
+        subquery: Box<LogicalPlan>,
     },
     /// Filter-position operands that are reads but never value origins — for
     /// the suppressed parts a construct-specific variant doesn't already cover

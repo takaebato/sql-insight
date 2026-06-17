@@ -201,7 +201,7 @@ pub mod formatter;
 pub mod normalizer;
 
 // The analysis engine: binds a `Statement` into a standard bound logical
-// plan (`Operator`) and walks it with a column-origin traversal for the
+// plan (`LogicalPlan`) and walks it with a column-origin traversal for the
 // extraction surfaces. Backs every public extractor.
 mod resolver;
 
