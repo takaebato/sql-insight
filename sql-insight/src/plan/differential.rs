@@ -421,6 +421,48 @@ fn update_catalog_parity() {
 }
 
 #[test]
+fn merge_parity() {
+    // MERGE (catalog-free): UPDATE SET / INSERT VALUES / DELETE actions, the
+    // ON / WHEN predicates as filter reads, and value-vs-filter feeding.
+    let corpus = [
+        "MERGE INTO tgt t USING src s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET v = s.v",
+        "MERGE INTO tgt t USING src s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET v = t.v + s.v \
+         WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+        "MERGE INTO tgt t USING src s ON t.id = s.id \
+         WHEN MATCHED THEN DELETE",
+        "MERGE INTO tgt t USING src s ON t.id = s.id \
+         WHEN MATCHED AND s.flag > 0 THEN UPDATE SET v = s.v",
+        // derived source: a value ref to the derived column traces through it
+        "MERGE INTO tgt t USING (SELECT id, v FROM raw) s ON t.id = s.id \
+         WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+}
+
+#[test]
+fn merge_catalog_parity() {
+    use crate::catalog::CatalogTable;
+    let catalog = Catalog::new()
+        .table(CatalogTable::new("public", "tgt").columns(["id", "v"]))
+        .table(CatalogTable::new("public", "src").columns(["id", "v"]));
+    let corpus = [
+        "MERGE INTO tgt t USING src s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET v = s.v \
+         WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+        // column-less INSERT → catalog-fill of tgt's columns
+        "MERGE INTO tgt t USING src s ON t.id = s.id \
+         WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)",
+    ];
+    for sql in corpus {
+        assert_parity_cat(sql, &catalog);
+    }
+}
+
+#[test]
 fn ddl_parity() {
     // CTAS / CREATE VIEW (data movers, like INSERT) + ALTER TABLE / DROP /
     // TRUNCATE (target / column writes, no lineage). Catalog-free.

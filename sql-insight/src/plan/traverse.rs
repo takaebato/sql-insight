@@ -17,7 +17,7 @@
 
 use sqlparser::ast::Ident;
 
-use super::operator::{Binding, ColRef, Cte, Expr, NamedExpr, Operator};
+use super::operator::{Binding, ColRef, Cte, Expr, MergeClause, NamedExpr, Operator};
 use crate::extractor::{ColumnLineageEdge, ColumnLineageKind, ColumnTarget, TableLineageEdge};
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableRead, TableReference};
 
@@ -221,6 +221,31 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
             let src = enter_withs(&c.input, &mut ctx);
             relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
         }
+        // MERGE: each WHEN action's value traces to its target column (an
+        // UPDATE SET `RHS → target.col`; an INSERT `value → target.col`). A
+        // `Derived` source ref traces through the source relation. DELETE
+        // moves no value.
+        Operator::Merge(m) => {
+            for clause in &m.clauses {
+                match clause {
+                    MergeClause::Update { assignments } => {
+                        for a in assignments {
+                            merge_value_edges(
+                                &a.target, &a.value, &m.target, &m.source, &mut ctx, &mut edges,
+                            );
+                        }
+                    }
+                    MergeClause::Insert { columns, values } => {
+                        for (column, value) in columns.iter().zip(values) {
+                            merge_value_edges(
+                                column, value, &m.target, &m.source, &mut ctx, &mut edges,
+                            );
+                        }
+                    }
+                    MergeClause::Delete => {}
+                }
+            }
+        }
         // A bare query (or unmodelled root): one `QueryOutput` group per
         // projection (a set operation has one per branch — positions restart
         // per branch, mirroring the resolver).
@@ -277,6 +302,29 @@ fn relation_lineage<'a>(
     }
 }
 
+/// Emit the `value → target.column` lineage edges of one MERGE WHEN value, its
+/// origins traced through the `source` relation.
+fn merge_value_edges<'a>(
+    column: &Ident,
+    value: &'a Expr,
+    target: &TableReference,
+    source: &'a Operator,
+    ctx: &mut Ctx<'a>,
+    out: &mut Vec<ColumnLineageEdge>,
+) {
+    let tgt = ColumnTarget::Relation(ColumnReference {
+        table: Some(target.clone()),
+        name: column.clone(),
+    });
+    for (src, kind) in origins_of_expr(value, source, ctx) {
+        out.push(ColumnLineageEdge {
+            source: src,
+            target: tgt.clone(),
+            kind,
+        });
+    }
+}
+
 /// A query's output operands: one `(output columns, producing input)` per
 /// set-operation branch (a plain query has a single operand). Peels the clause
 /// layers above the projection (GROUP BY / HAVING `Filter`, ORDER BY `Sort`)
@@ -318,7 +366,38 @@ pub(crate) fn writes(op: &Operator) -> Vec<ColumnReference> {
         Operator::CreateTableAs(c) => qualify(&c.columns, &c.target),
         Operator::CreateView(c) => qualify(&c.columns, &c.target),
         Operator::AlterTable(a) => qualify(&a.columns, &a.target),
+        // MERGE writes each WHEN action's target columns (UPDATE SET targets;
+        // INSERT columns paired with values).
+        Operator::Merge(m) => m
+            .clauses
+            .iter()
+            .flat_map(|clause| merge_clause_writes(clause, &m.target))
+            .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// The columns one MERGE WHEN action writes, qualified by the target.
+fn merge_clause_writes(clause: &MergeClause, target: &TableReference) -> Vec<ColumnReference> {
+    match clause {
+        MergeClause::Update { assignments } => assignments
+            .iter()
+            .map(|a| ColumnReference {
+                table: Some(target.clone()),
+                name: a.target.clone(),
+            })
+            .collect(),
+        // Only columns paired with a value are written (a column-less / short
+        // INSERT writes nothing; `zip` stops at the shorter side).
+        MergeClause::Insert { columns, values } => columns
+            .iter()
+            .zip(values)
+            .map(|(name, _)| ColumnReference {
+                table: Some(target.clone()),
+                name: name.clone(),
+            })
+            .collect(),
+        MergeClause::Delete => Vec::new(),
     }
 }
 
@@ -333,6 +412,7 @@ pub(crate) fn table_writes(op: &Operator) -> Vec<TableReference> {
         Operator::CreateTableAs(c) => vec![c.target.clone()],
         Operator::CreateView(c) => vec![c.target.clone()],
         Operator::AlterTable(a) => vec![a.target.clone()],
+        Operator::Merge(m) => vec![m.target.clone()],
         // DROP / TRUNCATE name their relations directly as write targets.
         Operator::Drop(d) => d.targets.clone(),
         _ => Vec::new(),
@@ -373,6 +453,28 @@ pub(crate) fn table_lineage(op: &Operator) -> Vec<TableLineageEdge> {
         Operator::CreateView(c) => {
             feeding_scans(&c.input, &mut ctx, &mut sources);
             &c.target
+        }
+        // MERGE feeds from the source relation plus each *written* WHEN value
+        // (an UPDATE SET RHS; an INSERT value paired with a column). The ON /
+        // predicate reads and an unpaired INSERT value do not feed.
+        Operator::Merge(m) => {
+            feeding_scans(&m.source, &mut ctx, &mut sources);
+            for clause in &m.clauses {
+                match clause {
+                    MergeClause::Update { assignments } => {
+                        for a in assignments {
+                            expr_feeding(&a.value, &mut ctx, &mut sources);
+                        }
+                    }
+                    MergeClause::Insert { columns, values } => {
+                        for (_col, value) in columns.iter().zip(values) {
+                            expr_feeding(value, &mut ctx, &mut sources);
+                        }
+                    }
+                    MergeClause::Delete => {}
+                }
+            }
+            &m.target
         }
         _ => return Vec::new(),
     };
@@ -713,13 +815,27 @@ fn own_exprs(op: &Operator) -> Vec<&Expr> {
             .chain(u.returning.iter().map(|ne| &ne.expr))
             .collect(),
         Operator::Delete(d) => d.returning.iter().map(|ne| &ne.expr).collect(),
+        // MERGE: the ON / per-clause predicates (filter reads) plus each WHEN
+        // action's value expressions (SET RHS / INSERT values).
+        Operator::Merge(m) => {
+            let mut exprs: Vec<&Expr> = m.on.iter().collect();
+            for clause in &m.clauses {
+                match clause {
+                    MergeClause::Update { assignments } => {
+                        exprs.extend(assignments.iter().map(|a| &a.value));
+                    }
+                    MergeClause::Insert { values, .. } => exprs.extend(values.iter()),
+                    MergeClause::Delete => {}
+                }
+            }
+            exprs
+        }
         Operator::Scan(_)
         | Operator::SubqueryAlias(_)
         | Operator::SetOp(_)
         | Operator::With(_)
         | Operator::CteRef(_)
         | Operator::Empty
-        | Operator::Merge(_)
         | Operator::CreateTableAs(_)
         | Operator::CreateView(_)
         | Operator::AlterTable(_)

@@ -26,10 +26,10 @@ use sqlparser::ast::{
     AlterTable as SqlAlterTable, AlterTableOperation, AssignmentTarget, CreateTable,
     CreateView as SqlCreateView, Cte as SqlCte, Delete as SqlDelete, Expr as SqlExpr, FromTable,
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier,
-    Ident, Insert as SqlInsert, JoinConstraint, JoinOperator, ObjectName, ObjectType, OrderBy,
-    OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
-    TableFactor, TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind,
-    Values as SqlValues,
+    Ident, Insert as SqlInsert, JoinConstraint, JoinOperator, Merge as SqlMerge, MergeAction,
+    MergeInsertKind, ObjectName, ObjectType, OrderBy, OrderByExpr, OrderByKind, Query, Select,
+    SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject, TableWithJoins,
+    Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
 };
 
 use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
@@ -170,6 +170,7 @@ impl Binder<'_> {
             Statement::Insert(insert) => self.bind_insert(insert),
             Statement::Update(update) => self.bind_update(update),
             Statement::Delete(delete) => self.bind_delete(delete),
+            Statement::Merge(merge) => self.bind_merge(merge),
             Statement::CreateTable(create) => self.bind_create_table(create),
             Statement::CreateView(create) => self.bind_create_view(create),
             Statement::AlterView {
@@ -354,6 +355,91 @@ impl Binder<'_> {
             targets,
             input: Box::new(input),
             returning: Vec::new(),
+        })
+    }
+
+    /// `MERGE INTO target USING source ON pred WHEN … THEN …`: the target
+    /// (write, in scope but not scanned) and source (read) form the scope. The
+    /// ON predicate and every per-clause / INSERT predicate are filter reads
+    /// (non-feeding), folded onto `on`. Each WHEN action keeps its structure as
+    /// a `MergeClause`: an UPDATE SET's `RHS → target.col` and an INSERT's
+    /// `value → target.col` drive writes / lineage. A column-less INSERT fills
+    /// from the catalog (empty without one — the values are then reads only).
+    fn bind_merge(&self, merge: &SqlMerge) -> Operator {
+        let Some((target_relation, target)) = self.target_relation(&merge.table) else {
+            return Operator::Empty;
+        };
+        let mut scope = scope_of(target_relation);
+        let (source, source_scope) = self.bind_table_factor(&merge.source, &scope.relations);
+        scope.relations.extend(source_scope.relations);
+
+        let mut on = vec![self.bind_expr(&merge.on, &scope)];
+        let mut clauses = Vec::new();
+        for clause in &merge.clauses {
+            if let Some(predicate) = &clause.predicate {
+                on.push(self.bind_expr(predicate, &scope));
+            }
+            match &clause.action {
+                MergeAction::Insert(insert) => {
+                    if let Some(predicate) = &insert.insert_predicate {
+                        on.push(self.bind_expr(predicate, &scope));
+                    }
+                    if let MergeInsertKind::Values(values) = &insert.kind {
+                        let explicit: Vec<Ident> = insert
+                            .columns
+                            .iter()
+                            .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
+                            .collect();
+                        let columns = if explicit.is_empty() {
+                            self.table_match(&target).columns
+                        } else {
+                            explicit
+                        };
+                        // A MERGE INSERT is a single VALUES row.
+                        let row = values
+                            .rows
+                            .iter()
+                            .flatten()
+                            .map(|e| self.bind_expr(e, &scope))
+                            .collect();
+                        clauses.push(super::operator::MergeClause::Insert {
+                            columns,
+                            values: row,
+                        });
+                    }
+                }
+                MergeAction::Update(update) => {
+                    for predicate in [&update.update_predicate, &update.delete_predicate]
+                        .into_iter()
+                        .flatten()
+                    {
+                        on.push(self.bind_expr(predicate, &scope));
+                    }
+                    let assignments = update
+                        .assignments
+                        .iter()
+                        .flat_map(|a| {
+                            assignment_target_columns(&a.target)
+                                .into_iter()
+                                .map(move |column| (column, &a.value))
+                        })
+                        .map(|(column, value)| super::operator::Assignment {
+                            target: column,
+                            value: self.bind_expr(value, &scope),
+                        })
+                        .collect();
+                    clauses.push(super::operator::MergeClause::Update { assignments });
+                }
+                MergeAction::Delete { .. } => {
+                    clauses.push(super::operator::MergeClause::Delete);
+                }
+            }
+        }
+        Operator::Merge(super::operator::Merge {
+            target,
+            source: Box::new(source),
+            on,
+            clauses,
         })
     }
 
@@ -634,7 +720,8 @@ impl Binder<'_> {
             // to its DML root; it exposes no output scope to an enclosing query.
             SetExpr::Insert(statement)
             | SetExpr::Update(statement)
-            | SetExpr::Delete(statement) => (self.bind_statement(statement), Scope::default()),
+            | SetExpr::Delete(statement)
+            | SetExpr::Merge(statement) => (self.bind_statement(statement), Scope::default()),
             // A set operation: result columns are the left operand's (names
             // from the left, positional merge).
             SetExpr::SetOperation { left, right, .. } => {
