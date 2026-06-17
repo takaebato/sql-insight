@@ -28,8 +28,8 @@ use sqlparser::ast::{
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier,
     Ident, Insert as SqlInsert, JoinConstraint, JoinOperator, Merge as SqlMerge, MergeAction,
     MergeInsertKind, ObjectName, ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr,
-    OrderByKind, PivotValueSource, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
-    TableFactor, TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind,
+    OrderByKind, PipeOperator, PivotValueSource, Query, Select, SelectItem, SetExpr, Statement,
+    TableAlias, TableFactor, TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind,
     Values as SqlValues,
 };
 
@@ -81,6 +81,7 @@ struct Scope {
 /// bare passthrough (`SELECT a`): a clause reference to it falls through to
 /// the real column (a read); a non-identity (introduced) alias resolves to the
 /// output itself (`Binding::Derived`, dropped from reads).
+#[derive(Clone)]
 struct OutputCol {
     name: Option<Ident>,
     identity: bool,
@@ -849,10 +850,29 @@ impl Binder<'_> {
         (CteEnv { name, columns }, plan)
     }
 
-    /// Bind a query's body and trailing ORDER BY (the `WITH` is already in
-    /// scope via `self.ctes`).
+    /// Bind a query's body, its pipe-operator chain, and trailing ORDER BY (the
+    /// `WITH` is already in scope via `self.ctes`).
     fn bind_query_body(&self, query: &Query) -> (Operator, Scope) {
-        let (mut op, scope) = self.bind_set_expr(&query.body);
+        let (mut op, mut scope) = self.bind_set_expr(&query.body);
+        // Pipe operators (`|> WHERE`, `|> SELECT`, …) transform the body in
+        // sequence: an output-producing operator layers a `Project` (evolving
+        // the output scope), a filter operator adds reads. They resolve against
+        // the body's relations plus the running outputs (relations stay in
+        // scope across the chain).
+        if !query.pipe_operators.is_empty() {
+            let mut pipe_scope = match &op {
+                // A set-op body exposes no single relation scope for refs.
+                Operator::SetOp(_) => Scope {
+                    relations: Vec::new(),
+                    outputs: std::mem::take(&mut scope.outputs),
+                },
+                _ => scope,
+            };
+            for pipe_op in &query.pipe_operators {
+                op = self.bind_pipe(pipe_op, op, &mut pipe_scope);
+            }
+            scope = pipe_scope;
+        }
         if let Some(order_by) = &query.order_by {
             let keys = self.order_by_keys(order_by, &scope);
             if !keys.is_empty() {
@@ -860,6 +880,212 @@ impl Binder<'_> {
             }
         }
         (op, scope)
+    }
+
+    /// Bind one pipe operator on top of `input`, updating `scope.outputs` when
+    /// it reshapes the output. An output-producing operator (SELECT / EXTEND /
+    /// SET / AGGREGATE) layers a [`Project`] whose value expressions feed
+    /// `QueryOutput` lineage; a filter operator (WHERE / ORDER BY / LIMIT /
+    /// CALL / PIVOT / set-op / JOIN) wraps a non-feeding read [`Filter`]; the
+    /// rest (sampling / rename / drop / unpivot) pass through. The match is
+    /// exhaustive so a new pipe operator is reviewed here.
+    fn bind_pipe(&self, op: &PipeOperator, input: Operator, scope: &mut Scope) -> Operator {
+        match op {
+            PipeOperator::Select { exprs } => {
+                let new = self.bind_output_items(exprs, scope);
+                let (node, outputs) = self.pipe_project(input, &[], new, &scope.relations);
+                scope.outputs = outputs;
+                node
+            }
+            PipeOperator::Extend { exprs } => {
+                // The new columns see the running outputs; then they append.
+                let new = self.bind_output_items(exprs, scope);
+                let base = std::mem::take(&mut scope.outputs);
+                let (node, outputs) = self.pipe_project(input, &base, new, &scope.relations);
+                scope.outputs = outputs;
+                node
+            }
+            PipeOperator::Set { assignments } => {
+                let base = std::mem::take(&mut scope.outputs);
+                let (node, outputs) = self.pipe_set(input, base, assignments, scope);
+                scope.outputs = outputs;
+                node
+            }
+            PipeOperator::Aggregate {
+                full_table_exprs,
+                group_by_expr,
+            } => {
+                let new = full_table_exprs
+                    .iter()
+                    .chain(group_by_expr)
+                    .map(|e| NamedExpr {
+                        name: e.expr.alias.clone().or_else(|| inferred_name(&e.expr.expr)),
+                        expr: self.bind_expr(&e.expr.expr, scope),
+                    })
+                    .collect();
+                let (node, outputs) = self.pipe_project(input, &[], new, &scope.relations);
+                scope.outputs = outputs;
+                node
+            }
+            PipeOperator::Where { expr } => {
+                self.pipe_filter(input, vec![self.bind_expr(expr, scope)])
+            }
+            PipeOperator::Limit { expr, offset } => {
+                let mut reads = vec![self.bind_expr(expr, scope)];
+                reads.extend(offset.iter().map(|o| self.bind_expr(o, scope)));
+                self.pipe_filter(input, reads)
+            }
+            PipeOperator::OrderBy { exprs } => self.pipe_filter(
+                input,
+                exprs
+                    .iter()
+                    .map(|o| self.bind_expr(&o.expr, scope))
+                    .collect(),
+            ),
+            PipeOperator::Call { function, .. } => {
+                self.pipe_filter(input, self.bind_function_args(function, scope))
+            }
+            PipeOperator::Pivot {
+                aggregate_functions,
+                value_source,
+                ..
+            } => {
+                let mut reads: Vec<Expr> = aggregate_functions
+                    .iter()
+                    .map(|a| self.bind_expr(&a.expr, scope))
+                    .collect();
+                reads.extend(self.pivot_value_source_exprs(value_source, scope));
+                self.pipe_filter(input, reads)
+            }
+            PipeOperator::Union { queries, .. }
+            | PipeOperator::Intersect { queries, .. }
+            | PipeOperator::Except { queries, .. } => {
+                // Each set-op query's reads surface (non-feeding) — model as a
+                // filter-position subquery.
+                let reads = queries
+                    .iter()
+                    .map(|q| Expr::Exists(Box::new(self.bind_subquery(q, scope))))
+                    .collect();
+                self.pipe_filter(input, reads)
+            }
+            // `|> JOIN t ON …`: the joined table's scan surfaces (a table read),
+            // but — matching the resolver's loose pipe scoping — it is NOT added
+            // to the scope, so the ON predicate's references to it are
+            // unresolved (only the running relations resolve).
+            PipeOperator::Join(j) => {
+                let (right, _scope) = self.bind_table_factor(&j.relation, &scope.relations);
+                let on = join_on(&j.join_operator)
+                    .map(|e| self.bind_expr(e, scope))
+                    .into_iter()
+                    .collect();
+                join(input, right, on)
+            }
+            // No inspectable column expressions: a sampling clause, rename,
+            // drop, or unpivot.
+            PipeOperator::TableSample { .. }
+            | PipeOperator::Drop { .. }
+            | PipeOperator::As { .. }
+            | PipeOperator::Rename { .. }
+            | PipeOperator::Unpivot { .. } => input,
+        }
+    }
+
+    /// Bind a list of output items (SELECT / EXTEND projection items).
+    fn bind_output_items(&self, items: &[SelectItem], scope: &Scope) -> Vec<NamedExpr> {
+        items
+            .iter()
+            .filter_map(|i| self.bind_select_item(i, scope))
+            .collect()
+    }
+
+    /// Build an output-producing pipe `Project`: the passthrough of `base`
+    /// outputs (each re-resolved by name against the base — an identity output
+    /// re-reads its real column, a computed output is `Derived` and traced)
+    /// plus the `new` value columns.
+    fn pipe_project(
+        &self,
+        input: Operator,
+        base: &[OutputCol],
+        new: Vec<NamedExpr>,
+        relations: &[Relation],
+    ) -> (Operator, Vec<OutputCol>) {
+        let mut exprs = self.passthrough_exprs(base, relations);
+        exprs.extend(new);
+        let outputs = self.output_cols(&exprs);
+        (
+            Operator::Project(Project {
+                input: Box::new(input),
+                exprs,
+            }),
+            outputs,
+        )
+    }
+
+    /// Re-resolve each named `base` output as a passthrough projection item
+    /// (clause-alias resolution against the base, so an identity output
+    /// re-reads its real column while a computed output stays `Derived`).
+    fn passthrough_exprs(&self, base: &[OutputCol], relations: &[Relation]) -> Vec<NamedExpr> {
+        let pass_scope = Scope {
+            relations: relations.to_vec(),
+            outputs: base.to_vec(),
+        };
+        base.iter()
+            .filter_map(|o| o.name.clone())
+            .map(|name| NamedExpr {
+                expr: Expr::Column(Box::new(
+                    self.resolve(std::slice::from_ref(&name), &pass_scope),
+                )),
+                name: Some(name),
+            })
+            .collect()
+    }
+
+    /// `|> SET col = expr`: each assignment replaces a same-named base output in
+    /// place (else appends), so a SET after a SELECT rewrites that column.
+    fn pipe_set(
+        &self,
+        input: Operator,
+        base: Vec<OutputCol>,
+        assignments: &[sqlparser::ast::Assignment],
+        scope: &Scope,
+    ) -> (Operator, Vec<OutputCol>) {
+        let mut exprs = self.passthrough_exprs(&base, &scope.relations);
+        for a in assignments {
+            for column in assignment_target_columns(&a.target) {
+                let ne = NamedExpr {
+                    name: Some(column.clone()),
+                    expr: self.bind_expr(&a.value, scope),
+                };
+                match exprs
+                    .iter_mut()
+                    .find(|e| e.name.as_ref().is_some_and(|n| n.value == column.value))
+                {
+                    Some(slot) => *slot = ne,
+                    None => exprs.push(ne),
+                }
+            }
+        }
+        let outputs = self.output_cols(&exprs);
+        (
+            Operator::Project(Project {
+                input: Box::new(input),
+                exprs,
+            }),
+            outputs,
+        )
+    }
+
+    /// Wrap `input` in a non-feeding read [`Filter`] for a filter pipe operator
+    /// (empty predicate → unchanged).
+    fn pipe_filter(&self, input: Operator, predicate: Vec<Expr>) -> Operator {
+        if predicate.is_empty() {
+            input
+        } else {
+            Operator::Filter(Filter {
+                input: Box::new(input),
+                predicate,
+            })
+        }
     }
 
     fn bind_set_expr(&self, body: &SetExpr) -> (Operator, Scope) {

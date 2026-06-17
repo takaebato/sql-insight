@@ -421,6 +421,31 @@ fn update_catalog_parity() {
 }
 
 #[test]
+fn pipe_operator_parity() {
+    // Pipe syntax (`|>`) — output-producing (SELECT / EXTEND / SET / AGGREGATE)
+    // vs filter (WHERE / ORDER BY / LIMIT / JOIN / UNION) operators.
+    // (GenericDialect parses pipe operators.)
+    let corpus = [
+        "SELECT * FROM t |> WHERE a > 0",
+        "SELECT * FROM t |> SELECT a, b",
+        "SELECT * FROM t |> WHERE a > 0 |> SELECT a",
+        "SELECT * FROM t |> SELECT a + b AS s",
+        "SELECT * FROM t |> EXTEND a + b AS s",
+        "SELECT * FROM t |> SELECT a, b |> EXTEND a + b AS s",
+        "SELECT * FROM t |> SET a = a + 1",
+        "SELECT * FROM t |> SELECT a, b |> SET b = a + b",
+        "SELECT * FROM t |> AGGREGATE sum(amount) AS total GROUP BY dept",
+        "SELECT * FROM t |> ORDER BY a",
+        "SELECT * FROM t |> LIMIT 10",
+        "SELECT * FROM t |> WHERE a > 0 |> JOIN s ON t.id = s.id",
+        "SELECT * FROM t |> SELECT a |> WHERE a > 0",
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+}
+
+#[test]
 fn table_function_and_nested_join_parity() {
     // Opaque table-producing factors: their argument expressions are reads
     // (LATERAL-visible), the produced columns are a synthetic lineage source
