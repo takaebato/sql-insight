@@ -377,3 +377,162 @@ pub(crate) enum Binding {
     /// Several candidate owners.
     Ambiguous,
 }
+
+// ===== tree navigation ====================================================
+// Shared structural accessors over the plan, used by every extraction module
+// (`reads` / `lineage` / `origins` / `tables`). They describe the plan's
+// *shape* — which child operators and which own expressions a node has — so
+// they live with the type rather than in any one extraction concern.
+
+/// A node's own expressions (not its children's): predicates, projection /
+/// grouping / sort keys, table-function args, `VALUES` rows, and a DML root's
+/// RETURNING / SET / MERGE-WHEN / conflict expressions.
+pub(super) fn own_exprs(op: &LogicalPlan) -> Vec<&Expr> {
+    match op {
+        LogicalPlan::Filter(f) => f.predicate.iter().collect(),
+        LogicalPlan::Join(j) => j.on.iter().collect(),
+        LogicalPlan::Projection(p) => p.exprs.iter().map(|ne| &ne.expr).collect(),
+        // The grouping keys are reads (they pick groups, never originate a
+        // value); the aggregate functions live in the enclosing Projection.
+        LogicalPlan::Aggregate(a) => a.group_by.iter().collect(),
+        LogicalPlan::Sort(s) => s.keys.iter().collect(),
+        // A table function's argument expressions are reads.
+        LogicalPlan::TableFunction(tf) => tf.args.iter().collect(),
+        LogicalPlan::Values(v) => v.rows.iter().flatten().collect(),
+        // RETURNING items, conflict-action SET values, and the conflict
+        // predicate are all reads (an `EXCLUDED` ref within them is `Derived`,
+        // so dropped).
+        LogicalPlan::Insert(i) => i
+            .returning
+            .iter()
+            .map(|ne| &ne.expr)
+            .chain(i.on_conflict.iter().map(|a| &a.value))
+            .chain(i.conflict_predicate.iter())
+            .collect(),
+        LogicalPlan::Update(u) => u
+            .assignments
+            .iter()
+            .map(|a| &a.value)
+            .chain(u.returning.iter().map(|ne| &ne.expr))
+            .collect(),
+        LogicalPlan::Delete(d) => d.returning.iter().map(|ne| &ne.expr).collect(),
+        // MERGE: the ON / per-clause predicates (filter reads) plus each WHEN
+        // action's value expressions (SET RHS / INSERT values).
+        LogicalPlan::Merge(m) => {
+            let mut exprs: Vec<&Expr> = m.on.iter().collect();
+            for clause in &m.clauses {
+                match clause {
+                    MergeClause::Update { assignments } => {
+                        exprs.extend(assignments.iter().map(|a| &a.value));
+                    }
+                    MergeClause::Insert { values, .. } => exprs.extend(values.iter()),
+                    MergeClause::Delete => {}
+                }
+            }
+            exprs
+        }
+        LogicalPlan::Scan(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::SetOp(_)
+        | LogicalPlan::With(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::CreateTableAs(_)
+        | LogicalPlan::CreateView(_)
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => Vec::new(),
+    }
+}
+
+/// A node's structural child operators (not those nested in expressions — those
+/// are reached via [`own_expr_subplans`]; not CTE bodies — `With` is handled
+/// specially by each walk).
+pub(super) fn children(op: &LogicalPlan) -> Vec<&LogicalPlan> {
+    match op {
+        LogicalPlan::Filter(f) => vec![&f.input],
+        LogicalPlan::Join(j) => vec![&j.left, &j.right],
+        LogicalPlan::Aggregate(a) => vec![&a.input],
+        LogicalPlan::Projection(p) => vec![&p.input],
+        LogicalPlan::Sort(s) => vec![&s.input],
+        LogicalPlan::SetOp(so) => vec![&so.left, &so.right],
+        LogicalPlan::SubqueryAlias(sa) => vec![&sa.input],
+        // The inner (wrapped) table of a PIVOT / … is a child; the function
+        // args are own expressions.
+        LogicalPlan::TableFunction(tf) => vec![&tf.input],
+        LogicalPlan::With(w) => vec![&w.body],
+        LogicalPlan::Insert(i) => vec![&i.input],
+        LogicalPlan::Update(u) => vec![&u.input],
+        LogicalPlan::Delete(d) => vec![&d.input],
+        LogicalPlan::Merge(m) => vec![&m.source],
+        LogicalPlan::CreateTableAs(c) => vec![&c.input],
+        LogicalPlan::CreateView(c) => vec![&c.input],
+        LogicalPlan::Scan(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => Vec::new(),
+    }
+}
+
+/// The sub-plans appearing in a node's *own* expressions (a `WHERE … IN
+/// (SELECT …)` / scalar subquery).
+pub(super) fn own_expr_subplans(op: &LogicalPlan) -> Vec<&LogicalPlan> {
+    let mut out = Vec::new();
+    for expr in own_exprs(op) {
+        collect_subplans(expr, &mut out);
+    }
+    out
+}
+
+fn collect_subplans<'a>(expr: &'a Expr, out: &mut Vec<&'a LogicalPlan>) {
+    match expr {
+        Expr::Column(_) => {}
+        Expr::Call { args } => args.iter().for_each(|e| collect_subplans(e, out)),
+        Expr::Case { when, then, else_ } => {
+            when.iter()
+                .chain(then)
+                .for_each(|e| collect_subplans(e, out));
+            if let Some(e) = else_ {
+                collect_subplans(e, out);
+            }
+        }
+        Expr::Window {
+            arg,
+            partition,
+            order,
+        } => {
+            collect_subplans(arg, out);
+            partition
+                .iter()
+                .chain(order)
+                .for_each(|e| collect_subplans(e, out));
+        }
+        Expr::Subquery(plan) | Expr::Exists(plan) => out.push(plan),
+        Expr::InSubquery { expr, subquery } => {
+            collect_subplans(expr, out);
+            out.push(subquery);
+        }
+        Expr::Filter(exprs) => exprs.iter().for_each(|e| collect_subplans(e, out)),
+        Expr::Fanin(_) => {}
+    }
+}
+
+/// Peel leading `With` nodes to the wrapped root (a query or DML root).
+pub(super) fn peel_with(op: &LogicalPlan) -> &LogicalPlan {
+    let mut node = op;
+    while let LogicalPlan::With(w) = node {
+        node = &w.body;
+    }
+    node
+}
+
+/// Identifier equality for matching a resolved reference against a producer's
+/// output / relation name. The binder already resolved the reference with the
+/// dialect's column / alias fold, and no dialect treats column or alias names
+/// case-*sensitively* (they fold Upper / Lower / Insensitive), so an ASCII
+/// case-insensitive compare matches every policy without threading the casing
+/// into the walk.
+pub(super) fn idents_eq(a: &Ident, b: &Ident) -> bool {
+    a.value.eq_ignore_ascii_case(&b.value)
+}
