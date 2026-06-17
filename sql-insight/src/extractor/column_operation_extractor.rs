@@ -295,12 +295,12 @@ impl ColumnOperationExtractor {
         if statement_kind == StatementKind::Unsupported {
             return Ok(unsupported_column_operation(statement_kind, statement));
         }
-        let (plan, diagnostics) = crate::resolver::build_plan(statement, catalog, casing);
+        let (plan, diagnostics) = crate::resolver::build(statement, catalog, casing);
         Ok(ColumnOperation {
             statement_kind,
-            reads: crate::resolver::extract_reads(&plan),
-            writes: crate::resolver::extract_writes(&plan),
-            lineage: crate::resolver::extract_lineage(&plan),
+            reads: plan.reads(),
+            writes: plan.writes(),
+            lineage: plan.column_lineage(),
             // The bind accumulates `WildcardSuppressed` / `TooManyTableQualifiers`.
             diagnostics,
         })

@@ -217,7 +217,7 @@ impl TableOperationExtractor {
         if statement_kind == StatementKind::Unsupported {
             return Ok(unsupported_table_operation(statement_kind, statement));
         }
-        let (plan, column_diagnostics) = crate::resolver::build_plan(statement, catalog, casing);
+        let (plan, column_diagnostics) = crate::resolver::build(statement, catalog, casing);
         // Lineage is only for statements that move data into a target. A
         // column-less INSERT and a DELETE both bind to a `Write`, so the
         // structural walk can't tell them apart — gate on the kind. A MERGE
@@ -225,14 +225,14 @@ impl TableOperationExtractor {
         // target rows, so it moves no data even though the source is a
         // feeding input — gate it out via `merge_moves_data`.
         let lineage = if moves_data(&statement_kind) && merge_moves_data(statement) {
-            crate::resolver::extract_table_lineage(&plan)
+            plan.table_lineage()
         } else {
             Vec::new()
         };
         Ok(TableOperation {
             statement_kind,
-            reads: crate::resolver::extract_table_reads(&plan),
-            writes: crate::resolver::extract_table_writes(&plan),
+            reads: plan.table_reads(),
+            writes: plan.table_writes(),
             lineage,
             // Table-level diagnostics are the column-level ones projected
             // down (only `UnsupportedStatement` / `TooManyTableQualifiers`

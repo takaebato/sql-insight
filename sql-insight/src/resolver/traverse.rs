@@ -1,19 +1,22 @@
-//! Walking the bound [`LogicalPlan`] tree for the extraction surfaces.
+//! The [`LogicalPlan`] extraction surfaces, as methods that walk the tree:
 //!
-//! - [`reads`] — every physical base-column reference (occurrence-based; a
-//!   `Derived` ref is dropped, its read counted at the inner producer).
-//! - [`table_reads`] — every base table scanned.
-//! - [`column_lineage`] — `source → target` edges, by tracing each output
-//!   column's value expression to its base columns ([`origins_of_expr`] /
-//!   [`origins_into`], the `getColumnOrigins`-style traversal). A predicate's
-//!   columns are reads but never origins, so value/filter falls out for free.
-//!   A bare query targets `QueryOutput`; a DML root pairs the source's output
-//!   columns positionally with the write target's columns (`Relation`).
-//! - [`writes`] — every column written (DML target columns).
-//! - [`table_writes`] — every table written to.
-//! - [`table_lineage`] — `source → target` table edges: the read-role scans
-//!   that **feed data** into a DML target (value path only — predicate
-//!   subqueries do not feed).
+//! - [`reads`](LogicalPlan::reads) — every physical base-column reference
+//!   (occurrence-based; a `Derived` ref is dropped, its read counted at the
+//!   inner producer).
+//! - [`table_reads`](LogicalPlan::table_reads) — every base table scanned.
+//! - [`column_lineage`](LogicalPlan::column_lineage) — `source → target` edges,
+//!   by tracing each output column's value expression to its base columns
+//!   ([`origins_of_expr`] / [`origins_into`], the `getColumnOrigins`-style
+//!   traversal). A predicate's columns are reads but never origins, so
+//!   value/filter falls out for free. A bare query targets `QueryOutput`; a DML
+//!   root pairs the source's output columns positionally with the write
+//!   target's columns (`Relation`).
+//! - [`writes`](LogicalPlan::writes) — every column written (DML target columns).
+//! - [`table_writes`](LogicalPlan::table_writes) — every table written to.
+//! - [`table_lineage`](LogicalPlan::table_lineage) — `source → target` table
+//!   edges: the read-role scans that **feed data** into a DML target (value
+//!   path only — predicate subqueries do not feed).
+//! - [`flat_tables`](LogicalPlan::flat_tables) — the legacy flat table list.
 
 use sqlparser::ast::Ident;
 
@@ -21,14 +24,64 @@ use super::logical_plan::{Binding, ColRef, Cte, Expr, LogicalPlan, MergeClause, 
 use crate::extractor::{ColumnLineageEdge, ColumnLineageKind, ColumnTarget, TableLineageEdge};
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableRead, TableReference};
 
-// ===== reads =============================================================
+// ===== extraction surfaces (LogicalPlan's public API) ====================
 
-/// Every physical base-column read the plan expresses, occurrence-based.
-pub(crate) fn reads(op: &LogicalPlan) -> Vec<ColumnRead> {
-    let mut out = Vec::new();
-    collect_reads(op, &mut out);
-    out
+impl LogicalPlan {
+    /// Every physical base-column read, occurrence-based (a `Derived` ref is
+    /// dropped — its read is counted at the inner producer).
+    pub(crate) fn reads(&self) -> Vec<ColumnRead> {
+        let mut out = Vec::new();
+        collect_reads(self, &mut out);
+        out
+    }
+
+    /// Every base table scanned (read role), occurrence-based.
+    pub(crate) fn table_reads(&self) -> Vec<TableRead> {
+        let mut out = Vec::new();
+        walk(self, &mut |o| {
+            if let LogicalPlan::Scan(s) = o {
+                out.push(TableRead {
+                    reference: s.table.clone(),
+                    resolution: s.resolution,
+                });
+            }
+        });
+        out
+    }
+
+    /// Every column written — a DML root's target columns.
+    pub(crate) fn writes(&self) -> Vec<ColumnReference> {
+        collect_writes(self)
+    }
+
+    /// Every table written to — one per DML target.
+    pub(crate) fn table_writes(&self) -> Vec<TableReference> {
+        collect_table_writes(self)
+    }
+
+    /// The `source → target` column-lineage edges: each output column traced
+    /// to its base columns (`QueryOutput` for a query, `Relation` for a DML
+    /// target).
+    pub(crate) fn column_lineage(&self) -> Vec<ColumnLineageEdge> {
+        collect_column_lineage(self)
+    }
+
+    /// The `source → target` table-lineage edges: the read-role scans that
+    /// feed data into a DML target.
+    pub(crate) fn table_lineage(&self) -> Vec<TableLineageEdge> {
+        collect_table_lineage(self)
+    }
+
+    /// The flat list of every table the statement references — one per
+    /// relation binding (the legacy table surface).
+    pub(crate) fn flat_tables(&self) -> Vec<TableReference> {
+        let mut out = Vec::new();
+        collect_flat(self, &mut out);
+        out
+    }
 }
+
+// ===== reads =============================================================
 
 fn collect_reads(op: &LogicalPlan, out: &mut Vec<ColumnRead>) {
     for expr in own_exprs(op) {
@@ -100,20 +153,6 @@ fn column_read(c: &ColRef) -> Option<ColumnRead> {
 
 // ===== table reads =======================================================
 
-/// Every base table scanned (read role), occurrence-based.
-pub(crate) fn table_reads(op: &LogicalPlan) -> Vec<TableRead> {
-    let mut out = Vec::new();
-    walk(op, &mut |o| {
-        if let LogicalPlan::Scan(s) = o {
-            out.push(TableRead {
-                reference: s.table.clone(),
-                resolution: s.resolution,
-            });
-        }
-    });
-    out
-}
-
 fn walk(op: &LogicalPlan, f: &mut impl FnMut(&LogicalPlan)) {
     f(op);
     for child in children(op) {
@@ -183,7 +222,7 @@ fn collect_subplans<'a>(expr: &'a Expr, out: &mut Vec<&'a LogicalPlan>) {
 /// target's columns and emits `source → Relation` edges. A leading `WITH` is
 /// peeled (its CTE bodies feed the root through `CteRef` expansion, they are
 /// not lineage roots).
-pub(crate) fn column_lineage(op: &LogicalPlan) -> Vec<ColumnLineageEdge> {
+fn collect_column_lineage(op: &LogicalPlan) -> Vec<ColumnLineageEdge> {
     let mut ctx = Ctx::new(op);
     let mut edges = Vec::new();
     match peel_with(op) {
@@ -491,7 +530,7 @@ fn output_operands(op: &LogicalPlan) -> Vec<(&[NamedExpr], &LogicalPlan)> {
 /// Every column the statement writes — a DML root's target columns, qualified
 /// by the write target. Order follows source order (the public contract). A
 /// leading `WITH` is peeled.
-pub(crate) fn writes(op: &LogicalPlan) -> Vec<ColumnReference> {
+fn collect_writes(op: &LogicalPlan) -> Vec<ColumnReference> {
     match peel_with(op) {
         // INSERT columns, then any ON CONFLICT DO UPDATE SET targets (extra
         // writes on the same relation).
@@ -554,7 +593,7 @@ fn merge_clause_writes(clause: &MergeClause, target: &TableReference) -> Vec<Col
 
 /// Every table the statement writes to — one per DML target. A leading `WITH`
 /// is peeled.
-pub(crate) fn table_writes(op: &LogicalPlan) -> Vec<TableReference> {
+fn collect_table_writes(op: &LogicalPlan) -> Vec<TableReference> {
     match peel_with(op) {
         LogicalPlan::Insert(i) => vec![i.target.clone()],
         LogicalPlan::Update(u) => vec![u.target.clone()],
@@ -576,7 +615,7 @@ pub(crate) fn table_writes(op: &LogicalPlan) -> Vec<TableReference> {
 /// (projection) subqueries, and referenced CTE bodies — never predicate
 /// (filter) subqueries. A bare query, or a statement that moves no data, has
 /// no table lineage.
-pub(crate) fn table_lineage(op: &LogicalPlan) -> Vec<TableLineageEdge> {
+fn collect_table_lineage(op: &LogicalPlan) -> Vec<TableLineageEdge> {
     // `Ctx::new` peels leading WITHs and keeps their CTE bodies, so a `CteRef`
     // on the feeding path resolves to the body's feeding scans.
     let mut ctx = Ctx::new(op);
@@ -761,18 +800,6 @@ fn enter_withs<'a>(op: &'a LogicalPlan, ctx: &mut Ctx<'a>) -> &'a LogicalPlan {
 }
 
 // ===== flat tables (legacy) ==============================================
-
-/// The flat list of every table the statement references — one entry per
-/// relation *binding* (a table read more than once through separate FROM uses
-/// appears more than once; a table that is both a DML target and a row source
-/// appears once). Every `Scan` plus the DML / DDL write targets (none of which
-/// are scans in this plan), de-duplicating a DELETE target that is also a FROM
-/// scan. Order is the walk's, incidental.
-pub(crate) fn flat_tables(op: &LogicalPlan) -> Vec<TableReference> {
-    let mut out = Vec::new();
-    collect_flat(op, &mut out);
-    out
-}
 
 /// Walk the value sub-plans in a DML root's own expressions (a SET / WHEN /
 /// conflict-value scalar subquery's scans bind too, like the resolver counts
@@ -1198,7 +1225,8 @@ mod tests {
     }
 
     fn read_names(op: &LogicalPlan) -> Vec<String> {
-        let mut v: Vec<String> = reads(op)
+        let mut v: Vec<String> = op
+            .reads()
             .iter()
             .map(|r| match &r.reference.table {
                 Some(t) => format!("{}.{}", t.name.value, r.reference.name.value),
@@ -1210,7 +1238,8 @@ mod tests {
     }
 
     fn lineage_strs(op: &LogicalPlan) -> Vec<String> {
-        let mut v: Vec<String> = column_lineage(op)
+        let mut v: Vec<String> = op
+            .column_lineage()
             .iter()
             .map(|e| {
                 let src = e
@@ -1265,7 +1294,8 @@ mod tests {
     #[test]
     fn table_reads_one_per_scan() {
         let op = plan("SELECT t1.x FROM t1 JOIN t2 ON t1.id = t2.id");
-        let mut names: Vec<String> = table_reads(&op)
+        let mut names: Vec<String> = op
+            .table_reads()
             .iter()
             .map(|r| r.reference.name.value.clone())
             .collect();

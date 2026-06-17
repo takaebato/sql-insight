@@ -100,9 +100,9 @@ impl TableExtractor {
                 }],
             });
         }
-        let (plan, column_diagnostics) = crate::resolver::build_plan(statement, None, casing);
+        let (plan, column_diagnostics) = crate::resolver::build(statement, None, casing);
         Ok(TableExtraction {
-            tables: crate::resolver::extract_flat_tables(&plan),
+            tables: plan.flat_tables(),
             diagnostics: column_diagnostics
                 .iter()
                 .filter_map(|d| d.to_table_level())
