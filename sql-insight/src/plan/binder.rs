@@ -27,9 +27,9 @@ use sqlparser::ast::{
     CreateView as SqlCreateView, Cte as SqlCte, Delete as SqlDelete, Expr as SqlExpr, FromTable,
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier,
     Ident, Insert as SqlInsert, JoinConstraint, JoinOperator, Merge as SqlMerge, MergeAction,
-    MergeInsertKind, ObjectName, ObjectType, OrderBy, OrderByExpr, OrderByKind, Query, Select,
-    SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject, TableWithJoins,
-    Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
+    MergeInsertKind, ObjectName, ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr,
+    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
+    TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
 };
 
 use super::operator::{Binding, ColRef, Columns, Expr, Filter, NamedExpr, Operator, Project, Scan};
@@ -216,6 +216,12 @@ impl Binder<'_> {
             return Operator::Empty;
         };
         let target = self.table_match(&written).table;
+        // MySQL `INSERT INTO t SET col = expr, …`: the assignment form (no
+        // VALUES / SELECT source) — each assignment is a value column named by
+        // its target, like a single-row UPDATE.
+        if insert.source.is_none() && !insert.assignments.is_empty() {
+            return self.bind_insert_set(insert, target);
+        }
         let (input, scope) = match &insert.source {
             Some(source) => self.bind_query(source),
             None => (Operator::Empty, Scope::default()),
@@ -229,13 +235,115 @@ impl Binder<'_> {
         } else {
             insert.columns.clone()
         };
+        // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: extra writes + their
+        // `value → target.col` lineage, plus the optional `DO UPDATE … WHERE`
+        // (filter reads).
+        let (on_conflict, conflict_predicate) = match &insert.on {
+            Some(on) => self.bind_conflict(on, &target, &columns),
+            None => (Vec::new(), Vec::new()),
+        };
+        // RETURNING resolves against the target alone (the source query's
+        // scope is already popped).
+        let returning = self.bind_returning(&insert.returning, &self.target_scope(&target));
         Operator::Insert(super::operator::Insert {
             target,
             columns,
             input: Box::new(input),
-            returning: Vec::new(),
-            on_conflict: Vec::new(),
+            returning,
+            on_conflict,
+            conflict_predicate,
         })
+    }
+
+    /// MySQL `INSERT INTO t SET col = expr, …`: bind the assignment form like a
+    /// single-row UPDATE — each assignment is a value column named by its target
+    /// (resolved against the target's own columns), placed in a `Project` so the
+    /// `value → target.col` lineage reuses the relation-lineage machinery.
+    fn bind_insert_set(&self, insert: &SqlInsert, target: TableReference) -> Operator {
+        let scope = self.target_scope(&target);
+        let mut columns = Vec::new();
+        let mut exprs = Vec::new();
+        for assignment in &insert.assignments {
+            for column in assignment_target_columns(&assignment.target) {
+                exprs.push(NamedExpr {
+                    name: Some(column.clone()),
+                    expr: self.bind_expr(&assignment.value, &scope),
+                });
+                columns.push(column);
+            }
+        }
+        let (on_conflict, conflict_predicate) = match &insert.on {
+            Some(on) => self.bind_conflict(on, &target, &columns),
+            None => (Vec::new(), Vec::new()),
+        };
+        let returning = self.bind_returning(&insert.returning, &scope);
+        Operator::Insert(super::operator::Insert {
+            target,
+            columns,
+            input: Box::new(Operator::Project(Project {
+                input: Box::new(Operator::Empty),
+                exprs,
+            })),
+            returning,
+            on_conflict,
+            conflict_predicate,
+        })
+    }
+
+    /// Bind an INSERT's conflict action. PG / SQLite `ON CONFLICT DO UPDATE`
+    /// puts the `EXCLUDED` pseudo-table in scope — a synthetic relation
+    /// exposing the target columns, so `EXCLUDED.col` resolves to a `Derived`
+    /// ref the traversal maps back to the source's like-positioned output.
+    /// MySQL `ON DUPLICATE KEY UPDATE` has no EXCLUDED (its `VALUES(col)`
+    /// self-references the target). Returns the conflict assignments (extra
+    /// writes + lineage) and the optional `DO UPDATE … WHERE` (filter reads).
+    fn bind_conflict(
+        &self,
+        on: &OnInsert,
+        target: &TableReference,
+        columns: &[Ident],
+    ) -> (Vec<super::operator::Assignment>, Vec<Expr>) {
+        let (scope, assignments, selection) = match on {
+            OnInsert::DuplicateKeyUpdate(assignments) => {
+                (self.target_scope(target), assignments.as_slice(), None)
+            }
+            OnInsert::OnConflict(on_conflict) => match &on_conflict.action {
+                OnConflictAction::DoUpdate(do_update) => {
+                    let mut scope = self.target_scope(target);
+                    scope.relations.push(Relation {
+                        alias: Some(Ident::new("excluded")),
+                        source: RelSource::Derived {
+                            columns: columns.to_vec(),
+                        },
+                    });
+                    (
+                        scope,
+                        do_update.assignments.as_slice(),
+                        do_update.selection.as_ref(),
+                    )
+                }
+                OnConflictAction::DoNothing => return (Vec::new(), Vec::new()),
+            },
+            // `OnInsert` is non-exhaustive; an unmodelled action is a no-op.
+            _ => return (Vec::new(), Vec::new()),
+        };
+        let bound = assignments
+            .iter()
+            .flat_map(|a| {
+                assignment_target_columns(&a.target)
+                    .into_iter()
+                    .map(move |column| (column, &a.value))
+            })
+            .map(|(column, value)| super::operator::Assignment {
+                target: column,
+                value: self.bind_expr(value, &scope),
+            })
+            .collect();
+        let predicate = selection
+            .map(|s| self.bind_expr(s, &scope))
+            .into_iter()
+            .collect();
+        (bound, predicate)
     }
 
     /// `UPDATE target SET col = expr [FROM src] WHERE pred`: the target is in
@@ -294,11 +402,13 @@ impl Binder<'_> {
                 value: self.bind_expr(value, &scope),
             })
             .collect();
+        // RETURNING resolves against the statement scope (target + FROM).
+        let returning = self.bind_returning(&update.returning, &scope);
         Operator::Update(super::operator::Update {
             target,
             assignments,
             input: Box::new(input),
-            returning: Vec::new(),
+            returning,
         })
     }
 
@@ -351,10 +461,13 @@ impl Binder<'_> {
                 predicate: vec![self.bind_expr(predicate, &scope)],
             });
         }
+        // RETURNING resolves against the FROM / USING scope (which holds the
+        // target).
+        let returning = self.bind_returning(&delete.returning, &scope);
         Operator::Delete(super::operator::Delete {
             targets,
             input: Box::new(input),
-            returning: Vec::new(),
+            returning,
         })
     }
 
@@ -522,6 +635,38 @@ impl Binder<'_> {
         self.eq(fold, &a.name, &b.name)
             && seg_eq(a.schema.as_ref(), b.schema.as_ref())
             && seg_eq(a.catalog.as_ref(), b.catalog.as_ref())
+    }
+
+    /// A resolution scope holding just a write target (for `INSERT … RETURNING`,
+    /// whose references resolve against the target alone — the source query's
+    /// scope is already popped).
+    fn target_scope(&self, target: &TableReference) -> Scope {
+        let m = self.table_match(target);
+        let columns = if m.columns.is_empty() {
+            Columns::Open
+        } else {
+            Columns::Known(m.columns)
+        };
+        scope_of(Relation {
+            alias: None,
+            source: RelSource::Table {
+                table: m.table,
+                columns,
+                resolution: m.resolution,
+            },
+        })
+    }
+
+    /// Bind a `RETURNING` clause's projected columns against `scope` — a value
+    /// projection over the written relation, like a SELECT list, so each item
+    /// contributes target reads and a `QueryOutput` lineage edge. A wildcard is
+    /// suppressed (its diagnostic is a later brick).
+    fn bind_returning(&self, returning: &Option<Vec<SelectItem>>, scope: &Scope) -> Vec<NamedExpr> {
+        returning
+            .iter()
+            .flatten()
+            .filter_map(|item| self.bind_select_item(item, scope))
+            .collect()
     }
 
     /// `CREATE TABLE dst AS <query>` (CTAS): the source query's reads, paired

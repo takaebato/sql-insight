@@ -189,6 +189,22 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
         Operator::Insert(i) => {
             let src = enter_withs(&i.input, &mut ctx);
             relation_lineage(&i.columns, &i.target, src, &mut ctx, &mut edges);
+            // ON CONFLICT DO UPDATE SET col = value: each `value → target.col`,
+            // an `EXCLUDED.x` ref mapped to the source's like-positioned output.
+            for a in &i.on_conflict {
+                let target = ColumnTarget::Relation(ColumnReference {
+                    table: Some(i.target.clone()),
+                    name: a.target.clone(),
+                });
+                for (source, kind) in conflict_value_origins(&a.value, &i.columns, src, &mut ctx) {
+                    edges.push(ColumnLineageEdge {
+                        source,
+                        target: target.clone(),
+                        kind,
+                    });
+                }
+            }
+            returning_lineage(&i.returning, &i.input, &mut ctx, &mut edges);
         }
         // UPDATE … SET col = expr: each assignment's RHS value traces to its
         // target column (`Relation` edge). A `Derived` RHS ref (a column of a
@@ -207,10 +223,11 @@ pub(crate) fn column_lineage(op: &Operator) -> Vec<ColumnLineageEdge> {
                     });
                 }
             }
+            returning_lineage(&u.returning, &u.input, &mut ctx, &mut edges);
         }
-        // DELETE moves no data (rows go wholesale) — no column lineage (only a
-        // RETURNING projection would, a later brick).
-        Operator::Delete(_) => {}
+        // DELETE moves no data (rows go wholesale) — its only lineage is a
+        // RETURNING projection of the deleted rows.
+        Operator::Delete(d) => returning_lineage(&d.returning, &d.input, &mut ctx, &mut edges),
         // CTAS / CREATE VIEW move data like INSERT: pair the source's outputs
         // with the new relation's columns.
         Operator::CreateTableAs(c) => {
@@ -302,6 +319,96 @@ fn relation_lineage<'a>(
     }
 }
 
+/// Emit a DML statement's `RETURNING` lineage: each returned column is a
+/// `QueryOutput` target (the statement both writes and projects), its origins
+/// traced through `input` (the written relation / FROM scope).
+fn returning_lineage<'a>(
+    returning: &'a [NamedExpr],
+    input: &'a Operator,
+    ctx: &mut Ctx<'a>,
+    out: &mut Vec<ColumnLineageEdge>,
+) {
+    for (position, ne) in returning.iter().enumerate() {
+        let target = ColumnTarget::QueryOutput {
+            name: ne.name.clone(),
+            position,
+        };
+        for (source, kind) in origins_of_expr(&ne.expr, input, ctx) {
+            out.push(ColumnLineageEdge {
+                source,
+                target: target.clone(),
+                kind,
+            });
+        }
+    }
+}
+
+/// The origins of an ON CONFLICT DO UPDATE value. Like [`origins_of_expr`],
+/// but an `EXCLUDED.col` reference (a `Derived` ref, qualified `excluded`) maps
+/// to the INSERT source's like-positioned output column — or, when the source
+/// has no inspectable projection (a `VALUES` source), to the `EXCLUDED.col`
+/// pseudo-column itself (a synthetic lineage source, not a read).
+fn conflict_value_origins<'a>(
+    value: &'a Expr,
+    columns: &[Ident],
+    source: &'a Operator,
+    ctx: &mut Ctx<'a>,
+) -> Vec<(ColumnRead, ColumnLineageKind)> {
+    match value {
+        // A `Derived` ref here is `EXCLUDED.col` (the only synthetic relation in
+        // a conflict scope). Map it to the source's `col`-positioned output.
+        Expr::Column(c) if matches!(c.binding, Binding::Derived) => {
+            match columns.iter().position(|t| idents_eq(t, &c.name)) {
+                Some(i) => match output_operands(source).first() {
+                    Some((outputs, input)) if outputs.len() > i => {
+                        origins_of_expr(&outputs[i].expr, input, ctx)
+                    }
+                    // No inspectable projection (VALUES): EXCLUDED.col stays a
+                    // synthetic pseudo-source.
+                    _ => vec![(excluded_source(c), ColumnLineageKind::Passthrough)],
+                },
+                None => Vec::new(),
+            }
+        }
+        // A non-EXCLUDED ref (a target column, MySQL `VALUES(col)` inner, …)
+        // and the structural variants trace like any value.
+        Expr::Column(_) => origins_of_expr(value, source, ctx),
+        Expr::Call { args } => transform(
+            args.iter()
+                .flat_map(|e| conflict_value_origins(e, columns, source, ctx)),
+        ),
+        Expr::Case { then, else_, .. } => {
+            let mut sources: Vec<_> = then
+                .iter()
+                .flat_map(|e| conflict_value_origins(e, columns, source, ctx))
+                .collect();
+            if let Some(e) = else_ {
+                sources.extend(conflict_value_origins(e, columns, source, ctx));
+            }
+            transform(sources)
+        }
+        Expr::Window { arg, .. } => transform(conflict_value_origins(arg, columns, source, ctx)),
+        Expr::Subquery(plan) => transform(query_col0_origins(plan, ctx)),
+        Expr::Exists(_) | Expr::InSubquery { .. } => Vec::new(),
+    }
+}
+
+/// The `EXCLUDED.col` pseudo-table lineage source (when the source can't be
+/// collapsed through): the qualifier (`EXCLUDED`, original text) as the table.
+fn excluded_source(c: &ColRef) -> ColumnRead {
+    ColumnRead {
+        reference: ColumnReference {
+            table: c.qualifier.clone().map(|q| TableReference {
+                catalog: None,
+                schema: None,
+                name: q,
+            }),
+            name: c.name.clone(),
+        },
+        resolution: ResolutionKind::Inferred,
+    }
+}
+
 /// Emit the `value → target.column` lineage edges of one MERGE WHEN value, its
 /// origins traced through the `source` relation.
 fn merge_value_edges<'a>(
@@ -351,7 +458,16 @@ fn output_operands(op: &Operator) -> Vec<(&[NamedExpr], &Operator)> {
 /// leading `WITH` is peeled.
 pub(crate) fn writes(op: &Operator) -> Vec<ColumnReference> {
     match peel_with(op) {
-        Operator::Insert(i) => qualify(&i.columns, &i.target),
+        // INSERT columns, then any ON CONFLICT DO UPDATE SET targets (extra
+        // writes on the same relation).
+        Operator::Insert(i) => {
+            let mut w = qualify(&i.columns, &i.target);
+            w.extend(i.on_conflict.iter().map(|a| ColumnReference {
+                table: Some(i.target.clone()),
+                name: a.target.clone(),
+            }));
+            w
+        }
         // Each SET assignment writes its target column.
         Operator::Update(u) => u
             .assignments
@@ -807,7 +923,16 @@ fn own_exprs(op: &Operator) -> Vec<&Expr> {
             .collect(),
         Operator::Sort(s) => s.keys.iter().collect(),
         Operator::Values(v) => v.rows.iter().flatten().collect(),
-        Operator::Insert(i) => i.returning.iter().map(|ne| &ne.expr).collect(),
+        // RETURNING items, conflict-action SET values, and the conflict
+        // predicate are all reads (an `EXCLUDED` ref within them is `Derived`,
+        // so dropped).
+        Operator::Insert(i) => i
+            .returning
+            .iter()
+            .map(|ne| &ne.expr)
+            .chain(i.on_conflict.iter().map(|a| &a.value))
+            .chain(i.conflict_predicate.iter())
+            .collect(),
         Operator::Update(u) => u
             .assignments
             .iter()

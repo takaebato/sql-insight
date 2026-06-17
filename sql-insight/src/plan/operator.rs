@@ -166,7 +166,12 @@ pub(crate) struct Values {
 /// `INSERT INTO target (columns) <input>`: the source `input`'s output
 /// columns pair positionally with `columns` for relation lineage.
 /// `returning` projects the written relation; `on_conflict` is the
-/// `DO UPDATE SET` / `ON DUPLICATE KEY UPDATE` action (extra writes).
+/// `DO UPDATE SET` / `ON DUPLICATE KEY UPDATE` action (extra writes, each
+/// `value → target.col`), and `conflict_predicate` is its optional
+/// `DO UPDATE … WHERE` (filter reads, non-feeding). A conflict value may
+/// reference the `EXCLUDED` pseudo-table (the proposed row) — resolved to a
+/// `Derived` ref qualified `excluded`, traced to the source's like-positioned
+/// output column.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Insert {
     pub(crate) target: TableReference,
@@ -174,6 +179,7 @@ pub(crate) struct Insert {
     pub(crate) input: Box<Operator>,
     pub(crate) returning: Vec<NamedExpr>,
     pub(crate) on_conflict: Vec<Assignment>,
+    pub(crate) conflict_predicate: Vec<Expr>,
 }
 
 /// `UPDATE target SET assignments [FROM ...] WHERE ...`: `input` carries the

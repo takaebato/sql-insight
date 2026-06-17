@@ -421,6 +421,51 @@ fn update_catalog_parity() {
 }
 
 #[test]
+fn on_conflict_parity() {
+    let pg = sqlparser::dialect::PostgreSqlDialect {};
+    // PG / SQLite ON CONFLICT DO UPDATE: EXCLUDED collapses to the source for a
+    // SELECT source, stays a pseudo-source for VALUES; DO NOTHING is a plain
+    // insert; a DO UPDATE WHERE is a filter read.
+    for sql in [
+        "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
+        "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO NOTHING",
+        "INSERT INTO t (a, b) SELECT x, y FROM s ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
+        "INSERT INTO t (a, b) SELECT x, y FROM s ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b + 1",
+        "INSERT INTO t (a, b) SELECT x, y FROM s ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b WHERE t.a > 0",
+    ] {
+        assert_parity_inner(sql, &pg, None);
+    }
+    // MySQL ON DUPLICATE KEY UPDATE: no EXCLUDED — `VALUES(col)` self-references
+    // the target. Plus the `INSERT … SET` assignment form.
+    let mysql = sqlparser::dialect::MySqlDialect {};
+    for sql in [
+        "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b)",
+        "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = b + 1",
+        "INSERT INTO t SET a = 1, b = 2",
+        "INSERT INTO t SET a = 1 ON DUPLICATE KEY UPDATE b = VALUES(b)",
+    ] {
+        assert_parity_inner(sql, &mysql, None);
+    }
+}
+
+#[test]
+fn returning_parity() {
+    // RETURNING projects the written relation — a `QueryOutput` edge per item,
+    // and the returned columns are reads of the target.
+    let corpus = [
+        "INSERT INTO t (a, b) SELECT x, y FROM s RETURNING a",
+        "INSERT INTO t (a) VALUES (1) RETURNING a, b",
+        "INSERT INTO t (a) SELECT x FROM s RETURNING a AS created",
+        "UPDATE t SET a = b WHERE c > 0 RETURNING a, c",
+        "DELETE FROM t WHERE a > 0 RETURNING a, b",
+        "UPDATE t SET a = s.x FROM s WHERE t.id = s.id RETURNING t.a",
+    ];
+    for sql in corpus {
+        assert_parity(sql);
+    }
+}
+
+#[test]
 fn merge_parity() {
     // MERGE (catalog-free): UPDATE SET / INSERT VALUES / DELETE actions, the
     // ON / WHEN predicates as filter reads, and value-vs-filter feeding.
