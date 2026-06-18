@@ -206,12 +206,28 @@ by hand.
 
 ## Design conventions
 
-- **Materialize, then walk.** The binder builds a complete `Plan`
+- **Materialize, then walk.** The binder builds a complete `LogicalPlan`
   tree (bind = AST → tree, one pass); extraction is a pure walk of the
   clean tree. Keep the plan a *complete* representation: where a bind
   shortcut would throw info away (folding a subquery, dropping an
   unreferenced CTE, discarding a role), raise plan granularity so it's
   carried in the tree, not routed around it via side channels.
+  - **Why a *materialized* tree** (rather than fusing bind and extraction
+    into one AST pass): the tree exists for the **breadth**, not for the
+    lineage collapse. It is walked by seven independent extraction
+    surfaces (`reads` / `table_reads` / `writes` / `table_writes` /
+    `column_lineage` / `table_lineage` / `flat_tables`), each with its own
+    traversal rules; a complete tree lets each be a pure, separate walk
+    instead of seven rule-sets interleaved into the bind. It also keeps
+    the value/filter split **structural** (positional in the tree, not a
+    clause tag threaded through bind — the side channel the design
+    rejects) and models a CTE as a **shared node** (bound once, referenced
+    by a lightweight `CteRef` the walk resolves to its body on demand —
+    without the tree you'd rebuild a CTE registry and re-traverse, i.e.
+    reinvent part of the tree). For column-lineage collapse *alone* a
+    fused bind+collapse pass would suffice; the tree is the price of that
+    breadth, paid once and discarded (it is not an execution plan, nothing
+    optimizes or reuses it).
 - **Bind returns `(Plan, Scope)`** bottom-up; the `Scope` is scratch
   (current frame = the subtree's output relations + introduced
   outputs; enclosing frames via `outer_scopes` for correlation). Don't
