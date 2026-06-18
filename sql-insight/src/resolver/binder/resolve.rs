@@ -4,6 +4,20 @@
 
 use super::*;
 
+/// One candidate owner of a column reference, with the binding it would
+/// contribute and whether it's a confirmed (catalog-listed) witness.
+struct Candidate {
+    binding: Binding,
+    confirmed: bool,
+}
+
+/// The outcome of matching a written table reference against the catalog.
+pub(super) struct TableMatch {
+    pub(super) table: TableReference,
+    pub(super) resolution: ResolutionKind,
+    pub(super) columns: Vec<Ident>,
+}
+
 impl<'a> Binder<'a> {
     // ===== column resolution =============================================
 
@@ -54,7 +68,7 @@ impl<'a> Binder<'a> {
     /// could own the column (so the caller falls through to an enclosing
     /// scope) and `Some(binding)` once at least one is a candidate (even if
     /// that collapses to `Ambiguous` — a name owned here doesn't escape).
-    pub(super) fn resolve_in(&self, parts: &[Ident], relations: &[Relation]) -> Option<Binding> {
+    fn resolve_in(&self, parts: &[Ident], relations: &[Relation]) -> Option<Binding> {
         let name = parts.last()?;
         let candidates: Vec<Candidate> = if parts.len() == 1 {
             relations
@@ -77,7 +91,7 @@ impl<'a> Binder<'a> {
     /// A relation is an unqualified candidate iff it could own `name`: a
     /// `Known` schema must list it (confirmed witness); an `Open` table always
     /// could (suspect).
-    pub(super) fn unqualified_candidate(&self, rel: &Relation, name: &Ident) -> Option<Candidate> {
+    fn unqualified_candidate(&self, rel: &Relation, name: &Ident) -> Option<Candidate> {
         match &rel.source {
             RelSource::Table {
                 table,
@@ -111,7 +125,7 @@ impl<'a> Binder<'a> {
     /// non-aliased real table by right-anchored path, anything else by its
     /// single exposed (alias) name. A `Known` table that doesn't list the
     /// column still resolves (`Inferred`) — the qualifier pins it.
-    pub(super) fn qualified_candidate(
+    fn qualified_candidate(
         &self,
         rel: &Relation,
         qualifier_parts: &[Ident],
@@ -172,7 +186,7 @@ impl<'a> Binder<'a> {
     /// binding verbatim; several with exactly one confirmed witness → that
     /// witness, downgraded to `Inferred` (Known-witness-over-Open); otherwise
     /// `Ambiguous`.
-    pub(super) fn pick(&self, candidates: Vec<Candidate>) -> Binding {
+    fn pick(&self, candidates: Vec<Candidate>) -> Binding {
         match candidates.len() {
             0 => Binding::Unresolved,
             1 => candidates.into_iter().next().unwrap().binding,

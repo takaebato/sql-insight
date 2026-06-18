@@ -3,17 +3,17 @@
 //! AST → tree; an unmodelled construct falls to [`LogicalPlan::Empty`] (with an
 //! `UnsupportedStatement` diagnostic) rather than hard-erroring.
 //!
-//! This root module holds the shared scratch types and the entry point; the
-//! bind logic is split by concern across submodules, each adding an `impl
-//! Binder` block over those shared types:
+//! This root module holds the [`Binder`] context, the entry point, and the
+//! plan- / AST-construction glue; the bind logic is split by concern across
+//! submodules, each adding an `impl Binder` block over the shared types:
 //!
 //! - [`Binder`] — the bind context (`catalog` / `casing` / the CTE and
 //!   correlation stacks / the shared diagnostics sink) and the small core
 //!   methods over it (child-binder construction, table-ref canonicalization,
 //!   diagnostic recording).
-//! - [`Scope`] / [`Relation`] / [`OutputCol`] / [`CteEnv`] — the relation-grouped
-//!   scratch threaded bottom-up (`bind_* -> (LogicalPlan, Scope)`), never stored
-//!   on the tree.
+//! - [`scope`] — the bind-time [`Scope`] model (FROM `relations` / `query_outputs`
+//!   / USING `merge_columns`) threaded bottom-up (`bind_* -> (LogicalPlan,
+//!   Scope)`), never stored on the tree.
 //! - [`statement`] — the DML / DDL roots (INSERT / UPDATE / DELETE / MERGE /
 //!   CREATE / ALTER / DROP) and write-target resolution.
 //! - [`query`] — `WITH` / CTEs, set operations, `VALUES`, SELECT, the FROM
@@ -63,12 +63,15 @@ use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::reference::{ResolutionKind, TableReference};
 
 // The bind pass is split by concern; each submodule adds an `impl Binder`
-// block over the shared scratch types (`Binder` / `Scope` / `Relation` / …)
-// and free helpers defined here in the root.
+// block over the shared types — the `Binder` context and free helpers here,
+// the `Scope` relation / output model in `scope`.
 mod expr;
 mod query;
 mod resolve;
+mod scope;
 mod statement;
+
+use scope::*;
 
 /// Bind a statement into an [`LogicalPlan`] tree plus the column-level
 /// diagnostics it raised (unsupported statement, suppressed wildcard,
@@ -89,95 +92,6 @@ pub(crate) fn build_with_diagnostics(
     }
     .bind_statement(statement);
     (op, diagnostics.into_inner())
-}
-
-/// A CTE in scope: its name and the output column names it exposes (so a
-/// `FROM cte` reference resolves through them). The body lives once on the
-/// owning `With` node; a reference is a lightweight `CteRef`.
-#[derive(Clone)]
-struct CteEnv {
-    name: Ident,
-    columns: Vec<Ident>,
-}
-
-// ===== bind-time scope (scratch, relation-grouped) =======================
-
-/// The relations visible at a point in the bind. Scratch — never stored on
-/// the [`LogicalPlan`] tree.
-#[derive(Default)]
-struct Scope {
-    relations: Vec<Relation>,
-    /// This (sub)query's output columns — the SELECT list's results. Visible by
-    /// name to its own GROUP BY / HAVING / ORDER BY (clause-alias visibility);
-    /// harvested by a parent as a derived table / CTE's exposed columns; and at
-    /// the top level these become the [`ColumnTarget::QueryOutput`] lineage
-    /// targets — hence the name. Empty at FROM-level resolution (WHERE /
-    /// projection), populated once the projection is bound.
-    ///
-    /// [`ColumnTarget::QueryOutput`]: crate::extractor::ColumnTarget::QueryOutput
-    query_outputs: Vec<OutputCol>,
-    /// `JOIN … USING (col)` merge-column names: an unqualified reference to one
-    /// fans in to every joined relation that could own it.
-    merge_columns: Vec<Ident>,
-}
-
-/// A projection output column, for clause-alias resolution. `identity` marks a
-/// bare passthrough (`SELECT a`): a clause reference to it falls through to
-/// the real column (a read); a non-identity (introduced) alias resolves to the
-/// output itself (`Binding::Derived`, dropped from reads).
-#[derive(Clone)]
-struct OutputCol {
-    name: Option<Ident>,
-    identity: bool,
-}
-
-/// A relation in scope: its use-site alias (if any) and where its columns
-/// come from. Cloned onto the correlation stack so an inner subquery can
-/// resolve against enclosing relations.
-#[derive(Clone)]
-struct Relation {
-    alias: Option<Ident>,
-    source: RelSource,
-}
-
-#[derive(Clone)]
-enum RelSource {
-    /// A real table: its canonical identity and catalog column knowledge.
-    /// (The table-level resolution kind lives on the `Scan`; here the `columns`
-    /// — `Known` vs `Open` — drive a column reference's resolution.)
-    Table {
-        table: TableReference,
-        columns: Columns,
-    },
-    /// A derived table / CTE reference: a synthetic relation exposing the named
-    /// output columns of an inner query. A reference through it is
-    /// `Binding::Derived` — the origin traversal traces into the producing
-    /// sub-plan (`SubqueryAlias` / `CteRef`).
-    Derived { columns: Vec<Ident> },
-    /// An opaque table function / PIVOT / … relation with dynamic columns. A
-    /// bare name is **not** claimed by it (so it stays resolvable against real
-    /// tables); a qualified ref through its alias is `Binding::Derived` — the
-    /// origin traversal reaches the [`LogicalPlan::TableFunction`] node and emits
-    /// the synthetic `alias.col` source (a lineage source, dropped from reads).
-    TableFunction,
-}
-
-impl Relation {
-    /// The name this relation answers to in a qualifier: its alias, else a
-    /// real table's bare name. A derived relation answers only to its alias.
-    pub(super) fn exposed_name(&self) -> Option<&Ident> {
-        self.alias.as_ref().or(match &self.source {
-            RelSource::Table { table, .. } => Some(&table.name),
-            RelSource::Derived { .. } | RelSource::TableFunction => None,
-        })
-    }
-}
-
-/// One candidate owner of a column reference, with the binding it would
-/// contribute and whether it's a confirmed (catalog-listed) witness.
-struct Candidate {
-    binding: Binding,
-    confirmed: bool,
 }
 
 struct Binder<'a> {
@@ -277,13 +191,6 @@ impl<'a> Binder<'a> {
 }
 
 // ===== catalog matching ==================================================
-
-/// The outcome of matching a written table reference against the catalog.
-struct TableMatch {
-    table: TableReference,
-    resolution: ResolutionKind,
-    columns: Vec<Ident>,
-}
 
 /// Fill a query reference's missing prefix segments from the catalog's
 /// defaults (bare → schema then catalog).
@@ -420,22 +327,6 @@ fn sort(input: LogicalPlan, keys: Vec<Expr>) -> LogicalPlan {
     })
 }
 
-fn scope_of(relation: Relation) -> Scope {
-    Scope {
-        relations: vec![relation],
-        ..Scope::default()
-    }
-}
-
-/// A resolution scope over the FROM siblings to a factor's left (the
-/// LATERAL-visible relations a table function's arguments read against).
-fn sibling_scope(left: &[Relation]) -> Scope {
-    Scope {
-        relations: left.to_vec(),
-        ..Scope::default()
-    }
-}
-
 /// The names of a table alias's explicit column list (`AS d(x, y)`), empty if
 /// none.
 fn alias_column_names(alias: &TableAlias) -> Vec<Ident> {
@@ -465,26 +356,6 @@ fn rename_outputs(op: &mut LogicalPlan, names: &[Ident]) {
         }
         _ => {}
     }
-}
-
-/// The output column names a derived table / CTE exposes: an explicit column
-/// alias list (`AS d(x, y)`) renames positionally; otherwise each output keeps
-/// its own inferred name (anonymous outputs with no alias are unnameable, so
-/// dropped — they can't be referenced).
-fn exposed_columns(query_outputs: &[OutputCol], alias: Option<&TableAlias>) -> Vec<Ident> {
-    let alias_columns: Vec<&Ident> = alias
-        .map(|a| a.columns.iter().map(|c| &c.name).collect())
-        .unwrap_or_default();
-    query_outputs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, o)| {
-            alias_columns
-                .get(i)
-                .map(|n| (*n).clone())
-                .or_else(|| o.name.clone())
-        })
-        .collect()
 }
 
 /// The name SQL infers for an unaliased projection item: a bare column keeps

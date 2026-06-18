@@ -212,7 +212,7 @@ impl<'a> Binder<'a> {
         let Some((target_relation, target)) = self.target_relation(&update.table.relation) else {
             return LogicalPlan::Empty;
         };
-        let mut scope = scope_of(target_relation);
+        let mut scope = Scope::single(target_relation);
         let mut input = LogicalPlan::Empty;
         // Joins on the UPDATE target clause are read relations.
         for j in &update.table.joins {
@@ -347,7 +347,7 @@ impl<'a> Binder<'a> {
         let Some((target_relation, target)) = self.target_relation(&merge.table) else {
             return LogicalPlan::Empty;
         };
-        let mut scope = scope_of(target_relation);
+        let mut scope = Scope::single(target_relation);
         let (source, source_scope) = self.bind_table_factor(&merge.source, &scope.relations);
         scope.relations.extend(source_scope.relations);
 
@@ -523,7 +523,7 @@ impl<'a> Binder<'a> {
         } else {
             Columns::Known(m.columns)
         };
-        scope_of(Relation {
+        Scope::single(Relation {
             alias: None,
             source: RelSource::Table {
                 table: m.table,
@@ -567,7 +567,7 @@ impl<'a> Binder<'a> {
         };
         let (input, scope) = self.bind_query(query);
         let columns = if create.columns.is_empty() {
-            exposed_columns(&scope.query_outputs, None)
+            scope.exposed_columns(None)
         } else {
             create.columns.iter().map(|c| c.name.clone()).collect()
         };
@@ -587,7 +587,7 @@ impl<'a> Binder<'a> {
         let target = self.table_match(&written).table;
         let (input, scope) = self.bind_query(&create.query);
         let columns = if create.columns.is_empty() {
-            exposed_columns(&scope.query_outputs, None)
+            scope.exposed_columns(None)
         } else {
             create.columns.iter().map(|c| c.name.clone()).collect()
         };
@@ -612,7 +612,7 @@ impl<'a> Binder<'a> {
         let target = self.table_match(&written).table;
         let (input, scope) = self.bind_query(query);
         let columns = if columns.is_empty() {
-            exposed_columns(&scope.query_outputs, None)
+            scope.exposed_columns(None)
         } else {
             columns.to_vec()
         };

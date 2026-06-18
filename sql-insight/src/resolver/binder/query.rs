@@ -8,10 +8,9 @@ use super::*;
 impl<'a> Binder<'a> {
     /// Bind a query, returning the operator and its output [`Scope`] (the FROM
     /// relations plus the query outputs). A leading `WITH` is peeled first: each
-    /// CTE binds in
-    /// declaration order into an environment the later CTEs and the body
-    /// resolve against; the bodies are owned by a `With` node, references are
-    /// `CteRef`s.
+    /// CTE binds in declaration order into an environment the later CTEs and the
+    /// body resolve against; the bodies are owned by a `With` node, references
+    /// are `CteRef`s.
     pub(super) fn bind_query(&self, query: &Query) -> (LogicalPlan, Scope) {
         let Some(with) = &query.with else {
             return self.bind_query_body(query);
@@ -51,14 +50,11 @@ impl<'a> Binder<'a> {
         let name = cte.alias.name.clone();
         let inner_env = if recursive {
             let provisional = match cte.query.body.as_ref() {
-                SetExpr::SetOperation { left, .. } => exposed_columns(
-                    &self
-                        .with_ctes(env.to_vec())
-                        .bind_set_expr(left)
-                        .1
-                        .query_outputs,
-                    Some(&cte.alias),
-                ),
+                SetExpr::SetOperation { left, .. } => self
+                    .with_ctes(env.to_vec())
+                    .bind_set_expr(left)
+                    .1
+                    .exposed_columns(Some(&cte.alias)),
                 _ => Vec::new(),
             };
             let mut e = env.to_vec();
@@ -71,7 +67,7 @@ impl<'a> Binder<'a> {
             env.to_vec()
         };
         let (mut plan, scope) = self.with_ctes(inner_env).bind_query(&cte.query);
-        let columns = exposed_columns(&scope.query_outputs, Some(&cte.alias));
+        let columns = scope.exposed_columns(Some(&cte.alias));
         // An explicit `c (x, y)` column list renames the body's output columns
         // so a reference through the CTE traces to them.
         rename_outputs(&mut plan, &alias_column_names(&cte.alias));
@@ -457,12 +453,7 @@ impl<'a> Binder<'a> {
             .iter()
             .filter_map(|item| self.bind_select_item(item, &scope))
             .collect();
-        let query_outputs = self.output_cols(&exprs);
-        let clause_scope = Scope {
-            relations: scope.relations,
-            query_outputs,
-            merge_columns: scope.merge_columns,
-        };
+        let clause_scope = scope.with_query_outputs(self.output_cols(&exprs));
         // GROUP BY → an `Aggregate` over the filtered rows; its keys are reads.
         let group_by = self.group_by_keys(&select.group_by, &clause_scope);
         if !group_by.is_empty() {
@@ -512,8 +503,7 @@ impl<'a> Binder<'a> {
         // earlier ones only if it is LATERAL.
         for twj in iter {
             let (right, right_scope) = self.bind_table_with_joins(twj, &scope.relations);
-            scope.relations.extend(right_scope.relations);
-            scope.merge_columns.extend(right_scope.merge_columns);
+            scope.absorb(right_scope);
             node = join(node, right, Vec::new());
         }
         (node, scope)
@@ -532,11 +522,10 @@ impl<'a> Binder<'a> {
             // inputs accumulated so far.
             let visible: Vec<Relation> = left.iter().chain(&scope.relations).cloned().collect();
             let (right, right_scope) = self.bind_table_factor(&j.relation, &visible);
-            scope.relations.extend(right_scope.relations);
-            scope.merge_columns.extend(right_scope.merge_columns);
+            scope.absorb(right_scope);
             // A `USING (col)` join records its merge columns: an unqualified
             // reference to one fans in to both sides.
-            scope.merge_columns.extend(join_using(&j.join_operator));
+            scope.add_merge_columns(join_using(&j.join_operator));
             // The ON predicate resolves against both sides' columns.
             let on = join_on(&j.join_operator)
                 .map(|e| self.bind_expr(e, &scope))
@@ -574,7 +563,7 @@ impl<'a> Binder<'a> {
                 columns,
             },
         };
-        (scan, scope_of(relation))
+        (scan, Scope::single(relation))
     }
 
     pub(super) fn bind_table_factor(
@@ -610,7 +599,7 @@ impl<'a> Binder<'a> {
                             LogicalPlan::CteRef(CteRef {
                                 name: cte.name.clone(),
                             }),
-                            scope_of(relation),
+                            Scope::single(relation),
                         );
                     }
                 }
@@ -621,7 +610,8 @@ impl<'a> Binder<'a> {
                 let node = match args {
                     Some(args) => LogicalPlan::Filter(Filter {
                         input: Box::new(scan),
-                        predicate: self.bind_function_arg_list(&args.args, &sibling_scope(left)),
+                        predicate: self
+                            .bind_function_arg_list(&args.args, &Scope::from_relations(left)),
                     }),
                     None => scan,
                 };
@@ -642,7 +632,7 @@ impl<'a> Binder<'a> {
                 } else {
                     self.bind_query(subquery)
                 };
-                let columns = exposed_columns(&sub_scope.query_outputs, alias.as_ref());
+                let columns = sub_scope.exposed_columns(alias.as_ref());
                 let relation = Relation {
                     alias: alias.as_ref().map(|a| a.name.clone()),
                     source: RelSource::Derived { columns },
@@ -657,7 +647,7 @@ impl<'a> Binder<'a> {
                     }
                     None => op,
                 };
-                (node, scope_of(relation))
+                (node, Scope::single(relation))
             }
             // A parenthesized join `(a JOIN b …)`: the inner tables bind
             // directly into the current scope (their refs resolve, their ON
@@ -670,17 +660,17 @@ impl<'a> Binder<'a> {
             // the argument expressions read against the surrounding
             // (LATERAL-visible) `left` scope; no inner table feeds.
             TableFactor::TableFunction { expr, alias } => {
-                let args = vec![self.bind_expr(expr, &sibling_scope(left))];
+                let args = vec![self.bind_expr(expr, &Scope::from_relations(left))];
                 self.opaque(LogicalPlan::Empty, args, alias.as_ref())
             }
             TableFactor::Function { args, alias, .. } => {
-                let bound = self.bind_function_arg_list(args, &sibling_scope(left));
+                let bound = self.bind_function_arg_list(args, &Scope::from_relations(left));
                 self.opaque(LogicalPlan::Empty, bound, alias.as_ref())
             }
             TableFactor::UNNEST {
                 array_exprs, alias, ..
             } => {
-                let args = self.bind_exprs(array_exprs, &sibling_scope(left));
+                let args = self.bind_exprs(array_exprs, &Scope::from_relations(left));
                 self.opaque(LogicalPlan::Empty, args, alias.as_ref())
             }
             TableFactor::JsonTable {
@@ -689,7 +679,7 @@ impl<'a> Binder<'a> {
             | TableFactor::OpenJsonTable {
                 json_expr, alias, ..
             } => {
-                let args = vec![self.bind_expr(json_expr, &sibling_scope(left))];
+                let args = vec![self.bind_expr(json_expr, &Scope::from_relations(left))];
                 self.opaque(LogicalPlan::Empty, args, alias.as_ref())
             }
             TableFactor::XmlTable {
@@ -698,7 +688,7 @@ impl<'a> Binder<'a> {
                 alias,
                 ..
             } => {
-                let scope = sibling_scope(left);
+                let scope = Scope::from_relations(left);
                 let mut args = vec![self.bind_expr(row_expression, &scope)];
                 args.extend(
                     passing
@@ -716,7 +706,7 @@ impl<'a> Binder<'a> {
                 alias,
                 ..
             } => {
-                let scope = sibling_scope(left);
+                let scope = Scope::from_relations(left);
                 let mut args = self.bind_exprs(dimensions, &scope);
                 args.extend(self.bind_exprs(metrics, &scope));
                 args.extend(self.bind_exprs(facts, &scope));
@@ -813,7 +803,7 @@ impl<'a> Binder<'a> {
             args,
         });
         let scope = match alias_name {
-            Some(name) => scope_of(Relation {
+            Some(name) => Scope::single(Relation {
                 alias: Some(name),
                 source: RelSource::TableFunction,
             }),
