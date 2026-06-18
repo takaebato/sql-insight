@@ -81,7 +81,7 @@ impl<'a> Binder<'a> {
         let columns = if insert.columns.is_empty() {
             self.catalog_columns(&target)
                 .into_iter()
-                .take(scope.outputs.len())
+                .take(scope.query_outputs.len())
                 .collect()
         } else {
             insert.columns.clone()
@@ -567,7 +567,7 @@ impl<'a> Binder<'a> {
         };
         let (input, scope) = self.bind_query(query);
         let columns = if create.columns.is_empty() {
-            exposed_columns(&scope.outputs, None)
+            exposed_columns(&scope.query_outputs, None)
         } else {
             create.columns.iter().map(|c| c.name.clone()).collect()
         };
@@ -587,7 +587,7 @@ impl<'a> Binder<'a> {
         let target = self.table_match(&written).table;
         let (input, scope) = self.bind_query(&create.query);
         let columns = if create.columns.is_empty() {
-            exposed_columns(&scope.outputs, None)
+            exposed_columns(&scope.query_outputs, None)
         } else {
             create.columns.iter().map(|c| c.name.clone()).collect()
         };
@@ -612,7 +612,7 @@ impl<'a> Binder<'a> {
         let target = self.table_match(&written).table;
         let (input, scope) = self.bind_query(query);
         let columns = if columns.is_empty() {
-            exposed_columns(&scope.outputs, None)
+            exposed_columns(&scope.query_outputs, None)
         } else {
             columns.to_vec()
         };

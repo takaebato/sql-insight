@@ -6,8 +6,9 @@
 use super::*;
 
 impl<'a> Binder<'a> {
-    /// Bind a query, returning the operator and its output scope (relations +
-    /// outputs). A leading `WITH` is peeled first: each CTE binds in
+    /// Bind a query, returning the operator and its output [`Scope`] (the FROM
+    /// relations plus the query outputs). A leading `WITH` is peeled first: each
+    /// CTE binds in
     /// declaration order into an environment the later CTEs and the body
     /// resolve against; the bodies are owned by a `With` node, references are
     /// `CteRef`s.
@@ -51,7 +52,11 @@ impl<'a> Binder<'a> {
         let inner_env = if recursive {
             let provisional = match cte.query.body.as_ref() {
                 SetExpr::SetOperation { left, .. } => exposed_columns(
-                    &self.with_ctes(env.to_vec()).bind_set_expr(left).1.outputs,
+                    &self
+                        .with_ctes(env.to_vec())
+                        .bind_set_expr(left)
+                        .1
+                        .query_outputs,
                     Some(&cte.alias),
                 ),
                 _ => Vec::new(),
@@ -66,7 +71,7 @@ impl<'a> Binder<'a> {
             env.to_vec()
         };
         let (mut plan, scope) = self.with_ctes(inner_env).bind_query(&cte.query);
-        let columns = exposed_columns(&scope.outputs, Some(&cte.alias));
+        let columns = exposed_columns(&scope.query_outputs, Some(&cte.alias));
         // An explicit `c (x, y)` column list renames the body's output columns
         // so a reference through the CTE traces to them.
         rename_outputs(&mut plan, &alias_column_names(&cte.alias));
@@ -91,7 +96,7 @@ impl<'a> Binder<'a> {
                 // A set-op body exposes no single relation scope for refs.
                 LogicalPlan::SetOp(_) => Scope {
                     relations: Vec::new(),
-                    outputs: std::mem::take(&mut scope.outputs),
+                    query_outputs: std::mem::take(&mut scope.query_outputs),
                     merge_columns: Vec::new(),
                 },
                 _ => scope,
@@ -134,7 +139,7 @@ impl<'a> Binder<'a> {
         (op, scope)
     }
 
-    /// Bind one pipe operator on top of `input`, updating `scope.outputs` when
+    /// Bind one pipe operator on top of `input`, updating `scope.query_outputs` when
     /// it reshapes the output. An output-producing operator (SELECT / EXTEND /
     /// SET / AGGREGATE) layers a [`Projection`] whose value expressions feed
     /// `QueryOutput` lineage; a filter operator (WHERE / ORDER BY / LIMIT /
@@ -150,22 +155,22 @@ impl<'a> Binder<'a> {
         match op {
             PipeOperator::Select { exprs } => {
                 let new = self.bind_output_items(exprs, scope);
-                let (node, outputs) = self.pipe_project(input, &[], new, &scope.relations);
-                scope.outputs = outputs;
+                let (node, query_outputs) = self.pipe_project(input, &[], new, &scope.relations);
+                scope.query_outputs = query_outputs;
                 node
             }
             PipeOperator::Extend { exprs } => {
                 // The new columns see the running outputs; then they append.
                 let new = self.bind_output_items(exprs, scope);
-                let base = std::mem::take(&mut scope.outputs);
-                let (node, outputs) = self.pipe_project(input, &base, new, &scope.relations);
-                scope.outputs = outputs;
+                let base = std::mem::take(&mut scope.query_outputs);
+                let (node, query_outputs) = self.pipe_project(input, &base, new, &scope.relations);
+                scope.query_outputs = query_outputs;
                 node
             }
             PipeOperator::Set { assignments } => {
-                let base = std::mem::take(&mut scope.outputs);
-                let (node, outputs) = self.pipe_set(input, base, assignments, scope);
-                scope.outputs = outputs;
+                let base = std::mem::take(&mut scope.query_outputs);
+                let (node, query_outputs) = self.pipe_set(input, base, assignments, scope);
+                scope.query_outputs = query_outputs;
                 node
             }
             PipeOperator::Aggregate {
@@ -180,8 +185,8 @@ impl<'a> Binder<'a> {
                         expr: self.bind_expr(&e.expr.expr, scope),
                     })
                     .collect();
-                let (node, outputs) = self.pipe_project(input, &[], new, &scope.relations);
-                scope.outputs = outputs;
+                let (node, query_outputs) = self.pipe_project(input, &[], new, &scope.relations);
+                scope.query_outputs = query_outputs;
                 node
             }
             PipeOperator::Where { expr } => {
@@ -268,13 +273,13 @@ impl<'a> Binder<'a> {
     ) -> (LogicalPlan, Vec<OutputCol>) {
         let mut exprs = self.passthrough_exprs(base, relations);
         exprs.extend(new);
-        let outputs = self.output_cols(&exprs);
+        let query_outputs = self.output_cols(&exprs);
         (
             LogicalPlan::Projection(Projection {
                 input: Box::new(input),
                 exprs,
             }),
-            outputs,
+            query_outputs,
         )
     }
 
@@ -288,7 +293,7 @@ impl<'a> Binder<'a> {
     ) -> Vec<NamedExpr> {
         let pass_scope = Scope {
             relations: relations.to_vec(),
-            outputs: base.to_vec(),
+            query_outputs: base.to_vec(),
             merge_columns: Vec::new(),
         };
         base.iter()
@@ -327,13 +332,13 @@ impl<'a> Binder<'a> {
                 }
             }
         }
-        let outputs = self.output_cols(&exprs);
+        let query_outputs = self.output_cols(&exprs);
         (
             LogicalPlan::Projection(Projection {
                 input: Box::new(input),
                 exprs,
             }),
-            outputs,
+            query_outputs,
         )
     }
 
@@ -402,7 +407,7 @@ impl<'a> Binder<'a> {
                     .collect()
             })
             .collect();
-        let outputs = (0..width)
+        let query_outputs = (0..width)
             .map(|_| OutputCol {
                 name: None,
                 identity: false,
@@ -412,7 +417,7 @@ impl<'a> Binder<'a> {
             LogicalPlan::Values(Values { rows }),
             Scope {
                 relations: Vec::new(),
-                outputs,
+                query_outputs,
                 merge_columns: Vec::new(),
             },
         )
@@ -452,10 +457,10 @@ impl<'a> Binder<'a> {
             .iter()
             .filter_map(|item| self.bind_select_item(item, &scope))
             .collect();
-        let outputs = self.output_cols(&exprs);
+        let query_outputs = self.output_cols(&exprs);
         let clause_scope = Scope {
             relations: scope.relations,
-            outputs,
+            query_outputs,
             merge_columns: scope.merge_columns,
         };
         // GROUP BY → an `Aggregate` over the filtered rows; its keys are reads.
@@ -637,7 +642,7 @@ impl<'a> Binder<'a> {
                 } else {
                     self.bind_query(subquery)
                 };
-                let columns = exposed_columns(&sub_scope.outputs, alias.as_ref());
+                let columns = exposed_columns(&sub_scope.query_outputs, alias.as_ref());
                 let relation = Relation {
                     alias: alias.as_ref().map(|a| a.name.clone()),
                     source: RelSource::Derived { columns },

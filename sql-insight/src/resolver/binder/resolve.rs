@@ -16,9 +16,9 @@ impl<'a> Binder<'a> {
         // naming an *introduced* output alias resolves to that output
         // (`Derived`, dropped from reads — the real dependency is at the
         // projection). An *identity* passthrough falls through to the real
-        // column. (Empty `outputs` at FROM-level, so this is a no-op there.)
+        // column. (Empty `query_outputs` at FROM-level, so this is a no-op there.)
         if parts.len() == 1 {
-            if let Some(out) = scope.outputs.iter().find(|o| {
+            if let Some(out) = scope.query_outputs.iter().find(|o| {
                 o.name
                     .as_ref()
                     .is_some_and(|n| self.eq(self.casing.column, n, name))

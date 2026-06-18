@@ -107,10 +107,15 @@ struct CteEnv {
 #[derive(Default)]
 struct Scope {
     relations: Vec<Relation>,
-    /// The enclosing SELECT's output columns, visible to its own GROUP BY /
-    /// HAVING / ORDER BY (clause-alias visibility). Empty at FROM-level
-    /// resolution (WHERE / projection).
-    outputs: Vec<OutputCol>,
+    /// This (sub)query's output columns — the SELECT list's results. Visible by
+    /// name to its own GROUP BY / HAVING / ORDER BY (clause-alias visibility);
+    /// harvested by a parent as a derived table / CTE's exposed columns; and at
+    /// the top level these become the [`ColumnTarget::QueryOutput`] lineage
+    /// targets — hence the name. Empty at FROM-level resolution (WHERE /
+    /// projection), populated once the projection is bound.
+    ///
+    /// [`ColumnTarget::QueryOutput`]: crate::extractor::ColumnTarget::QueryOutput
+    query_outputs: Vec<OutputCol>,
     /// `JOIN … USING (col)` merge-column names: an unqualified reference to one
     /// fans in to every joined relation that could own it.
     merge_columns: Vec<Ident>,
@@ -466,11 +471,11 @@ fn rename_outputs(op: &mut LogicalPlan, names: &[Ident]) {
 /// alias list (`AS d(x, y)`) renames positionally; otherwise each output keeps
 /// its own inferred name (anonymous outputs with no alias are unnameable, so
 /// dropped — they can't be referenced).
-fn exposed_columns(outputs: &[OutputCol], alias: Option<&TableAlias>) -> Vec<Ident> {
+fn exposed_columns(query_outputs: &[OutputCol], alias: Option<&TableAlias>) -> Vec<Ident> {
     let alias_columns: Vec<&Ident> = alias
         .map(|a| a.columns.iter().map(|c| &c.name).collect())
         .unwrap_or_default();
-    outputs
+    query_outputs
         .iter()
         .enumerate()
         .filter_map(|(i, o)| {
