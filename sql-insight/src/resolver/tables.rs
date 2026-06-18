@@ -22,8 +22,8 @@ use crate::reference::{ColumnReference, TableReference};
 /// Every column the statement writes — a DML root's target columns, qualified
 /// by the write target. Order follows source order (the public contract). A
 /// leading `WITH` is peeled. Backs [`crate::resolver::writes`].
-pub(super) fn collect_writes(op: &LogicalPlan) -> Vec<ColumnReference> {
-    match peel_with(op) {
+pub(super) fn collect_writes(plan: &LogicalPlan) -> Vec<ColumnReference> {
+    match peel_with(plan) {
         // INSERT columns, then any ON CONFLICT DO UPDATE SET targets (extra
         // writes on the same relation).
         LogicalPlan::Insert(i) => {
@@ -85,8 +85,8 @@ fn merge_clause_writes(clause: &MergeClause, target: &TableReference) -> Vec<Col
 
 /// Every table the statement writes to — one per DML target. A leading `WITH`
 /// is peeled. Backs [`crate::resolver::table_writes`].
-pub(super) fn collect_table_writes(op: &LogicalPlan) -> Vec<TableReference> {
-    match peel_with(op) {
+pub(super) fn collect_table_writes(plan: &LogicalPlan) -> Vec<TableReference> {
+    match peel_with(plan) {
         LogicalPlan::Insert(i) => vec![i.target.clone()],
         LogicalPlan::Update(u) => vec![u.target.clone()],
         // A DELETE removes rows from each of its targets.

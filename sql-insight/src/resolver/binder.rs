@@ -565,9 +565,9 @@ mod tests {
         build_with_diagnostics(&statements[0], catalog, casing).0
     }
 
-    fn only_binding(op: &LogicalPlan) -> &Binding {
-        let LogicalPlan::Projection(p) = op else {
-            panic!("expected Projection, got {op:?}")
+    fn only_binding(plan: &LogicalPlan) -> &Binding {
+        let LogicalPlan::Projection(p) = plan else {
+            panic!("expected Projection, got {plan:?}")
         };
         match &p.exprs[..] {
             [NamedExpr {

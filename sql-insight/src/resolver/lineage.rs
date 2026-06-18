@@ -25,10 +25,10 @@ use crate::reference::{ColumnReference, TableRead, TableReference};
 /// columns and emits `source → Relation` edges. A leading `WITH` is peeled (its
 /// CTE bodies feed the root through `CteRef` expansion, they are not lineage
 /// roots). Backs [`crate::resolver::column_lineage`].
-pub(super) fn collect_column_lineage(op: &LogicalPlan) -> Vec<ColumnLineageEdge> {
-    let mut ctx = Ctx::new(op);
+pub(super) fn collect_column_lineage(plan: &LogicalPlan) -> Vec<ColumnLineageEdge> {
+    let mut ctx = Ctx::new(plan);
     let mut edges = Vec::new();
-    match peel_with(op) {
+    match peel_with(plan) {
         // INSERT … <source>: pair the source's outputs with the target columns.
         // A statement-level `WITH` rides on the source (the parser attaches it
         // there, so the `With` is *inside* `input`, not above the `Insert`);
@@ -113,7 +113,7 @@ pub(super) fn collect_column_lineage(op: &LogicalPlan) -> Vec<ColumnLineageEdge>
         // A bare query (or unmodelled root): one `QueryOutput` group per
         // projection (a set operation has one per branch — positions restart
         // per branch, mirroring the resolver).
-        _ => query_output_lineage(op, &mut ctx, &mut edges),
+        _ => query_output_lineage(plan, &mut ctx, &mut edges),
     }
     edges
 }
@@ -225,12 +225,12 @@ fn merge_value_edges<'a>(
 /// (projection) subqueries, and referenced CTE bodies — never predicate
 /// (filter) subqueries. A bare query, or a statement that moves no data, has
 /// no table lineage. Backs [`crate::resolver::table_lineage`].
-pub(super) fn collect_table_lineage(op: &LogicalPlan) -> Vec<TableLineageEdge> {
+pub(super) fn collect_table_lineage(plan: &LogicalPlan) -> Vec<TableLineageEdge> {
     // `Ctx::new` peels leading WITHs and keeps their CTE bodies, so a `CteRef`
     // on the feeding path resolves to the body's feeding scans.
-    let mut ctx = Ctx::new(op);
+    let mut ctx = Ctx::new(plan);
     let mut sources = Vec::new();
-    let target = match peel_with(op) {
+    let target = match peel_with(plan) {
         LogicalPlan::Insert(i) => {
             feeding_scans(&i.input, &mut ctx, &mut sources);
             &i.target
@@ -395,8 +395,8 @@ mod tests {
         .0
     }
 
-    fn read_names(op: &LogicalPlan) -> Vec<String> {
-        let mut v: Vec<String> = reads(op)
+    fn read_names(plan: &LogicalPlan) -> Vec<String> {
+        let mut v: Vec<String> = reads(plan)
             .iter()
             .map(|r| match &r.reference.table {
                 Some(t) => format!("{}.{}", t.name.value, r.reference.name.value),
@@ -407,8 +407,8 @@ mod tests {
         v
     }
 
-    fn lineage_strs(op: &LogicalPlan) -> Vec<String> {
-        let mut v: Vec<String> = column_lineage(op)
+    fn lineage_strs(plan: &LogicalPlan) -> Vec<String> {
+        let mut v: Vec<String> = column_lineage(plan)
             .iter()
             .map(|e| {
                 let src = e
