@@ -70,7 +70,7 @@ pub(super) fn origins_of_expr<'a>(
         // The function argument is value; partition / order keys are filter.
         Expr::Window { arg, .. } => transform(origins_of_expr(arg, input, ctx)),
         // A scalar subquery's first output column flows as a transformation.
-        Expr::Subquery(plan) => transform(query_col0_origins(plan, ctx)),
+        Expr::Subquery(plan) => transform(scalar_subquery_origins(plan, ctx)),
         // A merge-column fan-in: each owning side is a `Passthrough` origin.
         Expr::Fanin(refs) => refs
             .iter()
@@ -202,7 +202,7 @@ fn origins_into<'a>(
 
 /// The origins of a (sub)query's first output column (a scalar subquery's
 /// value).
-fn query_col0_origins<'a>(
+fn scalar_subquery_origins<'a>(
     op: &'a LogicalPlan,
     ctx: &mut Ctx<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
@@ -265,7 +265,7 @@ pub(super) fn conflict_value_origins<'a>(
             transform(sources)
         }
         Expr::Window { arg, .. } => transform(conflict_value_origins(arg, columns, source, ctx)),
-        Expr::Subquery(plan) => transform(query_col0_origins(plan, ctx)),
+        Expr::Subquery(plan) => transform(scalar_subquery_origins(plan, ctx)),
         Expr::Fanin(refs) => refs
             .iter()
             .filter_map(|c| column_read(c).map(|r| (r, ColumnLineageKind::Passthrough)))

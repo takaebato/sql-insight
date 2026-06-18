@@ -13,8 +13,8 @@ use sqlparser::ast::Ident;
 
 use super::logical_plan::{idents_eq, peel_with, Expr, LogicalPlan, MergeClause, NamedExpr};
 use super::origins::{conflict_value_origins, enter_withs, origins_of_expr, output_operands, Ctx};
-use crate::extractor::{ColumnLineageEdge, ColumnTarget, TableLineageEdge};
-use crate::reference::{ColumnReference, TableRead, TableReference};
+use crate::extractor::{ColumnLineageEdge, ColumnLineageKind, ColumnTarget, TableLineageEdge};
+use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference};
 
 // ===== column lineage ====================================================
 
@@ -43,13 +43,11 @@ pub(super) fn collect_column_lineage(plan: &LogicalPlan) -> Vec<ColumnLineageEdg
                     table: Some(i.target.clone()),
                     name: a.target.clone(),
                 });
-                for (source, kind) in conflict_value_origins(&a.value, &i.columns, src, &mut ctx) {
-                    edges.push(ColumnLineageEdge {
-                        source,
-                        target: target.clone(),
-                        kind,
-                    });
-                }
+                emit_edges(
+                    conflict_value_origins(&a.value, &i.columns, src, &mut ctx),
+                    target,
+                    &mut edges,
+                );
             }
             returning_lineage(&i.returning, &i.input, &mut ctx, &mut edges);
         }
@@ -62,13 +60,11 @@ pub(super) fn collect_column_lineage(plan: &LogicalPlan) -> Vec<ColumnLineageEdg
                     table: Some(u.target.clone()),
                     name: a.target.clone(),
                 });
-                for (source, kind) in origins_of_expr(&a.value, &u.input, &mut ctx) {
-                    edges.push(ColumnLineageEdge {
-                        source,
-                        target: target.clone(),
-                        kind,
-                    });
-                }
+                emit_edges(
+                    origins_of_expr(&a.value, &u.input, &mut ctx),
+                    target,
+                    &mut edges,
+                );
             }
             returning_lineage(&u.returning, &u.input, &mut ctx, &mut edges);
         }
@@ -132,14 +128,27 @@ fn query_output_lineage<'a>(
                 name: ne.name.clone(),
                 position,
             };
-            for (source, kind) in origins_of_expr(&ne.expr, input, ctx) {
-                out.push(ColumnLineageEdge {
-                    source,
-                    target: target.clone(),
-                    kind,
-                });
-            }
+            emit_edges(origins_of_expr(&ne.expr, input, ctx), target, out);
         }
+    }
+}
+
+/// Push one `source → target` edge per traced origin — the shared tail of every
+/// column-lineage producer. Given an expression's already-traced origins (value
+/// sources with their composed [`ColumnLineageKind`]) and a fixed target, emit
+/// the edges. Decouples *how* origins are computed (`origins_of_expr` /
+/// `conflict_value_origins`) from edge construction.
+fn emit_edges(
+    origins: impl IntoIterator<Item = (ColumnRead, ColumnLineageKind)>,
+    target: ColumnTarget,
+    out: &mut Vec<ColumnLineageEdge>,
+) {
+    for (source, kind) in origins {
+        out.push(ColumnLineageEdge {
+            source,
+            target: target.clone(),
+            kind,
+        });
     }
 }
 
@@ -159,13 +168,7 @@ fn relation_lineage<'a>(
                 table: Some(target.clone()),
                 name: target_column.clone(),
             });
-            for (source, kind) in origins_of_expr(&ne.expr, src_input, ctx) {
-                out.push(ColumnLineageEdge {
-                    source,
-                    target: tgt.clone(),
-                    kind,
-                });
-            }
+            emit_edges(origins_of_expr(&ne.expr, src_input, ctx), tgt, out);
         }
     }
 }
@@ -184,13 +187,7 @@ fn returning_lineage<'a>(
             name: ne.name.clone(),
             position,
         };
-        for (source, kind) in origins_of_expr(&ne.expr, input, ctx) {
-            out.push(ColumnLineageEdge {
-                source,
-                target: target.clone(),
-                kind,
-            });
-        }
+        emit_edges(origins_of_expr(&ne.expr, input, ctx), target, out);
     }
 }
 
@@ -208,13 +205,7 @@ fn merge_value_edges<'a>(
         table: Some(target.clone()),
         name: column.clone(),
     });
-    for (src, kind) in origins_of_expr(value, source, ctx) {
-        out.push(ColumnLineageEdge {
-            source: src,
-            target: tgt.clone(),
-            kind,
-        });
-    }
+    emit_edges(origins_of_expr(value, source, ctx), tgt, out);
 }
 
 // ===== table lineage =====================================================
@@ -381,7 +372,6 @@ mod tests {
     use super::super::{column_lineage, reads, table_reads};
     use super::*;
     use crate::casing::IdentifierCasing;
-    use crate::extractor::ColumnLineageKind;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
