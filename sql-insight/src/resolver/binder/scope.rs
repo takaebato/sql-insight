@@ -21,11 +21,11 @@ use sqlparser::ast::{Ident, TableAlias};
 use super::super::logical_plan::Columns;
 use crate::reference::TableReference;
 
-/// A CTE in scope: its name and the output column names it exposes (so a
-/// `FROM cte` reference resolves through them). The body lives once on the
-/// owning `With` node; a reference is a lightweight `CteRef`.
+/// A declared CTE in scope: its name and the output column names it exposes
+/// (so a `FROM cte` reference resolves through them). The body lives once on
+/// the owning `With` node; a reference is a lightweight `CteRef`.
 #[derive(Clone)]
-pub(super) struct CteEnv {
+pub(super) struct CteDecl {
     pub(super) name: Ident,
     pub(super) columns: Vec<Ident>,
 }

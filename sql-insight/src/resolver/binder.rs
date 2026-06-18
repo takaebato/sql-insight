@@ -98,7 +98,7 @@ struct Binder<'a> {
     catalog: Option<&'a Catalog>,
     casing: IdentifierCasing,
     /// CTEs in scope (declaration order, innermost `WITH` last).
-    ctes: Vec<CteEnv>,
+    ctes: Vec<CteDecl>,
     /// Enclosing queries' relations (the correlation stack, outermost first)
     /// that an inner subquery's references fall through to.
     outer: Vec<Vec<Relation>>,
@@ -110,7 +110,7 @@ struct Binder<'a> {
 impl<'a> Binder<'a> {
     /// A child binder with a different CTE environment (sharing catalog /
     /// casing / correlation stack / diagnostics).
-    pub(super) fn with_ctes(&self, ctes: Vec<CteEnv>) -> Binder<'a> {
+    pub(super) fn with_ctes(&self, ctes: Vec<CteDecl>) -> Binder<'a> {
         Binder {
             catalog: self.catalog,
             casing: self.casing,

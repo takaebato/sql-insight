@@ -44,9 +44,9 @@ impl<'a> Binder<'a> {
     pub(super) fn bind_cte(
         &self,
         cte: &SqlCte,
-        env: &[CteEnv],
+        env: &[CteDecl],
         recursive: bool,
-    ) -> (CteEnv, LogicalPlan) {
+    ) -> (CteDecl, LogicalPlan) {
         let name = cte.alias.name.clone();
         let inner_env = if recursive {
             let provisional = match cte.query.body.as_ref() {
@@ -58,7 +58,7 @@ impl<'a> Binder<'a> {
                 _ => Vec::new(),
             };
             let mut e = env.to_vec();
-            e.push(CteEnv {
+            e.push(CteDecl {
                 name: name.clone(),
                 columns: provisional,
             });
@@ -71,7 +71,7 @@ impl<'a> Binder<'a> {
         // An explicit `c (x, y)` column list renames the body's output columns
         // so a reference through the CTE traces to them.
         rename_outputs(&mut plan, &alias_column_names(&cte.alias));
-        (CteEnv { name, columns }, plan)
+        (CteDecl { name, columns }, plan)
     }
 
     /// Bind a query's body, its pipe-operator chain, and trailing ORDER BY (the
