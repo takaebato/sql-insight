@@ -4,13 +4,6 @@
 
 use super::*;
 
-/// One candidate owner of a column reference, with the binding it would
-/// contribute and whether it's a confirmed (catalog-listed) witness.
-struct Candidate {
-    binding: Binding,
-    confirmed: bool,
-}
-
 /// The outcome of matching a written table reference against the catalog.
 pub(super) struct TableMatch {
     pub(super) table: TableReference,
@@ -70,7 +63,7 @@ impl<'a> Binder<'a> {
     /// that collapses to `Ambiguous` — a name owned here doesn't escape).
     fn resolve_in(&self, parts: &[Ident], relations: &[Relation]) -> Option<Binding> {
         let name = parts.last()?;
-        let candidates: Vec<Candidate> = if parts.len() == 1 {
+        let candidates: Vec<Binding> = if parts.len() == 1 {
             relations
                 .iter()
                 .filter_map(|rel| self.unqualified_candidate(rel, name))
@@ -91,30 +84,25 @@ impl<'a> Binder<'a> {
     /// A relation is an unqualified candidate iff it could own `name`: a
     /// `Known` schema must list it (confirmed witness); an `Open` table always
     /// could (suspect).
-    fn unqualified_candidate(&self, rel: &Relation, name: &Ident) -> Option<Candidate> {
+    fn unqualified_candidate(&self, rel: &Relation, name: &Ident) -> Option<Binding> {
         match &rel.source {
             RelSource::Table {
                 table,
                 columns: Columns::Known(cols),
                 ..
-            } => self.list_has(cols, name).then(|| Candidate {
-                binding: base(table, ResolutionKind::Cataloged),
-                confirmed: true,
-            }),
+            } => self
+                .list_has(cols, name)
+                .then(|| base(table, ResolutionKind::Cataloged)),
             RelSource::Table {
                 table,
                 columns: Columns::Open,
                 ..
-            } => Some(Candidate {
-                binding: base(table, ResolutionKind::Inferred),
-                confirmed: false,
-            }),
+            } => Some(base(table, ResolutionKind::Inferred)),
             // A derived relation owns the column iff it exposes it (confirmed
             // witness, like a Known table); the origin traversal collapses it.
-            RelSource::Derived { columns } => self.list_has(columns, name).then_some(Candidate {
-                binding: Binding::Derived,
-                confirmed: true,
-            }),
+            RelSource::Derived { columns } => {
+                self.list_has(columns, name).then_some(Binding::Derived)
+            }
             // A table function's columns are opaque — a bare name is not
             // claimed by it (stays resolvable against real tables).
             RelSource::TableFunction => None,
@@ -131,7 +119,7 @@ impl<'a> Binder<'a> {
         qualifier_parts: &[Ident],
         qualifier_ref: Option<&TableReference>,
         name: &Ident,
-    ) -> Option<Candidate> {
+    ) -> Option<Binding> {
         let qualifier_ok = match &rel.source {
             RelSource::Table { table, .. } if rel.alias.is_none() => {
                 qualifier_ref.is_some_and(|q| self.qualifier_matches_table(q, table))
@@ -149,51 +137,42 @@ impl<'a> Binder<'a> {
                 columns: Columns::Known(cols),
                 ..
             } => {
-                let confirmed = self.list_has(cols, name);
-                let resolution = if confirmed {
+                // A listed column is a `Cataloged` witness; the qualifier still
+                // pins an unlisted one, surfaced `Inferred` (not a witness).
+                let resolution = if self.list_has(cols, name) {
                     ResolutionKind::Cataloged
                 } else {
                     ResolutionKind::Inferred
                 };
-                Some(Candidate {
-                    binding: base(table, resolution),
-                    confirmed,
-                })
+                Some(base(table, resolution))
             }
             RelSource::Table {
                 table,
                 columns: Columns::Open,
                 ..
-            } => Some(Candidate {
-                binding: base(table, ResolutionKind::Inferred),
-                confirmed: false,
-            }),
-            RelSource::Derived { columns } => self.list_has(columns, name).then_some(Candidate {
-                binding: Binding::Derived,
-                confirmed: true,
-            }),
+            } => Some(base(table, ResolutionKind::Inferred)),
+            RelSource::Derived { columns } => {
+                self.list_has(columns, name).then_some(Binding::Derived)
+            }
             // A ref qualified by a table function's alias resolves to it: a
             // `Derived` binding the traversal turns into the synthetic
             // `alias.col` lineage source (dropped from reads).
-            RelSource::TableFunction => Some(Candidate {
-                binding: Binding::Derived,
-                confirmed: true,
-            }),
+            RelSource::TableFunction => Some(Binding::Derived),
         }
     }
 
-    /// Collapse candidates to a [`Binding`]: none → `Unresolved`; one → its
-    /// binding verbatim; several with exactly one confirmed witness → that
-    /// witness, downgraded to `Inferred` (Known-witness-over-Open); otherwise
+    /// Collapse candidate bindings to one: none → `Unresolved`; one → it
+    /// verbatim; several with exactly one confirmed witness → that witness,
+    /// downgraded to `Inferred` (Known-witness-over-Open); otherwise
     /// `Ambiguous`.
-    fn pick(&self, candidates: Vec<Candidate>) -> Binding {
+    fn pick(&self, candidates: Vec<Binding>) -> Binding {
         match candidates.len() {
             0 => Binding::Unresolved,
-            1 => candidates.into_iter().next().unwrap().binding,
+            1 => candidates.into_iter().next().unwrap(),
             _ => {
-                let mut confirmed = candidates.into_iter().filter(|c| c.confirmed);
-                match (confirmed.next(), confirmed.next()) {
-                    (Some(witness), None) => downgrade(witness.binding),
+                let mut witnesses = candidates.into_iter().filter(is_confirmed);
+                match (witnesses.next(), witnesses.next()) {
+                    (Some(witness), None) => downgrade(witness),
                     _ => Binding::Ambiguous,
                 }
             }
@@ -274,4 +253,20 @@ impl<'a> Binder<'a> {
     pub(super) fn eq(&self, fold: CaseFold, a: &Ident, b: &Ident) -> bool {
         fold.normalize(a) == fold.normalize(b)
     }
+}
+
+/// A confirmed witness for the multi-candidate tiebreaker: a catalog-listed
+/// real column (`Cataloged`) or a derived / CTE column the producing query
+/// exposes — as opposed to an `Open`-table suspect (`Inferred`). Candidate
+/// bindings are only ever `Base` or `Derived` (`Unresolved` / `Ambiguous` are
+/// `pick` outcomes, not inputs), so this distinguishes every case.
+fn is_confirmed(binding: &Binding) -> bool {
+    matches!(
+        binding,
+        Binding::Derived
+            | Binding::Base {
+                resolution: ResolutionKind::Cataloged,
+                ..
+            }
+    )
 }
