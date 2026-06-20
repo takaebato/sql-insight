@@ -58,7 +58,7 @@ use super::logical_plan::{
     Cte, CteRef, Delete, Drop, Expr, Filter, Insert, Join, LogicalPlan, Merge, MergeClause,
     NamedExpr, Projection, Scan, SetOp, Sort, SubqueryAlias, TableFunction, Update, Values, With,
 };
-use crate::casing::{CaseFold, IdentifierCasing};
+use crate::casing::{CaseRule, IdentifierCasing};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::reference::{ResolutionKind, TableReference};
@@ -226,7 +226,7 @@ fn fill_query_defaults(written: &TableReference, catalog: &Catalog) -> TableRefe
 
 /// Right-anchored, dialect-cased match of a (default-filled) query reference
 /// against a registered table.
-fn catalog_table_matches(query: &TableReference, table: &CatalogTable, fold: CaseFold) -> bool {
+fn catalog_table_matches(query: &TableReference, table: &CatalogTable, fold: CaseRule) -> bool {
     if fold.normalize(&query.name) != normalize_catalog(table.name_segment(), fold) {
         return false;
     }
@@ -243,7 +243,7 @@ fn catalog_table_matches(query: &TableReference, table: &CatalogTable, fold: Cas
     }
 }
 
-fn normalize_catalog(segment: &str, fold: CaseFold) -> String {
+fn normalize_catalog(segment: &str, fold: CaseRule) -> String {
     fold.normalize(&Ident::with_quote('"', segment))
 }
 

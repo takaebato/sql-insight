@@ -86,9 +86,9 @@ by hand.
 - Identifier matching is dialect-aware (`crate::casing`). The
   extractor derives an `IdentifierCasing` from the `&dyn Dialect`
   (`IdentifierCasing::for_dialect`) and threads it into the binder;
-  comparisons fold through `CaseFold::normalize`. The policy splits by
+  comparisons fold through `CaseRule::normalize`. The policy splits by
   class — `table` (catalog/schema/table), `table_alias` (aliases + CTE
-  / derived / table-function names), `column` — each a `CaseFold`
+  / derived / table-function names), `column` — each a `CaseRule`
   (`Upper` / `Lower` / `Insensitive` / `Sensitive`). Most dialects are
   homogeneous (PG=Lower, ANSI/Snowflake=Upper, DuckDB/SQLite=
   Insensitive); MySQL and BigQuery split (real tables `Sensitive`,

@@ -8,7 +8,7 @@
 //! to decide e.g. whether `Users` and `users` are the same table.
 //!
 //! This folds the (well-surveyed) cross-dialect matrix down to a
-//! [`CaseFold`] per identifier *class*. The six syntactic positions
+//! [`CaseRule`] per identifier *class*. The six syntactic positions
 //! (catalog / schema / table / table-alias / column / column-alias)
 //! collapse to three classes, because every dialect models
 //! catalog / schema / table alike, and column / column-alias alike:
@@ -41,7 +41,7 @@ use sqlparser::dialect::{
 /// instance-specific models (filesystem-dependent, collation-dependent)
 /// are resolved to a concrete choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CaseFold {
+pub(crate) enum CaseRule {
     /// Unquoted → upper-case; quoted → preserved (exact). ANSI /
     /// Oracle / Snowflake / DB2.
     Upper,
@@ -62,17 +62,17 @@ pub(crate) enum CaseFold {
     Sensitive,
 }
 
-impl CaseFold {
+impl CaseRule {
     /// Normalize `ident` to its comparison key under this fold.
     pub(crate) fn normalize(self, ident: &Ident) -> String {
         match self {
-            CaseFold::Upper if ident.quote_style.is_none() => ident.value.to_ascii_uppercase(),
-            CaseFold::Lower if ident.quote_style.is_none() => ident.value.to_ascii_lowercase(),
+            CaseRule::Upper if ident.quote_style.is_none() => ident.value.to_ascii_uppercase(),
+            CaseRule::Lower if ident.quote_style.is_none() => ident.value.to_ascii_lowercase(),
             // Quoted under Upper/Lower → preserved; Sensitive → always
             // preserved regardless of quoting.
-            CaseFold::Upper | CaseFold::Lower | CaseFold::Sensitive => ident.value.clone(),
+            CaseRule::Upper | CaseRule::Lower | CaseRule::Sensitive => ident.value.clone(),
             // Quoting ignored; fold case away.
-            CaseFold::Insensitive => ident.value.to_ascii_lowercase(),
+            CaseRule::Insensitive => ident.value.to_ascii_lowercase(),
         }
     }
 }
@@ -81,15 +81,15 @@ impl CaseFold {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IdentifierCasing {
     /// catalog / schema / table names.
-    pub(crate) table: CaseFold,
+    pub(crate) table: CaseRule,
     /// Table aliases and CTE / derived / table-function names.
-    pub(crate) table_alias: CaseFold,
+    pub(crate) table_alias: CaseRule,
     /// Column names and column aliases.
-    pub(crate) column: CaseFold,
+    pub(crate) column: CaseRule,
 }
 
 impl IdentifierCasing {
-    const fn uniform(fold: CaseFold) -> Self {
+    const fn uniform(fold: CaseRule) -> Self {
         Self {
             table: fold,
             table_alias: fold,
@@ -98,7 +98,7 @@ impl IdentifierCasing {
     }
 
     /// Map a parsed dialect to its default casing. Unrecognised
-    /// dialects fall back to the generic policy ([`CaseFold::Lower`]
+    /// dialects fall back to the generic policy ([`CaseRule::Lower`]
     /// everywhere), which preserves the resolver's historical
     /// behaviour.
     ///
@@ -106,18 +106,18 @@ impl IdentifierCasing {
     /// (SQL Server) models can't be known from the dialect alone, so
     /// they resolve to a fixed default here: SQL Server to the common
     /// case-insensitive collation, MySQL table names to the
-    /// false-merge-avoiding [`CaseFold::Sensitive`]. A future override
+    /// false-merge-avoiding [`CaseRule::Sensitive`]. A future override
     /// API can refine these per deployment.
     pub(crate) fn for_dialect(dialect: &dyn Dialect) -> Self {
         if dialect.is::<PostgreSqlDialect>() || dialect.is::<RedshiftSqlDialect>() {
-            Self::uniform(CaseFold::Lower)
+            Self::uniform(CaseRule::Lower)
         } else if dialect.is::<AnsiDialect>()
             || dialect.is::<SnowflakeDialect>()
             || dialect.is::<OracleDialect>()
         {
             // Oracle folds nonquoted identifiers to upper-case and keeps
             // quoted ones case-sensitive — the ANSI rule.
-            Self::uniform(CaseFold::Upper)
+            Self::uniform(CaseRule::Upper)
         } else if dialect.is::<DuckDbDialect>()
             || dialect.is::<SQLiteDialect>()
             || dialect.is::<HiveDialect>()
@@ -126,16 +126,16 @@ impl IdentifierCasing {
             // Hive and Databricks / Spark SQL resolve identifiers
             // case-insensitively by default (`spark.sql.caseSensitive`
             // defaults to false).
-            Self::uniform(CaseFold::Insensitive)
+            Self::uniform(CaseRule::Insensitive)
         } else if dialect.is::<MsSqlDialect>() {
             // Default install collation is case-insensitive (e.g.
             // `*_CI_AS`); a CS collation would flip every class.
-            Self::uniform(CaseFold::Insensitive)
+            Self::uniform(CaseRule::Insensitive)
         } else if dialect.is::<ClickHouseDialect>() {
             // All identifiers — database / table / column and aliases —
             // are case-sensitive (aliases are identifiers too); quoting
             // handles special characters, not case.
-            Self::uniform(CaseFold::Sensitive)
+            Self::uniform(CaseRule::Sensitive)
         } else if dialect.is::<MySqlDialect>() {
             // Table names are filesystem-dependent (Unix CS / Win-mac
             // CI) → Sensitive fallback (avoid merging distinct stored
@@ -145,29 +145,29 @@ impl IdentifierCasing {
             // lenient Insensitive rather than introduce a phantom
             // reference. Columns are definitively CI.
             Self {
-                table: CaseFold::Sensitive,
-                table_alias: CaseFold::Insensitive,
-                column: CaseFold::Insensitive,
+                table: CaseRule::Sensitive,
+                table_alias: CaseRule::Insensitive,
+                column: CaseRule::Insensitive,
             }
         } else if dialect.is::<BigQueryDialect>() {
             // Tables case-sensitive, but aliases and columns are
             // case-insensitive.
             Self {
-                table: CaseFold::Sensitive,
-                table_alias: CaseFold::Insensitive,
-                column: CaseFold::Insensitive,
+                table: CaseRule::Sensitive,
+                table_alias: CaseRule::Insensitive,
+                column: CaseRule::Insensitive,
             }
         } else {
             // GenericDialect and anything unrecognised: preserve the
             // resolver's historical lower-fold behaviour.
-            Self::uniform(CaseFold::Lower)
+            Self::uniform(CaseRule::Lower)
         }
     }
 }
 
 impl Default for IdentifierCasing {
     fn default() -> Self {
-        Self::uniform(CaseFold::Lower)
+        Self::uniform(CaseRule::Lower)
     }
 }
 
@@ -185,7 +185,7 @@ mod tests {
 
     /// Two identifiers match under `fold` iff their normalized keys
     /// are equal.
-    fn matches(fold: CaseFold, a: &Ident, b: &Ident) -> bool {
+    fn matches(fold: CaseRule, a: &Ident, b: &Ident) -> bool {
         fold.normalize(a) == fold.normalize(b)
     }
 
@@ -203,7 +203,7 @@ mod tests {
     /// | `"Users"` | `"users"` | ✗     | ✗     | ✓           | ✗         |
     #[test]
     fn quoting_matrix() {
-        use CaseFold::{Insensitive, Lower, Sensitive, Upper};
+        use CaseRule::{Insensitive, Lower, Sensitive, Upper};
 
         // (binding, reference) → [Upper, Lower, Insensitive, Sensitive]
         let cases: &[(Ident, Ident, [bool; 4])] = &[
@@ -264,14 +264,14 @@ mod tests {
     #[test]
     fn per_segment_quoting_is_independent() {
         // Under Lower: quoted segment preserved, unquoted folded.
-        assert_eq!(CaseFold::Lower.normalize(&quoted("Schema")), "Schema");
-        assert_eq!(CaseFold::Lower.normalize(&unquoted("Table")), "table");
+        assert_eq!(CaseRule::Lower.normalize(&quoted("Schema")), "Schema");
+        assert_eq!(CaseRule::Lower.normalize(&unquoted("Table")), "table");
         // Under Sensitive: quoting ignored, both preserved.
-        assert_eq!(CaseFold::Sensitive.normalize(&quoted("Schema")), "Schema");
-        assert_eq!(CaseFold::Sensitive.normalize(&unquoted("Table")), "Table");
+        assert_eq!(CaseRule::Sensitive.normalize(&quoted("Schema")), "Schema");
+        assert_eq!(CaseRule::Sensitive.normalize(&unquoted("Table")), "Table");
         // Under Insensitive: quoting ignored, both folded.
-        assert_eq!(CaseFold::Insensitive.normalize(&quoted("Schema")), "schema");
-        assert_eq!(CaseFold::Insensitive.normalize(&unquoted("Table")), "table");
+        assert_eq!(CaseRule::Insensitive.normalize(&quoted("Schema")), "schema");
+        assert_eq!(CaseRule::Insensitive.normalize(&unquoted("Table")), "table");
     }
 
     /// `for_dialect` maps every recognised dialect to its
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn dialect_casing_matrix() {
         use sqlparser::dialect::GenericDialect;
-        use CaseFold::{Insensitive, Lower, Sensitive, Upper};
+        use CaseRule::{Insensitive, Lower, Sensitive, Upper};
 
         let uniform = |fold| IdentifierCasing {
             table: fold,

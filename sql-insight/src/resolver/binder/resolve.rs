@@ -250,7 +250,7 @@ impl<'a> Binder<'a> {
             .collect()
     }
 
-    pub(super) fn eq(&self, fold: CaseFold, a: &Ident, b: &Ident) -> bool {
+    pub(super) fn eq(&self, fold: CaseRule, a: &Ident, b: &Ident) -> bool {
         fold.normalize(a) == fold.normalize(b)
     }
 }
@@ -396,10 +396,10 @@ mod tests {
         let qualifier = tref(None, None, "Users");
         let table = tref(None, None, "users");
         for (fold, expected) in [
-            (CaseFold::Upper, true),
-            (CaseFold::Lower, true),
-            (CaseFold::Insensitive, true),
-            (CaseFold::Sensitive, false),
+            (CaseRule::Upper, true),
+            (CaseRule::Lower, true),
+            (CaseRule::Insensitive, true),
+            (CaseRule::Sensitive, false),
         ] {
             let diagnostics = RefCell::new(Vec::new());
             // Only the `table` fold matters for qualifier matching.
@@ -608,15 +608,15 @@ mod tests {
         };
 
         // (fold, query, expected match)
-        let cases: &[(CaseFold, &TableReference, bool)] = &[
-            (CaseFold::Upper, &unquoted, false),
-            (CaseFold::Upper, &quoted, true),
-            (CaseFold::Lower, &unquoted, false),
-            (CaseFold::Lower, &quoted, true),
-            (CaseFold::Sensitive, &unquoted, false),
-            (CaseFold::Sensitive, &quoted, true),
-            (CaseFold::Insensitive, &unquoted, true),
-            (CaseFold::Insensitive, &quoted, true),
+        let cases: &[(CaseRule, &TableReference, bool)] = &[
+            (CaseRule::Upper, &unquoted, false),
+            (CaseRule::Upper, &quoted, true),
+            (CaseRule::Lower, &unquoted, false),
+            (CaseRule::Lower, &quoted, true),
+            (CaseRule::Sensitive, &unquoted, false),
+            (CaseRule::Sensitive, &quoted, true),
+            (CaseRule::Insensitive, &unquoted, true),
+            (CaseRule::Insensitive, &quoted, true),
         ];
 
         for (fold, query, expected) in cases {
@@ -649,15 +649,15 @@ mod tests {
         let quoted = Ident::with_quote('"', "Name");
 
         // (column fold, query, expected match)
-        let cases: &[(CaseFold, &Ident, bool)] = &[
-            (CaseFold::Upper, &unquoted, false),
-            (CaseFold::Upper, &quoted, true),
-            (CaseFold::Lower, &unquoted, false),
-            (CaseFold::Lower, &quoted, true),
-            (CaseFold::Sensitive, &unquoted, false),
-            (CaseFold::Sensitive, &quoted, true),
-            (CaseFold::Insensitive, &unquoted, true),
-            (CaseFold::Insensitive, &quoted, true),
+        let cases: &[(CaseRule, &Ident, bool)] = &[
+            (CaseRule::Upper, &unquoted, false),
+            (CaseRule::Upper, &quoted, true),
+            (CaseRule::Lower, &unquoted, false),
+            (CaseRule::Lower, &quoted, true),
+            (CaseRule::Sensitive, &unquoted, false),
+            (CaseRule::Sensitive, &quoted, true),
+            (CaseRule::Insensitive, &unquoted, true),
+            (CaseRule::Insensitive, &quoted, true),
         ];
 
         for (fold, query, expected) in cases {
