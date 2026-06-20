@@ -270,3 +270,148 @@ fn is_confirmed(binding: &Binding) -> bool {
             }
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal `Binder` over a borrowed diagnostics sink — only its `casing`
+    /// matters here (`qualifier_matches_table` ignores catalog / ctes / outer).
+    fn binder<'a>(
+        diagnostics: &'a RefCell<Vec<ColumnLevelDiagnostic>>,
+        casing: IdentifierCasing,
+    ) -> Binder<'a> {
+        Binder {
+            catalog: None,
+            casing,
+            ctes: Vec::new(),
+            outer: Vec::new(),
+            diagnostics,
+        }
+    }
+
+    /// Build a table reference from optional `catalog` / `schema` segments.
+    fn tref(catalog: Option<&str>, schema: Option<&str>, name: &str) -> TableReference {
+        TableReference {
+            catalog: catalog.map(Ident::new),
+            schema: schema.map(Ident::new),
+            name: Ident::new(name),
+        }
+    }
+
+    /// Right-anchored qualifier matching: a `qualifier` matches a `table` when
+    /// the `name` segments are equal and each of `schema` / `catalog` is equal
+    /// **or absent on either side** (an omitted segment is a wildcard). Folding
+    /// is the dialect's table case — here `Lower` over lowercase idents, so a
+    /// no-op; the quoting / casing matrix lives in [`crate::casing`].
+    ///
+    /// | qualifier          | table              | matches |
+    /// |--------------------|--------------------|---------|
+    /// | `users`            | `users`            | ✓       |
+    /// | `users`            | `public.users`     | ✓       |
+    /// | `users`            | `db.public.users`  | ✓       |
+    /// | `public.users`     | `public.users`     | ✓       |
+    /// | `public.users`     | `users`            | ✓       |
+    /// | `public.users`     | `other.users`      | ✗       |
+    /// | `db.public.users`  | `db.public.users`  | ✓       |
+    /// | `db.public.users`  | `public.users`     | ✓       |
+    /// | `db1.public.users` | `db2.public.users` | ✗       |
+    /// | `orders`           | `users`            | ✗       |
+    /// | `public.orders`    | `public.users`     | ✗       |
+    #[test]
+    fn right_anchored_qualifier_matrix() {
+        let diagnostics = RefCell::new(Vec::new());
+        let binder = binder(&diagnostics, IdentifierCasing::default());
+
+        // (qualifier, table, expected)
+        let cases: &[(TableReference, TableReference, bool)] = &[
+            (tref(None, None, "users"), tref(None, None, "users"), true),
+            (
+                tref(None, None, "users"),
+                tref(None, Some("public"), "users"),
+                true,
+            ),
+            (
+                tref(None, None, "users"),
+                tref(Some("db"), Some("public"), "users"),
+                true,
+            ),
+            (
+                tref(None, Some("public"), "users"),
+                tref(None, Some("public"), "users"),
+                true,
+            ),
+            // over-qualified ref vs barer table: the table's absent schema is a wildcard.
+            (
+                tref(None, Some("public"), "users"),
+                tref(None, None, "users"),
+                true,
+            ),
+            // both schemas present and differ: contradiction.
+            (
+                tref(None, Some("public"), "users"),
+                tref(None, Some("other"), "users"),
+                false,
+            ),
+            (
+                tref(Some("db"), Some("public"), "users"),
+                tref(Some("db"), Some("public"), "users"),
+                true,
+            ),
+            (
+                tref(Some("db"), Some("public"), "users"),
+                tref(None, Some("public"), "users"),
+                true,
+            ),
+            // catalogs both present and differ: contradiction.
+            (
+                tref(Some("db1"), Some("public"), "users"),
+                tref(Some("db2"), Some("public"), "users"),
+                false,
+            ),
+            // name differs: never matches, regardless of qualifier.
+            (tref(None, None, "orders"), tref(None, None, "users"), false),
+            (
+                tref(None, Some("public"), "orders"),
+                tref(None, Some("public"), "users"),
+                false,
+            ),
+        ];
+
+        for (qualifier, table, expected) in cases {
+            assert_eq!(
+                binder.qualifier_matches_table(qualifier, table),
+                *expected,
+                "{qualifier:?} vs {table:?}"
+            );
+        }
+    }
+
+    /// The match folds each segment by the dialect's *table* case, so an
+    /// unquoted `Users` qualifier matches a `users` table under `Upper` /
+    /// `Lower`, but not under `Sensitive` (the false-merge-avoiding fold).
+    #[test]
+    fn matching_applies_the_table_fold() {
+        let qualifier = tref(None, None, "Users");
+        let table = tref(None, None, "users");
+        for (fold, expected) in [
+            (CaseFold::Upper, true),
+            (CaseFold::Lower, true),
+            (CaseFold::Insensitive, true),
+            (CaseFold::Sensitive, false),
+        ] {
+            let diagnostics = RefCell::new(Vec::new());
+            // Only the `table` fold matters for qualifier matching.
+            let casing = IdentifierCasing {
+                table: fold,
+                ..IdentifierCasing::default()
+            };
+            let binder = binder(&diagnostics, casing);
+            assert_eq!(
+                binder.qualifier_matches_table(&qualifier, &table),
+                expected,
+                "fold {fold:?}"
+            );
+        }
+    }
+}
