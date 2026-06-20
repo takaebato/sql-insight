@@ -19,57 +19,70 @@ by hand.
 
 - The private `resolver` module is the analysis engine: it binds a
   `Statement` into a **materialized, full-stack bound logical-plan
-  tree** (`ir::Plan`) and walks that tree for the extraction surfaces.
-  It is *not* an execution plan — nothing optimizes or runs SQL. (An
-  earlier design built this as an incubating `plan` module beside a
-  flat-buffer resolver; at parity it took over the `resolver` name, so
-  the module is `resolver` but its output type is `Plan`.) Sub-modules:
-  - `ir` — the persistent operator-tree types.
+  tree** (`logical_plan::LogicalPlan`) and walks that tree for the
+  extraction surfaces. It is *not* an execution plan — nothing
+  optimizes or runs SQL. `resolver.rs` is the **facade**: `build` plus
+  the seven free-function surfaces (`reads` / `table_reads` / `writes`
+  / `table_writes` / `column_lineage` / `table_lineage` /
+  `flat_tables`), each a thin entry delegating to a concern submodule
+  (so `LogicalPlan` stays plain data — extraction is a pass *over* the
+  tree, not a method *on* it). Sub-modules:
+  - `logical_plan` — the bound operator-tree types (the `LogicalPlan`
+    enum + its node structs) and the shared tree-navigation helpers
+    (`own_exprs` / `children` / `own_expr_subplans` / `peel_with` /
+    `idents_eq`) every extraction walker uses.
   - `binder` — `build_with_diagnostics(stmt, catalog, casing) ->
-    (Option<Plan>, Vec<ColumnLevelDiagnostic>)`, the bind pass
-    (AST → resolved `Plan`); plus the bind-time `Scope` / `Relation`
-    scratch and the `ExprCollector` value/filter splitter.
-  - `extract` — walk a `Plan` for `reads` / `writes` / `lineage`
-    (column + table) and the legacy flat table list.
-  - `operation` / `table_operation` — assemble the public
-    `ColumnOperation` / `TableOperation` (and the flat list) from a
-    `Plan`, using `classify_statement` for the verb and projecting
-    column-level diagnostics down to the table level.
-- `ir::Plan` variants: `Scan` (named real-table leaf, carrying
-  `resolution: ResolutionKind` and `role: ScanRole {Read,Write}`),
-  `OpaqueLeaf` (VALUES / table function / unmodelled leaf, no
-  columns), `PassThrough` (join **and** every filter — output is the
-  identity concat of inputs; `reads` are predicate columns; filter
-  subqueries hang on `subqueries`, non-feeding), `Project` (the only
-  column-defining producer — `outputs: Vec<BoundColumn>`; value
-  subqueries on `subqueries`, feeding), `SetOp` (positional fan-in),
-  `Write` (INSERT / UPDATE / MERGE / CTAS / CREATE VIEW / ALTER —
-  `target` + `target_columns` + source `input` + `returning` +
-  `conflict_updates`), `Delete` (multi-target `DeletePlan`), `Drop`
-  (DROP / TRUNCATE relations), `With` + `CteRef` (shared-node CTE
-  model — a CTE body is bound once at the `With` and referenced by a
-  lightweight `CteRef`, so reads count once and an unreferenced CTE
-  still counts).
-- **Provenance is pre-collapsed bottom-up.** Each `BoundColumn`
-  carries `provenance: Vec<ProvenanceSource>`, already resolved to
-  real base columns, each with its composed `ColumnLineageKind`.
-  A `ProvenanceSource` reached *through* a synthetic step (derived /
-  CTE column, output alias, scalar subquery output) is marked
-  `synthetic_origin`: it stays a lineage source (the collapsed base
-  column) but is excluded from `reads` (its physical read was already
-  counted at the inner producer). So extraction is a pure walk.
-- The bind-time `Scope` (`Vec<Relation>` + `outputs` + `merge_columns`)
-  is **scratch** — threaded bottom-up (`bind_* -> (Plan, Scope)`),
-  never stored on the tree. A `Relation` is `{alias, source:
-  RelationSource}` where source is `Table {table, columns:
-  RelationColumns}` / `Derived {columns}` (synthetic) / `TableFunction`
-  (opaque synthetic). Correlation reaches enclosing scopes via the
-  binder's `outer_scopes` stack.
-- The binder takes an optional `&dyn Catalog`. With a catalog, a
-  matched table's columns are `Known` and column resolution is strict
-  (typos → `table: None` / `ResolutionKind::Unresolved`; multi-hit →
-  `Ambiguous`); catalog-free, columns are `Open` and resolved reads
-  are `Inferred`.
+    (LogicalPlan, Vec<ColumnLevelDiagnostic>)`, the bind pass
+    (AST → resolved `LogicalPlan`). Split by concern into
+    `binder/{statement, query, expr, resolve}` (each an `impl Binder`
+    block) over the shared `binder/scope` model (`Scope` / `Relation` /
+    `OutputCol` / `CteDecl`); the root holds the `Binder` context and
+    the plan- / AST-construction helpers.
+  - `reads` / `origins` / `lineage` / `tables` — the extraction walkers
+    backing the facade. `origins` is the `getColumnOrigins`-style value
+    trace that `lineage` builds on; `tables` covers the write surfaces
+    and the legacy flat list. `classify_statement` (in `extractor`)
+    supplies the verb; column-level diagnostics project down to the
+    table level via `ColumnLevelDiagnostic::to_table_level`.
+- `LogicalPlan` is a **standard relational-algebra tree** — recognizable
+  to anyone who knows logical plans. Query operators: `Scan` (named
+  real-table leaf, carrying `columns: Columns` and `resolution:
+  ResolutionKind`), `Filter` (WHERE / HAVING / any non-feeding predicate
+  reads), `Join`, `Aggregate` (GROUP BY keys), `Projection` (the only
+  column-defining producer — `exprs: Vec<NamedExpr>`), `Sort` (ORDER BY
+  keys), `SetOp` (positional fan-in), `SubqueryAlias` (a named derived
+  table), `TableFunction` (opaque dynamic-column leaf), `Values`,
+  `With` + `Cte` + `CteRef` (shared-node CTE model — a CTE body is bound
+  once on the `With` and referenced by a lightweight `CteRef`, so reads
+  count once and an unreferenced CTE still counts), `Empty`; plus
+  distinct DML / DDL roots `Insert` / `Update` / `Delete` / `Merge` /
+  `CreateTableAs` / `CreateView` / `AlterTable` / `Drop`. The clause
+  stack is canonical: `Scan → Filter(WHERE) → Aggregate(GROUP BY) →
+  Filter(HAVING) → Projection → Sort(ORDER BY)`.
+- **Lineage is traced at walk time, not pre-collapsed.** A resolved
+  column reference on the tree is a `BoundColumn { qualifier, name,
+  binding }`; `binding: Binding` is `Base { table, resolution }` /
+  `Derived` / `Unresolved` / `Ambiguous`. The `origins` walk collapses
+  a `Derived` reference to its real base columns *lazily*, tracing into
+  the producing `Projection` / `CteRef` / `SubqueryAlias` and composing
+  the `ColumnLineageKind` end-to-end; `reads` drops `Derived` (its
+  physical read was counted at the inner producer). So extraction is a
+  pure walk of a clean tree — no provenance is baked onto the nodes.
+- The bind-time `Scope` (`relations: Vec<Relation>` + `query_outputs` +
+  `merge_columns`) is **scratch** — threaded bottom-up (`bind_* ->
+  (LogicalPlan, Scope)`), never stored on the tree, with its operations
+  as `Scope` methods (`single` / `from_relations` / `absorb` /
+  `add_merge_columns` / `with_query_outputs` / `exposed_columns`). A
+  `Relation` is an enum: `Table { alias, table, columns }` / `Derived
+  { alias, columns }` (synthetic) / `TableFunction { alias }` (opaque
+  synthetic). Correlation reaches enclosing scopes via the binder's
+  `outer` stack; CTEs in scope live on the binder's `ctes`
+  (`Vec<CteDecl>`).
+- The binder takes an optional `&Catalog`. With a catalog, a matched
+  table's columns are `Columns::Cataloged` and column resolution is
+  strict (typos → `table: None` / `ResolutionKind::Unresolved`;
+  multi-hit → `Ambiguous`); catalog-free, columns are `Columns::Unknown`
+  and resolved reads are `Inferred`.
 - Identifier matching is dialect-aware (`crate::casing`). The
   extractor derives an `IdentifierCasing` from the `&dyn Dialect`
   (`IdentifierCasing::for_dialect`) and threads it into the binder;
@@ -87,7 +100,7 @@ by hand.
 - **Catalog canonicalization**: `table_match` rewrites a uniquely
   matched reference to its registered full `catalog.schema.name` path,
   so a bare `users` and an explicit `public.users` agree. Write
-  targets canonicalize too (`canonical_target`). Without a catalog —
+  targets canonicalize too (same `table_match` path). Without a catalog —
   or on a miss / ambiguous match — the reference stays as written, so
   `mydb.users` and `otherdb.users` stay distinct and a bare `users`
   does not merge into `mydb.users`. Column resolution is
@@ -184,10 +197,13 @@ by hand.
   `reads` but not `lineage`.
 - `StatementKind` — the verb of the statement; combined with the
   `reads` / `writes` split recovers every granularity distinction.
-- Internal-only `ScanRole` (Read / Write) lives on `ir::Scan` to mark
-  a write-target scan (kept in scope for resolution, skipped from
-  reads). It is not exposed via the public API — surface it through
-  `reads` / `writes` instead.
+- A DML target is **not a `Scan`** in the tree — it's named on the DML
+  root (`Insert.target` / `Update.target` / `Merge.target` / …), and the
+  root's `input` carries only the *read* relations. So a write target
+  never lands in `reads` by construction (there is no scan-role flag to
+  skip); it surfaces only through `writes` / `table_writes`. Its columns
+  are still bound — for resolving SET / WHERE / RETURNING — via a scratch
+  target `Scope` that is then discarded.
 - `TableReference` is identity-only (`catalog` / `schema` / `name`).
   Alias is a use-site decoration, not part of a table's identity,
   so `HashSet<TableReference>` dedup and cross-statement comparison
@@ -208,11 +224,11 @@ by hand.
 - `ResolutionKind` (`Cataloged` / `Inferred` / `Ambiguous` /
   `Unresolved`) records *how* a `ColumnRead` / `TableRead` resolved,
   not the SQL's
-  correctness. `Cataloged` means a `Known` schema (catalog or CTE /
-  derived body) positively confirmed the reference; `Inferred` means
+  correctness. `Cataloged` means a known column list (a catalog table, or
+  a CTE / derived body) positively confirmed the reference; `Inferred` means
   the binder adopted a candidate without firm evidence (catalog-less
-  mode, qualifier-only resolution, or Known-witness-over-Open-suspects
-  tiebreaker). `Ambiguous` / `Unresolved` are the two failure modes —
+  mode, qualifier-only resolution, or the
+  `Cataloged`-witness-over-`Unknown`-suspect tiebreaker). `Ambiguous` / `Unresolved` are the two failure modes —
   both come with `table: None` on a `ColumnRead` (`Unresolved` is
   columns-only). At table granularity the reference is always present,
   so a `TableRead` can be `Ambiguous` (the catalog matched several
@@ -246,17 +262,22 @@ by hand.
     fused bind+collapse pass would suffice; the tree is the price of that
     breadth, paid once and discarded (it is not an execution plan, nothing
     optimizes or reuses it).
-- **Bind returns `(Plan, Scope)`** bottom-up; the `Scope` is scratch
-  (current frame = the subtree's output relations + introduced
-  outputs; enclosing frames via `outer_scopes` for correlation). Don't
-  push caller state into the binder via flag bags — use scoped helpers.
-- **Value vs filter** is decided at bind time by `ExprCollector`
-  (`sources` / `value_subplans` feed lineage; `filter_reads` /
-  `filter_subplans` don't), with `suppressed(|c| …)` forcing filter
-  position inside a `CASE` condition / `EXISTS` / `IN` / `ANY` / `ALL`
-  / window key. The split is then **structural** in the tree: value
-  subqueries sit on `Project.subqueries` (feeding), filter subqueries
-  on a non-feeding `PassThrough` — so the extraction walk needs no tag.
+- **Bind returns `(LogicalPlan, Scope)`** bottom-up; the `Scope` is
+  scratch (current frame = the subtree's relations + introduced
+  `query_outputs`; enclosing frames via the binder's `outer` stack for
+  correlation). Don't push caller state into the binder via flag bags —
+  spawn a child binder (`with_ctes` / `with_outer`) and thread the
+  `Scope`.
+- **Value vs filter** is decided at bind time and made **structural** in
+  the `Expr` it lowers to: a value operand becomes `Expr::Call` /
+  `Expr::Window` `arg` / a scalar `Expr::Subquery` (the `origins` trace
+  follows these), while a filter operand is bucketed into `Expr::Filter`
+  (the `suppress` helper) or is a construct's filter slot (a `CASE`
+  `when`, a window `partition` / `order` key, `Expr::Exists` /
+  `Expr::InSubquery`). The clause split is structural too — WHERE /
+  HAVING are `Filter` nodes, the SELECT list is the `Projection`. So the
+  extraction walk needs no clause tag: `reads` walks every column,
+  `origins` follows only the value operands.
 - Wildcards (`SELECT *`, `t.*`) are not expanded at the parser
   level — even with a catalog. The rigor cost (USING / NATURAL JOIN
   merge, EXCLUDE / REPLACE / RENAME clauses, CTE column rename,
@@ -288,7 +309,7 @@ by hand.
   single owner, so an unqualified ref to `a` resolves to *every* joined
   relation that could own it — one read / lineage source per side, not
   an ambiguous `table: None`. Mechanism: the binder records the USING
-  names on `Scope::merge_columns`; `resolve_ref`, for an unqualified
+  names on `Scope::merge_columns`; `merge_fanin`, for an unqualified
   merge-column ref, fans in to each scope relation that could own it —
   a catalog narrows the fan-in to declaring relations (`Cataloged`),
   catalog-free reaches every joined relation (`Inferred`). Qualified
@@ -318,8 +339,8 @@ by hand.
   unscannable.
 - Keep `sqlparser-rs` AST `match` arms exhaustive in the binder
   and extractors — wildcard arms silently hide newly added variants.
-  Likewise keep the `match plan { … }` arms over `ir::Plan` exhaustive
-  in `extract`.
+  Likewise keep the `match` arms over `LogicalPlan` exhaustive in the
+  extraction walkers (`reads` / `origins` / `lineage` / `tables`).
 - Public enums are **exhaustive (no `#[non_exhaustive]`) while pre-1.0**
   (`StatementKind` / `ColumnLineageKind` / `ColumnTarget` /
   `ResolutionKind` / `TableLevelDiagnosticKind` /
@@ -334,13 +355,15 @@ by hand.
   per-reference resolution outcomes. `TableLevelDiagnostic` carries
   `UnsupportedStatement` and `TooManyTableQualifiers` (an
   over-qualified, >`catalog.schema.name`, table name that's dropped);
-  `ColumnLevelDiagnostic` is the superset, adding `WildcardSuppressed`.
-  The binder produces the column-level set; table-level surfaces
-  project it down via `ColumnLevelDiagnostic::to_table_level`
-  (exhaustive match, so a new column kind forces a table-level
-  decision — `WildcardSuppressed` maps to `None`). Per-occurrence
-  resolution status (ambiguous / unresolved column refs) lives on
-  `ColumnRead::resolution`, not in a parallel diagnostic stream.
+  `ColumnLevelDiagnostic` is the superset, adding `WildcardSuppressed`
+  and `InsertColumnsUnresolved` (a column-list-less INSERT / MERGE-INSERT
+  whose target columns can't be filled without a catalog). The binder
+  produces the column-level set; table-level surfaces project it down
+  via `ColumnLevelDiagnostic::to_table_level` (exhaustive match, so a new
+  column kind forces a table-level decision — `WildcardSuppressed` and
+  `InsertColumnsUnresolved` both map to `None`, being column-only gaps).
+  Per-occurrence resolution status (ambiguous / unresolved column refs)
+  lives on `ColumnRead::resolution`, not in a parallel diagnostic stream.
 - For unsupported SQL, accumulate diagnostics instead of `?`-bailing
   mid-walk. Reserve hard errors for genuinely unrecoverable
   conditions.

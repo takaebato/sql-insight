@@ -102,9 +102,9 @@ pub struct ColumnRead {
 /// `(table, name)` placement?".
 ///
 /// Catalog-less mode runs as an *inference mode*: every real-table
-/// binding's schema is `Unknown`, so a single-candidate resolution
+/// binding's schema is unknown, so a single-candidate resolution
 /// is best-effort, not catalog-backed. CTE and derived bodies do carry
-/// `Known` schemas (the resolver derives them from the body's
+/// known schemas (the resolver derives them from the body's
 /// projection), but those refs are synthetic and dropped from the
 /// public reads / lineage by the resolver's post-pass.
 ///
@@ -116,30 +116,30 @@ pub struct ColumnRead {
 /// # Invariants
 ///
 /// - **Catalog-less mode → no public `Cataloged`**: every surviving
-///   non-synthetic ref points at an `Unknown` real table, so the
+///   non-synthetic ref points at an unknown real table, so the
 ///   strongest claim the resolver can make is
 ///   [`Inferred`](Self::Inferred). Catalog-aware analysis is
 ///   therefore detectable by the presence of `Cataloged`.
 /// - **Catalog-aware mode does not imply `Cataloged`**: catalogs are
 ///   often partial. Refs against tables the catalog doesn't cover,
-///   or against a real `Unknown` table that won a multi-candidate
-///   tiebreaker over `Known` ones, both still come back as
+///   or against a real unknown table that won a multi-candidate
+///   tiebreaker over known ones, both still come back as
 ///   [`Inferred`](Self::Inferred).
 ///
 /// # How each variant arises
 ///
 /// | Situation | ResolutionKind |
 /// |---|---|
-/// | catalog-less, real `Unknown` table, sole candidate | [`Inferred`](Self::Inferred) |
-/// | catalog-less, two real `Unknown` tables in scope | [`Ambiguous`](Self::Ambiguous) |
-/// | catalog-less, CTE `Known` body confirms the column | (internal `Cataloged`; synthetic, dropped) |
-/// | catalog-less, CTE `Known` body denies the column (`SELECT typo FROM cte` where cte = `[id]`) | [`Unresolved`](Self::Unresolved) |
-/// | catalog-aware, `Known` binding lists the column | [`Cataloged`](Self::Cataloged) |
-/// | catalog-aware, `Known` binding *doesn't* list the column | [`Unresolved`](Self::Unresolved) |
-/// | catalog-aware, one `Known` confirms + one `Unknown` suspect (Known-witness-over-Unknown-suspects) | [`Inferred`](Self::Inferred) |
-/// | catalog-aware, two or more `Known` schemas confirm | [`Ambiguous`](Self::Ambiguous) |
-/// | qualified `t.col` where `t` is `Unknown` | [`Inferred`](Self::Inferred) |
-/// | qualified `t.col` where `t` is `Known` and lists `col` | [`Cataloged`](Self::Cataloged) |
+/// | catalog-less, real unknown table, sole candidate | [`Inferred`](Self::Inferred) |
+/// | catalog-less, two real unknown tables in scope | [`Ambiguous`](Self::Ambiguous) |
+/// | catalog-less, CTE known body confirms the column | (internal `Cataloged`; synthetic, dropped) |
+/// | catalog-less, CTE known body denies the column (`SELECT typo FROM cte` where cte = `[id]`) | [`Unresolved`](Self::Unresolved) |
+/// | catalog-aware, known binding lists the column | [`Cataloged`](Self::Cataloged) |
+/// | catalog-aware, known binding *doesn't* list the column | [`Unresolved`](Self::Unresolved) |
+/// | catalog-aware, one known confirms + one unknown suspect (known-witness-over-unknown-suspects) | [`Inferred`](Self::Inferred) |
+/// | catalog-aware, two or more known schemas confirm | [`Ambiguous`](Self::Ambiguous) |
+/// | qualified `t.col` where `t` is unknown | [`Inferred`](Self::Inferred) |
+/// | qualified `t.col` where `t` is known and lists `col` | [`Cataloged`](Self::Cataloged) |
 ///
 /// # Consumer guidance
 ///
@@ -153,28 +153,28 @@ pub struct ColumnRead {
 ///   [`Unresolved`](Self::Unresolved) as "incomplete".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResolutionKind {
-    /// Backed by a `Known` schema that lists the column / names the
+    /// Backed by a known schema that lists the column / names the
     /// table. On the public surface this means a catalog (or registry)
     /// entry backed the reference. Internally a CTE / derived body's
-    /// `Known` schema also yields this variant on a synthetic ref, but
+    /// known schema also yields this variant on a synthetic ref, but
     /// the post-pass drops those — so consumers only ever see
     /// `Cataloged` for catalog-backed real references.
     Cataloged,
     /// Resolution succeeded by assuming the reference exists where the
-    /// resolver placed it: an `Unknown`-schema binding adopted as the
+    /// resolver placed it: an unknown-schema binding adopted as the
     /// sole candidate, a qualified reference whose qualifier alone
-    /// determined the table, or a `Known` witness winning over
-    /// `Unknown` suspects in a multi-candidate scope. All defensible
+    /// determined the table, or a known witness winning over
+    /// unknown suspects in a multi-candidate scope. All defensible
     /// inferences in catalog-less or partial-catalog mode, but not
     /// proven.
     Inferred,
     /// Multiple plausible candidates and the resolver couldn't pick
-    /// one: either two-or-more `Known` schemas confirmed the column
-    /// (genuine ambiguity), or every candidate was an `Unknown`
+    /// one: either two-or-more known schemas confirmed the column
+    /// (genuine ambiguity), or every candidate was an unknown
     /// suspect with no tiebreaker. `ColumnReference.table` is `None`.
     Ambiguous,
     /// No in-scope binding could plausibly own the column: either
-    /// every `Known` schema in scope explicitly denied it, or the
+    /// every known schema in scope explicitly denied it, or the
     /// scope chain held no bindings at all. `ColumnReference.table`
     /// is `None`. Columns only.
     Unresolved,

@@ -56,14 +56,16 @@
 //!   per-clause `Relation`-target lineage for WHEN MATCHED UPDATE
 //!   (per assignment) and
 //!   WHEN NOT MATCHED INSERT VALUES (positional pair with the INSERT
-//!   column list); DELETE actions emit nothing. Column-list-less
-//!   INSERT SELECT is deferred.
+//!   column list); DELETE actions emit nothing. A column-list-less
+//!   INSERT / MERGE-INSERT without a catalog can't pair its columns, so
+//!   it emits no column `writes` / `lineage` and is flagged
+//!   [`InsertColumnsUnresolved`](crate::diagnostic::ColumnLevelDiagnosticKind::InsertColumnsUnresolved).
 //!
 //! **Strictness scales with the catalog.** Without a catalog, Table
 //! bindings have `Unknown` schemas and unqualified refs to a
 //! single-table scope resolve unconditionally (best-effort, matches
 //! the implicit promise of `catalog: None`). With a catalog, Table
-//! schemas come back `Known(cols)` and unqualified refs only resolve
+//! schemas come back `Cataloged(cols)` and unqualified refs only resolve
 //! when the candidate's schema actually lists the column — column
 //! typos that would otherwise silently resolve become unresolved.
 
