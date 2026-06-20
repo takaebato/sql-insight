@@ -607,6 +607,7 @@ mod tests {
 
     mod cte {
         use super::*;
+        use crate::test_utils::{all_dialects_except, DialectName};
 
         #[test]
         fn test_statement_with_cte() {
@@ -619,7 +620,25 @@ mod tests {
         fn test_statement_with_case_insensitive_cte_reference() {
             let sql = "WITH T2 AS (SELECT id FROM t1) SELECT * FROM t2";
             let expected = vec![ok_tables(vec![table("t1")])];
-            assert_table_extraction(sql, expected, all_dialects());
+            // ClickHouse excluded: its identifiers are case-sensitive, so
+            // the lowercase `t2` reference does not bind the uppercase
+            // `T2` CTE (see
+            // `test_case_sensitive_cte_reference_does_not_match`).
+            assert_table_extraction(
+                sql,
+                expected,
+                all_dialects_except(&[DialectName::ClickHouse]),
+            );
+        }
+
+        #[test]
+        fn test_case_sensitive_cte_reference_does_not_match() {
+            // ClickHouse identifiers are case-sensitive, so the lowercase
+            // `t2` reference does not bind the `T2` CTE — it surfaces as a
+            // real (unresolved) table alongside the CTE body's `t1`.
+            let sql = "WITH T2 AS (SELECT id FROM t1) SELECT * FROM t2";
+            let expected = vec![ok_tables(vec![table("t2"), table("t1")])];
+            assert_table_extraction(sql, expected, vec![DialectName::ClickHouse.instance()]);
         }
 
         #[test]
@@ -815,7 +834,9 @@ mod tests {
             // but a multi-table DELETE target is bound by the *table*
             // (relation) fold, so a mismatched-case alias target doesn't
             // merge — a known limitation of the relation / table-alias
-            // fold split at DELETE-target binding sites.
+            // fold split at DELETE-target binding sites. ClickHouse is
+            // excluded for the same reason: its table fold is
+            // case-sensitive, so the mismatched-case target doesn't merge.
             let sql = "DELETE T1_ALIAS FROM t1 AS t1_alias JOIN t2 ON t1_alias.a = t2.a";
             let expected = vec![ok_tables(vec![table("t1"), table("t2")])];
             assert_table_extraction(
@@ -826,6 +847,7 @@ mod tests {
                     DialectName::BigQuery,
                     DialectName::Oracle,
                     DialectName::MySql,
+                    DialectName::ClickHouse,
                 ]),
             );
         }

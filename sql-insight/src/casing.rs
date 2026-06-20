@@ -30,8 +30,9 @@
 
 use sqlparser::ast::Ident;
 use sqlparser::dialect::{
-    AnsiDialect, BigQueryDialect, Dialect, DuckDbDialect, MsSqlDialect, MySqlDialect,
-    PostgreSqlDialect, RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect,
+    AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
+    HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect, RedshiftSqlDialect,
+    SQLiteDialect, SnowflakeDialect,
 };
 
 /// How a single identifier folds before an equality comparison.
@@ -47,15 +48,17 @@ pub(crate) enum CaseFold {
     /// Unquoted → lower-case; quoted → preserved (exact). PostgreSQL,
     /// and the generic default.
     Lower,
-    /// Quoting ignored; comparison case-insensitive. DuckDB; MySQL /
-    /// BigQuery columns; BigQuery aliases.
+    /// Quoting ignored; comparison case-insensitive. DuckDB / Hive /
+    /// Databricks; MySQL / BigQuery columns; BigQuery aliases.
     Insensitive,
-    /// Quoting ignored; comparison case-sensitive (exact). BigQuery
-    /// tables; the safe fallback for filesystem-dependent real *table
-    /// names*, where over-matching (a false merge of two distinct
-    /// stored tables) is a data-correctness risk. Statement-local
-    /// aliases don't use this — they default lenient (see
-    /// [`IdentifierCasing::table_alias`]).
+    /// Quoting ignored; comparison case-sensitive (exact). ClickHouse
+    /// (all identifiers) and BigQuery tables; also the safe fallback for
+    /// filesystem-dependent real *table names*, where over-matching (a
+    /// false merge of two distinct stored tables) is a data-correctness
+    /// risk. Statement-local aliases don't use this *as a fallback* —
+    /// they default lenient (see [`IdentifierCasing::table_alias`]) — but
+    /// an engine that is definitively case-sensitive (ClickHouse) folds
+    /// every class here.
     Sensitive,
 }
 
@@ -108,14 +111,31 @@ impl IdentifierCasing {
     pub(crate) fn for_dialect(dialect: &dyn Dialect) -> Self {
         if dialect.is::<PostgreSqlDialect>() || dialect.is::<RedshiftSqlDialect>() {
             Self::uniform(CaseFold::Lower)
-        } else if dialect.is::<AnsiDialect>() || dialect.is::<SnowflakeDialect>() {
+        } else if dialect.is::<AnsiDialect>()
+            || dialect.is::<SnowflakeDialect>()
+            || dialect.is::<OracleDialect>()
+        {
+            // Oracle folds nonquoted identifiers to upper-case and keeps
+            // quoted ones case-sensitive — the ANSI rule.
             Self::uniform(CaseFold::Upper)
-        } else if dialect.is::<DuckDbDialect>() || dialect.is::<SQLiteDialect>() {
+        } else if dialect.is::<DuckDbDialect>()
+            || dialect.is::<SQLiteDialect>()
+            || dialect.is::<HiveDialect>()
+            || dialect.is::<DatabricksDialect>()
+        {
+            // Hive and Databricks / Spark SQL resolve identifiers
+            // case-insensitively by default (`spark.sql.caseSensitive`
+            // defaults to false).
             Self::uniform(CaseFold::Insensitive)
         } else if dialect.is::<MsSqlDialect>() {
             // Default install collation is case-insensitive (e.g.
             // `*_CI_AS`); a CS collation would flip every class.
             Self::uniform(CaseFold::Insensitive)
+        } else if dialect.is::<ClickHouseDialect>() {
+            // All identifiers — database / table / column and aliases —
+            // are case-sensitive (aliases are identifiers too); quoting
+            // handles special characters, not case.
+            Self::uniform(CaseFold::Sensitive)
         } else if dialect.is::<MySqlDialect>() {
             // Table names are filesystem-dependent (Unix CS / Win-mac
             // CI) → Sensitive fallback (avoid merging distinct stored
@@ -252,5 +272,85 @@ mod tests {
         // Under Insensitive: quoting ignored, both folded.
         assert_eq!(CaseFold::Insensitive.normalize(&quoted("Schema")), "schema");
         assert_eq!(CaseFold::Insensitive.normalize(&unquoted("Table")), "table");
+    }
+
+    /// `for_dialect` maps every recognised dialect to its
+    /// identifier-casing policy. Homogeneous dialects fold every class
+    /// alike; MySQL and BigQuery *split* — real table names are stricter
+    /// (`Sensitive`) than statement-local aliases / columns
+    /// (`Insensitive`). Anything unrecognised falls back to the generic
+    /// lower-fold. Covers all `sqlparser` dialect structs (an `is::<…>()`
+    /// ladder has no compile-time exhaustiveness, so the table stands in
+    /// as arm coverage).
+    ///
+    /// | dialect    | table       | table_alias | column      |
+    /// |------------|-------------|-------------|-------------|
+    /// | PostgreSQL | Lower       | Lower       | Lower       |
+    /// | Redshift   | Lower       | Lower       | Lower       |
+    /// | ANSI       | Upper       | Upper       | Upper       |
+    /// | Snowflake  | Upper       | Upper       | Upper       |
+    /// | Oracle     | Upper       | Upper       | Upper       |
+    /// | DuckDB     | Insensitive | Insensitive | Insensitive |
+    /// | SQLite     | Insensitive | Insensitive | Insensitive |
+    /// | SQL Server | Insensitive | Insensitive | Insensitive |
+    /// | Hive       | Insensitive | Insensitive | Insensitive |
+    /// | Databricks | Insensitive | Insensitive | Insensitive |
+    /// | ClickHouse | Sensitive   | Sensitive   | Sensitive   |
+    /// | MySQL      | Sensitive   | Insensitive | Insensitive |
+    /// | BigQuery   | Sensitive   | Insensitive | Insensitive |
+    /// | Generic    | Lower       | Lower       | Lower       |
+    #[test]
+    fn dialect_casing_matrix() {
+        use sqlparser::dialect::GenericDialect;
+        use CaseFold::{Insensitive, Lower, Sensitive, Upper};
+
+        let uniform = |fold| IdentifierCasing {
+            table: fold,
+            table_alias: fold,
+            column: fold,
+        };
+        // MySQL / BigQuery: real tables stricter than aliases / columns.
+        let split = IdentifierCasing {
+            table: Sensitive,
+            table_alias: Insensitive,
+            column: Insensitive,
+        };
+
+        let cases: Vec<(&str, Box<dyn Dialect>, IdentifierCasing)> = vec![
+            ("PostgreSQL", Box::new(PostgreSqlDialect {}), uniform(Lower)),
+            ("Redshift", Box::new(RedshiftSqlDialect {}), uniform(Lower)),
+            ("ANSI", Box::new(AnsiDialect {}), uniform(Upper)),
+            ("Snowflake", Box::new(SnowflakeDialect {}), uniform(Upper)),
+            ("Oracle", Box::new(OracleDialect {}), uniform(Upper)),
+            ("DuckDB", Box::new(DuckDbDialect {}), uniform(Insensitive)),
+            ("SQLite", Box::new(SQLiteDialect {}), uniform(Insensitive)),
+            (
+                "SQL Server",
+                Box::new(MsSqlDialect {}),
+                uniform(Insensitive),
+            ),
+            ("Hive", Box::new(HiveDialect {}), uniform(Insensitive)),
+            (
+                "Databricks",
+                Box::new(DatabricksDialect {}),
+                uniform(Insensitive),
+            ),
+            (
+                "ClickHouse",
+                Box::new(ClickHouseDialect {}),
+                uniform(Sensitive),
+            ),
+            ("MySQL", Box::new(MySqlDialect {}), split),
+            ("BigQuery", Box::new(BigQueryDialect {}), split),
+            ("Generic", Box::new(GenericDialect {}), uniform(Lower)),
+        ];
+
+        for (name, dialect, expected) in cases {
+            assert_eq!(
+                IdentifierCasing::for_dialect(dialect.as_ref()),
+                expected,
+                "{name}"
+            );
+        }
     }
 }
