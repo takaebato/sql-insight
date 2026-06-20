@@ -86,13 +86,18 @@ impl Catalog {
     /// matter as long as the statement parses. `ddl` is parsed with
     /// `dialect`, so pass the dialect matching your schema dump.
     ///
-    /// An unqualified `CREATE TABLE t` registers under `default_schema`
-    /// (e.g. `"public"`); right-anchored matching then lets a bare query
-    /// `t` still resolve. Skipped (not registered): statements that aren't
-    /// `CREATE TABLE`, `CREATE TABLE`s with no column definitions
-    /// (`... AS SELECT`, `... LIKE ...`), and names with more than three
-    /// `catalog.schema.name` segments. A parse failure (the DDL is invalid
-    /// for `dialect`) returns `Err`.
+    /// An unqualified `CREATE TABLE t` registers *schema-less* (no schema
+    /// is fabricated); right-anchored matching still lets a bare query `t`
+    /// — or even a qualified `s.t` — resolve to it. Skipped (not
+    /// registered): statements that aren't `CREATE TABLE`, `CREATE TABLE`s
+    /// with no column definitions (`... AS SELECT`, `... LIKE ...`), and
+    /// names with more than three `catalog.schema.name` segments. A parse
+    /// failure (the DDL is invalid for `dialect`) returns `Err`.
+    ///
+    /// **Only `CREATE TABLE` is interpreted.** Session-default statements
+    /// (`USE ...`, `SET search_path ...`) are *not* read — query-side
+    /// defaults are the caller's responsibility via
+    /// [`Catalog::default_schema`] / [`Catalog::default_catalog`].
     ///
     /// ```rust
     /// use sql_insight::catalog::Catalog;
@@ -100,10 +105,10 @@ impl Catalog {
     ///
     /// let ddl = "CREATE TABLE users (id INT, name TEXT); \
     ///            CREATE TABLE app.orders (id INT, total NUMERIC);";
-    /// let catalog = Catalog::from_ddl(&GenericDialect {}, ddl, "public").unwrap();
-    /// // `users` registered under the default schema; `app.orders` keeps its own.
+    /// let catalog = Catalog::from_ddl(&GenericDialect {}, ddl).unwrap();
+    /// // `users` registered schema-less; `app.orders` keeps its schema.
     /// ```
-    pub fn from_ddl(dialect: &dyn Dialect, ddl: &str, default_schema: &str) -> Result<Self, Error> {
+    pub fn from_ddl(dialect: &dyn Dialect, ddl: &str) -> Result<Self, Error> {
         let statements = Parser::parse_sql(dialect, ddl)?;
         let mut catalog = Catalog::new();
         for statement in &statements {
@@ -116,7 +121,7 @@ impl Catalog {
             }
             let parts: Vec<&Ident> = create.name.0.iter().filter_map(|p| p.as_ident()).collect();
             let table = match parts.as_slice() {
-                [name] => CatalogTable::new(default_schema, name.value.clone()),
+                [name] => CatalogTable::unqualified(name.value.clone()),
                 [schema, name] => CatalogTable::new(schema.value.clone(), name.value.clone()),
                 [catalog_seg, schema, name] => {
                     CatalogTable::new(schema.value.clone(), name.value.clone())
@@ -157,20 +162,21 @@ impl FromIterator<CatalogTable> for Catalog {
     }
 }
 
-/// One table registered in a [`Catalog`]: a `(catalog?, schema, name)`
+/// One table registered in a [`Catalog`]: a `(catalog?, schema?, name)`
 /// identity plus its column names.
 ///
-/// Registration requires the full identity — `schema` and `name` are
-/// mandatory (`catalog` is optional, for engines without a catalog
-/// layer). This keeps the catalog unambiguous ground truth: query
-/// references may omit qualifiers (resolved by right-anchoring /
-/// defaults), but a registered table never does. All identifiers are
+/// `name` is mandatory; `schema` and `catalog` are optional — a bare
+/// table (e.g. from unqualified DDL) has neither, and engines without a
+/// catalog layer omit the catalog. An omitted segment matches *any* query
+/// value there (right-anchored, the same wildcard rule a query reference
+/// gets for its own omitted qualifiers), so a schema-less `users` matches
+/// both a bare `users` and a qualified `public.users`. All identifiers are
 /// stored verbatim and matched exactly (see the module docs); `columns`
-/// may be empty when the schema is known but its columns aren't.
+/// may be empty when the table is known but its columns aren't.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogTable {
     catalog: Option<String>,
-    schema: String,
+    schema: Option<String>,
     name: String,
     columns: Vec<String>,
 }
@@ -182,7 +188,20 @@ impl CatalogTable {
     pub fn new(schema: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             catalog: None,
-            schema: schema.into(),
+            schema: Some(schema.into()),
+            name: name.into(),
+            columns: Vec::new(),
+        }
+    }
+
+    /// A table with no schema (e.g. from unqualified DDL). The omitted
+    /// schema is a wildcard, so it matches a query by name alone — bare
+    /// `users` and qualified `public.users` both match. Add columns with
+    /// [`Self::columns`].
+    pub fn unqualified(name: impl Into<String>) -> Self {
+        Self {
+            catalog: None,
+            schema: None,
             name: name.into(),
             columns: Vec::new(),
         }
@@ -208,8 +227,8 @@ impl CatalogTable {
         self.catalog.as_deref()
     }
 
-    pub(crate) fn schema_segment(&self) -> &str {
-        &self.schema
+    pub(crate) fn schema_segment(&self) -> Option<&str> {
+        self.schema.as_deref()
     }
 
     pub(crate) fn name_segment(&self) -> &str {
@@ -223,9 +242,15 @@ impl CatalogTable {
 
 impl fmt::Display for CatalogTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.catalog {
-            Some(c) => write!(f, "{c}.{}.{}", self.schema, self.name),
-            None => write!(f, "{}.{}", self.schema, self.name),
-        }
+        let path = [
+            self.catalog.as_deref(),
+            self.schema.as_deref(),
+            Some(self.name.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(".");
+        write!(f, "{path}")
     }
 }

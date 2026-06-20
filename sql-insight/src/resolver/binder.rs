@@ -230,8 +230,11 @@ fn catalog_table_matches(query: &TableReference, table: &CatalogTable, fold: Cas
     if fold.normalize(&query.name) != normalize_catalog(table.name_segment(), fold) {
         return false;
     }
-    if let Some(schema) = &query.schema {
-        if fold.normalize(schema) != normalize_catalog(table.schema_segment(), fold) {
+    // Both sides present and differing → no match; an omitted schema on
+    // either side (a bare query ref, or a schema-less registered table) is
+    // a wildcard.
+    if let (Some(query_schema), Some(table_schema)) = (&query.schema, table.schema_segment()) {
+        if fold.normalize(query_schema) != normalize_catalog(table_schema, fold) {
             return false;
         }
     }
@@ -266,10 +269,9 @@ fn canonical_ref(table: &CatalogTable, written: &TableReference) -> TableReferen
         catalog: table
             .catalog_segment()
             .map(|c| seg(c, span_of(written.catalog.as_ref()))),
-        schema: Some(seg(
-            table.schema_segment(),
-            span_of(written.schema.as_ref()),
-        )),
+        schema: table
+            .schema_segment()
+            .map(|s| seg(s, span_of(written.schema.as_ref()))),
         name: seg(table.name_segment(), written.name.span),
     }
 }

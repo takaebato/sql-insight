@@ -8,7 +8,7 @@ use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::{ColumnRead, ResolutionKind};
 
 fn reads_with(ddl: &str, query: &str) -> Vec<ColumnRead> {
-    let catalog = Catalog::from_ddl(&GenericDialect {}, ddl, "public").unwrap();
+    let catalog = Catalog::from_ddl(&GenericDialect {}, ddl).unwrap();
     extract_column_operations_with_options(
         &GenericDialect {},
         query,
@@ -28,20 +28,63 @@ fn find<'a>(reads: &'a [ColumnRead], col: &str) -> &'a ColumnRead {
 }
 
 #[test]
-fn unqualified_ddl_registers_under_default_schema_and_canonicalizes() {
-    // `CREATE TABLE users` (no schema) registers as `public.users`, so a
-    // bare `users` query right-anchor-matches it: Cataloged + canonical.
-    let read = {
-        let reads = reads_with(
-            "CREATE TABLE users (id INT, name TEXT)",
-            "SELECT name FROM users",
-        );
-        find(&reads, "name").clone()
-    };
+fn unqualified_ddl_registers_schema_less_and_resolves_bare_query() {
+    // `CREATE TABLE users` (no schema) registers schema-less — no schema
+    // is fabricated. A bare `users` query still matches (Cataloged) and
+    // the surfaced identity stays bare (no injected `public`).
+    let reads = reads_with(
+        "CREATE TABLE users (id INT, name TEXT)",
+        "SELECT name FROM users",
+    );
+    let read = find(&reads, "name");
     assert_eq!(read.resolution, ResolutionKind::Cataloged);
-    let table = read.reference.table.unwrap();
-    assert_eq!(table.schema.unwrap().value, "public");
+    let table = read.reference.table.as_ref().unwrap();
+    assert!(
+        table.schema.is_none(),
+        "schema-less stays bare, got {table:?}"
+    );
     assert_eq!(table.name.value, "users");
+}
+
+#[test]
+fn schema_less_table_matches_a_qualified_query_by_wildcard() {
+    // The omitted schema on the registered side is a wildcard, so a
+    // qualified `public.users` reference still matches the schema-less
+    // `users` and canonicalizes to the registered (bare) identity.
+    let reads = reads_with(
+        "CREATE TABLE users (id INT)",
+        "SELECT public.users.id FROM users",
+    );
+    let read = find(&reads, "id");
+    assert_eq!(read.resolution, ResolutionKind::Cataloged);
+    let table = read.reference.table.as_ref().unwrap();
+    assert!(table.schema.is_none());
+    assert_eq!(table.name.value, "users");
+}
+
+#[test]
+fn catalog_table_unqualified_matches_bare_and_qualified_queries() {
+    // `CatalogTable::unqualified` directly (not via DDL): a schema-less
+    // entry matches both a bare and a qualified query by name.
+    use sql_insight::catalog::CatalogTable;
+    let catalog = Catalog::new().table(CatalogTable::unqualified("users").columns(["id"]));
+    for query in ["SELECT id FROM users", "SELECT id FROM public.users"] {
+        let reads = extract_column_operations_with_options(
+            &GenericDialect {},
+            query,
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap()
+        .reads;
+        let read = find(&reads, "id");
+        assert_eq!(read.resolution, ResolutionKind::Cataloged, "for `{query}`");
+        assert!(
+            read.reference.table.as_ref().unwrap().schema.is_none(),
+            "for `{query}`"
+        );
+    }
 }
 
 #[test]
@@ -103,5 +146,5 @@ fn non_create_table_statements_are_ignored() {
 
 #[test]
 fn invalid_ddl_returns_error() {
-    assert!(Catalog::from_ddl(&GenericDialect {}, "CREATE TABLE", "public").is_err());
+    assert!(Catalog::from_ddl(&GenericDialect {}, "CREATE TABLE").is_err());
 }
