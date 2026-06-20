@@ -414,4 +414,77 @@ mod tests {
             );
         }
     }
+
+    fn base_cataloged(name: &str) -> Binding {
+        Binding::Base {
+            table: tref(None, None, name),
+            resolution: ResolutionKind::Cataloged,
+        }
+    }
+
+    fn base_inferred(name: &str) -> Binding {
+        Binding::Base {
+            table: tref(None, None, name),
+            resolution: ResolutionKind::Inferred,
+        }
+    }
+
+    /// The multi-candidate tiebreaker `pick` applies after candidates are
+    /// gathered: 0 → `Unresolved`; exactly 1 → that binding **verbatim** (a sole
+    /// candidate keeps full confidence, *not* downgraded); 2+ → if exactly one
+    /// is a confirmed witness (a `Cataloged` real column or a `Derived`
+    /// exposure) that witness `downgrade`d to `Inferred` (a `Derived` witness is
+    /// left as-is), otherwise `Ambiguous`.
+    ///
+    /// | candidates                           | pick                          |
+    /// |--------------------------------------|-------------------------------|
+    /// | (none)                               | `Unresolved`                  |
+    /// | `[Base a Inferred]`                  | `Base a Inferred`             |
+    /// | `[Base a Cataloged]`                 | `Base a Cataloged` (verbatim) |
+    /// | `[Derived]`                          | `Derived`                     |
+    /// | `[Base a Cataloged, Base b Inferred]`| `Base a Inferred` (downgraded)|
+    /// | `[Base a Inferred, Base b Inferred]` | `Ambiguous` (no witness)      |
+    /// | `[Base a Cataloged, Base b Cataloged]`| `Ambiguous` (two witnesses)  |
+    /// | `[Derived, Base b Inferred]`         | `Derived` (the sole witness)  |
+    /// | `[Derived, Base a Cataloged]`        | `Ambiguous` (two witnesses)   |
+    #[test]
+    fn candidate_tiebreaker() {
+        let diagnostics = RefCell::new(Vec::new());
+        let binder = binder(&diagnostics, IdentifierCasing::default());
+
+        let cases: Vec<(Vec<Binding>, Binding)> = vec![
+            (vec![], Binding::Unresolved),
+            (vec![base_inferred("a")], base_inferred("a")),
+            // A sole candidate keeps its `Cataloged` confidence — only ties downgrade.
+            (vec![base_cataloged("a")], base_cataloged("a")),
+            (vec![Binding::Derived], Binding::Derived),
+            // One confirmed witness over a suspect → the witness, downgraded.
+            (
+                vec![base_cataloged("a"), base_inferred("b")],
+                base_inferred("a"),
+            ),
+            // No witness among suspects → ambiguous.
+            (
+                vec![base_inferred("a"), base_inferred("b")],
+                Binding::Ambiguous,
+            ),
+            // Two witnesses → ambiguous.
+            (
+                vec![base_cataloged("a"), base_cataloged("b")],
+                Binding::Ambiguous,
+            ),
+            // A `Derived` is a witness too; sole witness over a suspect, left as-is.
+            (vec![Binding::Derived, base_inferred("b")], Binding::Derived),
+            // `Derived` + `Cataloged` are two witnesses → ambiguous.
+            (
+                vec![Binding::Derived, base_cataloged("a")],
+                Binding::Ambiguous,
+            ),
+        ];
+
+        for (candidates, expected) in cases {
+            let debug = format!("{candidates:?}");
+            assert_eq!(binder.pick(candidates), expected, "candidates {debug}");
+        }
+    }
 }
