@@ -629,7 +629,7 @@ mod writes {
     fn insert_without_explicit_columns_yields_no_writes() {
         // Without an explicit column list AND without a catalog, the
         // resolver can't pair source projections to target columns;
-        // writes / lineage stay empty.
+        // writes / lineage stay empty and `InsertColumnsUnresolved` flags it.
         assert_column_ops(
             "INSERT INTO t1 SELECT t2.b FROM t2",
             ColumnOperation {
@@ -637,7 +637,7 @@ mod writes {
                 reads: vec![read("t2", "b")],
                 writes: vec![],
                 lineage: vec![],
-                diagnostics: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsUnresolved)],
             },
         );
     }
@@ -1669,8 +1669,10 @@ mod lineage {
 
     #[test]
     fn insert_without_explicit_cols_emits_no_lineage() {
-        // Target column names would need catalog-driven positional
-        // mapping; without catalog the resolver emits nothing.
+        // Target column names would need catalog-driven positional mapping;
+        // without a catalog the resolver can't pair them, so column writes /
+        // lineage are dropped — flagged with `InsertColumnsUnresolved` so the
+        // empty surfaces read as "couldn't analyze", not "nothing written".
         assert_column_ops(
             "INSERT INTO t1 SELECT x FROM t2",
             ColumnOperation {
@@ -1678,7 +1680,7 @@ mod lineage {
                 reads: vec![read("t2", "x")],
                 writes: vec![],
                 lineage: vec![],
-                diagnostics: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsUnresolved)],
             },
         );
     }
@@ -2081,8 +2083,9 @@ mod merge {
     fn merge_column_less_insert_without_catalog_is_reads_only() {
         // Without a catalog the target's column names are unknown, so a
         // column-less MERGE INSERT can't pair its values — the values
-        // surface as reads but there's no write / lineage. (With a catalog
-        // they pair positionally; see the catalog-aware test.)
+        // surface as reads but there's no write / lineage, flagged with
+        // `InsertColumnsUnresolved`. (With a catalog they pair positionally;
+        // see the catalog-aware test.)
         assert_column_ops(
             "MERGE INTO t USING s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.a)",
@@ -2096,7 +2099,7 @@ mod merge {
                 ],
                 writes: vec![],
                 lineage: vec![],
-                diagnostics: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsUnresolved)],
             },
         );
     }

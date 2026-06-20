@@ -188,6 +188,20 @@ impl<'a> Binder<'a> {
             span,
         });
     }
+
+    /// Record an `InsertColumnsUnresolved` diagnostic for a column-list-less
+    /// INSERT / MERGE-INSERT whose target columns couldn't be filled from a
+    /// catalog, so its column-level `writes` / `lineage` are dropped (the
+    /// table still surfaces in `table_writes`).
+    pub(super) fn record_insert_columns_unresolved(&self, target: &TableReference) {
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::InsertColumnsUnresolved,
+            message: format!(
+                "column-list-less INSERT into `{target}` can't pair source columns to target columns without a catalog — column writes / lineage dropped"
+            ),
+            span: None,
+        });
+    }
 }
 
 // ===== catalog matching ==================================================

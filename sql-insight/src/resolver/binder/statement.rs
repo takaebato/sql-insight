@@ -86,6 +86,12 @@ impl<'a> Binder<'a> {
         } else {
             insert.columns.clone()
         };
+        // A column-list-less INSERT whose target columns can't be filled (no
+        // catalog) drops its column writes / lineage — flag it so the empty
+        // surfaces read as "couldn't analyze", not "nothing written".
+        if columns.is_empty() && insert.source.is_some() {
+            self.record_insert_columns_unresolved(&target);
+        }
         // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: extra writes + their
         // `value → target.col` lineage, plus the optional `DO UPDATE … WHERE`
         // (filter reads).
@@ -374,12 +380,17 @@ impl<'a> Binder<'a> {
                             explicit
                         };
                         // A MERGE INSERT is a single VALUES row.
-                        let row = values
+                        let row: Vec<Expr> = values
                             .rows
                             .iter()
                             .flatten()
                             .map(|e| self.bind_expr(e, &scope))
                             .collect();
+                        // Column-list-less and no catalog to fill the target
+                        // columns: the values can't be paired (see `bind_insert`).
+                        if columns.is_empty() && !row.is_empty() {
+                            self.record_insert_columns_unresolved(&target);
+                        }
                         clauses.push(MergeClause::Insert {
                             columns,
                             values: row,

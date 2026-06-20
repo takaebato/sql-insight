@@ -46,9 +46,10 @@
 //!   [`diagnostic::ColumnLevelDiagnostic`]) — non-fatal issues surface
 //!   alongside the extraction result rather than failing the whole call.
 //!   The kinds are tool-side coverage gaps: unsupported statements,
-//!   suppressed wildcards, and over-qualified table names. Per-reference
-//!   resolution outcomes live on [`ColumnRead::resolution`] instead, so
-//!   the diagnostic stream stays reserved for those gaps.
+//!   suppressed wildcards, over-qualified table names, and column-list-less
+//!   `INSERT`s that need a catalog. Per-reference resolution outcomes live
+//!   on [`ColumnRead::resolution`] instead, so the diagnostic stream stays
+//!   reserved for those gaps.
 //!
 //! ## Quick Start
 //!
@@ -142,6 +143,14 @@
 //!   terminates against the anchor branch's columns (via an active-set),
 //!   so lineage traces through to the anchor's real tables — it doesn't
 //!   enumerate per-iteration contributions.
+//! - **Column-list-less `INSERT` needs a catalog for column lineage**: an
+//!   `INSERT INTO t SELECT …` (or `MERGE … INSERT VALUES …`) without an
+//!   explicit column list can only pair source columns to target columns
+//!   when a catalog supplies `t`'s columns. Catalog-free, the column-level
+//!   `writes` / `lineage` are dropped (the table still surfaces in
+//!   `table_writes`), flagged
+//!   [`InsertColumnsUnresolved`](diagnostic::ColumnLevelDiagnosticKind::InsertColumnsUnresolved)
+//!   so the empty surfaces read as "couldn't analyze", not "nothing written".
 //! - **Lineage kind is coarse** (`Passthrough` vs `Transformation`).
 //!   Aggregates, window functions, arithmetic, casts, etc. are all
 //!   `Transformation` — the model deliberately does not sub-classify
