@@ -632,12 +632,15 @@ mod tests {
     /// matching (`list_has`) is exact in the same way as table names — but
     /// governed by the **column** fold, which a dialect can set apart from the
     /// table fold. A stored `Name` matches a quoted `"Name"`, not an unquoted
-    /// `name` the fold lowercases, and `Insensitive` folds both.
+    /// `name` the fold lower/upper-cases away, and `Insensitive` folds both —
+    /// the same shape as the table-name matrix above.
     ///
     /// stored column `Name`, vs:
     /// | column fold   | `name` (unquoted) | `"Name"` (quoted) |
     /// |---------------|-------------------|-------------------|
+    /// | `Upper`       | ✗                 | ✓                 |
     /// | `Lower`       | ✗                 | ✓                 |
+    /// | `Sensitive`   | ✗                 | ✓                 |
     /// | `Insensitive` | ✓                 | ✓                 |
     #[test]
     fn catalog_columns_are_matched_as_quoted() {
@@ -647,8 +650,12 @@ mod tests {
 
         // (column fold, query, expected match)
         let cases: &[(CaseFold, &Ident, bool)] = &[
+            (CaseFold::Upper, &unquoted, false),
+            (CaseFold::Upper, &quoted, true),
             (CaseFold::Lower, &unquoted, false),
             (CaseFold::Lower, &quoted, true),
+            (CaseFold::Sensitive, &unquoted, false),
+            (CaseFold::Sensitive, &quoted, true),
             (CaseFold::Insensitive, &unquoted, true),
             (CaseFold::Insensitive, &quoted, true),
         ];
