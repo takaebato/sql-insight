@@ -88,6 +88,48 @@ fn catalog_table_unqualified_matches_bare_and_qualified_queries() {
 }
 
 #[test]
+fn default_schema_qualifies_bare_ref_without_registered_tables() {
+    // No registered tables, just `default_schema = public`: a bare `users`
+    // surfaces qualified as `public.users` (Inferred) — the declared
+    // default is applied to the resolved identity, not just to matching.
+    let catalog = Catalog::new().default_schema("public");
+    let reads = extract_column_operations_with_options(
+        &GenericDialect {},
+        "SELECT id FROM users",
+        ExtractorOptions::new().with_catalog(&catalog),
+    )
+    .unwrap()
+    .remove(0)
+    .unwrap()
+    .reads;
+    let read = find(&reads, "id");
+    assert_eq!(read.resolution, ResolutionKind::Inferred);
+    let table = read.reference.table.as_ref().unwrap();
+    assert_eq!(table.schema.as_ref().unwrap().value, "public");
+    assert_eq!(table.name.value, "users");
+}
+
+#[test]
+fn default_schema_discriminates_a_mismatched_qualifier() {
+    // `FROM users` resolves as `public.users` (via the default), so a column
+    // qualified with a *different* schema (`db.users`) no longer matches the
+    // relation — it surfaces Unresolved instead of silently binding.
+    let catalog = Catalog::new().default_schema("public");
+    let reads = extract_column_operations_with_options(
+        &GenericDialect {},
+        "SELECT db.users.id FROM users",
+        ExtractorOptions::new().with_catalog(&catalog),
+    )
+    .unwrap()
+    .remove(0)
+    .unwrap()
+    .reads;
+    let read = find(&reads, "id");
+    assert_eq!(read.resolution, ResolutionKind::Unresolved);
+    assert!(read.reference.table.is_none());
+}
+
+#[test]
 fn qualified_ddl_keeps_its_own_schema() {
     let reads = reads_with(
         "CREATE TABLE app.orders (id INT, total NUMERIC)",

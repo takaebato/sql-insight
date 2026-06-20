@@ -224,6 +224,40 @@ fn fill_query_defaults(written: &TableReference, catalog: &Catalog) -> TableRefe
     filled
 }
 
+/// The *surfaced* identity for a reference that didn't uniquely match a
+/// registered table: written segments are kept verbatim, omitted prefix
+/// segments are filled from the catalog defaults as plain (unquoted)
+/// idents. Unlike [`fill_query_defaults`] (which quotes filled segments for
+/// case-exact *matching*), this produces the identity shown to consumers —
+/// so a bare `users` under `default_schema = "public"` surfaces as
+/// `public.users` and dedups with an explicit `public.users` elsewhere.
+/// With no configured defaults it returns the written ref unchanged.
+fn surface_with_defaults(written: &TableReference, catalog: &Catalog) -> TableReference {
+    let plain = |value: &str| Ident {
+        value: value.to_string(),
+        quote_style: None,
+        span: Span::empty(),
+    };
+    let schema = written
+        .schema
+        .clone()
+        .or_else(|| catalog.default_schema_segment().map(plain));
+    // Catalog default fills only once a schema is present (matching
+    // `fill_query_defaults`' gating).
+    let catalog_segment = if written.catalog.is_some() {
+        written.catalog.clone()
+    } else if schema.is_some() {
+        catalog.default_catalog_segment().map(plain)
+    } else {
+        None
+    };
+    TableReference {
+        catalog: catalog_segment,
+        schema,
+        name: written.name.clone(),
+    }
+}
+
 /// Right-anchored, dialect-cased match of a (default-filled) query reference
 /// against a registered table.
 fn catalog_table_matches(query: &TableReference, table: &CatalogTable, fold: CaseRule) -> bool {

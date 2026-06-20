@@ -181,16 +181,26 @@ impl<'a> Binder<'a> {
 
     /// Match a written table reference against the catalog (after default-fill,
     /// right-anchored, dialect-cased). Unique hit → canonical identity + its
-    /// column list + `Cataloged`; several → written ref + `Ambiguous`; no catalog
-    /// or no hit → written ref + `Inferred`.
+    /// column list + `Cataloged`; several → default-normalized ref +
+    /// `Ambiguous`; no hit → default-normalized ref + `Inferred`. With no
+    /// catalog at all, or no configured defaults, the ref surfaces as written.
     pub(super) fn table_match(&self, written: &TableReference) -> TableMatch {
+        // No catalog → no defaults to apply: surface as written.
+        let Some(catalog) = self.catalog else {
+            return TableMatch {
+                table: written.clone(),
+                resolution: ResolutionKind::Inferred,
+                columns: Vec::new(),
+            };
+        };
+        // A non-unique outcome surfaces the default-normalized identity
+        // (== written when no defaults are configured), so an explicit
+        // `default_schema` qualifies bare refs even without a matching
+        // registration — and lets them dedup with qualified refs.
         let no_hit = |resolution| TableMatch {
-            table: written.clone(),
+            table: surface_with_defaults(written, catalog),
             resolution,
             columns: Vec::new(),
-        };
-        let Some(catalog) = self.catalog else {
-            return no_hit(ResolutionKind::Inferred);
         };
         let filled = fill_query_defaults(written, catalog);
         let fold = self.casing.table;
