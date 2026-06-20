@@ -60,21 +60,16 @@ pub(super) struct OutputCol {
     pub(super) identity: bool,
 }
 
-/// A relation in scope: its use-site alias (if any) and where its columns
-/// come from. Cloned onto the correlation stack so an inner subquery can
-/// resolve against enclosing relations.
+/// A relation in scope: where its columns come from, plus its use-site `alias`
+/// (if any). Cloned onto the correlation stack so an inner subquery can resolve
+/// against enclosing relations.
 #[derive(Clone)]
-pub(super) struct Relation {
-    pub(super) alias: Option<Ident>,
-    pub(super) source: RelSource,
-}
-
-#[derive(Clone)]
-pub(super) enum RelSource {
+pub(super) enum Relation {
     /// A real table: its canonical identity and catalog column knowledge.
     /// (The table-level resolution kind lives on the `Scan`; here the `columns`
     /// — `Cataloged` vs `Unknown` — drive a column reference's resolution.)
     Table {
+        alias: Option<Ident>,
         table: TableReference,
         columns: Columns,
     },
@@ -82,14 +77,17 @@ pub(super) enum RelSource {
     /// output columns of an inner query. A reference through it is
     /// `Binding::Derived` — the origin traversal traces into the producing
     /// sub-plan (`SubqueryAlias` / `CteRef`).
-    Derived { columns: Vec<Ident> },
+    Derived {
+        alias: Option<Ident>,
+        columns: Vec<Ident>,
+    },
     /// An opaque table function / PIVOT / … relation with dynamic columns. A
     /// bare name is **not** claimed by it (so it stays resolvable against real
     /// tables); a qualified ref through its alias is `Binding::Derived` — the
     /// origin traversal reaches the [`LogicalPlan::TableFunction`](super::LogicalPlan::TableFunction)
     /// node and emits the synthetic `alias.col` source (a lineage source,
     /// dropped from reads).
-    TableFunction,
+    TableFunction { alias: Option<Ident> },
 }
 
 impl Scope {
@@ -159,9 +157,9 @@ impl Relation {
     /// The name this relation answers to in a qualifier: its alias, else a
     /// real table's bare name. A derived relation answers only to its alias.
     pub(super) fn exposed_name(&self) -> Option<&Ident> {
-        self.alias.as_ref().or(match &self.source {
-            RelSource::Table { table, .. } => Some(&table.name),
-            RelSource::Derived { .. } | RelSource::TableFunction => None,
-        })
+        match self {
+            Relation::Table { alias, table, .. } => alias.as_ref().or(Some(&table.name)),
+            Relation::Derived { alias, .. } | Relation::TableFunction { alias } => alias.as_ref(),
+        }
     }
 }

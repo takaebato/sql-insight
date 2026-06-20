@@ -556,12 +556,10 @@ impl<'a> Binder<'a> {
             columns: columns.clone(),
             resolution: m.resolution,
         });
-        let relation = Relation {
+        let relation = Relation::Table {
             alias,
-            source: RelSource::Table {
-                table: m.table,
-                columns,
-            },
+            table: m.table,
+            columns,
         };
         (scan, Scope::single(relation))
     }
@@ -589,11 +587,9 @@ impl<'a> Binder<'a> {
                         .rev()
                         .find(|c| self.eq(self.casing.table_alias, &c.name, &written.name))
                     {
-                        let relation = Relation {
+                        let relation = Relation::Derived {
                             alias: alias_name.or_else(|| Some(cte.name.clone())),
-                            source: RelSource::Derived {
-                                columns: cte.columns.clone(),
-                            },
+                            columns: cte.columns.clone(),
                         };
                         return (
                             LogicalPlan::CteRef(CteRef {
@@ -633,9 +629,9 @@ impl<'a> Binder<'a> {
                     self.bind_query(subquery)
                 };
                 let columns = sub_scope.exposed_columns(alias.as_ref());
-                let relation = Relation {
+                let relation = Relation::Derived {
                     alias: alias.as_ref().map(|a| a.name.clone()),
-                    source: RelSource::Derived { columns },
+                    columns,
                 };
                 let node = match alias {
                     Some(a) => {
@@ -789,7 +785,7 @@ impl<'a> Binder<'a> {
     /// Assemble an opaque table-producing factor: an [`LogicalPlan::TableFunction`]
     /// node carrying the (already-bound) argument reads over `input` (the wrapped
     /// inner table, or [`LogicalPlan::Empty`] for a bare function), exposed as a
-    /// synthetic [`RelSource::TableFunction`] relation under the alias.
+    /// synthetic [`Relation::TableFunction`] relation under the alias.
     pub(super) fn opaque(
         &self,
         input: LogicalPlan,
@@ -803,10 +799,7 @@ impl<'a> Binder<'a> {
             args,
         });
         let scope = match alias_name {
-            Some(name) => Scope::single(Relation {
-                alias: Some(name),
-                source: RelSource::TableFunction,
-            }),
+            Some(name) => Scope::single(Relation::TableFunction { alias: Some(name) }),
             None => Scope::default(),
         };
         (node, scope)

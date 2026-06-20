@@ -17,7 +17,7 @@ impl<'a> Binder<'a> {
     /// Resolve a dotted reference (`parts`) against the scope. Unqualified
     /// ranks every relation; qualified matches the qualifier first. Collapsed
     /// by [`pick`](Self::pick).
-    pub(super) fn resolve(&self, parts: &[Ident], scope: &Scope) -> ColRef {
+    pub(super) fn resolve(&self, parts: &[Ident], scope: &Scope) -> BoundColumn {
         let name = parts.last().expect("a reference has at least one segment");
         // Clause-alias visibility (GROUP BY / HAVING / ORDER BY): a bare ref
         // naming an *introduced* output alias resolves to that output
@@ -31,7 +31,7 @@ impl<'a> Binder<'a> {
                     .is_some_and(|n| self.eq(self.casing.column, n, name))
             }) {
                 if !out.identity {
-                    return ColRef {
+                    return BoundColumn {
                         qualifier: None,
                         name: name.clone(),
                         binding: Binding::Derived,
@@ -50,7 +50,7 @@ impl<'a> Binder<'a> {
                     .find_map(|relations| self.resolve_in(parts, relations))
             })
             .unwrap_or(Binding::Unresolved);
-        ColRef {
+        BoundColumn {
             qualifier: (parts.len() >= 2).then(|| parts[parts.len() - 2].clone()),
             name: name.clone(),
             binding,
@@ -85,27 +85,27 @@ impl<'a> Binder<'a> {
     /// `Cataloged` schema must list it (confirmed witness); an `Unknown` table always
     /// could (suspect).
     fn unqualified_candidate(&self, rel: &Relation, name: &Ident) -> Option<Binding> {
-        match &rel.source {
-            RelSource::Table {
+        match rel {
+            Relation::Table {
                 table,
                 columns: Columns::Cataloged(cols),
                 ..
             } => self
                 .list_has(cols, name)
                 .then(|| base(table, ResolutionKind::Cataloged)),
-            RelSource::Table {
+            Relation::Table {
                 table,
                 columns: Columns::Unknown,
                 ..
             } => Some(base(table, ResolutionKind::Inferred)),
             // A derived relation owns the column iff it exposes it (confirmed
             // witness, like a Cataloged table); the origin traversal collapses it.
-            RelSource::Derived { columns } => {
+            Relation::Derived { columns, .. } => {
                 self.list_has(columns, name).then_some(Binding::Derived)
             }
             // A table function's columns are opaque — a bare name is not
             // claimed by it (stays resolvable against real tables).
-            RelSource::TableFunction => None,
+            Relation::TableFunction { .. } => None,
         }
     }
 
@@ -120,10 +120,10 @@ impl<'a> Binder<'a> {
         qualifier_ref: Option<&TableReference>,
         name: &Ident,
     ) -> Option<Binding> {
-        let qualifier_ok = match &rel.source {
-            RelSource::Table { table, .. } if rel.alias.is_none() => {
-                qualifier_ref.is_some_and(|q| self.qualifier_matches_table(q, table))
-            }
+        let qualifier_ok = match rel {
+            Relation::Table {
+                table, alias: None, ..
+            } => qualifier_ref.is_some_and(|q| self.qualifier_matches_table(q, table)),
             _ => rel.exposed_name().is_some_and(|exposed| {
                 matches!(qualifier_parts, [only] if self.eq(self.casing.table_alias, only, exposed))
             }),
@@ -131,8 +131,8 @@ impl<'a> Binder<'a> {
         if !qualifier_ok {
             return None;
         }
-        match &rel.source {
-            RelSource::Table {
+        match rel {
+            Relation::Table {
                 table,
                 columns: Columns::Cataloged(cols),
                 ..
@@ -146,18 +146,18 @@ impl<'a> Binder<'a> {
                 };
                 Some(base(table, resolution))
             }
-            RelSource::Table {
+            Relation::Table {
                 table,
                 columns: Columns::Unknown,
                 ..
             } => Some(base(table, ResolutionKind::Inferred)),
-            RelSource::Derived { columns } => {
+            Relation::Derived { columns, .. } => {
                 self.list_has(columns, name).then_some(Binding::Derived)
             }
             // A ref qualified by a table function's alias resolves to it: a
             // `Derived` binding the traversal turns into the synthetic
             // `alias.col` lineage source (dropped from reads).
-            RelSource::TableFunction => Some(Binding::Derived),
+            Relation::TableFunction { .. } => Some(Binding::Derived),
         }
     }
 

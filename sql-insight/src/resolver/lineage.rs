@@ -11,7 +11,7 @@
 
 use sqlparser::ast::Ident;
 
-use super::logical_plan::{idents_eq, peel_with, Expr, LogicalPlan, MergeClause, NamedExpr};
+use super::logical_plan::{peel_with, Expr, LogicalPlan, MergeClause, NamedExpr};
 use super::origins::{conflict_value_origins, enter_withs, origins_of_expr, output_operands, Ctx};
 use crate::extractor::{ColumnLineageEdge, ColumnLineageKind, ColumnTarget, TableLineageEdge};
 use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference};
@@ -311,26 +311,10 @@ fn feeding_scans<'a>(op: &'a LogicalPlan, ctx: &mut Ctx<'a>, out: &mut Vec<Table
             feeding_scans(&so.right, ctx, out);
         }
         LogicalPlan::With(w) => {
-            let added = w.ctes.len();
-            w.ctes.iter().for_each(|c| ctx.ctes.push(c));
-            feeding_scans(&w.body, ctx, out);
-            ctx.ctes.truncate(ctx.ctes.len() - added);
+            ctx.with_decls(&w.ctes, |ctx| feeding_scans(&w.body, ctx, out));
         }
         LogicalPlan::CteRef(r) => {
-            if ctx.active.iter().any(|n| n == &r.name.value) {
-                return; // recursive self-reference — terminate
-            }
-            if let Some(cte) = ctx
-                .ctes
-                .iter()
-                .rev()
-                .find(|c| idents_eq(&c.name, &r.name))
-                .copied()
-            {
-                ctx.active.push(r.name.value.clone());
-                feeding_scans(&cte.body, ctx, out);
-                ctx.active.pop();
-            }
+            ctx.enter_cte(&r.name, |ctx, body| feeding_scans(body, ctx, out));
         }
         // A nested data-mover feeds through its source; DELETE / DROP / ALTER /
         // VALUES move no row data into a feeding path.

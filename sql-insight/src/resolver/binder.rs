@@ -54,9 +54,9 @@ use sqlparser::ast::{
 use sqlparser::tokenizer::Span;
 
 use super::logical_plan::{
-    Aggregate, AlterTable, Assignment, Binding, ColRef, Columns, CreateTableAs, CreateView, Cte,
-    CteRef, Delete, Drop, Expr, Filter, Insert, Join, LogicalPlan, Merge, MergeClause, NamedExpr,
-    Projection, Scan, SetOp, Sort, SubqueryAlias, TableFunction, Update, Values, With,
+    Aggregate, AlterTable, Assignment, Binding, BoundColumn, Columns, CreateTableAs, CreateView,
+    Cte, CteRef, Delete, Drop, Expr, Filter, Insert, Join, LogicalPlan, Merge, MergeClause,
+    NamedExpr, Projection, Scan, SetOp, Sort, SubqueryAlias, TableFunction, Update, Values, With,
 };
 use crate::casing::{CaseFold, IdentifierCasing};
 use crate::catalog::{Catalog, CatalogTable};

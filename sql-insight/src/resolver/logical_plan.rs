@@ -1,5 +1,5 @@
 //! The bound logical plan: a tree of relational operators with resolved
-//! column references ([`ColRef`] / [`Binding`]) and expressions ([`Expr`]).
+//! column references ([`BoundColumn`] / [`Binding`]) and expressions ([`Expr`]).
 //!
 //! Each node is a textbook relational operator (or a DML / DDL root). The
 //! tree carries no pre-collapsed provenance: lineage is derived by tracing
@@ -285,16 +285,16 @@ pub(crate) struct Drop {
 
 // ===== expressions =======================================================
 
-/// A resolved expression. Column references are resolved to a [`ColRef`];
+/// A resolved expression. Column references are resolved to a [`BoundColumn`];
 /// the construct-specific variants carry the value/filter split structurally
 /// — `origins` traces the **value** operands (composing the lineage kind) and
 /// skips the **filter** ones, while `reads` walks every column reference.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Expr {
     /// A column reference (value position; a bare column → `Passthrough`).
-    /// Boxed: a resolved [`ColRef`] carries several spanned identifiers, so
+    /// Boxed: a resolved [`BoundColumn`] carries several spanned identifiers, so
     /// it dwarfs the other variants if stored inline.
-    Column(Box<ColRef>),
+    Column(Box<BoundColumn>),
     /// A function / operator / cast — a transformation over its value `args`.
     Call { args: Vec<Expr> },
     /// `CASE`: the `when` conditions are filter (reads, not origins); the
@@ -330,7 +330,7 @@ pub(crate) enum Expr {
     /// single owner, so it fans in to every joined relation that could own it
     /// — each a `Passthrough` read / origin (one per side, not an ambiguous
     /// `table: None`).
-    Fanin(Vec<ColRef>),
+    Fanin(Vec<BoundColumn>),
 }
 
 /// A named output expression — a projection item, an aggregate, a group key,
@@ -354,7 +354,7 @@ pub(crate) struct Assignment {
 /// feeds the public read's source location). `binding` is the bind-time
 /// resolution outcome.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ColRef {
+pub(crate) struct BoundColumn {
     pub(crate) qualifier: Option<Ident>,
     pub(crate) name: Ident,
     pub(crate) binding: Binding,

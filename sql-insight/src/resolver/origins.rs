@@ -9,7 +9,7 @@
 
 use sqlparser::ast::Ident;
 
-use super::logical_plan::{idents_eq, Binding, ColRef, Cte, Expr, LogicalPlan, NamedExpr};
+use super::logical_plan::{idents_eq, Binding, BoundColumn, Cte, Expr, LogicalPlan, NamedExpr};
 use super::reads::column_read;
 use crate::extractor::ColumnLineageKind;
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
@@ -35,6 +35,46 @@ impl<'a> Ctx<'a> {
             ctes,
             active: Vec::new(),
         }
+    }
+
+    /// Run `f` with a `With`'s declarations pushed onto the CTE env, popping
+    /// them after so a sibling subtree doesn't see them (the balanced
+    /// push/truncate every nested-`With` walk shares).
+    pub(super) fn with_decls<R>(
+        &mut self,
+        ctes: &'a [Cte],
+        f: impl FnOnce(&mut Ctx<'a>) -> R,
+    ) -> R {
+        let added = ctes.len();
+        ctes.iter().for_each(|c| self.ctes.push(c));
+        let r = f(self);
+        self.ctes.truncate(self.ctes.len() - added);
+        r
+    }
+
+    /// Resolve a `CteRef` by name and run `f` on its body with the name marked
+    /// active (popped after), so a recursive self-reference terminates. Returns
+    /// `None` — and never calls `f` — for an unknown name or an already-active
+    /// self-reference (the recursion-termination case). Centralises the subtle
+    /// active-set bookkeeping every walk that expands a `CteRef` shares.
+    pub(super) fn enter_cte<R>(
+        &mut self,
+        name: &Ident,
+        f: impl FnOnce(&mut Ctx<'a>, &'a LogicalPlan) -> R,
+    ) -> Option<R> {
+        if self.active.iter().any(|n| n == &name.value) {
+            return None; // recursive self-reference — terminate
+        }
+        let cte = self
+            .ctes
+            .iter()
+            .rev()
+            .find(|c| idents_eq(&c.name, name))
+            .copied()?;
+        self.active.push(name.value.clone());
+        let r = f(self, &cte.body);
+        self.active.pop();
+        Some(r)
     }
 }
 
@@ -150,38 +190,22 @@ fn origins_into<'a>(
             o
         }
         LogicalPlan::With(w) => {
-            let added = w.ctes.len();
-            w.ctes.iter().for_each(|c| ctx.ctes.push(c));
-            let o = origins_into(&w.body, qualifier, name, ctx);
-            ctx.ctes.truncate(ctx.ctes.len() - added);
-            o
+            ctx.with_decls(&w.ctes, |ctx| origins_into(&w.body, qualifier, name, ctx))
         }
-        LogicalPlan::CteRef(r) => {
-            if ctx.active.iter().any(|n| n == &r.name.value) {
-                return Vec::new(); // recursive self-reference — terminate
-            }
-            let Some(cte) = ctx
-                .ctes
-                .iter()
-                .rev()
-                .find(|c| idents_eq(&c.name, &r.name))
-                .copied()
-            else {
-                return Vec::new();
-            };
-            // A VALUES-backed CTE has no traceable base columns — the exposed
-            // column is a synthetic source (cte.col).
-            if values_backed(&cte.body) {
-                return vec![(
-                    synthetic_source(&r.name, name),
-                    ColumnLineageKind::Passthrough,
-                )];
-            }
-            ctx.active.push(r.name.value.clone());
-            let o = origins_into(&cte.body, None, name, ctx);
-            ctx.active.pop();
-            o
-        }
+        LogicalPlan::CteRef(r) => ctx
+            .enter_cte(&r.name, |ctx, body| {
+                // A VALUES-backed CTE has no traceable base columns — the
+                // exposed column is a synthetic source (cte.col).
+                if values_backed(body) {
+                    vec![(
+                        synthetic_source(&r.name, name),
+                        ColumnLineageKind::Passthrough,
+                    )]
+                } else {
+                    origins_into(body, None, name, ctx)
+                }
+            })
+            .unwrap_or_default(),
         // A `Derived` reference resolves at a producer's named output (a
         // `Projection` / `Aggregate` expr), never at a raw `Scan` — a reference to
         // a base column is `Binding::Base` and returns directly, not via this
@@ -276,7 +300,7 @@ pub(super) fn conflict_value_origins<'a>(
 
 /// The `EXCLUDED.col` pseudo-table lineage source (when the source can't be
 /// collapsed through): the qualifier (`EXCLUDED`, original text) as the table.
-fn excluded_source(c: &ColRef) -> ColumnRead {
+fn excluded_source(c: &BoundColumn) -> ColumnRead {
     ColumnRead {
         reference: ColumnReference {
             table: c.qualifier.clone().map(|q| TableReference {

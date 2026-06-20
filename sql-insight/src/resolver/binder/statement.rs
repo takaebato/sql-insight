@@ -67,7 +67,8 @@ impl<'a> Binder<'a> {
         let Some(written) = self.table_ref(name) else {
             return LogicalPlan::Empty;
         };
-        let target = self.table_match(&written).table;
+        let m = self.table_match(&written);
+        let target = m.table;
         // MySQL `INSERT INTO t SET col = expr, …`: the assignment form (no
         // VALUES / SELECT source) — each assignment is a value column named by
         // its target, like a single-row UPDATE.
@@ -78,10 +79,15 @@ impl<'a> Binder<'a> {
             Some(source) => self.bind_query(source),
             None => (LogicalPlan::Empty, Scope::default()),
         };
+        // A column-less INSERT fills from the target's catalog columns — reuse
+        // the list from the `table_match` above rather than re-matching via
+        // `catalog_columns`. They are quote-wrapped for folded resolution; the
+        // written column list takes the plain identifier.
         let columns = if insert.columns.is_empty() {
-            self.catalog_columns(&target)
-                .into_iter()
+            m.columns
+                .iter()
                 .take(scope.query_outputs.len())
+                .map(|c| Ident::new(&c.value))
                 .collect()
         } else {
             insert.columns.clone()
@@ -171,11 +177,9 @@ impl<'a> Binder<'a> {
             OnInsert::OnConflict(on_conflict) => match &on_conflict.action {
                 OnConflictAction::DoUpdate(do_update) => {
                     let mut scope = self.target_scope(target);
-                    scope.relations.push(Relation {
+                    scope.relations.push(Relation::Derived {
                         alias: Some(Ident::new("excluded")),
-                        source: RelSource::Derived {
-                            columns: columns.to_vec(),
-                        },
+                        columns: columns.to_vec(),
                     });
                     (
                         scope,
@@ -444,12 +448,12 @@ impl<'a> Binder<'a> {
         // root, not read.
         let (_scan, scope) = self.bind_table_factor(factor, &[]);
         let relation = scope.relations.into_iter().next()?;
-        match &relation.source {
-            RelSource::Table { table, .. } => {
+        match &relation {
+            Relation::Table { table, .. } => {
                 let target = table.clone();
                 Some((relation, target))
             }
-            RelSource::Derived { .. } | RelSource::TableFunction => None,
+            Relation::Derived { .. } | Relation::TableFunction { .. } => None,
         }
     }
 
@@ -490,23 +494,20 @@ impl<'a> Binder<'a> {
         scope: &Scope,
     ) -> Option<TableReference> {
         let canonical = self.table_match(written).table;
-        scope
-            .relations
-            .iter()
-            .find_map(|relation| match &relation.source {
-                RelSource::Table { table, .. } => {
-                    let matches = match &relation.alias {
-                        Some(alias) => {
-                            written.schema.is_none()
-                                && written.catalog.is_none()
-                                && self.eq(self.casing.table_alias, alias, &written.name)
-                        }
-                        None => self.table_identity_eq(&canonical, table),
-                    };
-                    matches.then(|| table.clone())
-                }
-                RelSource::Derived { .. } | RelSource::TableFunction => None,
-            })
+        scope.relations.iter().find_map(|relation| match relation {
+            Relation::Table { table, alias, .. } => {
+                let matches = match alias {
+                    Some(alias) => {
+                        written.schema.is_none()
+                            && written.catalog.is_none()
+                            && self.eq(self.casing.table_alias, alias, &written.name)
+                    }
+                    None => self.table_identity_eq(&canonical, table),
+                };
+                matches.then(|| table.clone())
+            }
+            Relation::Derived { .. } | Relation::TableFunction { .. } => None,
+        })
     }
 
     /// Exact (not right-anchored) identity match of two table references under
@@ -534,12 +535,10 @@ impl<'a> Binder<'a> {
         } else {
             Columns::Cataloged(m.columns)
         };
-        Scope::single(Relation {
+        Scope::single(Relation::Table {
             alias: None,
-            source: RelSource::Table {
-                table: m.table,
-                columns,
-            },
+            table: m.table,
+            columns,
         })
     }
 

@@ -278,7 +278,7 @@ impl<'a> Binder<'a> {
         {
             return None;
         }
-        let refs: Vec<ColRef> = scope
+        let refs: Vec<BoundColumn> = scope
             .relations
             .iter()
             .filter_map(|rel| self.fanin_owner(rel, name))
@@ -289,21 +289,21 @@ impl<'a> Binder<'a> {
     /// A relation's contribution to a merge-column fan-in: a real table owns
     /// the column if `Unknown` (catalog-free → `Inferred`) or its `Cataloged` schema
     /// lists it (`Cataloged`); a derived / function relation doesn't.
-    pub(super) fn fanin_owner(&self, rel: &Relation, name: &Ident) -> Option<ColRef> {
-        let (table, resolution) = match &rel.source {
-            RelSource::Table {
+    pub(super) fn fanin_owner(&self, rel: &Relation, name: &Ident) -> Option<BoundColumn> {
+        let (table, resolution) = match rel {
+            Relation::Table {
                 table,
                 columns: Columns::Unknown,
                 ..
             } => (table, ResolutionKind::Inferred),
-            RelSource::Table {
+            Relation::Table {
                 table,
                 columns: Columns::Cataloged(cols),
                 ..
             } if self.list_has(cols, name) => (table, ResolutionKind::Cataloged),
             _ => return None,
         };
-        Some(ColRef {
+        Some(BoundColumn {
             qualifier: None,
             name: name.clone(),
             binding: base(table, resolution),

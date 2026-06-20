@@ -8,7 +8,7 @@
 //! the inner producer; the lineage trace reaches the real column instead.
 
 use super::logical_plan::{
-    children, own_expr_subplans, own_exprs, Binding, ColRef, Expr, LogicalPlan,
+    children, own_expr_subplans, own_exprs, Binding, BoundColumn, Expr, LogicalPlan,
 };
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableRead};
 
@@ -89,7 +89,7 @@ fn expr_reads(expr: &Expr, out: &mut Vec<ColumnRead>) {
 /// A column reference as a public read — `None` for a `Derived` ref (its
 /// physical read was counted at the inner producer). Shared with the origin
 /// trace, which turns a traced base column into the same `ColumnRead`.
-pub(super) fn column_read(c: &ColRef) -> Option<ColumnRead> {
+pub(super) fn column_read(c: &BoundColumn) -> Option<ColumnRead> {
     let (table, resolution) = match &c.binding {
         Binding::Base { table, resolution } => (Some(table.clone()), *resolution),
         Binding::Unresolved => (None, ResolutionKind::Unresolved),
