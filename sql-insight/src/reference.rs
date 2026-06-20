@@ -286,6 +286,35 @@ impl fmt::Display for TableReference {
     }
 }
 
+impl fmt::Display for ColumnReference {
+    /// `table.column` when the owning table is known (the table renders as
+    /// its own [`TableReference`] path), otherwise just `column`. Mirrors
+    /// [`TableReference`]'s `Display` for the column-identity case.
+    ///
+    /// ```rust
+    /// use sql_insight::{ColumnReference, TableReference};
+    ///
+    /// let qualified = ColumnReference {
+    ///     table: Some(TableReference {
+    ///         catalog: None,
+    ///         schema: Some("public".into()),
+    ///         name: "users".into(),
+    ///     }),
+    ///     name: "id".into(),
+    /// };
+    /// assert_eq!(qualified.to_string(), "public.users.id");
+    ///
+    /// let bare = ColumnReference { table: None, name: "id".into() };
+    /// assert_eq!(bare.to_string(), "id");
+    /// ```
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.table {
+            Some(table) => write!(f, "{table}.{}", self.name),
+            None => write!(f, "{}", self.name),
+        }
+    }
+}
+
 impl TryFrom<&Insert> for TableReference {
     type Error = Error;
 

@@ -29,6 +29,10 @@
 //! as actually stored (e.g. what `information_schema` reports); the
 //! resolver's dialect-casing policy governs the comparison.
 
+use crate::error::Error;
+use sqlparser::ast::{Ident, Statement};
+use sqlparser::dialect::Dialect;
+use sqlparser::parser::Parser;
 use std::fmt;
 
 /// A concrete, eager schema registry. Build it with [`Catalog::new`]
@@ -73,6 +77,58 @@ impl Catalog {
     pub fn default_schema(mut self, schema: impl Into<String>) -> Self {
         self.default_schema = Some(schema.into());
         self
+    }
+
+    /// Build a catalog from SQL DDL: every `CREATE TABLE` with an explicit
+    /// column list becomes a registered table — its `[catalog.]schema.name`
+    /// path and column names. Column *types* and constraints are ignored
+    /// (only names are needed), so dialect-specific type syntax doesn't
+    /// matter as long as the statement parses. `ddl` is parsed with
+    /// `dialect`, so pass the dialect matching your schema dump.
+    ///
+    /// An unqualified `CREATE TABLE t` registers under `default_schema`
+    /// (e.g. `"public"`); right-anchored matching then lets a bare query
+    /// `t` still resolve. Skipped (not registered): statements that aren't
+    /// `CREATE TABLE`, `CREATE TABLE`s with no column definitions
+    /// (`... AS SELECT`, `... LIKE ...`), and names with more than three
+    /// `catalog.schema.name` segments. A parse failure (the DDL is invalid
+    /// for `dialect`) returns `Err`.
+    ///
+    /// ```rust
+    /// use sql_insight::catalog::Catalog;
+    /// use sql_insight::sqlparser::dialect::GenericDialect;
+    ///
+    /// let ddl = "CREATE TABLE users (id INT, name TEXT); \
+    ///            CREATE TABLE app.orders (id INT, total NUMERIC);";
+    /// let catalog = Catalog::from_ddl(&GenericDialect {}, ddl, "public").unwrap();
+    /// // `users` registered under the default schema; `app.orders` keeps its own.
+    /// ```
+    pub fn from_ddl(dialect: &dyn Dialect, ddl: &str, default_schema: &str) -> Result<Self, Error> {
+        let statements = Parser::parse_sql(dialect, ddl)?;
+        let mut catalog = Catalog::new();
+        for statement in &statements {
+            let Statement::CreateTable(create) = statement else {
+                continue;
+            };
+            // No column definitions → CTAS / LIKE: nothing to register.
+            if create.columns.is_empty() {
+                continue;
+            }
+            let parts: Vec<&Ident> = create.name.0.iter().filter_map(|p| p.as_ident()).collect();
+            let table = match parts.as_slice() {
+                [name] => CatalogTable::new(default_schema, name.value.clone()),
+                [schema, name] => CatalogTable::new(schema.value.clone(), name.value.clone()),
+                [catalog_seg, schema, name] => {
+                    CatalogTable::new(schema.value.clone(), name.value.clone())
+                        .catalog(catalog_seg.value.clone())
+                }
+                // 0 or 4+ segments — unrepresentable identity.
+                _ => continue,
+            };
+            let columns = create.columns.iter().map(|c| c.name.value.clone());
+            catalog = catalog.table(table.columns(columns));
+        }
+        Ok(catalog)
     }
 
     /// The registered tables, in registration order.
