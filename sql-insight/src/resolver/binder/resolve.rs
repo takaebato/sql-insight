@@ -210,7 +210,7 @@ impl<'a> Binder<'a> {
             .map(|c| Ident::with_quote('"', c))
             .collect();
         TableMatch {
-            table: canonical_ref(first),
+            table: canonical_ref(first, written),
             resolution: ResolutionKind::Cataloged,
             columns,
         }
