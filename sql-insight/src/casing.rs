@@ -117,7 +117,7 @@ impl IdentifierCasing {
     /// false-merge-avoiding [`CaseRule::Sensitive`]. A future override
     /// API can refine these per deployment.
     pub fn for_dialect(dialect: &dyn Dialect) -> Self {
-        if dialect.is::<PostgreSqlDialect>() || dialect.is::<RedshiftSqlDialect>() {
+        if dialect.is::<PostgreSqlDialect>() {
             Self::uniform(CaseRule::Lower)
         } else if dialect.is::<AnsiDialect>()
             || dialect.is::<SnowflakeDialect>()
@@ -130,10 +130,16 @@ impl IdentifierCasing {
             || dialect.is::<SQLiteDialect>()
             || dialect.is::<HiveDialect>()
             || dialect.is::<DatabricksDialect>()
+            || dialect.is::<RedshiftSqlDialect>()
         {
             // Hive and Databricks / Spark SQL resolve identifiers
             // case-insensitively by default (`spark.sql.caseSensitive`
-            // defaults to false).
+            // defaults to false). Redshift, by default, folds *both*
+            // unquoted and double-quoted identifiers to lower case
+            // (case-insensitive) — `enable_case_sensitive_identifier` is
+            // `false` out of the box; setting it to `true` would make
+            // quoted identifiers case-sensitive (a Lower rule), a
+            // per-deployment override not modelled here.
             Self::uniform(CaseRule::Insensitive)
         } else if dialect.is::<MsSqlDialect>() {
             // Default install collation is case-insensitive (e.g.
@@ -294,7 +300,7 @@ mod tests {
     /// | dialect    | table       | table_alias | column      |
     /// |------------|-------------|-------------|-------------|
     /// | PostgreSQL | Lower       | Lower       | Lower       |
-    /// | Redshift   | Lower       | Lower       | Lower       |
+    /// | Redshift   | Insensitive | Insensitive | Insensitive |
     /// | ANSI       | Upper       | Upper       | Upper       |
     /// | Snowflake  | Upper       | Upper       | Upper       |
     /// | Oracle     | Upper       | Upper       | Upper       |
@@ -326,7 +332,11 @@ mod tests {
 
         let cases: Vec<(&str, Box<dyn Dialect>, IdentifierCasing)> = vec![
             ("PostgreSQL", Box::new(PostgreSqlDialect {}), uniform(Lower)),
-            ("Redshift", Box::new(RedshiftSqlDialect {}), uniform(Lower)),
+            (
+                "Redshift",
+                Box::new(RedshiftSqlDialect {}),
+                uniform(Insensitive),
+            ),
             ("ANSI", Box::new(AnsiDialect {}), uniform(Upper)),
             ("Snowflake", Box::new(SnowflakeDialect {}), uniform(Upper)),
             ("Oracle", Box::new(OracleDialect {}), uniform(Upper)),
