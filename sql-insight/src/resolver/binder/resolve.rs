@@ -678,4 +678,61 @@ mod tests {
             );
         }
     }
+
+    /// `fill_query_defaults` completes a written ref's omitted prefix from the
+    /// catalog's defaults, **schema before catalog** — and catalog-fill is gated
+    /// on a *present* schema, so `default_catalog` alone never touches a bare
+    /// name. (Asserts segment values; the fill quote-wraps internally for
+    /// matching, which doesn't affect the resolved values.)
+    ///
+    /// | written     | defaults       | filled            |
+    /// |-------------|----------------|-------------------|
+    /// | `users`     | schema+catalog | `db.public.users` |
+    /// | `s.users`   | schema+catalog | `db.s.users`      |
+    /// | `c.s.users` | schema+catalog | `c.s.users`       |
+    /// | `users`     | catalog only   | `users` (gated)   |
+    /// | `s.users`   | catalog only   | `db.s.users`      |
+    /// | `users`     | schema only    | `public.users`    |
+    /// | `users`     | (none)         | `users`           |
+    #[test]
+    fn fill_query_defaults_rule() {
+        // (catalog, schema, name) values, quoting aside.
+        fn seg(t: &TableReference) -> (Option<&str>, Option<&str>, &str) {
+            (
+                t.catalog.as_ref().map(|i| i.value.as_str()),
+                t.schema.as_ref().map(|i| i.value.as_str()),
+                t.name.value.as_str(),
+            )
+        }
+
+        let both = Catalog::new()
+            .default_schema("public")
+            .default_catalog("db");
+        // bare → schema filled, then catalog (catalog-fill needs a schema).
+        let f = fill_query_defaults(&tref(None, None, "users"), &both);
+        assert_eq!(seg(&f), (Some("db"), Some("public"), "users"));
+        // schema present → only catalog fills.
+        let f = fill_query_defaults(&tref(None, Some("s"), "users"), &both);
+        assert_eq!(seg(&f), (Some("db"), Some("s"), "users"));
+        // fully qualified → unchanged.
+        let f = fill_query_defaults(&tref(Some("c"), Some("s"), "users"), &both);
+        assert_eq!(seg(&f), (Some("c"), Some("s"), "users"));
+
+        // `default_catalog` without `default_schema`: a bare name gets nothing
+        // (catalog-fill is gated on a present schema), a schema-qualified one does.
+        let catalog_only = Catalog::new().default_catalog("db");
+        let f = fill_query_defaults(&tref(None, None, "users"), &catalog_only);
+        assert_eq!(seg(&f), (None, None, "users"));
+        let f = fill_query_defaults(&tref(None, Some("s"), "users"), &catalog_only);
+        assert_eq!(seg(&f), (Some("db"), Some("s"), "users"));
+
+        // `default_schema` only: bare gets the schema, catalog stays absent.
+        let schema_only = Catalog::new().default_schema("public");
+        let f = fill_query_defaults(&tref(None, None, "users"), &schema_only);
+        assert_eq!(seg(&f), (None, Some("public"), "users"));
+
+        // No defaults: unchanged.
+        let f = fill_query_defaults(&tref(None, None, "users"), &Catalog::new());
+        assert_eq!(seg(&f), (None, None, "users"));
+    }
 }
