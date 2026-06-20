@@ -62,7 +62,9 @@ pub struct TableExtraction {
     /// FROM uses appears twice. **In source order** — by each table's written
     /// token span (`name.span`), a deterministic function of the SQL rather
     /// than the internal tree walk; occurrence count is preserved. For the
-    /// distinct set, dedup via a `HashSet`.
+    /// distinct set, dedup via a `HashSet` (or, catalog-free, by
+    /// [`TableReference::identity_key`](crate::TableReference::identity_key)
+    /// to fold case-equivalent spellings).
     pub tables: Vec<TableReference>,
     pub diagnostics: Vec<TableLevelDiagnostic>,
 }

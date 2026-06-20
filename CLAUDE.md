@@ -85,29 +85,54 @@ by hand.
   and resolved reads are `Inferred`.
 - Identifier matching is dialect-aware (`crate::casing`). The
   extractor derives an `IdentifierCasing` from the `&dyn Dialect`
-  (`IdentifierCasing::for_dialect`) and threads it into the binder;
-  comparisons fold through `CaseRule::normalize`. The policy splits by
-  class — `table` (catalog/schema/table), `table_alias` (aliases + CTE
-  / derived / table-function names), `column` — each a `CaseRule`
-  (`Upper` / `Lower` / `Insensitive` / `Sensitive`). Most dialects are
-  homogeneous (PG=Lower, ANSI/Snowflake=Upper, DuckDB/SQLite=
-  Insensitive); MySQL and BigQuery split (real tables `Sensitive`,
-  columns/aliases `Insensitive`). Filesystem- / collation-dependent
-  models (MySQL table names, SQL Server) resolve to a fixed safe
+  (`IdentifierCasing::for_dialect`) and threads it into the binder —
+  bundled with the dialect's surface quote char (`canonical_quote`) as
+  the internal `IdentifierStyle { casing, quote }` (casing is a
+  user-overridable matching policy via `ExtractorOptions::with_casing`;
+  quote is always dialect-derived, a surface concern). Comparisons fold
+  through `CaseRule::normalize` (quote-aware: it keys on quoted-vs-unquoted
+  and the fold, never the quote *char*). The policy splits by class —
+  `table` (catalog/schema/table), `table_alias` (aliases + CTE / derived /
+  table-function names), `column` — each a `CaseRule` (`Upper` / `Lower` /
+  `Insensitive` / `Sensitive`). Most dialects are homogeneous (PG=Lower,
+  ANSI/Snowflake/Oracle=Upper, DuckDB/SQLite/Hive/Databricks/Redshift=
+  Insensitive, ClickHouse=Sensitive); MySQL and BigQuery split (real
+  tables `Sensitive`, columns/aliases `Insensitive`). Filesystem- /
+  collation-dependent models (MySQL table names, SQL Server) and
+  config-dependent ones (Redshift `enable_case_sensitive_identifier`,
+  Snowflake `QUOTED_IDENTIFIERS_IGNORE_CASE`) resolve to a fixed safe
   default; a per-deployment override API is a future addition. Only
-  matching folds — surfaced `TableReference` / `ColumnReference` keep
-  the original identifier text.
+  matching folds — a *written* (non-canonical) `TableReference` /
+  `ColumnReference` keeps the original identifier text.
 - **Catalog canonicalization**: `table_match` rewrites a uniquely
   matched reference to its registered full `catalog.schema.name` path,
-  so a bare `users` and an explicit `public.users` agree. Write
-  targets canonicalize too (same `table_match` path). Without a catalog —
-  or on a miss / ambiguous match — the reference stays as written, so
-  `mydb.users` and `otherdb.users` stay distinct and a bare `users`
-  does not merge into `mydb.users`. Column resolution is
-  **right-anchored** (`qualifier_matches_table`): a partial qualifier
-  like `users.col` matches `mydb.users`. DELETE-target merge identity
-  is **exact** (`scope_target` / `table_identity_eq`): bare `t1`
-  merges with FROM `t1` but not FROM `mydb.t1`.
+  so a bare `users` and an explicit `public.users` agree. The canonical
+  identity is **case-exact**, so it surfaces **quoted** with the dialect's
+  `canonical_quote` (`canonical_ref`) — else a later qualifier fold under
+  an upper-folding dialect would re-case it and fail to match its own
+  relation. Write targets canonicalize too (same `table_match` path).
+  Without a catalog, the reference stays exactly as written. On a miss /
+  ambiguous match it surfaces *default-normalized* (`surface_with_defaults`):
+  omitted prefix segments filled from the catalog's `default_schema` /
+  `default_catalog` as **unquoted** (foldable) idents — an unconfirmed
+  search-path qualifier, so it still fold-matches a plain column
+  qualifier — while written segments stay verbatim. With no configured
+  defaults this equals the written ref, so `mydb.users` and `otherdb.users`
+  stay distinct and a bare `users` does not merge into `mydb.users`.
+  Column resolution is **right-anchored** (`qualifier_matches_table`): a
+  partial qualifier like `users.col` matches `mydb.users`. DELETE-target
+  merge identity is **exact** (`scope_target` / `table_identity_eq`): bare
+  `t1` merges with FROM `t1` but not FROM `mydb.t1`.
+- **Two-level identity equality.** `TableReference` / `ColumnReference`
+  derive *structural* `Eq` / `Hash` (case- and quote-sensitive) — the right
+  dedup for catalog-backed analysis (matched refs are canonicalized) and
+  direct cross-statement comparison. For **catalog-free** dedup, where one
+  table appears under fold-equivalent spellings (`users` vs `USERS`),
+  `identity_key(&IdentifierCasing)` / `same_table` / `same_column` fold by a
+  dialect's casing. The key is an **opaque** `TableIdentityKey` /
+  `ColumnIdentityKey` (`Eq` + `Hash`, no readable value) so the fold output
+  never surfaces — it's identity (every present segment significant, not
+  the resolver's right-anchored wildcard matching).
 - Extractors are thin wrappers around the plan engine:
   - `table_extractor` — flat list of `TableReference`s.
   - `crud_table_extractor` — CRUD-bucketed tables (a thin shim over

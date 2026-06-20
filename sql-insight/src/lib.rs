@@ -234,7 +234,10 @@ pub use casing::{CaseRule, IdentifierCasing};
 // are re-exported at the crate root because they thread through
 // every other module's public surface.
 mod reference;
-pub use reference::{ColumnRead, ColumnReference, ResolutionKind, TableRead, TableReference};
+pub use reference::{
+    ColumnIdentityKey, ColumnRead, ColumnReference, ResolutionKind, TableIdentityKey, TableRead,
+    TableReference,
+};
 
 // `sqlparser` is re-exported so consumers can name `Dialect` /
 // `Ident` / etc. via `sql_insight::sqlparser::...` without taking a

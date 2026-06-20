@@ -7,18 +7,26 @@
 
 use core::fmt;
 
+use crate::casing::IdentifierCasing;
 use crate::error::Error;
 use sqlparser::ast::{Ident, Insert, ObjectName, TableFactor, TableObject};
 
 /// Physical table identity — the `catalog.schema.name` triplet.
 ///
 /// `TableReference` deliberately carries no alias: aliasing is a
-/// use-site decoration, not part of a table's identity. Two SQL
-/// fragments that reference the same physical table produce equal
-/// `TableReference`s regardless of how they alias it, so `HashSet` /
-/// `HashMap` dedup behaves intuitively and cross-statement comparison
-/// is direct. Use-site alias information, when needed, is carried by
-/// the structures that wrap a `TableReference` (e.g. resolver bindings).
+/// use-site decoration, not part of a table's identity. Use-site alias
+/// information, when needed, is carried by the structures that wrap a
+/// `TableReference` (e.g. resolver bindings).
+///
+/// **Equality has two levels.** The derived `Eq` / `Hash` are
+/// *structural* — case- and quote-sensitive, exact segments. That is the
+/// right dedup when references come from catalog-backed analysis (matched
+/// tables are canonicalized, so equal tables produce equal references) and
+/// for direct cross-statement comparison. For catalog-free dedup, where
+/// the same table may appear under fold-equivalent spellings (`users` vs
+/// `USERS`), use [`identity_key`](Self::identity_key) /
+/// [`same_table`](Self::same_table), which fold by a dialect's
+/// [`IdentifierCasing`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TableReference {
     pub catalog: Option<Ident>,
@@ -312,6 +320,75 @@ impl fmt::Display for ColumnReference {
             Some(table) => write!(f, "{table}.{}", self.name),
             None => write!(f, "{}", self.name),
         }
+    }
+}
+
+/// An opaque, dialect-aware identity key for a [`TableReference`].
+///
+/// Two references whose keys are equal denote the same table *under the
+/// given dialect's case-folding* — e.g. `users` and `USERS` share a key in
+/// PostgreSQL, but not in a case-sensitive dialect. Use it to deduplicate
+/// references catalog-free, where the structural `Eq` / `Hash` on
+/// `TableReference` (case-sensitive, quote-sensitive) would over-count
+/// fold-equivalent spellings. (With a catalog, matched references are
+/// already canonicalized, so structural dedup suffices.)
+///
+/// The key is **identity**, not wildcard matching: every present segment is
+/// significant, so a bare `users` and a qualified `public.users` have
+/// *different* keys (they are different identities). The folded text is not
+/// observable — only equality / hashing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TableIdentityKey {
+    catalog: Option<String>,
+    schema: Option<String>,
+    name: String,
+}
+
+/// An opaque, dialect-aware identity key for a [`ColumnReference`] — the
+/// [`TableIdentityKey`] of its owning table (if any, folded by the table
+/// rule) plus the column name folded by the column rule. See
+/// [`TableIdentityKey`] for the identity-vs-matching and opacity notes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ColumnIdentityKey {
+    table: Option<TableIdentityKey>,
+    name: String,
+}
+
+impl TableReference {
+    /// The dialect-aware [`TableIdentityKey`] for this reference: each
+    /// segment folded by `casing`'s table rule. Equal keys denote the same
+    /// table under that dialect's casing.
+    pub fn identity_key(&self, casing: &IdentifierCasing) -> TableIdentityKey {
+        let fold = |ident: &Ident| casing.table.normalize(ident);
+        TableIdentityKey {
+            catalog: self.catalog.as_ref().map(&fold),
+            schema: self.schema.as_ref().map(&fold),
+            name: fold(&self.name),
+        }
+    }
+
+    /// Whether `self` and `other` denote the same table under `casing` —
+    /// equivalent to comparing their [`identity_key`](Self::identity_key)s.
+    pub fn same_table(&self, other: &Self, casing: &IdentifierCasing) -> bool {
+        self.identity_key(casing) == other.identity_key(casing)
+    }
+}
+
+impl ColumnReference {
+    /// The dialect-aware [`ColumnIdentityKey`] for this reference: the
+    /// owning table folded by the table rule, the column name by the column
+    /// rule. Equal keys denote the same column under that dialect's casing.
+    pub fn identity_key(&self, casing: &IdentifierCasing) -> ColumnIdentityKey {
+        ColumnIdentityKey {
+            table: self.table.as_ref().map(|t| t.identity_key(casing)),
+            name: casing.column.normalize(&self.name),
+        }
+    }
+
+    /// Whether `self` and `other` denote the same column under `casing` —
+    /// equivalent to comparing their [`identity_key`](Self::identity_key)s.
+    pub fn same_column(&self, other: &Self, casing: &IdentifierCasing) -> bool {
+        self.identity_key(casing) == other.identity_key(casing)
     }
 }
 

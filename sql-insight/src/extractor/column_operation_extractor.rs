@@ -161,7 +161,9 @@ pub struct ColumnOperation {
     /// function of the SQL rather than the internal traversal. References that
     /// share a token (a `USING` fan-in) keep a stable relative order. For the
     /// distinct identity set, dedup `reads.iter().map(|r| &r.reference)` via a
-    /// `HashSet`.
+    /// `HashSet` (or, catalog-free, by
+    /// [`ColumnReference::identity_key`](crate::ColumnReference::identity_key)
+    /// to fold case-equivalent spellings).
     pub reads: Vec<ColumnRead>,
     /// Columns written by the statement, in source (column-list) order.
     /// Occurrence-based like `reads`. Write targets come straight from SQL

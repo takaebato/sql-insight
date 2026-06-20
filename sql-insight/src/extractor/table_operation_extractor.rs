@@ -78,7 +78,10 @@ pub struct TableOperation {
     /// [`ResolutionKind`](crate::ResolutionKind). **In source order** — by
     /// each read's written token span (`reference.name.span`), a deterministic
     /// function of the SQL rather than the internal traversal. For the distinct
-    /// identity set, dedup `reads.iter().map(|r| &r.reference)` via a `HashSet`.
+    /// identity set, dedup `reads.iter().map(|r| &r.reference)` via a `HashSet`
+    /// (or, catalog-free, by
+    /// [`TableReference::identity_key`](crate::TableReference::identity_key)
+    /// to fold case-equivalent spellings).
     pub reads: Vec<TableRead>,
     /// Tables written by the statement, in source order. Occurrence-based
     /// like `reads`. Bare [`TableReference`] — write targets are trivially
