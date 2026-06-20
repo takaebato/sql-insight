@@ -51,9 +51,11 @@ pub(super) struct Scope {
 }
 
 /// A projection output column, for clause-alias resolution. `identity` marks a
-/// bare passthrough (`SELECT a`): a clause reference to it falls through to
-/// the real column (a read); a non-identity (introduced) alias resolves to the
-/// output itself (`Binding::Derived`, dropped from reads).
+/// bare passthrough (`SELECT a`, or the redundant `SELECT a AS a` — the test is
+/// name-equality, not alias presence): a clause reference to it falls through to
+/// the real column (a read); a non-identity (introduced) alias — a rename
+/// (`a AS x`) or a computed expr (`a + b AS s`) — resolves to the output itself
+/// (`Binding::Derived`, dropped from reads). See [`Binder::output_cols`](super::Binder::output_cols).
 #[derive(Clone)]
 pub(super) struct OutputCol {
     pub(super) name: Option<Ident>,

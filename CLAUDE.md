@@ -117,6 +117,24 @@ by hand.
   artifact); occurrence count is preserved and each reference carries
   its source span, so consumers sort by span for source order. Tests
   compare these surfaces as multisets. `writes` follow source order.
+- `reads` is **occurrence-based, by token** — each *syntactic* appearance
+  of a base-column reference is one read, not each *physical* read. The
+  unit is "the column name appeared as a token here", not "the engine
+  re-read the table": `SELECT a FROM t WHERE a > 0` reads `t.a` twice
+  (projection + WHERE), and `SELECT a FROM t GROUP BY a` twice (projection
+  + GROUP BY). A **post-projection clause** (GROUP BY / HAVING / ORDER BY)
+  is the subtle case, because output aliases are visible there: a token
+  naming a **base column** (an *identity* output — `a`, or the redundant
+  `a AS a`) counts as another occurrence, but a token naming only an
+  **introduced output alias** (`ORDER BY x` for `a AS x`, or `ORDER BY s`
+  for `a + b AS s`) is a reference to the projection *output*, not a base
+  occurrence — it binds `Binding::Derived` and is **not** a read (the
+  dependency was already counted at the projection). So `GROUP BY a`
+  (counts) and `ORDER BY x` (doesn't) are deliberately **asymmetric** in
+  `reads`. `lineage` is **symmetric** — each captures the `a -> output`
+  dependency once at the projection — so dependency comprehension is
+  unaffected; the asymmetry lives only in the read occurrence count. (See
+  the projection-alias visibility convention below for the mechanism.)
 
 ## Vocabulary
 
@@ -248,19 +266,23 @@ by hand.
   either supply resolved query plans or do their own expansion.
 - Projection-alias visibility in GROUP BY / HAVING / ORDER BY is
   **structural**: the clause ordering is a logical-plan operator stack,
-  so the WHERE `PassThrough` sits *below* the `Project` (no output
-  aliases visible) while GROUP BY / HAVING / ORDER BY resolve against a
-  scope that includes the `Project`'s `outputs`. A bare ref there
-  naming an **introduced** alias (computed expr or renamed column, e.g.
-  `total` in `SELECT a+b AS total … ORDER BY total`) resolves to that
-  output column's pre-collapsed provenance, marked `synthetic_origin`,
+  so the WHERE `Filter` sits *below* the `Projection` (no output aliases
+  visible) while GROUP BY / HAVING / ORDER BY resolve against a scope that
+  includes the `Projection`'s outputs. A bare ref there naming an
+  **introduced** alias (computed expr or renamed column, e.g. `total` in
+  `SELECT a+b AS total … ORDER BY total`) binds `Binding::Derived` and the
+  origin traversal traces it through the output column to its base origins,
   so it stays a lineage source but drops from `reads` (no phantom
-  `t.total`; the real dependency is already at the projection). An
-  *identity* passthrough (`SELECT a … GROUP BY a`) falls through to
-  normal resolution, so the common case still surfaces `a`. Qualified
-  refs (`t.total`) are never treated as aliases. Dialect-specific
-  alias-vs-column precedence (ORDER BY favours alias, GROUP BY the input
-  column) is not modelled.
+  `t.total`; the real dependency is already at the projection — this is the
+  occurrence-based `reads` policy above). An *identity* passthrough
+  (`SELECT a … GROUP BY a`) falls through to normal resolution, so the
+  common case still surfaces `a`. **Identity is name-equality, not alias
+  presence**: an output is identity iff it is a bare column whose output
+  name equals that column's own name, so the redundant `a AS a` is identity
+  too (keeps the `GROUP BY a` read), while `a AS x` is not. Qualified refs
+  (`t.total`) are never treated as aliases. Dialect-specific alias-vs-column
+  precedence (ORDER BY favours alias, GROUP BY the input column) is not
+  modelled.
 - `JOIN … USING (col)` merge columns **fan in**: a `USING (a)` join
   folds both sides' `a` into one COALESCE-style logical column with no
   single owner, so an unqualified ref to `a` resolves to *every* joined

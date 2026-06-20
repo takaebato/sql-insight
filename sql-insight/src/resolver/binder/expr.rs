@@ -614,7 +614,15 @@ impl<'a> Binder<'a> {
     }
 
     /// Summarise the projection outputs for clause-alias resolution. An output
-    /// is *identity* iff it is a bare column under its own name.
+    /// is *identity* iff it is a bare column reference whose output name equals
+    /// that column's own name — `SELECT a` (and the redundant `SELECT a AS a`),
+    /// but **not** a rename (`a AS x`) or a computed expr (`a + b AS s`).
+    ///
+    /// The test is name-*equality*, not alias *presence*: a redundant self-alias
+    /// (`a AS a`) stays identity on purpose, so a clause reference like
+    /// `GROUP BY a` falls through to the real `a` read. (Keying on "has an alias"
+    /// would misclassify `a AS a` as introduced and resolve `GROUP BY a` to the
+    /// output as `Binding::Derived`, silently dropping that read.)
     pub(super) fn output_cols(&self, exprs: &[NamedExpr]) -> Vec<OutputCol> {
         exprs
             .iter()

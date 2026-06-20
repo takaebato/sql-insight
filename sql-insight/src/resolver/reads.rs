@@ -2,10 +2,17 @@
 //! base-column reference (occurrence-based) and every base table scanned. These
 //! back the [`crate::resolver`] facade's `reads` / `table_reads` entry points.
 //!
-//! A read is *occurrence-based*: a column referenced in both the projection and
-//! the `WHERE` clause surfaces twice. A `Derived` reference (a CTE / derived /
-//! computed column) is dropped here — its physical read was already counted at
-//! the inner producer; the lineage trace reaches the real column instead.
+//! A read is *occurrence-based, by token*: each syntactic appearance of a
+//! base-column reference counts, not each physical read — a column referenced in
+//! both the projection and the `WHERE` clause surfaces twice. In a
+//! post-projection clause (GROUP BY / HAVING / ORDER BY) a token naming a base
+//! column (an identity output, e.g. `GROUP BY a`) counts as another occurrence,
+//! but one naming only an introduced output alias (`ORDER BY x` for `a AS x`)
+//! binds `Derived` and drops — the dependency was already counted at the
+//! projection (and is carried by lineage). A `Derived` reference (a CTE /
+//! derived / computed column) is likewise dropped here — its physical read was
+//! already counted at the inner producer; the lineage trace reaches the real
+//! column instead.
 
 use super::logical_plan::{
     children, own_expr_subplans, own_exprs, Binding, BoundColumn, Expr, LogicalPlan,
