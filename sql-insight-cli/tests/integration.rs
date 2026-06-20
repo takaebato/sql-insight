@@ -350,9 +350,10 @@ mod integration {
         use super::*;
 
         #[test]
-        fn test_extract_with_catalog() {
-            // A DDL `--catalog` makes resolution catalog-aware: `users`
-            // canonicalizes to `public.users` and the read is `(cataloged)`.
+        fn test_extract_with_ddl_file() {
+            // A `--ddl-file` makes resolution catalog-aware. The unqualified
+            // `CREATE TABLE users` registers schema-less, so the read is
+            // `(cataloged)` and surfaces bare `users.name` (no fabricated schema).
             let mut schema = NamedTempFile::new().unwrap();
             schema
                 .write_all(b"CREATE TABLE users (id INT, name TEXT);")
@@ -360,14 +361,34 @@ mod integration {
             sql_insight_cmd()
                 .arg("extract")
                 .arg("column-ops")
-                .arg("--catalog")
+                .arg("--ddl-file")
                 .arg(schema.path())
                 .arg("SELECT name FROM users")
                 .assert()
                 .success()
                 .stdout(
-                    "[1] Select\n  reads:   public.users.name (cataloged)\n  lineage: public.users.name (cataloged) -> name\n",
+                    "[1] Select\n  reads:   users.name (cataloged)\n  lineage: users.name (cataloged) -> name\n",
                 )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_with_default_schema() {
+            // An explicit --default-schema fills the bare query ref before
+            // matching; the unqualified DDL table (schema-less) still matches.
+            let mut schema = NamedTempFile::new().unwrap();
+            schema.write_all(b"CREATE TABLE users (id INT);").unwrap();
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("--ddl-file")
+                .arg(schema.path())
+                .arg("--default-schema")
+                .arg("app")
+                .arg("SELECT id FROM users")
+                .assert()
+                .success()
+                .stdout("[1] Select\n  reads:   users.id (cataloged)\n  lineage: users.id (cataloged) -> id\n")
                 .stderr("");
         }
 

@@ -124,8 +124,14 @@ pub struct ExtractExecutor {
     pub kind: ExtractKind,
     pub sql: String,
     pub dialect_name: Option<String>,
-    pub catalog_file: Option<String>,
-    pub default_schema: String,
+    /// DDL file whose `CREATE TABLE`s populate the catalog.
+    pub ddl_file: Option<String>,
+    /// Query-side default schema / catalog (the search-path-style fill
+    /// used before matching). Set only when the user asked — a fallback
+    /// must not leak into query fill or it would break multi-schema
+    /// right-anchored resolution. Also names unqualified DDL tables.
+    pub default_schema: Option<String>,
+    pub default_catalog: Option<String>,
     pub casing: CasingOverride,
 }
 
@@ -165,19 +171,27 @@ impl CliExecutable for ExtractExecutor {
 }
 
 impl ExtractExecutor {
-    /// Read `--catalog` DDL (if any) and build a catalog from it.
+    /// Build the catalog from the `--ddl-file` (if any) plus query-side
+    /// defaults. Defaults without a DDL file are a no-op (no tables to
+    /// match), so a missing DDL file yields no catalog.
     fn load_catalog(&self, dialect: &dyn Dialect) -> Result<Option<Catalog>, Error> {
-        let Some(path) = &self.catalog_file else {
+        let Some(path) = &self.ddl_file else {
             return Ok(None);
         };
-        let ddl = std::fs::read_to_string(path).map_err(|e| {
-            Error::ArgumentError(format!("Failed to read catalog file {path}: {e}"))
-        })?;
-        Ok(Some(Catalog::from_ddl(
-            dialect,
-            &ddl,
-            &self.default_schema,
-        )?))
+        let ddl = std::fs::read_to_string(path)
+            .map_err(|e| Error::ArgumentError(format!("Failed to read DDL file {path}: {e}")))?;
+        // Unqualified DDL tables register schema-less (no fabricated schema).
+        // `--default-schema` / `--default-catalog` set only the query-side
+        // fill, so a multi-schema catalog still resolves bare refs by
+        // right-anchoring when no default is given.
+        let mut catalog = Catalog::from_ddl(dialect, &ddl)?;
+        if let Some(schema) = &self.default_schema {
+            catalog = catalog.default_schema(schema.clone());
+        }
+        if let Some(cat) = &self.default_catalog {
+            catalog = catalog.default_catalog(cat.clone());
+        }
+        Ok(Some(catalog))
     }
 }
 

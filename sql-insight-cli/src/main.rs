@@ -102,11 +102,18 @@ struct ExtractArgs {
     common: CommonOptions,
     /// SQL DDL file (CREATE TABLE statements) to resolve against — enables
     /// catalog-aware analysis (canonicalized identities, strict columns).
+    #[clap(long = "ddl-file")]
+    ddl_file: Option<String>,
+    /// Query-side default schema (search-path-style fill before matching);
+    /// also names unqualified tables in the DDL. Without it, unqualified
+    /// DDL tables register under `public` and bare refs resolve by
+    /// right-anchoring. Only meaningful with --ddl-file.
     #[clap(long)]
-    catalog: Option<String>,
-    /// Schema assigned to unqualified tables in the --catalog DDL.
-    #[clap(long, default_value = "public")]
-    default_schema: String,
+    default_schema: Option<String>,
+    /// Query-side default catalog (search-path-style fill). Only
+    /// meaningful with --ddl-file.
+    #[clap(long)]
+    default_catalog: Option<String>,
     /// Override identifier casing for every class (table / alias / column).
     #[clap(long, value_enum)]
     casing: Option<CasingArg>,
@@ -167,8 +174,9 @@ impl ExtractTarget {
             kind,
             sql,
             dialect_name: args.common.dialect.clone(),
-            catalog_file: args.catalog.clone(),
+            ddl_file: args.ddl_file.clone(),
             default_schema: args.default_schema.clone(),
+            default_catalog: args.default_catalog.clone(),
             casing: CasingOverride {
                 all: args.casing.map(Into::into),
                 table: args.casing_table.map(Into::into),
