@@ -1,12 +1,12 @@
 mod executor;
 
 use crate::executor::{
-    CliExecutable, ColumnOperationExtractExecutor, CrudTableExtractExecutor, FormatExecutor,
-    NormalizeExecutor, TableExtractExecutor, TableOperationExtractExecutor,
+    CasingOverride, CliExecutable, ExtractExecutor, ExtractKind, FormatExecutor, NormalizeExecutor,
 };
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use sql_insight::error::Error;
 use sql_insight::normalizer::NormalizerOptions;
+use sql_insight::CaseRule;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
@@ -85,37 +85,97 @@ enum Commands {
 #[derive(Subcommand, Debug)]
 enum ExtractTarget {
     /// Flat list of tables the statement references
-    Tables(CommonOptions),
+    Tables(ExtractArgs),
     /// Tables bucketed by CRUD verb (Create / Read / Update / Delete)
-    Crud(CommonOptions),
+    Crud(ExtractArgs),
     /// Table-level reads / writes / lineage per statement
-    TableOps(CommonOptions),
+    TableOps(ExtractArgs),
     /// Column-level reads / writes / lineage per statement
-    ColumnOps(CommonOptions),
+    ColumnOps(ExtractArgs),
+}
+
+/// Options shared by every `extract` subcommand: the source / dialect plus
+/// catalog- and casing-aware analysis controls.
+#[derive(Parser, Debug)]
+struct ExtractArgs {
+    #[clap(flatten)]
+    common: CommonOptions,
+    /// SQL DDL file (CREATE TABLE statements) to resolve against — enables
+    /// catalog-aware analysis (canonicalized identities, strict columns).
+    #[clap(long)]
+    catalog: Option<String>,
+    /// Schema assigned to unqualified tables in the --catalog DDL.
+    #[clap(long, default_value = "public")]
+    default_schema: String,
+    /// Override identifier casing for every class (table / alias / column).
+    #[clap(long, value_enum)]
+    casing: Option<CasingArg>,
+    /// Override casing for catalog / schema / table names only.
+    #[clap(long = "casing-table", value_enum)]
+    casing_table: Option<CasingArg>,
+    /// Override casing for table aliases / CTE / derived names only.
+    #[clap(long = "casing-table-alias", value_enum)]
+    casing_table_alias: Option<CasingArg>,
+    /// Override casing for column names only.
+    #[clap(long = "casing-column", value_enum)]
+    casing_column: Option<CasingArg>,
+}
+
+/// CLI surface of the library's `CaseRule`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CasingArg {
+    Upper,
+    Lower,
+    Insensitive,
+    Sensitive,
+}
+
+impl From<CasingArg> for CaseRule {
+    fn from(arg: CasingArg) -> Self {
+        match arg {
+            CasingArg::Upper => CaseRule::Upper,
+            CasingArg::Lower => CaseRule::Lower,
+            CasingArg::Insensitive => CaseRule::Insensitive,
+            CasingArg::Sensitive => CaseRule::Sensitive,
+        }
+    }
 }
 
 impl ExtractTarget {
-    fn common(&self) -> &CommonOptions {
+    fn args(&self) -> &ExtractArgs {
         match self {
-            ExtractTarget::Tables(o)
-            | ExtractTarget::Crud(o)
-            | ExtractTarget::TableOps(o)
-            | ExtractTarget::ColumnOps(o) => o,
+            ExtractTarget::Tables(a)
+            | ExtractTarget::Crud(a)
+            | ExtractTarget::TableOps(a)
+            | ExtractTarget::ColumnOps(a) => a,
         }
     }
 
+    fn common(&self) -> &CommonOptions {
+        &self.args().common
+    }
+
     fn executor(&self, sql: String) -> Box<dyn CliExecutable> {
-        let dialect = self.common().dialect.clone();
-        match self {
-            ExtractTarget::Tables(_) => Box::new(TableExtractExecutor::new(sql, dialect)),
-            ExtractTarget::Crud(_) => Box::new(CrudTableExtractExecutor::new(sql, dialect)),
-            ExtractTarget::TableOps(_) => {
-                Box::new(TableOperationExtractExecutor::new(sql, dialect))
-            }
-            ExtractTarget::ColumnOps(_) => {
-                Box::new(ColumnOperationExtractExecutor::new(sql, dialect))
-            }
-        }
+        let args = self.args();
+        let kind = match self {
+            ExtractTarget::Tables(_) => ExtractKind::Tables,
+            ExtractTarget::Crud(_) => ExtractKind::Crud,
+            ExtractTarget::TableOps(_) => ExtractKind::TableOps,
+            ExtractTarget::ColumnOps(_) => ExtractKind::ColumnOps,
+        };
+        Box::new(ExtractExecutor {
+            kind,
+            sql,
+            dialect_name: args.common.dialect.clone(),
+            catalog_file: args.catalog.clone(),
+            default_schema: args.default_schema.clone(),
+            casing: CasingOverride {
+                all: args.casing.map(Into::into),
+                table: args.casing_table.map(Into::into),
+                table_alias: args.casing_table_alias.map(Into::into),
+                column: args.casing_column.map(Into::into),
+            },
+        })
     }
 }
 

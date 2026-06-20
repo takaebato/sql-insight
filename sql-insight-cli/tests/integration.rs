@@ -346,6 +346,48 @@ mod integration {
         }
     }
 
+    mod extract_options {
+        use super::*;
+
+        #[test]
+        fn test_extract_with_catalog() {
+            // A DDL `--catalog` makes resolution catalog-aware: `users`
+            // canonicalizes to `public.users` and the read is `(cataloged)`.
+            let mut schema = NamedTempFile::new().unwrap();
+            schema
+                .write_all(b"CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("--catalog")
+                .arg(schema.path())
+                .arg("SELECT name FROM users")
+                .assert()
+                .success()
+                .stdout(
+                    "[1] Select\n  reads:   public.users.name (cataloged)\n  lineage: public.users.name (cataloged) -> name\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_with_casing_sensitive() {
+            // Case-sensitive override: lowercase `t2` no longer binds the
+            // uppercase CTE `T2`, so it surfaces as a distinct table.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("tables")
+                .arg("--casing")
+                .arg("sensitive")
+                .arg("WITH T2 AS (SELECT id FROM t1) SELECT * FROM t2")
+                .assert()
+                .success()
+                .stdout("t1, t2\n")
+                .stderr("");
+        }
+    }
+
     mod interactive_mode {
         use super::*;
         use std::time::Duration;

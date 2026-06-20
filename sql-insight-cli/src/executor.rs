@@ -1,8 +1,13 @@
+use sql_insight::catalog::Catalog;
 use sql_insight::error::Error;
-use sql_insight::extractor::{ColumnLineageKind, ColumnOperation, ColumnTarget, TableOperation};
+use sql_insight::extractor::{
+    extract_column_operations_with_options, extract_crud_tables_with_options,
+    extract_table_operations_with_options, extract_tables_with_options, ColumnLineageKind,
+    ColumnOperation, ColumnTarget, ExtractorOptions, TableOperation,
+};
 use sql_insight::normalizer::NormalizerOptions;
-use sql_insight::sqlparser::dialect;
-use sql_insight::{ColumnRead, ResolutionKind, TableRead};
+use sql_insight::sqlparser::dialect::{self, Dialect};
+use sql_insight::{CaseRule, ColumnRead, IdentifierCasing, ResolutionKind, TableRead};
 
 pub trait CliExecutable {
     fn execute(&self) -> Result<Vec<String>, Error>;
@@ -65,99 +70,114 @@ impl CliExecutable for NormalizeExecutor {
     }
 }
 
-pub struct TableExtractExecutor {
+/// Which extraction surface an [`ExtractExecutor`] produces.
+pub enum ExtractKind {
+    Tables,
+    Crud,
+    TableOps,
+    ColumnOps,
+}
+
+/// Per-class identifier-casing overrides from the CLI. `all` is the
+/// uniform base; the per-class fields patch individual classes on top.
+/// All `None` = use the dialect default unchanged.
+#[derive(Default)]
+pub struct CasingOverride {
+    pub all: Option<CaseRule>,
+    pub table: Option<CaseRule>,
+    pub table_alias: Option<CaseRule>,
+    pub column: Option<CaseRule>,
+}
+
+impl CasingOverride {
+    /// Resolve to an [`IdentifierCasing`], or `None` when no override was
+    /// given (so the binder keeps the dialect default). Layering: dialect
+    /// default → uniform `all` → per-class patches.
+    fn resolve(&self, dialect: &dyn Dialect) -> Option<IdentifierCasing> {
+        if self.all.is_none()
+            && self.table.is_none()
+            && self.table_alias.is_none()
+            && self.column.is_none()
+        {
+            return None;
+        }
+        let mut casing = match self.all {
+            Some(rule) => IdentifierCasing::uniform(rule),
+            None => IdentifierCasing::for_dialect(dialect),
+        };
+        if let Some(rule) = self.table {
+            casing.table = rule;
+        }
+        if let Some(rule) = self.table_alias {
+            casing.table_alias = rule;
+        }
+        if let Some(rule) = self.column {
+            casing.column = rule;
+        }
+        Some(casing)
+    }
+}
+
+/// The single extractor entry point: builds the dialect, optional catalog
+/// (from a DDL file), and casing override once, then dispatches on `kind`.
+pub struct ExtractExecutor {
+    pub kind: ExtractKind,
     pub sql: String,
     pub dialect_name: Option<String>,
+    pub catalog_file: Option<String>,
+    pub default_schema: String,
+    pub casing: CasingOverride,
 }
 
-impl TableExtractExecutor {
-    pub fn new(sql: String, dialect_name: Option<String>) -> Self {
-        Self { sql, dialect_name }
-    }
-}
-
-impl CliExecutable for TableExtractExecutor {
+impl CliExecutable for ExtractExecutor {
     fn execute(&self) -> Result<Vec<String>, Error> {
-        let result = sql_insight::extractor::extract_tables(
-            get_dialect(self.dialect_name.as_deref())?.as_ref(),
-            self.sql.as_ref(),
-        )?;
-        Ok(result
-            .iter()
-            .map(|r| match r {
-                Ok(tables) => format!("{}", tables),
-                Err(e) => format!("Error: {}", e),
-            })
-            .collect())
+        let dialect = get_dialect(self.dialect_name.as_deref())?;
+        let dialect = dialect.as_ref();
+        let catalog = self.load_catalog(dialect)?;
+        let casing = self.casing.resolve(dialect);
+
+        let mut options = ExtractorOptions::new();
+        if let Some(catalog) = &catalog {
+            options = options.with_catalog(catalog);
+        }
+        if let Some(casing) = casing {
+            options = options.with_casing(casing);
+        }
+
+        let sql = self.sql.as_ref();
+        match self.kind {
+            ExtractKind::Tables => Ok(render_display(&extract_tables_with_options(
+                dialect, sql, options,
+            )?)),
+            ExtractKind::Crud => Ok(render_display(&extract_crud_tables_with_options(
+                dialect, sql, options,
+            )?)),
+            ExtractKind::TableOps => Ok(render_statements(
+                &extract_table_operations_with_options(dialect, sql, options)?,
+                format_table_operation,
+            )),
+            ExtractKind::ColumnOps => Ok(render_statements(
+                &extract_column_operations_with_options(dialect, sql, options)?,
+                format_column_operation,
+            )),
+        }
     }
 }
 
-pub struct CrudTableExtractExecutor {
-    sql: String,
-    dialect_name: Option<String>,
-}
-
-impl CrudTableExtractExecutor {
-    pub fn new(sql: String, dialect_name: Option<String>) -> Self {
-        Self { sql, dialect_name }
-    }
-}
-
-impl CliExecutable for CrudTableExtractExecutor {
-    fn execute(&self) -> Result<Vec<String>, Error> {
-        let result = sql_insight::extractor::extract_crud_tables(
-            get_dialect(self.dialect_name.as_deref())?.as_ref(),
-            self.sql.as_ref(),
-        )?;
-        Ok(result
-            .iter()
-            .map(|r| match r {
-                Ok(crud_tables) => format!("{}", crud_tables),
-                Err(e) => format!("Error: {}", e),
-            })
-            .collect())
-    }
-}
-
-pub struct TableOperationExtractExecutor {
-    sql: String,
-    dialect_name: Option<String>,
-}
-
-impl TableOperationExtractExecutor {
-    pub fn new(sql: String, dialect_name: Option<String>) -> Self {
-        Self { sql, dialect_name }
-    }
-}
-
-impl CliExecutable for TableOperationExtractExecutor {
-    fn execute(&self) -> Result<Vec<String>, Error> {
-        let result = sql_insight::extractor::extract_table_operations(
-            get_dialect(self.dialect_name.as_deref())?.as_ref(),
-            self.sql.as_ref(),
-        )?;
-        Ok(render_statements(&result, format_table_operation))
-    }
-}
-
-pub struct ColumnOperationExtractExecutor {
-    sql: String,
-    dialect_name: Option<String>,
-}
-
-impl ColumnOperationExtractExecutor {
-    pub fn new(sql: String, dialect_name: Option<String>) -> Self {
-        Self { sql, dialect_name }
-    }
-}
-
-impl CliExecutable for ColumnOperationExtractExecutor {
-    fn execute(&self) -> Result<Vec<String>, Error> {
-        let result = sql_insight::extractor::extract_column_operations(
-            get_dialect(self.dialect_name.as_deref())?.as_ref(),
-            self.sql.as_ref(),
-        )?;
-        Ok(render_statements(&result, format_column_operation))
+impl ExtractExecutor {
+    /// Read `--catalog` DDL (if any) and build a catalog from it.
+    fn load_catalog(&self, dialect: &dyn Dialect) -> Result<Option<Catalog>, Error> {
+        let Some(path) = &self.catalog_file else {
+            return Ok(None);
+        };
+        let ddl = std::fs::read_to_string(path).map_err(|e| {
+            Error::ArgumentError(format!("Failed to read catalog file {path}: {e}"))
+        })?;
+        Ok(Some(Catalog::from_ddl(
+            dialect,
+            &ddl,
+            &self.default_schema,
+        )?))
     }
 }
 
@@ -183,6 +203,18 @@ fn render_statements<T>(
         .map(|(i, r)| match r {
             Ok(op) => format_one(i + 1, op),
             Err(e) => format!("[{}] Error: {}", i + 1, e),
+        })
+        .collect()
+}
+
+/// Render the `Display`-backed extractors (`tables` / `crud`), one
+/// statement per line.
+fn render_display<T: std::fmt::Display>(results: &[Result<T, Error>]) -> Vec<String> {
+    results
+        .iter()
+        .map(|r| match r {
+            Ok(value) => value.to_string(),
+            Err(e) => format!("Error: {e}"),
         })
         .collect()
 }
