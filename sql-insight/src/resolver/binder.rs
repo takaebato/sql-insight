@@ -248,11 +248,29 @@ fn normalize_catalog(segment: &str, fold: CaseFold) -> String {
 }
 
 /// The surfaced canonical identity of a matched table: plain (unquoted) idents.
-fn canonical_ref(table: &CatalogTable) -> TableReference {
+/// The canonical identity of a matched catalog table — its registered
+/// `catalog.schema.name` path. Each segment's *value* comes from the
+/// registration (so a bare `users` and an explicit `public.users` agree), but
+/// its *span* is carried from the matching `written` segment so
+/// `reference.name.span` still points at where the reference was written (for
+/// source-order sorting). A segment the catalog *filled in* has no source token,
+/// so it gets an empty span.
+fn canonical_ref(table: &CatalogTable, written: &TableReference) -> TableReference {
+    let seg = |value: &str, span: Span| Ident {
+        value: value.to_string(),
+        quote_style: None,
+        span,
+    };
+    let span_of = |ident: Option<&Ident>| ident.map_or(Span::empty(), |i| i.span);
     TableReference {
-        catalog: table.catalog_segment().map(Ident::new),
-        schema: Some(Ident::new(table.schema_segment())),
-        name: Ident::new(table.name_segment()),
+        catalog: table
+            .catalog_segment()
+            .map(|c| seg(c, span_of(written.catalog.as_ref()))),
+        schema: Some(seg(
+            table.schema_segment(),
+            span_of(written.schema.as_ref()),
+        )),
+        name: seg(table.name_segment(), written.name.span),
     }
 }
 

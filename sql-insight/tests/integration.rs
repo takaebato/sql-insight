@@ -536,6 +536,33 @@ mod diagnostics {
         assert_eq!(span.start.line, 1);
         assert_eq!(span.start.column, 8);
     }
+
+    #[test]
+    fn cataloged_table_read_keeps_its_written_span() {
+        // Canonicalizing a catalog hit rewrites the surfaced identity's *value*
+        // (bare `users` → `public.users`) but keeps the *span* of the written
+        // table token, so `reference.name.span` still locates the reference for
+        // source-order sorting — consistent with the catalog-free path.
+        //
+        // `users` starts at column 16 in `SELECT id FROM users`.
+        let catalog = Catalog::new().table(CatalogTable::new("public", "users").columns(["id"]));
+
+        let result =
+            extract_table_operations(&GenericDialect {}, "SELECT id FROM users", Some(&catalog))
+                .unwrap();
+        let ops = result[0].as_ref().unwrap();
+        let read = ops
+            .reads
+            .iter()
+            .find(|r| r.reference.name.value == "users")
+            .expect("`users` read not found");
+        // Canonicalized to the registered schema, but the source span survives.
+        assert_eq!(read.resolution, sql_insight::ResolutionKind::Cataloged);
+        assert_eq!(read.reference.schema.as_ref().unwrap().value, "public");
+        let span = read.reference.name.span;
+        assert_eq!(span.start.line, 1);
+        assert_eq!(span.start.column, 16);
+    }
 }
 
 /// Cross-cutting properties that should hold for every parseable SQL
