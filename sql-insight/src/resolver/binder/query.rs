@@ -547,9 +547,9 @@ impl<'a> Binder<'a> {
     ) -> (LogicalPlan, Scope) {
         let m = self.table_match(written);
         let columns = if m.columns.is_empty() {
-            Columns::Open
+            Columns::Unknown
         } else {
-            Columns::Known(m.columns)
+            Columns::Cataloged(m.columns)
         };
         let scan = LogicalPlan::Scan(Scan {
             table: m.table.clone(),

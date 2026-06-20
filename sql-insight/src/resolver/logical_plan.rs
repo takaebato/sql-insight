@@ -46,7 +46,7 @@ pub(crate) enum LogicalPlan {
 }
 
 /// A base-table scan (leaf). `columns` is the catalog-known list
-/// ([`Columns::Known`]) or [`Columns::Open`] (catalog-free / miss / ambiguous);
+/// ([`Columns::Cataloged`]) or [`Columns::Unknown`] (catalog-free / miss / ambiguous);
 /// `resolution` is how the catalog identified the table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Scan {
@@ -55,15 +55,18 @@ pub(crate) struct Scan {
     pub(crate) resolution: ResolutionKind,
 }
 
-/// What a [`Scan`] exposes for resolution.
+/// What a [`Scan`] exposes for column resolution: an authoritative
+/// (catalog-confirmed) column list, or none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Columns {
-    /// Catalog-known column names. A name in the list resolves
-    /// `Base { Cataloged }`; a name absent means the relation can't own it.
-    Known(Vec<Ident>),
-    /// Column set unknown (catalog-free, or a catalog miss / ambiguous match)
-    /// — any name could plausibly belong here (`Base { Inferred }`).
-    Open,
+    /// Catalog-confirmed column names — an authoritative, *closed* list. A
+    /// name in it resolves `Base { Cataloged }`; a name absent means the
+    /// relation can't own it (it's ruled out as a candidate).
+    Cataloged(Vec<Ident>),
+    /// The column set is unknown (catalog-free, or a catalog miss / ambiguous
+    /// match) — an open world: any name could plausibly belong, so the
+    /// relation is a best-effort suspect (`Base { Inferred }`).
+    Unknown,
 }
 
 /// Selection (σ): rows passing `predicate` flow through unchanged. The
@@ -364,7 +367,7 @@ pub(crate) struct ColRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Binding {
     /// A real base-table column (the table is canonicalised; `resolution` is
-    /// `Cataloged` for a Known hit, else `Inferred`).
+    /// `Cataloged` for a catalog hit, else `Inferred`).
     Base {
         table: TableReference,
         resolution: ResolutionKind,

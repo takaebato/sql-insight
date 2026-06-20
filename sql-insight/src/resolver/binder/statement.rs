@@ -530,9 +530,9 @@ impl<'a> Binder<'a> {
     pub(super) fn target_scope(&self, target: &TableReference) -> Scope {
         let m = self.table_match(target);
         let columns = if m.columns.is_empty() {
-            Columns::Open
+            Columns::Unknown
         } else {
-            Columns::Known(m.columns)
+            Columns::Cataloged(m.columns)
         };
         Scope::single(Relation {
             alias: None,

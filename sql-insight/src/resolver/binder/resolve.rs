@@ -82,24 +82,24 @@ impl<'a> Binder<'a> {
     }
 
     /// A relation is an unqualified candidate iff it could own `name`: a
-    /// `Known` schema must list it (confirmed witness); an `Open` table always
+    /// `Cataloged` schema must list it (confirmed witness); an `Unknown` table always
     /// could (suspect).
     fn unqualified_candidate(&self, rel: &Relation, name: &Ident) -> Option<Binding> {
         match &rel.source {
             RelSource::Table {
                 table,
-                columns: Columns::Known(cols),
+                columns: Columns::Cataloged(cols),
                 ..
             } => self
                 .list_has(cols, name)
                 .then(|| base(table, ResolutionKind::Cataloged)),
             RelSource::Table {
                 table,
-                columns: Columns::Open,
+                columns: Columns::Unknown,
                 ..
             } => Some(base(table, ResolutionKind::Inferred)),
             // A derived relation owns the column iff it exposes it (confirmed
-            // witness, like a Known table); the origin traversal collapses it.
+            // witness, like a Cataloged table); the origin traversal collapses it.
             RelSource::Derived { columns } => {
                 self.list_has(columns, name).then_some(Binding::Derived)
             }
@@ -111,7 +111,7 @@ impl<'a> Binder<'a> {
 
     /// A relation is a qualified candidate iff the qualifier matches it: a
     /// non-aliased real table by right-anchored path, anything else by its
-    /// single exposed (alias) name. A `Known` table that doesn't list the
+    /// single exposed (alias) name. A `Cataloged` table that doesn't list the
     /// column still resolves (`Inferred`) — the qualifier pins it.
     fn qualified_candidate(
         &self,
@@ -134,7 +134,7 @@ impl<'a> Binder<'a> {
         match &rel.source {
             RelSource::Table {
                 table,
-                columns: Columns::Known(cols),
+                columns: Columns::Cataloged(cols),
                 ..
             } => {
                 // A listed column is a `Cataloged` witness; the qualifier still
@@ -148,7 +148,7 @@ impl<'a> Binder<'a> {
             }
             RelSource::Table {
                 table,
-                columns: Columns::Open,
+                columns: Columns::Unknown,
                 ..
             } => Some(base(table, ResolutionKind::Inferred)),
             RelSource::Derived { columns } => {
@@ -163,7 +163,7 @@ impl<'a> Binder<'a> {
 
     /// Collapse candidate bindings to one: none → `Unresolved`; one → it
     /// verbatim; several with exactly one confirmed witness → that witness,
-    /// downgraded to `Inferred` (Known-witness-over-Open); otherwise
+    /// downgraded to `Inferred` (`Cataloged`-witness-over-`Unknown`); otherwise
     /// `Ambiguous`.
     fn pick(&self, candidates: Vec<Binding>) -> Binding {
         match candidates.len() {
@@ -180,8 +180,8 @@ impl<'a> Binder<'a> {
     }
 
     /// Match a written table reference against the catalog (after default-fill,
-    /// right-anchored, dialect-cased). Unique hit → canonical identity + Known
-    /// columns + `Cataloged`; several → written ref + `Ambiguous`; no catalog
+    /// right-anchored, dialect-cased). Unique hit → canonical identity + its
+    /// column list + `Cataloged`; several → written ref + `Ambiguous`; no catalog
     /// or no hit → written ref + `Inferred`.
     pub(super) fn table_match(&self, written: &TableReference) -> TableMatch {
         let no_hit = |resolution| TableMatch {
@@ -257,7 +257,7 @@ impl<'a> Binder<'a> {
 
 /// A confirmed witness for the multi-candidate tiebreaker: a catalog-listed
 /// real column (`Cataloged`) or a derived / CTE column the producing query
-/// exposes — as opposed to an `Open`-table suspect (`Inferred`). Candidate
+/// exposes — as opposed to an `Unknown`-table suspect (`Inferred`). Candidate
 /// bindings are only ever `Base` or `Derived` (`Unresolved` / `Ambiguous` are
 /// `pick` outcomes, not inputs), so this distinguishes every case.
 fn is_confirmed(binding: &Binding) -> bool {

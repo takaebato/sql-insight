@@ -24,10 +24,11 @@
 //!   tiebreaker, catalog matching, and case-folded identifier comparison.
 //!
 //! A table factor is matched against the catalog (right-anchored, dialect-cased)
-//! into a canonical identity with its `Known` columns and table-level
-//! [`ResolutionKind`], or `Open` (catalog-free / miss / ambiguous). Column
-//! resolution ranks the in-scope relations: a Known-witness over an Open suspect
-//! downgrades to `Inferred`, several owners give `Ambiguous`, none `Unresolved`,
+//! into a canonical identity with its `Cataloged` columns and table-level
+//! [`ResolutionKind`], or `Unknown` (catalog-free / miss / ambiguous). Column
+//! resolution ranks the in-scope relations: a `Cataloged`-witness over an
+//! `Unknown` suspect downgrades to `Inferred`, several owners give `Ambiguous`,
+//! none `Unresolved`,
 //! and a derived / CTE relation that exposes the column gives `Derived`. A DML
 //! target is in scope for resolving SET / WHERE but is the **write target**
 //! named on the root, never a read scan.
@@ -264,8 +265,8 @@ fn base(table: &TableReference, resolution: ResolutionKind) -> Binding {
     }
 }
 
-/// Downgrade a winning real-table witness to `Inferred` — adopted over Open
-/// suspects without firm evidence.
+/// Downgrade a winning real-table witness to `Inferred` — adopted over
+/// `Unknown` suspects without firm evidence.
 fn downgrade(binding: Binding) -> Binding {
     match binding {
         Binding::Base { table, .. } => Binding::Base {
@@ -501,8 +502,8 @@ mod tests {
     }
 
     #[test]
-    fn known_witness_over_open_downgrades_to_inferred() {
-        // `known_t` lists `a`; `open_t` is not in the catalog → Open suspect.
+    fn cataloged_witness_over_unknown_downgrades_to_inferred() {
+        // `known_t` lists `a`; `open_t` is not in the catalog → Unknown suspect.
         let cat = Catalog::new().table(CatalogTable::new("public", "known_t").columns(["a", "b"]));
         let op = bind_cat(
             "SELECT a FROM known_t JOIN open_t ON known_t.b = open_t.k",

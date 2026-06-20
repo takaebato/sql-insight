@@ -287,18 +287,18 @@ impl<'a> Binder<'a> {
     }
 
     /// A relation's contribution to a merge-column fan-in: a real table owns
-    /// the column if `Open` (catalog-free → `Inferred`) or its `Known` schema
+    /// the column if `Unknown` (catalog-free → `Inferred`) or its `Cataloged` schema
     /// lists it (`Cataloged`); a derived / function relation doesn't.
     pub(super) fn fanin_owner(&self, rel: &Relation, name: &Ident) -> Option<ColRef> {
         let (table, resolution) = match &rel.source {
             RelSource::Table {
                 table,
-                columns: Columns::Open,
+                columns: Columns::Unknown,
                 ..
             } => (table, ResolutionKind::Inferred),
             RelSource::Table {
                 table,
-                columns: Columns::Known(cols),
+                columns: Columns::Cataloged(cols),
                 ..
             } if self.list_has(cols, name) => (table, ResolutionKind::Cataloged),
             _ => return None,

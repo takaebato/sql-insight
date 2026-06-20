@@ -73,7 +73,7 @@ pub(super) struct Relation {
 pub(super) enum RelSource {
     /// A real table: its canonical identity and catalog column knowledge.
     /// (The table-level resolution kind lives on the `Scan`; here the `columns`
-    /// — `Known` vs `Open` — drive a column reference's resolution.)
+    /// — `Cataloged` vs `Unknown` — drive a column reference's resolution.)
     Table {
         table: TableReference,
         columns: Columns,
