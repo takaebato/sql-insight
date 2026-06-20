@@ -275,14 +275,15 @@ fn is_confirmed(binding: &Binding) -> bool {
 mod tests {
     use super::*;
 
-    /// A minimal `Binder` over a borrowed diagnostics sink — only its `casing`
-    /// matters here (`qualifier_matches_table` ignores catalog / ctes / outer).
+    /// A minimal `Binder` over a borrowed diagnostics sink (no CTEs / outer
+    /// scopes — those don't affect the pure resolution helpers tested here).
     fn binder<'a>(
         diagnostics: &'a RefCell<Vec<ColumnLevelDiagnostic>>,
+        catalog: Option<&'a Catalog>,
         casing: IdentifierCasing,
     ) -> Binder<'a> {
         Binder {
-            catalog: None,
+            catalog,
             casing,
             ctes: Vec::new(),
             outer: Vec::new(),
@@ -321,7 +322,7 @@ mod tests {
     #[test]
     fn right_anchored_qualifier_matrix() {
         let diagnostics = RefCell::new(Vec::new());
-        let binder = binder(&diagnostics, IdentifierCasing::default());
+        let binder = binder(&diagnostics, None, IdentifierCasing::default());
 
         // (qualifier, table, expected)
         let cases: &[(TableReference, TableReference, bool)] = &[
@@ -406,7 +407,7 @@ mod tests {
                 table: fold,
                 ..IdentifierCasing::default()
             };
-            let binder = binder(&diagnostics, casing);
+            let binder = binder(&diagnostics, None, casing);
             assert_eq!(
                 binder.qualifier_matches_table(&qualifier, &table),
                 expected,
@@ -450,7 +451,7 @@ mod tests {
     #[test]
     fn candidate_tiebreaker() {
         let diagnostics = RefCell::new(Vec::new());
-        let binder = binder(&diagnostics, IdentifierCasing::default());
+        let binder = binder(&diagnostics, None, IdentifierCasing::default());
 
         let cases: Vec<(Vec<Binding>, Binding)> = vec![
             (vec![], Binding::Unresolved),
@@ -486,5 +487,97 @@ mod tests {
             let debug = format!("{candidates:?}");
             assert_eq!(binder.pick(candidates), expected, "candidates {debug}");
         }
+    }
+
+    /// Catalog matching outcomes: a unique registration → `Cataloged` plus the
+    /// registered canonical path (and a non-empty column list); several → the
+    /// written ref + `Ambiguous`; none → the written ref + `Inferred`. Matching
+    /// is right-anchored (an omitted query segment is a wildcard), so a bare
+    /// name resolves when exactly one schema declares it.
+    ///
+    /// | written          | resolution   | table (canonical / kept) |
+    /// |------------------|--------------|--------------------------|
+    /// | `orders`         | `Cataloged`  | `public.orders`          |
+    /// | `users`          | `Ambiguous`  | `users` (kept)           |
+    /// | `public.users`   | `Cataloged`  | `public.users`           |
+    /// | `sales.users`    | `Cataloged`  | `sales.users`            |
+    /// | `other.users`    | `Inferred`   | `other.users` (kept)     |
+    /// | `missing`        | `Inferred`   | `missing` (kept)         |
+    #[test]
+    fn table_match_resolution_and_canonicalization() {
+        let catalog = Catalog::new()
+            .table(CatalogTable::new("public", "users").columns(["id", "name"]))
+            .table(CatalogTable::new("public", "orders").columns(["id"]))
+            .table(CatalogTable::new("sales", "users").columns(["x"]));
+        let diagnostics = RefCell::new(Vec::new());
+        let binder = binder(&diagnostics, Some(&catalog), IdentifierCasing::default());
+
+        // (written, expected resolution, expected canonical / kept table)
+        let cases: &[(TableReference, ResolutionKind, TableReference)] = &[
+            (
+                tref(None, None, "orders"),
+                ResolutionKind::Cataloged,
+                tref(None, Some("public"), "orders"),
+            ),
+            (
+                tref(None, None, "users"),
+                ResolutionKind::Ambiguous,
+                tref(None, None, "users"),
+            ),
+            (
+                tref(None, Some("public"), "users"),
+                ResolutionKind::Cataloged,
+                tref(None, Some("public"), "users"),
+            ),
+            (
+                tref(None, Some("sales"), "users"),
+                ResolutionKind::Cataloged,
+                tref(None, Some("sales"), "users"),
+            ),
+            (
+                tref(None, Some("other"), "users"),
+                ResolutionKind::Inferred,
+                tref(None, Some("other"), "users"),
+            ),
+            (
+                tref(None, None, "missing"),
+                ResolutionKind::Inferred,
+                tref(None, None, "missing"),
+            ),
+        ];
+
+        for (written, resolution, table) in cases {
+            let m = binder.table_match(written);
+            assert_eq!(m.resolution, *resolution, "resolution for {written:?}");
+            assert_eq!(m.table, *table, "canonical for {written:?}");
+            // Columns are filled only on a unique hit.
+            assert_eq!(
+                m.columns.is_empty(),
+                *resolution != ResolutionKind::Cataloged,
+                "columns for {written:?}"
+            );
+        }
+    }
+
+    /// A catalog's `default_schema` / `default_catalog` fill a bare reference's
+    /// omitted prefix segments *before* matching, so it resolves to the
+    /// fully-qualified registration (the catalog segment fills only once a
+    /// schema is present).
+    #[test]
+    fn table_match_fills_catalog_defaults() {
+        let catalog = Catalog::new()
+            .default_catalog("db")
+            .default_schema("public")
+            .table(
+                CatalogTable::new("public", "users")
+                    .catalog("db")
+                    .columns(["id"]),
+            );
+        let diagnostics = RefCell::new(Vec::new());
+        let binder = binder(&diagnostics, Some(&catalog), IdentifierCasing::default());
+
+        let m = binder.table_match(&tref(None, None, "users"));
+        assert_eq!(m.resolution, ResolutionKind::Cataloged);
+        assert_eq!(m.table, tref(Some("db"), Some("public"), "users"));
     }
 }
