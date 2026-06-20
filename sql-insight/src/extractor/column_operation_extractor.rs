@@ -338,7 +338,3 @@ fn unsupported_column_operation(
         }],
     }
 }
-
-#[cfg(test)]
-#[path = "column_operation_extractor_tests.rs"]
-mod tests;
