@@ -155,7 +155,7 @@ mod integration {
         #[test]
         fn test_extract_crud_tables() {
             sql_insight_cmd()
-                .arg("extract-crud")
+                .arg("extract").arg("crud")
                 .arg("select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
                 .assert()
                 .success()
@@ -166,7 +166,7 @@ mod integration {
         #[test]
         fn test_extract_crud_tables_with_dialect() {
             sql_insight_cmd()
-                .arg("extract-crud")
+                .arg("extract").arg("crud")
                 .arg("--dialect")
                 .arg("mysql")
                 .arg("select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
@@ -179,7 +179,8 @@ mod integration {
         #[test]
         fn test_extract_crud_tables_with_cte() {
             sql_insight_cmd()
-                .arg("extract-crud")
+                .arg("extract")
+                .arg("crud")
                 .arg("with t2 as (select id from t1) select * from t2;")
                 .assert()
                 .success()
@@ -194,7 +195,7 @@ mod integration {
                 .write_all(b"select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
                 .unwrap();
             sql_insight_cmd()
-                .arg("extract-crud")
+                .arg("extract").arg("crud")
                 .arg("--file")
                 .arg(temp_file.path())
                 .assert()
@@ -210,7 +211,7 @@ mod integration {
         #[test]
         fn test_extract_tables() {
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract").arg("tables")
                 .arg("select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
                 .assert()
                 .success()
@@ -221,7 +222,7 @@ mod integration {
         #[test]
         fn test_extract_tables_with_full_identifiers_and_alis() {
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract").arg("tables")
                 .arg("select * from catalog.schema.t1 as t1 inner join catalog.schema.t2 as t2 using(id); \
                       insert into catalog.schema.t1 (a) select b from catalog.schema.t2;")
                 .assert()
@@ -233,7 +234,8 @@ mod integration {
         #[test]
         fn test_extract_tables_with_cte() {
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract")
+                .arg("tables")
                 .arg("with t2 as (select id from t1) select * from t2;")
                 .assert()
                 .success()
@@ -244,7 +246,7 @@ mod integration {
         #[test]
         fn test_extract_tables_with_dialect() {
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract").arg("tables")
                 .arg("--dialect")
                 .arg("mysql")
                 .arg("select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
@@ -261,12 +263,85 @@ mod integration {
                 .write_all(b"select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
                 .unwrap();
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract")
+                .arg("tables")
                 .arg("--file")
                 .arg(temp_file.path())
                 .assert()
                 .success()
                 .stdout("t1, t2\nt1, t2\n")
+                .stderr("");
+        }
+    }
+
+    mod extract_table_ops {
+        use super::*;
+
+        #[test]
+        fn test_extract_table_ops() {
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("table-ops")
+                .arg("INSERT INTO orders SELECT id, amount FROM staging")
+                .assert()
+                .success()
+                .stdout(
+                    "[1] Insert\n  reads:   staging\n  writes:  orders\n  lineage: staging -> orders\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_table_ops_select_reads_only() {
+            // A SELECT has reads but no writes / lineage — empty surfaces
+            // are omitted from the block.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("table-ops")
+                .arg("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id")
+                .assert()
+                .success()
+                .stdout("[1] Select\n  reads:   t1, t2\n")
+                .stderr("");
+        }
+    }
+
+    mod extract_column_ops {
+        use super::*;
+
+        #[test]
+        fn test_extract_column_ops() {
+            // Transformations carry a `[transform]` marker; passthroughs don't.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("INSERT INTO orders (id, total) SELECT id, a + b AS total FROM staging")
+                .assert()
+                .success()
+                .stdout(
+                    "[1] Insert\n  \
+                     reads:   staging.id, staging.a, staging.b\n  \
+                     writes:  orders.id, orders.total\n  \
+                     lineage: staging.id -> orders.id\n           \
+                     staging.a -> orders.total [transform]\n           \
+                     staging.b -> orders.total [transform]\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_column_ops_ambiguous_marker() {
+            // Unqualified `a` is ambiguous between t1 / t2 → `(ambiguous)`;
+            // the qualified `t1.a` / `t2.a` are catalog-free Inferred (unmarked).
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("SELECT a FROM t1 JOIN t2 ON t1.a = t2.a")
+                .assert()
+                .success()
+                .stdout(
+                    "[1] Select\n  reads:   a (ambiguous), t1.a, t2.a\n  lineage: a (ambiguous) -> a\n",
+                )
                 .stderr("");
         }
     }
@@ -450,7 +525,8 @@ mod integration {
             // dropping the unrepresentable relation, so the statement yields
             // an empty (no-table) line.
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract")
+                .arg("tables")
                 .arg("select * from catalog.schema.table.extra")
                 .assert()
                 .success()
@@ -467,7 +543,8 @@ mod integration {
             // so it drops the unrepresentable relation and reports an empty
             // result instead of failing the statement.
             sql_insight_cmd()
-                .arg("extract-crud")
+                .arg("extract")
+                .arg("crud")
                 .arg("select * from catalog.schema.table.extra")
                 .assert()
                 .success()
@@ -478,7 +555,8 @@ mod integration {
         #[test]
         fn test_file_not_found() {
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract")
+                .arg("tables")
                 .arg("--file")
                 .arg("non_existent_file.sql")
                 .assert()

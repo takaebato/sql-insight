@@ -1,8 +1,8 @@
 mod executor;
 
 use crate::executor::{
-    CliExecutable, CrudTableExtractExecutor, FormatExecutor, NormalizeExecutor,
-    TableExtractExecutor,
+    CliExecutable, ColumnOperationExtractExecutor, CrudTableExtractExecutor, FormatExecutor,
+    NormalizeExecutor, TableExtractExecutor, TableOperationExtractExecutor,
 };
 use clap::{ArgGroup, Parser, Subcommand};
 use sql_insight::error::Error;
@@ -57,27 +57,13 @@ enum ProcessType {
 
 impl From<&Commands> for ProcessType {
     fn from(command: &Commands) -> Self {
-        match command {
-            Commands::Format(opts)
-            | Commands::ExtractCrud(opts)
-            | Commands::ExtractTables(opts) => {
-                if opts.sql.is_some() {
-                    ProcessType::Sql(opts.sql.clone().unwrap())
-                } else if opts.file.is_some() {
-                    ProcessType::File(opts.file.clone().unwrap())
-                } else {
-                    ProcessType::Interactive
-                }
-            }
-            Commands::Normalize(opts) => {
-                if opts.common_options.sql.is_some() {
-                    ProcessType::Sql(opts.common_options.sql.clone().unwrap())
-                } else if opts.common_options.file.is_some() {
-                    ProcessType::File(opts.common_options.file.clone().unwrap())
-                } else {
-                    ProcessType::Interactive
-                }
-            }
+        let opts = command.common();
+        if let Some(sql) = &opts.sql {
+            ProcessType::Sql(sql.clone())
+        } else if let Some(file) = &opts.file {
+            ProcessType::File(file.clone())
+        } else {
+            ProcessType::Interactive
         }
     }
 }
@@ -88,13 +74,61 @@ enum Commands {
     Format(CommonOptions),
     /// Normalize SQL
     Normalize(NormalizeCommandOptions),
-    /// Extract CRUD operations from SQL
-    ExtractCrud(CommonOptions),
-    /// Extract tables from SQL
-    ExtractTables(CommonOptions),
+    /// Extract what a statement touches, at a chosen granularity
+    Extract {
+        #[command(subcommand)]
+        target: ExtractTarget,
+    },
+}
+
+/// Extraction granularities — thin wrappers over the library's extractors.
+#[derive(Subcommand, Debug)]
+enum ExtractTarget {
+    /// Flat list of tables the statement references
+    Tables(CommonOptions),
+    /// Tables bucketed by CRUD verb (Create / Read / Update / Delete)
+    Crud(CommonOptions),
+    /// Table-level reads / writes / lineage per statement
+    TableOps(CommonOptions),
+    /// Column-level reads / writes / lineage per statement
+    ColumnOps(CommonOptions),
+}
+
+impl ExtractTarget {
+    fn common(&self) -> &CommonOptions {
+        match self {
+            ExtractTarget::Tables(o)
+            | ExtractTarget::Crud(o)
+            | ExtractTarget::TableOps(o)
+            | ExtractTarget::ColumnOps(o) => o,
+        }
+    }
+
+    fn executor(&self, sql: String) -> Box<dyn CliExecutable> {
+        let dialect = self.common().dialect.clone();
+        match self {
+            ExtractTarget::Tables(_) => Box::new(TableExtractExecutor::new(sql, dialect)),
+            ExtractTarget::Crud(_) => Box::new(CrudTableExtractExecutor::new(sql, dialect)),
+            ExtractTarget::TableOps(_) => {
+                Box::new(TableOperationExtractExecutor::new(sql, dialect))
+            }
+            ExtractTarget::ColumnOps(_) => {
+                Box::new(ColumnOperationExtractExecutor::new(sql, dialect))
+            }
+        }
+    }
 }
 
 impl Commands {
+    /// The source / dialect options shared by every command.
+    fn common(&self) -> &CommonOptions {
+        match self {
+            Commands::Format(opts) => opts,
+            Commands::Normalize(opts) => &opts.common_options,
+            Commands::Extract { target } => target.common(),
+        }
+    }
+
     fn execute(&self) -> Result<Vec<String>, Error> {
         match ProcessType::from(self) {
             ProcessType::Sql(sql) => self.execute_sql(sql),
@@ -181,12 +215,7 @@ impl Commands {
                         .with_unify_values(opts.unify_values),
                 ),
             ),
-            Commands::ExtractCrud(opts) => {
-                Box::new(CrudTableExtractExecutor::new(sql, opts.dialect.clone()))
-            }
-            Commands::ExtractTables(opts) => {
-                Box::new(TableExtractExecutor::new(sql, opts.dialect.clone()))
-            }
+            Commands::Extract { target } => target.executor(sql),
         }
     }
 }
