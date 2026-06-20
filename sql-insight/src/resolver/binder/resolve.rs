@@ -590,6 +590,7 @@ mod tests {
     /// stored case. The quoting / folding matrix itself lives in `crate::casing`.)
     ///
     /// stored `Users`, vs:
+    ///
     /// | fold          | `users` (unquoted) | `"Users"` (quoted) |
     /// |---------------|--------------------|--------------------|
     /// | `Upper`       | ✗ (`USERS`)        | ✓                  |
@@ -621,6 +622,50 @@ mod tests {
         for (fold, query, expected) in cases {
             assert_eq!(
                 catalog_table_matches(query, &table, *fold),
+                *expected,
+                "{fold:?}: {query:?}"
+            );
+        }
+    }
+
+    /// Catalog *column* names are quote-wrapped by `table_match` too, so column
+    /// matching (`list_has`) is exact in the same way as table names — but
+    /// governed by the **column** fold, which a dialect can set apart from the
+    /// table fold. A stored `Name` matches a quoted `"Name"`, not an unquoted
+    /// `name` the fold lowercases, and `Insensitive` folds both.
+    ///
+    /// stored column `Name`, vs:
+    /// | column fold   | `name` (unquoted) | `"Name"` (quoted) |
+    /// |---------------|-------------------|-------------------|
+    /// | `Lower`       | ✗                 | ✓                 |
+    /// | `Insensitive` | ✓                 | ✓                 |
+    #[test]
+    fn catalog_columns_are_matched_as_quoted() {
+        let catalog = Catalog::new().table(CatalogTable::new("public", "users").columns(["Name"]));
+        let unquoted = Ident::new("name");
+        let quoted = Ident::with_quote('"', "Name");
+
+        // (column fold, query, expected match)
+        let cases: &[(CaseFold, &Ident, bool)] = &[
+            (CaseFold::Lower, &unquoted, false),
+            (CaseFold::Lower, &quoted, true),
+            (CaseFold::Insensitive, &unquoted, true),
+            (CaseFold::Insensitive, &quoted, true),
+        ];
+
+        for (fold, query, expected) in cases {
+            let diagnostics = RefCell::new(Vec::new());
+            // Keep the default (`Lower`) table fold so `users` resolves; vary
+            // only the column fold that `list_has` consults.
+            let casing = IdentifierCasing {
+                column: *fold,
+                ..IdentifierCasing::default()
+            };
+            let binder = binder(&diagnostics, Some(&catalog), casing);
+            // The columns come from the catalog (quote-wrapped by `table_match`).
+            let columns = binder.table_match(&tref(None, None, "users")).columns;
+            assert_eq!(
+                binder.list_has(&columns, query),
                 *expected,
                 "{fold:?}: {query:?}"
             );
