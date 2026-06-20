@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use crate::casing::IdentifierCasing;
+use crate::casing::IdentifierStyle;
 use crate::catalog::Catalog;
 use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
@@ -106,19 +106,19 @@ impl CrudTableExtractor {
         options: ExtractorOptions,
     ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
-        let casing = options.casing_for(dialect);
+        let style = options.identifier_style(dialect);
         Ok(statements
             .iter()
-            .map(|s| Self::extract_from_statement(s, options.catalog, casing))
+            .map(|s| Self::extract_from_statement(s, options.catalog, style))
             .collect())
     }
 
     fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&Catalog>,
-        casing: IdentifierCasing,
+        style: IdentifierStyle,
     ) -> Result<CrudTables, Error> {
-        let ops = TableOperationExtractor::extract_from_statement(statement, catalog, casing)?;
+        let ops = TableOperationExtractor::extract_from_statement(statement, catalog, style)?;
         // CRUD buckets are identity-only — drop the per-read
         // `ResolutionKind` and keep the bare `TableReference`s.
         let reads: Vec<TableReference> = ops.reads.into_iter().map(|r| r.reference).collect();

@@ -7,6 +7,7 @@ pub use sql_insight::extractor::{
     extract_column_operations, extract_column_operations_with_options, ColumnLineageEdge,
     ColumnLineageKind, ColumnOperation, ColumnTarget, ExtractorOptions, StatementKind,
 };
+pub use sql_insight::sqlparser::ast::Ident;
 pub use sql_insight::sqlparser::dialect::{Dialect, GenericDialect};
 pub use sql_insight::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
 
@@ -55,13 +56,15 @@ pub fn table(name: &str) -> TableReference {
 /// catalog-aware test modules all register tables under a `public`
 /// schema, and a unique match canonicalizes the reference to that full
 /// path — so `Cataloged` reads / writes / lineage carry `public.<name>`,
-/// not the bare name written in the SQL. Used by `read_confirmed` /
+/// not the bare name written in the SQL. The canonical identity is
+/// case-exact, so its segments surface **quoted** (the dialect's quote;
+/// `"` for the GenericDialect these tests use). Used by `read_confirmed` /
 /// `col_confirmed` and the catalog modules' write / relation helpers.
 pub fn cataloged_table(name: &str) -> TableReference {
     TableReference {
         catalog: None,
-        schema: Some("public".into()),
-        name: name.into(),
+        schema: Some(Ident::with_quote('"', "public")),
+        name: Ident::with_quote('"', name),
     }
 }
 

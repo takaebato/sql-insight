@@ -81,11 +81,18 @@ mod dialect_casing_coverage {
     #[test]
     fn bigquery_column_is_case_insensitive() {
         // BigQuery columns fold case-insensitively: `Id` matches the
-        // catalog's `id`, confirming the resolution on t1.
+        // catalog's `id`, confirming the resolution on t1. The canonical
+        // identity surfaces with BigQuery's quote — a backtick, not the
+        // `"` the shared `cataloged_table` helper assumes.
         let catalog = TestCatalog::default().with("t1", vec!["id"]);
+        let bq_t1 = TableReference {
+            catalog: None,
+            schema: Some(Ident::with_quote('`', "public")),
+            name: Ident::with_quote('`', "t1"),
+        };
         assert_unordered_eq!(
             reads("SELECT Id FROM t1", &BigQueryDialect {}, Some(&catalog)),
-            vec![read_confirmed("t1", "Id")]
+            vec![read_with_ref(bq_t1, "Id", ResolutionKind::Cataloged)]
         );
     }
 }

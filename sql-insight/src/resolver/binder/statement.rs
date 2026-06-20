@@ -500,7 +500,7 @@ impl<'a> Binder<'a> {
                     Some(alias) => {
                         written.schema.is_none()
                             && written.catalog.is_none()
-                            && self.eq(self.casing.table_alias, alias, &written.name)
+                            && self.eq(self.style.casing.table_alias, alias, &written.name)
                     }
                     None => self.table_identity_eq(&canonical, table),
                 };
@@ -514,7 +514,7 @@ impl<'a> Binder<'a> {
     /// the dialect's table casing — every present segment must agree and a
     /// missing segment matches only a missing one.
     pub(super) fn table_identity_eq(&self, a: &TableReference, b: &TableReference) -> bool {
-        let fold = self.casing.table;
+        let fold = self.style.casing.table;
         let seg_eq = |x: Option<&Ident>, y: Option<&Ident>| match (x, y) {
             (Some(p), Some(q)) => self.eq(fold, p, q),
             (None, None) => true,

@@ -1120,12 +1120,14 @@ mod catalog_resolution {
 
     /// The canonical `public.<name>` identity a registered table
     /// surfaces with on the write / lineage-target side (bare
-    /// `TableReference`).
+    /// `TableReference`). The canonical identity is case-exact, so its
+    /// segments are quoted (the GenericDialect quote, `"`).
     fn pub_table(name: &str) -> TableReference {
+        use sql_insight::sqlparser::ast::Ident;
         TableReference {
             catalog: None,
-            schema: Some("public".into()),
-            name: name.into(),
+            schema: Some(Ident::with_quote('"', "public")),
+            name: Ident::with_quote('"', name),
         }
     }
 

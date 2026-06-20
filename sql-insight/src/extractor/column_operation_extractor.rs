@@ -69,7 +69,7 @@
 //! when the candidate's schema actually lists the column — column
 //! typos that would otherwise silently resolve become unresolved.
 
-use crate::casing::IdentifierCasing;
+use crate::casing::IdentifierStyle;
 use crate::catalog::Catalog;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::error::Error;
@@ -289,10 +289,10 @@ impl ColumnOperationExtractor {
         options: ExtractorOptions,
     ) -> Result<Vec<Result<ColumnOperation, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
-        let casing = options.casing_for(dialect);
+        let style = options.identifier_style(dialect);
         Ok(statements
             .iter()
-            .map(|s| Self::extract_from_statement(s, options.catalog, casing))
+            .map(|s| Self::extract_from_statement(s, options.catalog, style))
             .collect())
     }
 
@@ -304,13 +304,13 @@ impl ColumnOperationExtractor {
     fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&Catalog>,
-        casing: IdentifierCasing,
+        style: IdentifierStyle,
     ) -> Result<ColumnOperation, Error> {
         let statement_kind = classify_statement(statement);
         if statement_kind == StatementKind::Unsupported {
             return Ok(unsupported_column_operation(statement_kind, statement));
         }
-        let (plan, diagnostics) = crate::resolver::build(statement, catalog, casing);
+        let (plan, diagnostics) = crate::resolver::build(statement, catalog, style);
         Ok(ColumnOperation {
             statement_kind,
             reads: crate::resolver::reads(&plan),

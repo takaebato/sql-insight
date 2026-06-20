@@ -367,7 +367,7 @@ mod integration {
                 .assert()
                 .success()
                 .stdout(
-                    "[1] Select\n  reads:   users.name (cataloged)\n  lineage: users.name (cataloged) -> name\n",
+                    "[1] Select\n  reads:   \"users\".name (cataloged)\n  lineage: \"users\".name (cataloged) -> name\n",
                 )
                 .stderr("");
         }
@@ -388,7 +388,7 @@ mod integration {
                 .arg("SELECT id FROM users")
                 .assert()
                 .success()
-                .stdout("[1] Select\n  reads:   users.id (cataloged)\n  lineage: users.id (cataloged) -> id\n")
+                .stdout("[1] Select\n  reads:   \"users\".id (cataloged)\n  lineage: \"users\".id (cataloged) -> id\n")
                 .stderr("");
         }
 

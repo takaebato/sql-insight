@@ -274,7 +274,7 @@ impl<'a> Binder<'a> {
         if !scope
             .merge_columns
             .iter()
-            .any(|m| self.eq(self.casing.column, m, name))
+            .any(|m| self.eq(self.style.casing.column, m, name))
         {
             return None;
         }
@@ -631,7 +631,7 @@ impl<'a> Binder<'a> {
                     Expr::Column(c) => ne
                         .name
                         .as_ref()
-                        .is_some_and(|n| self.eq(self.casing.column, n, &c.name)),
+                        .is_some_and(|n| self.eq(self.style.casing.column, n, &c.name)),
                     _ => false,
                 };
                 OutputCol {

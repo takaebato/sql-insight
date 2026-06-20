@@ -28,7 +28,7 @@ impl<'a> Binder<'a> {
             if let Some(out) = scope.query_outputs.iter().find(|o| {
                 o.name
                     .as_ref()
-                    .is_some_and(|n| self.eq(self.casing.column, n, name))
+                    .is_some_and(|n| self.eq(self.style.casing.column, n, name))
             }) {
                 if !out.identity {
                     return BoundColumn {
@@ -125,7 +125,7 @@ impl<'a> Binder<'a> {
                 table, alias: None, ..
             } => qualifier_ref.is_some_and(|q| self.qualifier_matches_table(q, table)),
             _ => rel.exposed_name().is_some_and(|exposed| {
-                matches!(qualifier_parts, [only] if self.eq(self.casing.table_alias, only, exposed))
+                matches!(qualifier_parts, [only] if self.eq(self.style.casing.table_alias, only, exposed))
             }),
         };
         if !qualifier_ok {
@@ -203,7 +203,7 @@ impl<'a> Binder<'a> {
             columns: Vec::new(),
         };
         let filled = fill_query_defaults(written, catalog);
-        let fold = self.casing.table;
+        let fold = self.style.casing.table;
         let mut hits = catalog
             .tables()
             .iter()
@@ -220,7 +220,7 @@ impl<'a> Binder<'a> {
             .map(|c| Ident::with_quote('"', c))
             .collect();
         TableMatch {
-            table: canonical_ref(first, written),
+            table: canonical_ref(first, written, self.style.quote),
             resolution: ResolutionKind::Cataloged,
             columns,
         }
@@ -234,7 +234,7 @@ impl<'a> Binder<'a> {
         qualifier: &TableReference,
         table: &TableReference,
     ) -> bool {
-        let fold = self.casing.table;
+        let fold = self.style.casing.table;
         let opt_eq = |a: Option<&Ident>, b: Option<&Ident>| match (a, b) {
             (Some(x), Some(y)) => fold.normalize(x) == fold.normalize(y),
             _ => true,
@@ -245,7 +245,9 @@ impl<'a> Binder<'a> {
     }
 
     pub(super) fn list_has(&self, columns: &[Ident], name: &Ident) -> bool {
-        columns.iter().any(|c| self.eq(self.casing.column, c, name))
+        columns
+            .iter()
+            .any(|c| self.eq(self.style.casing.column, c, name))
     }
 
     /// The target table's catalog column names (unquoted), for filling in a
@@ -284,9 +286,12 @@ fn is_confirmed(binding: &Binding) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::casing::IdentifierCasing;
 
     /// A minimal `Binder` over a borrowed diagnostics sink (no CTEs / outer
     /// scopes — those don't affect the pure resolution helpers tested here).
+    /// The surface quote defaults to the standard `"`; these helpers test
+    /// matching, which is quote-char-agnostic.
     fn binder<'a>(
         diagnostics: &'a RefCell<Vec<ColumnLevelDiagnostic>>,
         catalog: Option<&'a Catalog>,
@@ -294,7 +299,7 @@ mod tests {
     ) -> Binder<'a> {
         Binder {
             catalog,
-            casing,
+            style: IdentifierStyle { casing, quote: '"' },
             ctes: Vec::new(),
             outer: Vec::new(),
             diagnostics,
@@ -307,6 +312,18 @@ mod tests {
             catalog: catalog.map(Ident::new),
             schema: schema.map(Ident::new),
             name: Ident::new(name),
+        }
+    }
+
+    /// Like [`tref`] but with every segment double-quoted — the shape a
+    /// `Cataloged` hit surfaces (canonical identities are case-exact, so
+    /// they carry the dialect's quote; `"` here under the default style).
+    fn qref(catalog: Option<&str>, schema: Option<&str>, name: &str) -> TableReference {
+        let q = |s: &str| Ident::with_quote('"', s);
+        TableReference {
+            catalog: catalog.map(q),
+            schema: schema.map(q),
+            name: q(name),
         }
     }
 
@@ -527,7 +544,7 @@ mod tests {
             (
                 tref(None, None, "orders"),
                 ResolutionKind::Cataloged,
-                tref(None, Some("public"), "orders"),
+                qref(None, Some("public"), "orders"),
             ),
             (
                 tref(None, None, "users"),
@@ -537,12 +554,12 @@ mod tests {
             (
                 tref(None, Some("public"), "users"),
                 ResolutionKind::Cataloged,
-                tref(None, Some("public"), "users"),
+                qref(None, Some("public"), "users"),
             ),
             (
                 tref(None, Some("sales"), "users"),
                 ResolutionKind::Cataloged,
-                tref(None, Some("sales"), "users"),
+                qref(None, Some("sales"), "users"),
             ),
             (
                 tref(None, Some("other"), "users"),
@@ -588,7 +605,7 @@ mod tests {
 
         let m = binder.table_match(&tref(None, None, "users"));
         assert_eq!(m.resolution, ResolutionKind::Cataloged);
-        assert_eq!(m.table, tref(Some("db"), Some("public"), "users"));
+        assert_eq!(m.table, qref(Some("db"), Some("public"), "users"));
     }
 
     /// Catalog-stored segments are compared **exact** (treated as

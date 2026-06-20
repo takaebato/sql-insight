@@ -8,7 +8,7 @@
 
 use core::fmt;
 
-use crate::casing::IdentifierCasing;
+use crate::casing::IdentifierStyle;
 use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
@@ -97,10 +97,10 @@ impl TableExtractor {
         options: ExtractorOptions,
     ) -> Result<Vec<Result<TableExtraction, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
-        let casing = options.casing_for(dialect);
+        let style = options.identifier_style(dialect);
         let results = statements
             .iter()
-            .map(|s| Self::extract_from_statement(s, options.catalog, casing))
+            .map(|s| Self::extract_from_statement(s, options.catalog, style))
             .collect::<Vec<Result<TableExtraction, Error>>>();
         Ok(results)
     }
@@ -108,7 +108,7 @@ impl TableExtractor {
     fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&Catalog>,
-        casing: IdentifierCasing,
+        style: IdentifierStyle,
     ) -> Result<TableExtraction, Error> {
         // The flat table list is derived from the bound-plan engine. A
         // catalog changes no column data (this API surfaces no columns) but
@@ -126,7 +126,7 @@ impl TableExtractor {
                 }],
             });
         }
-        let (plan, column_diagnostics) = crate::resolver::build(statement, catalog, casing);
+        let (plan, column_diagnostics) = crate::resolver::build(statement, catalog, style);
         Ok(TableExtraction {
             tables: crate::resolver::flat_tables(&plan),
             diagnostics: column_diagnostics

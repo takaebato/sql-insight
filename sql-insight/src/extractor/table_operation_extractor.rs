@@ -19,7 +19,7 @@
 //! both roles (e.g. `DELETE t1 FROM t1` — t1 is the deletion target and
 //! a row source).
 
-use crate::casing::IdentifierCasing;
+use crate::casing::IdentifierStyle;
 use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
@@ -164,10 +164,10 @@ impl TableOperationExtractor {
         options: ExtractorOptions,
     ) -> Result<Vec<Result<TableOperation, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
-        let casing = options.casing_for(dialect);
+        let style = options.identifier_style(dialect);
         Ok(statements
             .iter()
-            .map(|s| Self::extract_from_statement(s, options.catalog, casing))
+            .map(|s| Self::extract_from_statement(s, options.catalog, style))
             .collect())
     }
 
@@ -179,13 +179,13 @@ impl TableOperationExtractor {
     pub(crate) fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&Catalog>,
-        casing: IdentifierCasing,
+        style: IdentifierStyle,
     ) -> Result<TableOperation, Error> {
         let statement_kind = classify_statement(statement);
         if statement_kind == StatementKind::Unsupported {
             return Ok(unsupported_table_operation(statement_kind, statement));
         }
-        let (plan, column_diagnostics) = crate::resolver::build(statement, catalog, casing);
+        let (plan, column_diagnostics) = crate::resolver::build(statement, catalog, style);
         // Lineage is only for statements that move data into a target. A
         // column-less INSERT and a DELETE both bind to a `Write`, so the
         // structural walk can't tell them apart — gate on the kind. A MERGE

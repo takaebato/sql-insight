@@ -357,18 +357,17 @@ mod tests {
     use super::super::binder::build_with_diagnostics;
     use super::super::{column_lineage, reads, table_reads};
     use super::*;
-    use crate::casing::IdentifierCasing;
+    use crate::casing::{canonical_quote, IdentifierCasing, IdentifierStyle};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
     fn plan(sql: &str) -> LogicalPlan {
         let statements = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        build_with_diagnostics(
-            &statements[0],
-            None,
-            IdentifierCasing::for_dialect(&GenericDialect {}),
-        )
-        .0
+        let style = IdentifierStyle {
+            casing: IdentifierCasing::for_dialect(&GenericDialect {}),
+            quote: canonical_quote(&GenericDialect {}),
+        };
+        build_with_diagnostics(&statements[0], None, style).0
     }
 
     fn read_names(plan: &LogicalPlan) -> Vec<String> {

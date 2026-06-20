@@ -29,7 +29,7 @@ pub use crud_table_extractor::*;
 pub use table_extractor::*;
 pub use table_operation_extractor::*;
 
-use crate::casing::IdentifierCasing;
+use crate::casing::{IdentifierCasing, IdentifierStyle};
 use crate::catalog::Catalog;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
@@ -81,9 +81,19 @@ impl<'a> ExtractorOptions<'a> {
     }
 
     /// The effective casing: the override if set, else the dialect default.
-    pub(crate) fn casing_for(&self, dialect: &dyn Dialect) -> IdentifierCasing {
+    fn casing_for(&self, dialect: &dyn Dialect) -> IdentifierCasing {
         self.casing
             .unwrap_or_else(|| IdentifierCasing::for_dialect(dialect))
+    }
+
+    /// The full identifier style for the binder: the effective casing plus
+    /// the dialect's canonical quote (always dialect-derived — quoting a
+    /// catalog-confirmed identity is a surface concern, not a user knob).
+    pub(crate) fn identifier_style(&self, dialect: &dyn Dialect) -> IdentifierStyle {
+        IdentifierStyle {
+            casing: self.casing_for(dialect),
+            quote: crate::casing::canonical_quote(dialect),
+        }
     }
 }
 

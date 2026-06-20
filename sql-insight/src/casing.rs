@@ -185,6 +185,44 @@ impl Default for IdentifierCasing {
     }
 }
 
+/// The canonical quote character a dialect uses to delimit a
+/// case-exact identifier. Used only when *surfacing* a catalog-confirmed
+/// identity (which is case-exact, so it carries this quote) — it is a
+/// presentation concern, distinct from the fold [`CaseRule`] used for
+/// matching. The choice is the form each engine documents as standard:
+/// backtick for MySQL / BigQuery / Hive / Spark (Databricks), square
+/// brackets for SQL Server, and the SQL-standard double quote for
+/// everything else (including ClickHouse / SQLite, which accept both but
+/// document `"` as the standard form, and the generic fallback).
+///
+/// `sqlparser`'s `Dialect::identifier_quote_style` is *not* used: it
+/// encodes which quote a parser accepts and is unset (`None`) for most
+/// dialects (e.g. BigQuery), so it can't supply a canonical character.
+pub(crate) fn canonical_quote(dialect: &dyn Dialect) -> char {
+    if dialect.is::<MySqlDialect>()
+        || dialect.is::<BigQueryDialect>()
+        || dialect.is::<HiveDialect>()
+        || dialect.is::<DatabricksDialect>()
+    {
+        '`'
+    } else if dialect.is::<MsSqlDialect>() {
+        '['
+    } else {
+        '"'
+    }
+}
+
+/// The full identifier-handling context threaded into the binder: the
+/// per-class fold [`IdentifierCasing`] (a matching policy the caller may
+/// override) plus the dialect's [`canonical_quote`] (a surface decoration
+/// for catalog-confirmed identities, always dialect-derived). Kept
+/// internal — only `IdentifierCasing` is part of the public surface.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IdentifierStyle {
+    pub(crate) casing: IdentifierCasing,
+    pub(crate) quote: char,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

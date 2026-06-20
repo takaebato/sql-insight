@@ -58,7 +58,7 @@ use super::logical_plan::{
     Cte, CteRef, Delete, Drop, Expr, Filter, Insert, Join, LogicalPlan, Merge, MergeClause,
     NamedExpr, Projection, Scan, SetOp, Sort, SubqueryAlias, TableFunction, Update, Values, With,
 };
-use crate::casing::{CaseRule, IdentifierCasing};
+use crate::casing::{CaseRule, IdentifierStyle};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::reference::{ResolutionKind, TableReference};
@@ -81,12 +81,12 @@ use scope::*;
 pub(crate) fn build_with_diagnostics(
     statement: &Statement,
     catalog: Option<&Catalog>,
-    casing: IdentifierCasing,
+    style: IdentifierStyle,
 ) -> (LogicalPlan, Vec<ColumnLevelDiagnostic>) {
     let diagnostics = RefCell::new(Vec::new());
     let op = Binder {
         catalog,
-        casing,
+        style,
         ctes: Vec::new(),
         outer: Vec::new(),
         diagnostics: &diagnostics,
@@ -97,7 +97,7 @@ pub(crate) fn build_with_diagnostics(
 
 struct Binder<'a> {
     catalog: Option<&'a Catalog>,
-    casing: IdentifierCasing,
+    style: IdentifierStyle,
     /// CTEs in scope (declaration order, innermost `WITH` last).
     ctes: Vec<CteDecl>,
     /// Enclosing queries' relations (the correlation stack, outermost first)
@@ -110,11 +110,11 @@ struct Binder<'a> {
 
 impl<'a> Binder<'a> {
     /// A child binder with a different CTE environment (sharing catalog /
-    /// casing / correlation stack / diagnostics).
+    /// style / correlation stack / diagnostics).
     pub(super) fn with_ctes(&self, ctes: Vec<CteDecl>) -> Binder<'a> {
         Binder {
             catalog: self.catalog,
-            casing: self.casing,
+            style: self.style,
             ctes,
             outer: self.outer.clone(),
             diagnostics: self.diagnostics,
@@ -129,7 +129,7 @@ impl<'a> Binder<'a> {
         outer.push(relations);
         Binder {
             catalog: self.catalog,
-            casing: self.casing,
+            style: self.style,
             ctes: self.ctes.clone(),
             outer,
             diagnostics: self.diagnostics,
@@ -284,18 +284,21 @@ fn normalize_catalog(segment: &str, fold: CaseRule) -> String {
     fold.normalize(&Ident::with_quote('"', segment))
 }
 
-/// The surfaced canonical identity of a matched table: plain (unquoted) idents.
 /// The canonical identity of a matched catalog table — its registered
 /// `catalog.schema.name` path. Each segment's *value* comes from the
-/// registration (so a bare `users` and an explicit `public.users` agree), but
-/// its *span* is carried from the matching `written` segment so
-/// `reference.name.span` still points at where the reference was written (for
-/// source-order sorting). A segment the catalog *filled in* has no source token,
-/// so it gets an empty span.
-fn canonical_ref(table: &CatalogTable, written: &TableReference) -> TableReference {
+/// registration (so a bare `users` and an explicit `public.users` agree), and
+/// is surfaced **quoted** with the dialect's [`canonical_quote`](crate::casing::canonical_quote): catalog
+/// identifiers are case-exact (matched as if quoted, via `normalize_catalog`),
+/// so the surfaced identity must be quoted too, or a later fold (e.g. a column
+/// qualifier under an upper-folding dialect) would re-case it and fail to match
+/// its own relation. Each segment's *span* is carried from the matching
+/// `written` segment so `reference.name.span` still points at where the
+/// reference was written (for source-order sorting); a segment the catalog
+/// *filled in* has no source token, so it gets an empty span.
+fn canonical_ref(table: &CatalogTable, written: &TableReference, quote: char) -> TableReference {
     let seg = |value: &str, span: Span| Ident {
         value: value.to_string(),
-        quote_style: None,
+        quote_style: Some(quote),
         span,
     };
     let span_of = |ident: Option<&Ident>| ident.map_or(Span::empty(), |i| i.span);
@@ -506,8 +509,11 @@ mod tests {
 
     fn bind_cat(sql: &str, catalog: Option<&Catalog>) -> LogicalPlan {
         let statements = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        let casing = IdentifierCasing::for_dialect(&GenericDialect {});
-        build_with_diagnostics(&statements[0], catalog, casing).0
+        let style = IdentifierStyle {
+            casing: crate::casing::IdentifierCasing::for_dialect(&GenericDialect {}),
+            quote: crate::casing::canonical_quote(&GenericDialect {}),
+        };
+        build_with_diagnostics(&statements[0], catalog, style).0
     }
 
     fn only_binding(plan: &LogicalPlan) -> &Binding {

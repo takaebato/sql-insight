@@ -581,11 +581,10 @@ impl<'a> Binder<'a> {
                 // (the body lives once on the owning `With`) exposing the CTE's
                 // output columns as a synthetic relation.
                 if written.schema.is_none() && written.catalog.is_none() {
-                    if let Some(cte) = self
-                        .ctes
-                        .iter()
-                        .rev()
-                        .find(|c| self.eq(self.casing.table_alias, &c.name, &written.name))
+                    if let Some(cte) =
+                        self.ctes.iter().rev().find(|c| {
+                            self.eq(self.style.casing.table_alias, &c.name, &written.name)
+                        })
                     {
                         let relation = Relation::Derived {
                             alias: alias_name.or_else(|| Some(cte.name.clone())),
