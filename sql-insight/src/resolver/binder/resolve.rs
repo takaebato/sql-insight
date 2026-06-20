@@ -580,4 +580,50 @@ mod tests {
         assert_eq!(m.resolution, ResolutionKind::Cataloged);
         assert_eq!(m.table, tref(Some("db"), Some("public"), "users"));
     }
+
+    /// Catalog-stored segments are compared **exact** (treated as
+    /// already-quoted): the query side folds / quotes per the dialect, and the
+    /// result must equal the stored name verbatim. So a stored `Users` matches a
+    /// query that produces exactly `Users` — a quoted `"Users"`, or any case
+    /// under `Insensitive` — never an unquoted `users` that the fold
+    /// lower/upper-cases away. (Hence: register catalog names in the engine's
+    /// stored case. The quoting / folding matrix itself lives in `crate::casing`.)
+    ///
+    /// stored `Users`, vs:
+    /// | fold          | `users` (unquoted) | `"Users"` (quoted) |
+    /// |---------------|--------------------|--------------------|
+    /// | `Upper`       | ✗ (`USERS`)        | ✓                  |
+    /// | `Lower`       | ✗ (`users`)        | ✓                  |
+    /// | `Sensitive`   | ✗                  | ✓                  |
+    /// | `Insensitive` | ✓                  | ✓                  |
+    #[test]
+    fn catalog_name_is_matched_as_quoted() {
+        let table = CatalogTable::new("public", "Users").columns(["id"]);
+        let unquoted = tref(None, None, "users");
+        let quoted = TableReference {
+            catalog: None,
+            schema: None,
+            name: Ident::with_quote('"', "Users"),
+        };
+
+        // (fold, query, expected match)
+        let cases: &[(CaseFold, &TableReference, bool)] = &[
+            (CaseFold::Upper, &unquoted, false),
+            (CaseFold::Upper, &quoted, true),
+            (CaseFold::Lower, &unquoted, false),
+            (CaseFold::Lower, &quoted, true),
+            (CaseFold::Sensitive, &unquoted, false),
+            (CaseFold::Sensitive, &quoted, true),
+            (CaseFold::Insensitive, &unquoted, true),
+            (CaseFold::Insensitive, &quoted, true),
+        ];
+
+        for (fold, query, expected) in cases {
+            assert_eq!(
+                catalog_table_matches(query, &table, *fold),
+                *expected,
+                "{fold:?}: {query:?}"
+            );
+        }
+    }
 }
