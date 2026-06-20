@@ -29,12 +29,9 @@ pub use crud_table_extractor::*;
 pub use table_extractor::*;
 pub use table_operation_extractor::*;
 
-// The statement classifier is shared by the column / flat extractors to
-// pick the statement verb before assembling their surfaces.
-pub(crate) use table_operation_extractor::classify_statement;
-
 use crate::casing::IdentifierCasing;
 use crate::catalog::Catalog;
+use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 
 /// Optional inputs shared by every `*_with_options` extractor. Defaults
@@ -87,5 +84,98 @@ impl<'a> ExtractorOptions<'a> {
     pub(crate) fn casing_for(&self, dialect: &dyn Dialect) -> IdentifierCasing {
         self.casing
             .unwrap_or_else(|| IdentifierCasing::for_dialect(dialect))
+    }
+}
+
+/// What a statement does, at a coarse level. The *verb* of the statement
+/// — INSERT vs CREATE TABLE vs MERGE vs … — combined with the
+/// `reads` / `writes` split recovers every distinction the project needs
+/// to make at table granularity. Shared by every extractor (each surfaces
+/// it as `statement_kind`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementKind {
+    /// `SELECT ...` (and other read-only queries: `TABLE foo`, `VALUES`,
+    /// `WITH ... SELECT ...`). Reads only — no writes, no lineage.
+    Select,
+    /// `INSERT INTO ...`. Writes to one target table; reads from the
+    /// `VALUES` / `SELECT` source. Emits source → target lineage.
+    Insert,
+    /// `UPDATE ... SET ...`. Reads and writes the same target table;
+    /// reads from any joined / sub-query sources. Emits lineage from
+    /// SET right-hand-side sources into the target columns.
+    Update,
+    /// `DELETE FROM ...`. The target table appears in both `reads`
+    /// (row source) and `writes` (deletion target). No lineage.
+    Delete,
+    /// `MERGE INTO ... USING ...`. The target appears in both `reads`
+    /// and `writes`; each `WHEN` clause may emit lineage from the
+    /// source into the target's update / insert columns.
+    Merge,
+    /// `CREATE TABLE ...`. The new table is a write target. CREATE
+    /// TABLE AS (CTAS) also reads from its SELECT and emits per-column
+    /// lineage into the new table's columns.
+    CreateTable,
+    /// `CREATE VIEW ... AS SELECT ...`. The new view is a write
+    /// target; reads come from the SELECT body. Per-column lineage
+    /// pairs the SELECT projections with the view's columns.
+    CreateView,
+    /// `ALTER TABLE ...`. The altered table is a write target.
+    /// Column-level changes are not modelled in detail.
+    AlterTable,
+    /// `ALTER VIEW ... AS SELECT ...`. Treated like CREATE VIEW for
+    /// extraction purposes — the view is a write target, the new
+    /// SELECT body supplies reads and per-column lineage.
+    AlterView,
+    /// `DROP TABLE` / `DROP VIEW` / `DROP MATERIALIZED VIEW`. The
+    /// dropped relation is a write target. Other DROP variants
+    /// (functions, schemas, indexes, etc.) classify as
+    /// [`Unsupported`](StatementKind::Unsupported).
+    Drop,
+    /// `TRUNCATE TABLE ...`. The truncated table is a write target.
+    Truncate,
+    /// Statement is outside the operation-extraction scope. The
+    /// accompanying `diagnostics` list explains why.
+    Unsupported,
+}
+
+/// Classify a parsed statement into its [`StatementKind`]. Shared by the
+/// column / flat / CRUD extractors to pick the verb before assembling
+/// their surfaces.
+pub(crate) fn classify_statement(statement: &Statement) -> StatementKind {
+    use sqlparser::ast::{ObjectType, SetExpr};
+    match statement {
+        // `WITH cte AS (...) INSERT/UPDATE/DELETE/MERGE ...` is parsed
+        // by sqlparser as a top-level Query whose body is a
+        // `SetExpr::Insert/Update/Delete/Merge` wrapping the actual
+        // DML statement. Reclassify against the inner statement so
+        // the public StatementKind matches the verb the user wrote,
+        // not the parser-level wrapper.
+        Statement::Query(query) => match query.body.as_ref() {
+            SetExpr::Insert(stmt)
+            | SetExpr::Update(stmt)
+            | SetExpr::Delete(stmt)
+            | SetExpr::Merge(stmt) => classify_statement(stmt),
+            _ => StatementKind::Select,
+        },
+        Statement::Insert(_) => StatementKind::Insert,
+        Statement::Update(_) => StatementKind::Update,
+        Statement::Delete(_) => StatementKind::Delete,
+        Statement::Merge(_) => StatementKind::Merge,
+        Statement::CreateTable(_) | Statement::CreateVirtualTable { .. } => {
+            StatementKind::CreateTable
+        }
+        Statement::CreateView(_) => StatementKind::CreateView,
+        Statement::AlterTable(_) => StatementKind::AlterTable,
+        Statement::AlterView { .. } => StatementKind::AlterView,
+        Statement::Drop {
+            object_type: ObjectType::Table | ObjectType::View | ObjectType::MaterializedView,
+            ..
+        } => StatementKind::Drop,
+        Statement::Truncate(_) => StatementKind::Truncate,
+        // Drop variants that don't target relations (DROP FUNCTION,
+        // DROP SCHEMA, etc.) — and every other unsupported variant —
+        // fall through to Unsupported so the caller still gets a clear
+        // diagnostic.
+        _ => StatementKind::Unsupported,
     }
 }
