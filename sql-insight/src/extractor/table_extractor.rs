@@ -46,10 +46,10 @@ pub struct TableExtraction {
     /// Every table the statement references, one entry per relation
     /// binding: a table that is both a write target and a row source
     /// appears once, while the same table reached through two separate
-    /// FROM uses appears twice. **Order is not contractual** — it reflects
-    /// an internal tree walk and may change between versions; occurrence
-    /// count is preserved. A consumer wanting source-text order sorts by
-    /// `name.span`, and one wanting the distinct set dedups via a `HashSet`.
+    /// FROM uses appears twice. **In source order** — by each table's written
+    /// token span (`name.span`), a deterministic function of the SQL rather
+    /// than the internal tree walk; occurrence count is preserved. For the
+    /// distinct set, dedup via a `HashSet`.
     pub tables: Vec<TableReference>,
     pub diagnostics: Vec<TableLevelDiagnostic>,
 }
@@ -166,9 +166,9 @@ mod tests {
                 .into_iter()
                 .map(|result| result.map(|extraction| extraction.tables))
                 .collect::<Vec<Result<Vec<TableReference>, Error>>>();
-            // The flat table list's order is not contractual (it reflects an
-            // internal tree walk); a table referenced N times still appears N
-            // times. Compare each statement's list as a multiset, but keep
+            // The flat table list is returned in source order; a table
+            // referenced N times still appears N times. Compare each
+            // statement's list as a multiset (span-agnostic), keeping
             // `Ok`/`Err` shape and statement order exact.
             assert_eq!(
                 result.len(),

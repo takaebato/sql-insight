@@ -18,7 +18,7 @@
 //!   derived table, or table function (synthetic relations, not
 //!   real storage) are dropped from reads — only references to real
 //!   tables or unresolved names surface. `reads` is a plain
-//!   occurrence list of `ColumnReference`s in walk order: a column
+//!   occurrence list of `ColumnReference`s in source order: a column
 //!   referenced more than once appears more than once, with no
 //!   syntactic clause tag. (Whether a reference contributes a value
 //!   or merely influences the result — e.g. a `WHERE` predicate — is
@@ -153,12 +153,12 @@ pub struct ColumnOperation {
     /// referenced more than once appears more than once (e.g.
     /// `SELECT a FROM t WHERE a > 0` yields `t.a` twice). Each entry pairs
     /// the [`ColumnReference`] identity with its
-    /// [`ResolutionKind`](crate::ResolutionKind). **Order is not
-    /// contractual** — it reflects an internal traversal and may change
-    /// between versions; occurrence count is preserved, and each entry
-    /// carries its source span, so a consumer wanting source-text order
-    /// sorts by `reference.name.span` and one wanting the distinct identity
-    /// set dedups `reads.iter().map(|r| &r.reference)` via a `HashSet`.
+    /// [`ResolutionKind`](crate::ResolutionKind). **In source order** — by
+    /// each read's written token span (`reference.name.span`), a deterministic
+    /// function of the SQL rather than the internal traversal. References that
+    /// share a token (a `USING` fan-in) keep a stable relative order. For the
+    /// distinct identity set, dedup `reads.iter().map(|r| &r.reference)` via a
+    /// `HashSet`.
     pub reads: Vec<ColumnRead>,
     /// Columns written by the statement, in source (column-list) order.
     /// Occurrence-based like `reads`. Write targets come straight from SQL
@@ -167,9 +167,9 @@ pub struct ColumnOperation {
     pub writes: Vec<ColumnReference>,
     /// Lineage edges. Statements that physically move data emit collapsed
     /// end-to-end edges (source → `ColumnTarget::Relation`); a bare
-    /// `SELECT` emits source → `ColumnTarget::QueryOutput` edges. **Order
-    /// is not contractual** (occurrence / multiplicity is preserved);
-    /// consumers compare as a set / multiset.
+    /// `SELECT` emits source → `ColumnTarget::QueryOutput` edges. **In source
+    /// order** of the contributing source column (by its written token span);
+    /// occurrence / multiplicity is preserved.
     pub lineage: Vec<ColumnLineageEdge>,
     /// Column-level diagnostics: wildcard suppression plus the
     /// `UnsupportedStatement` projection inherited from table

@@ -126,10 +126,15 @@ by hand.
   construct (e.g. a >3-segment table name) is dropped rather than
   hard-erroring, but flagged with a `TooManyTableQualifiers`
   diagnostic so the dropped relation stays observable.
-- `reads` / `lineage` order is **non-contractual** (a tree-walk
-  artifact); occurrence count is preserved and each reference carries
-  its source span, so consumers sort by span for source order. Tests
-  compare these surfaces as multisets. `writes` follow source order.
+- `reads` / `lineage` are returned in **source order** — the facade
+  re-sorts the walkers' (walk-order) output by each reference's
+  written-token span (`reference.name.span`), so the surfaces are a
+  deterministic function of the SQL, not the internal walk; references
+  sharing a token (USING fan-in) keep a stable relative order, and a
+  catalog-filled prefix segment (no source token) has an empty span, so
+  the **name** segment is the sort key. Occurrence count is preserved.
+  Tests still compare these surfaces as multisets (span-agnostic; the order
+  is pinned by a dedicated test). `writes` follow source order too.
 - `reads` is **occurrence-based, by token** — each *syntactic* appearance
   of a base-column reference is one read, not each *physical* read. The
   unit is "the column name appeared as a token here", not "the engine
@@ -368,8 +373,9 @@ by hand.
   mid-walk. Reserve hard errors for genuinely unrecoverable
   conditions.
 - Tests: compare whole values over field-by-field assertions, but
-  treat `reads` / `lineage` as **multisets** (order is non-contractual)
-  — use the `assert_unordered_eq!` helper; `writes` stay order-exact.
+  treat `reads` / `lineage` as **multisets** (span-agnostic; the source
+  order they're returned in is pinned by a dedicated test) — use the
+  `assert_unordered_eq!` helper; `writes` stay order-exact.
   Use a layered helper convention — `extract` → `extract_with(dialect)`
   → `extract_with_catalog(dialect, catalog)` — so callsites stay terse
   and new parameters fall through cleanly.

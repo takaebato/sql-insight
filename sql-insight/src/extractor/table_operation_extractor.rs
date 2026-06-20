@@ -66,12 +66,10 @@ pub struct TableOperation {
     /// Tables read by the statement. Occurrence-based: a table referenced
     /// more than once appears more than once. Each [`TableRead`] pairs the
     /// identity with the catalog-match
-    /// [`ResolutionKind`](crate::ResolutionKind). **Order is not
-    /// contractual** — it reflects an internal traversal and may change
-    /// between versions; occurrence count is preserved, and each reference
-    /// carries its source span, so a consumer wanting source-text order
-    /// sorts by `reference.name.span` and one wanting the distinct identity
-    /// set dedups `reads.iter().map(|r| &r.reference)` via a `HashSet`.
+    /// [`ResolutionKind`](crate::ResolutionKind). **In source order** — by
+    /// each read's written token span (`reference.name.span`), a deterministic
+    /// function of the SQL rather than the internal traversal. For the distinct
+    /// identity set, dedup `reads.iter().map(|r| &r.reference)` via a `HashSet`.
     pub reads: Vec<TableRead>,
     /// Tables written by the statement, in source order. Occurrence-based
     /// like `reads`. Bare [`TableReference`] — write targets are trivially
@@ -79,8 +77,9 @@ pub struct TableOperation {
     pub writes: Vec<TableReference>,
     /// Lineage edges, only for statements that physically move data
     /// (`INSERT`, `UPDATE`, `MERGE` with an Insert / Update WHEN
-    /// clause, CTAS, `CREATE VIEW`, `ALTER VIEW`). **Order is not
-    /// contractual** (occurrence / multiplicity is preserved).
+    /// clause, CTAS, `CREATE VIEW`, `ALTER VIEW`). **In source order** of the
+    /// feeding source table (by its written token span); occurrence /
+    /// multiplicity is preserved.
     pub lineage: Vec<TableLineageEdge>,
     /// Non-fatal diagnostics from the walk; only
     /// `UnsupportedStatement` arises at this granularity.
@@ -344,10 +343,10 @@ mod tests {
     use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
 
     /// Assert two collections are equal as multisets (order-independent).
-    /// `reads` / `lineage` order is non-contractual in the public API (a
-    /// consumer that cares orders by span), so tests pin the *set* of
-    /// extracted facts, not the walk order. `writes` stays order-sensitive
-    /// (source order is contractual), so it keeps a plain `assert_eq!`.
+    /// `reads` / `lineage` are returned in source order, but these tests
+    /// compare as multisets to stay span-agnostic — pinning the *set* of
+    /// extracted facts. `writes` keeps a plain `assert_eq!` (source order,
+    /// order-sensitive).
     macro_rules! assert_unordered_eq {
         ($actual:expr, $expected:expr, $msg:expr $(,)?) => {{
             let actual = $actual;

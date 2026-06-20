@@ -49,15 +49,31 @@ use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference};
 // `LogicalPlan::Empty`, so it doubles as `build`.
 pub(crate) use binder::build_with_diagnostics as build;
 
-/// Every physical base-column read of the statement, occurrence-based (a
-/// `Derived` reference is dropped — its read is counted at the inner producer).
-pub(crate) fn reads(plan: &LogicalPlan) -> Vec<ColumnRead> {
-    reads::collect_reads(plan)
+/// Source-order sort key for a surfaced reference: the `(line, column)` of the
+/// written identifier token's span. The walkers emit walk order (an internal
+/// artifact); the facade re-sorts by this so the surfaces are a deterministic
+/// function of the SQL — a *stable* sort, so references that share a token (a
+/// `USING` fan-in) keep a fixed relative order.
+fn source_order(name: &sqlparser::ast::Ident) -> (u64, u64) {
+    let start = name.span.start;
+    (start.line, start.column)
 }
 
-/// Every base table the statement scans (read role), occurrence-based.
+/// Every physical base-column read of the statement, occurrence-based (a
+/// `Derived` reference is dropped — its read is counted at the inner producer).
+/// Returned in source order (by the read's written token span).
+pub(crate) fn reads(plan: &LogicalPlan) -> Vec<ColumnRead> {
+    let mut reads = reads::collect_reads(plan);
+    reads.sort_by_key(|r| source_order(&r.reference.name));
+    reads
+}
+
+/// Every base table the statement scans (read role), occurrence-based. Returned
+/// in source order (by the table's written token span).
 pub(crate) fn table_reads(plan: &LogicalPlan) -> Vec<TableRead> {
-    reads::collect_table_reads(plan)
+    let mut reads = reads::collect_table_reads(plan);
+    reads.sort_by_key(|r| source_order(&r.reference.name));
+    reads
 }
 
 /// Every column the statement writes — a DML root's target columns, qualified
@@ -73,18 +89,28 @@ pub(crate) fn table_writes(plan: &LogicalPlan) -> Vec<TableReference> {
 
 /// The `source → target` column-lineage edges: each output column traced to
 /// its base columns (`QueryOutput` for a query, `Relation` for a DML target).
+/// Returned in source order of the contributing source column (by its written
+/// token span).
 pub(crate) fn column_lineage(plan: &LogicalPlan) -> Vec<ColumnLineageEdge> {
-    lineage::collect_column_lineage(plan)
+    let mut edges = lineage::collect_column_lineage(plan);
+    edges.sort_by_key(|e| source_order(&e.source.reference.name));
+    edges
 }
 
 /// The `source → target` table-lineage edges: the read-role scans that feed
-/// data into a DML target.
+/// data into a DML target. Returned in source order of the feeding source table
+/// (by its written token span).
 pub(crate) fn table_lineage(plan: &LogicalPlan) -> Vec<TableLineageEdge> {
-    lineage::collect_table_lineage(plan)
+    let mut edges = lineage::collect_table_lineage(plan);
+    edges.sort_by_key(|e| source_order(&e.source.reference.name));
+    edges
 }
 
 /// The flat list of every table the statement references — one per relation
-/// binding (the legacy table surface).
+/// binding (the legacy table surface). Returned in source order (by each
+/// table's written token span).
 pub(crate) fn flat_tables(plan: &LogicalPlan) -> Vec<TableReference> {
-    tables::collect_flat_tables(plan)
+    let mut tables = tables::collect_flat_tables(plan);
+    tables.sort_by_key(|t| source_order(&t.name));
+    tables
 }

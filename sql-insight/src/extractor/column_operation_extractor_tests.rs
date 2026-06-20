@@ -4,11 +4,11 @@ use crate::reference::{ResolutionKind, TableReference};
 use sqlparser::dialect::GenericDialect;
 
 /// Order-insensitive multiset equality for the `reads` / `lineage`
-/// surfaces. Their order is a walk-order artifact that the public API does
-/// **not** contract (occurrence count is preserved; consumers needing
-/// source order sort by span), so these tests pin membership + multiplicity
-/// rather than sequence. Compares via `PartialEq` (sqlparser `Ident`
-/// equality already ignores spans).
+/// surfaces. The public API returns them in source order, but these tests
+/// compare as multisets to stay span-agnostic and focus on membership +
+/// multiplicity — the source-order guarantee itself is pinned separately by
+/// `reads_are_returned_in_source_order`. Compares via `PartialEq`
+/// (sqlparser `Ident` equality already ignores spans).
 macro_rules! assert_unordered_eq {
     ($actual:expr, $expected:expr $(,)?) => {{
         let actual = $actual;
@@ -200,8 +200,9 @@ fn assert_column_ops_inner(
         actual.statement_kind, statement_kind,
         "kind for SQL: {sql} (statement {index})"
     );
-    // `reads` / `lineage` order is non-contractual (walk-order artifact),
-    // so compare as multisets; `writes` follow the source column order.
+    // `reads` / `lineage` come back in source order; these compare as
+    // multisets to stay span-agnostic (the order is pinned separately), while
+    // `writes` follow the source column order.
     assert_unordered_eq!(actual.reads, reads);
     assert_eq!(
         actual.writes, writes,
@@ -228,6 +229,22 @@ fn diag(kind: ColumnLevelDiagnosticKind) -> ColumnLevelDiagnostic {
 
 mod reads {
     use super::*;
+
+    /// The public surfaces are returned in **source order** (by each read's
+    /// written token span), independent of the internal walk. Walk order would
+    /// surface the ORDER BY key first (its `Sort` is the outermost node); the
+    /// facade re-sorts, so reads come back projection `a` (col 8), WHERE `c`
+    /// (col 23), ORDER BY `b` (col 38).
+    #[test]
+    fn reads_are_returned_in_source_order() {
+        let ops = extract("SELECT a FROM t WHERE c > 0 ORDER BY b");
+        let names: Vec<&str> = ops
+            .reads
+            .iter()
+            .map(|r| r.reference.name.value.as_str())
+            .collect();
+        assert_eq!(names, ["a", "c", "b"]);
+    }
 
     #[test]
     fn qualified_select_collects_qualified_reads() {
