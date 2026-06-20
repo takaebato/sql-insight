@@ -172,19 +172,26 @@ impl CliExecutable for ExtractExecutor {
 
 impl ExtractExecutor {
     /// Build the catalog from the `--ddl-file` (if any) plus query-side
-    /// defaults. Defaults without a DDL file are a no-op (no tables to
-    /// match), so a missing DDL file yields no catalog.
+    /// defaults. Returns `None` only when no catalog input was given at all
+    /// — defaults alone still build a (table-less) catalog, so a bare ref
+    /// qualifies to `--default-schema` even without a DDL file. Unqualified
+    /// DDL tables register schema-less (no fabricated schema).
     fn load_catalog(&self, dialect: &dyn Dialect) -> Result<Option<Catalog>, Error> {
-        let Some(path) = &self.ddl_file else {
+        if self.ddl_file.is_none()
+            && self.default_schema.is_none()
+            && self.default_catalog.is_none()
+        {
             return Ok(None);
+        }
+        let mut catalog = match &self.ddl_file {
+            Some(path) => {
+                let ddl = std::fs::read_to_string(path).map_err(|e| {
+                    Error::ArgumentError(format!("Failed to read DDL file {path}: {e}"))
+                })?;
+                Catalog::from_ddl(dialect, &ddl)?
+            }
+            None => Catalog::new(),
         };
-        let ddl = std::fs::read_to_string(path)
-            .map_err(|e| Error::ArgumentError(format!("Failed to read DDL file {path}: {e}")))?;
-        // Unqualified DDL tables register schema-less (no fabricated schema).
-        // `--default-schema` / `--default-catalog` set only the query-side
-        // fill, so a multi-schema catalog still resolves bare refs by
-        // right-anchoring when no default is given.
-        let mut catalog = Catalog::from_ddl(dialect, &ddl)?;
         if let Some(schema) = &self.default_schema {
             catalog = catalog.default_schema(schema.clone());
         }

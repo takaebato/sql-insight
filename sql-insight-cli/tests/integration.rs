@@ -393,6 +393,25 @@ mod integration {
         }
 
         #[test]
+        fn test_extract_with_default_schema_only() {
+            // --default-schema without a --ddl-file: no tables to confirm, but
+            // the declared default still qualifies the bare ref — `users`
+            // surfaces as `public.users` (Inferred, so unmarked).
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("--default-schema")
+                .arg("public")
+                .arg("SELECT id FROM users")
+                .assert()
+                .success()
+                .stdout(
+                    "[1] Select\n  reads:   public.users.id\n  lineage: public.users.id -> id\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
         fn test_extract_with_casing_sensitive() {
             // Case-sensitive override: lowercase `t2` no longer binds the
             // uppercase CTE `T2`, so it surfaces as a distinct table.
