@@ -7,8 +7,9 @@
 use sql_insight::catalog::{Catalog, CatalogTable};
 use sql_insight::diagnostic::{ColumnLevelDiagnosticKind, TableLevelDiagnosticKind};
 use sql_insight::extractor::{
-    extract_column_operations, extract_crud_tables, extract_table_operations, extract_tables,
-    ColumnLineageKind, ColumnTarget, CrudTables, StatementKind,
+    extract_column_operations, extract_column_operations_with_options, extract_crud_tables,
+    extract_table_operations, extract_table_operations_with_options, extract_tables,
+    ColumnLineageKind, ColumnTarget, CrudTables, ExtractorOptions, StatementKind,
 };
 use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::sqlparser::dialect::GenericDialect;
@@ -221,8 +222,7 @@ mod extract_table_operations {
 
     #[test]
     fn select_classifies_kind_and_collects_reads() {
-        let result =
-            extract_table_operations(&GenericDialect {}, "SELECT a FROM t1", None).unwrap();
+        let result = extract_table_operations(&GenericDialect {}, "SELECT a FROM t1").unwrap();
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.statement_kind, StatementKind::Select);
         assert_eq!(ops.reads.len(), 1);
@@ -234,7 +234,7 @@ mod extract_table_operations {
     #[test]
     fn insert_select_emits_source_to_target_lineage() {
         let sql = "INSERT INTO orders (id, total) SELECT id, amount FROM staging";
-        let result = extract_table_operations(&GenericDialect {}, sql, None).unwrap();
+        let result = extract_table_operations(&GenericDialect {}, sql).unwrap();
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.statement_kind, StatementKind::Insert);
         assert_eq!(ops.reads, vec![read("staging")]);
@@ -247,7 +247,7 @@ mod extract_table_operations {
     #[test]
     fn multi_statement_batch_returns_per_statement_results() {
         let sql = "SELECT * FROM t1; INSERT INTO t2 SELECT * FROM t3";
-        let result = extract_table_operations(&GenericDialect {}, sql, None).unwrap();
+        let result = extract_table_operations(&GenericDialect {}, sql).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(
             result[0].as_ref().unwrap().statement_kind,
@@ -262,8 +262,7 @@ mod extract_table_operations {
     #[test]
     fn unsupported_statement_surfaces_diagnostic() {
         let result =
-            extract_table_operations(&GenericDialect {}, "CREATE INDEX idx ON t1 (a)", None)
-                .unwrap();
+            extract_table_operations(&GenericDialect {}, "CREATE INDEX idx ON t1 (a)").unwrap();
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.statement_kind, StatementKind::Unsupported);
         assert!(ops
@@ -293,7 +292,7 @@ mod extract_column_operations {
     #[test]
     fn select_collects_per_column_reads() {
         let sql = "SELECT a FROM t1 WHERE b > 0";
-        let result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
+        let result = extract_column_operations(&GenericDialect {}, sql).unwrap();
         let ops = result[0].as_ref().unwrap();
         // Both the projection `a` and the filter `b` surface as reads
         // (occurrence list, no clause tag). value-vs-filter is
@@ -315,7 +314,7 @@ mod extract_column_operations {
     #[test]
     fn insert_select_emits_per_column_lineage() {
         let sql = "INSERT INTO orders (id, total) SELECT id, amount FROM staging";
-        let result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
+        let result = extract_column_operations(&GenericDialect {}, sql).unwrap();
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.lineage.len(), 2);
         // Both lineage edges are Passthrough into Relation targets.
@@ -328,7 +327,7 @@ mod extract_column_operations {
     #[test]
     fn aggregate_projection_marks_transformation() {
         let sql = "INSERT INTO summary (total) SELECT SUM(amount) FROM staging";
-        let result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
+        let result = extract_column_operations(&GenericDialect {}, sql).unwrap();
         let ops = result[0].as_ref().unwrap();
         assert_eq!(ops.lineage.len(), 1);
         assert_eq!(ops.lineage[0].source, col("staging", "amount"));
@@ -342,8 +341,7 @@ mod extract_column_operations {
 
     #[test]
     fn wildcard_in_projection_yields_wildcard_suppressed_diagnostic() {
-        let result =
-            extract_column_operations(&GenericDialect {}, "SELECT * FROM t1", None).unwrap();
+        let result = extract_column_operations(&GenericDialect {}, "SELECT * FROM t1").unwrap();
         let ops = result[0].as_ref().unwrap();
         assert!(ops
             .diagnostics
@@ -378,8 +376,12 @@ mod catalog {
             .with("orders", vec!["id", "total"])
             .with("staging", vec!["id", "amount"]);
         let sql = "INSERT INTO orders SELECT id, amount FROM staging";
-        let result =
-            extract_column_operations(&GenericDialect {}, sql, Some(&catalog.catalog)).unwrap();
+        let result = extract_column_operations_with_options(
+            &GenericDialect {},
+            sql,
+            ExtractorOptions::new().with_catalog(&catalog.catalog),
+        )
+        .unwrap();
         let ops = result[0].as_ref().unwrap();
         // Two lineage edges into Relation targets orders.id / orders.total.
         let relation_targets: Vec<_> = ops
@@ -405,9 +407,13 @@ mod catalog {
             .with("t2", vec!["a"]);
         let sql = "SELECT a FROM t1 JOIN t2 ON t1.a = t2.a";
 
-        let with =
-            extract_column_operations(&GenericDialect {}, sql, Some(&catalog.catalog)).unwrap();
-        let without = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
+        let with = extract_column_operations_with_options(
+            &GenericDialect {},
+            sql,
+            ExtractorOptions::new().with_catalog(&catalog.catalog),
+        )
+        .unwrap();
+        let without = extract_column_operations(&GenericDialect {}, sql).unwrap();
 
         let with_reads = &with[0].as_ref().unwrap().reads;
         let without_reads = &without[0].as_ref().unwrap().reads;
@@ -449,9 +455,13 @@ mod catalog {
         let catalog = TestCatalog::default().with("t1", vec!["a", "b"]);
         let sql = "SELECT missing FROM t1";
 
-        let with =
-            extract_column_operations(&GenericDialect {}, sql, Some(&catalog.catalog)).unwrap();
-        let without = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
+        let with = extract_column_operations_with_options(
+            &GenericDialect {},
+            sql,
+            ExtractorOptions::new().with_catalog(&catalog.catalog),
+        )
+        .unwrap();
+        let without = extract_column_operations(&GenericDialect {}, sql).unwrap();
 
         let with_reads = &with[0].as_ref().unwrap().reads;
         let without_reads = &without[0].as_ref().unwrap().reads;
@@ -474,8 +484,7 @@ mod diagnostics {
     #[test]
     fn unsupported_statement_kind_surfaces_via_table_operations() {
         let result =
-            extract_table_operations(&GenericDialect {}, "CREATE INDEX idx ON t (a)", None)
-                .unwrap();
+            extract_table_operations(&GenericDialect {}, "CREATE INDEX idx ON t (a)").unwrap();
         let ops = result[0].as_ref().unwrap();
         assert!(ops
             .diagnostics
@@ -491,8 +500,7 @@ mod diagnostics {
         // span propagation regresses — e.g. the resolver starts using
         // the surrounding SELECT node's span instead of the wildcard
         // token's — this test will fail with a concrete diff.
-        let result =
-            extract_column_operations(&GenericDialect {}, "SELECT * FROM t1", None).unwrap();
+        let result = extract_column_operations(&GenericDialect {}, "SELECT * FROM t1").unwrap();
         let ops = result[0].as_ref().unwrap();
         let wildcard = ops
             .diagnostics
@@ -520,9 +528,12 @@ mod diagnostics {
         // `missing` starts at column 8 in `SELECT missing FROM t1`.
         let catalog = Catalog::new().table(CatalogTable::new("public", "t1").columns(["a", "b"]));
 
-        let result =
-            extract_column_operations(&GenericDialect {}, "SELECT missing FROM t1", Some(&catalog))
-                .unwrap();
+        let result = extract_column_operations_with_options(
+            &GenericDialect {},
+            "SELECT missing FROM t1",
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap();
         let ops = result[0].as_ref().unwrap();
         let unresolved = ops
             .reads
@@ -547,9 +558,12 @@ mod diagnostics {
         // `users` starts at column 16 in `SELECT id FROM users`.
         let catalog = Catalog::new().table(CatalogTable::new("public", "users").columns(["id"]));
 
-        let result =
-            extract_table_operations(&GenericDialect {}, "SELECT id FROM users", Some(&catalog))
-                .unwrap();
+        let result = extract_table_operations_with_options(
+            &GenericDialect {},
+            "SELECT id FROM users",
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap();
         let ops = result[0].as_ref().unwrap();
         let read = ops
             .reads
@@ -624,8 +638,8 @@ mod invariants {
     }
 
     fn extract_paired(sql: &str) -> Vec<StatementPair> {
-        let col = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
-        let tab = extract_table_operations(&GenericDialect {}, sql, None).unwrap();
+        let col = extract_column_operations(&GenericDialect {}, sql).unwrap();
+        let tab = extract_table_operations(&GenericDialect {}, sql).unwrap();
         assert_eq!(
             col.len(),
             tab.len(),

@@ -73,25 +73,18 @@ use crate::casing::IdentifierCasing;
 use crate::catalog::Catalog;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::error::Error;
-use crate::extractor::{classify_statement, StatementKind};
+use crate::extractor::{classify_statement, ExtractorOptions, StatementKind};
 use crate::reference::{ColumnRead, ColumnReference};
 use sqlparser::ast::{Ident, Statement};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
-/// Convenience function to extract column-level operations from SQL.
-///
-/// `catalog` is an optional schema registry (see [`Catalog`]). When
-/// supplied, table references are matched against it (right-anchored,
-/// dialect-cased): a
-/// unique hit canonicalizes the surfaced identity to the registered
-/// path and supplies the column list, turning column resolution strict
-/// (a column the schema doesn't list surfaces as
-/// [`Unresolved`](crate::ResolutionKind::Unresolved), and an unqualified
-/// name two known schemas both declare as
-/// [`Ambiguous`](crate::ResolutionKind::Ambiguous)). Pass `None` for
-/// best-effort, catalog-free resolution (every resolved read is
-/// [`Inferred`](crate::ResolutionKind::Inferred)).
+/// Convenience function to extract column-level operations from SQL using
+/// the dialect defaults (no catalog, dialect-derived casing). For a
+/// catalog or a casing override, use
+/// [`extract_column_operations_with_options`]; with a catalog, table
+/// references are matched against it (right-anchored, dialect-cased) and
+/// column resolution turns strict.
 ///
 /// ## Example
 ///
@@ -104,7 +97,7 @@ use sqlparser::parser::Parser;
 ///
 /// let dialect = GenericDialect {};
 /// let result =
-///     extract_column_operations(&dialect, "SELECT a FROM t1", None).unwrap();
+///     extract_column_operations(&dialect, "SELECT a FROM t1").unwrap();
 /// let ops = result[0].as_ref().unwrap();
 ///
 /// // SELECT contributes reads + lineage but no writes.
@@ -136,9 +129,19 @@ use sqlparser::parser::Parser;
 pub fn extract_column_operations(
     dialect: &dyn Dialect,
     sql: &str,
-    catalog: Option<&Catalog>,
 ) -> Result<Vec<Result<ColumnOperation, Error>>, Error> {
-    ColumnOperationExtractor::extract(dialect, sql, catalog)
+    ColumnOperationExtractor::extract(dialect, sql)
+}
+
+/// Like [`extract_column_operations`] but with [`ExtractorOptions`] — a
+/// catalog and/or an identifier-casing override. `dialect` still drives
+/// parsing; the options govern only the analysis.
+pub fn extract_column_operations_with_options(
+    dialect: &dyn Dialect,
+    sql: &str,
+    options: ExtractorOptions,
+) -> Result<Vec<Result<ColumnOperation, Error>>, Error> {
+    ColumnOperationExtractor::extract_with_options(dialect, sql, options)
 }
 
 /// Column-level operations performed by a single SQL statement.
@@ -273,13 +276,23 @@ impl ColumnOperationExtractor {
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,
-        catalog: Option<&Catalog>,
+    ) -> Result<Vec<Result<ColumnOperation, Error>>, Error> {
+        Self::extract_with_options(dialect, sql, ExtractorOptions::new())
+    }
+
+    /// Like [`extract`](Self::extract) but with [`ExtractorOptions`] — a
+    /// catalog and/or an identifier-casing override. `dialect` still
+    /// drives parsing; the options govern only the analysis.
+    pub fn extract_with_options(
+        dialect: &dyn Dialect,
+        sql: &str,
+        options: ExtractorOptions,
     ) -> Result<Vec<Result<ColumnOperation, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
-        let casing = IdentifierCasing::for_dialect(dialect);
+        let casing = options.casing_for(dialect);
         Ok(statements
             .iter()
-            .map(|s| Self::extract_from_statement(s, catalog, casing))
+            .map(|s| Self::extract_from_statement(s, options.catalog, casing))
             .collect())
     }
 

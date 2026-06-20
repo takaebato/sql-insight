@@ -32,7 +32,7 @@ macro_rules! assert_unordered_eq {
 }
 
 fn extract(sql: &str) -> ColumnOperation {
-    let mut result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
+    let mut result = extract_column_operations(&GenericDialect {}, sql).unwrap();
     result.remove(0).unwrap()
 }
 
@@ -174,7 +174,7 @@ fn assert_column_ops(sql: &str, expected: ColumnOperation) {
 /// targets the statement at `index`. Compose multiple calls to
 /// pin down each statement in a batch independently.
 fn assert_nth_column_ops(sql: &str, index: usize, expected: ColumnOperation) {
-    let actual = extract_column_operations(&GenericDialect {}, sql, None)
+    let actual = extract_column_operations(&GenericDialect {}, sql)
         .unwrap()
         .into_iter()
         .nth(index)
@@ -2989,7 +2989,7 @@ mod on_conflict {
         dialect: &dyn sqlparser::dialect::Dialect,
         expected: ColumnOperation,
     ) {
-        let actual = extract_column_operations(dialect, sql, None)
+        let actual = extract_column_operations(dialect, sql)
             .unwrap()
             .into_iter()
             .next()
@@ -3547,7 +3547,8 @@ mod catalog_strict {
     }
 
     fn assert_column_ops_with_catalog(sql: &str, catalog: &TestCatalog, expected: ColumnOperation) {
-        let actual = extract_column_operations(&GenericDialect {}, sql, Some(&catalog.catalog))
+        let options = ExtractorOptions::new().with_catalog(&catalog.catalog);
+        let actual = extract_column_operations_with_options(&GenericDialect {}, sql, options)
             .unwrap()
             .into_iter()
             .next()
@@ -3903,7 +3904,7 @@ mod expr_arm_coverage {
 
     /// `reads` of the first statement, resolved without a catalog.
     fn reads(sql: &str) -> Vec<ColumnRead> {
-        extract_column_operations(&GenericDialect {}, sql, None)
+        extract_column_operations(&GenericDialect {}, sql)
             .unwrap()
             .remove(0)
             .unwrap()
@@ -3914,7 +3915,7 @@ mod expr_arm_coverage {
     /// (e.g. `ARRAY[...]` literals) are syntax `GenericDialect` rejects.
     fn reads_pg(sql: &str) -> Vec<ColumnRead> {
         use sqlparser::dialect::PostgreSqlDialect;
-        extract_column_operations(&PostgreSqlDialect {}, sql, None)
+        extract_column_operations(&PostgreSqlDialect {}, sql)
             .unwrap()
             .remove(0)
             .unwrap()
@@ -3923,7 +3924,7 @@ mod expr_arm_coverage {
 
     /// `lineage` of the first statement, resolved without a catalog.
     fn lineage(sql: &str) -> Vec<ColumnLineageEdge> {
-        extract_column_operations(&GenericDialect {}, sql, None)
+        extract_column_operations(&GenericDialect {}, sql)
             .unwrap()
             .remove(0)
             .unwrap()
@@ -4467,7 +4468,7 @@ mod relation_arm_coverage {
     }
 
     fn op_with(sql: &str, dialect: &dyn Dialect) -> ColumnOperation {
-        extract_column_operations(dialect, sql, None)
+        extract_column_operations(dialect, sql)
             .unwrap()
             .remove(0)
             .unwrap()
@@ -5221,7 +5222,7 @@ mod unsupported_statement_coverage {
     }
 
     fn assert_unsupported(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) {
-        let op = extract_column_operations(dialect, sql, None)
+        let op = extract_column_operations(dialect, sql)
             .unwrap()
             .remove(0)
             .unwrap();
@@ -5264,7 +5265,7 @@ mod supported_kind_only_coverage {
     #[test]
     fn supported_kind_only_statements_produce_empty_surfaces() {
         for (sql, expected_kind) in KIND_ONLY {
-            let result = extract_column_operations(&GenericDialect {}, sql, None).unwrap();
+            let result = extract_column_operations(&GenericDialect {}, sql).unwrap();
             let op = result[0].as_ref().unwrap();
             assert_eq!(op.statement_kind, *expected_kind, "kind for SQL: {sql}");
             assert!(op.reads.is_empty(), "reads for SQL: {sql}");
@@ -5300,7 +5301,11 @@ mod confidence_arm_coverage {
     }
 
     fn extract_reads(sql: &str, catalog: Option<&TestCatalog>) -> Vec<ColumnRead> {
-        extract_column_operations(&GenericDialect {}, sql, catalog.map(|c| &c.catalog))
+        let mut options = ExtractorOptions::new();
+        if let Some(c) = catalog {
+            options = options.with_catalog(&c.catalog);
+        }
+        extract_column_operations_with_options(&GenericDialect {}, sql, options)
             .unwrap()
             .remove(0)
             .unwrap()
@@ -5621,7 +5626,11 @@ mod dialect_casing_coverage {
     }
 
     fn reads(sql: &str, dialect: &dyn Dialect, catalog: Option<&TestCatalog>) -> Vec<ColumnRead> {
-        extract_column_operations(dialect, sql, catalog.map(|c| &c.catalog))
+        let mut options = ExtractorOptions::new();
+        if let Some(c) = catalog {
+            options = options.with_catalog(&c.catalog);
+        }
+        extract_column_operations_with_options(dialect, sql, options)
             .unwrap()
             .remove(0)
             .unwrap()

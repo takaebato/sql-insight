@@ -64,7 +64,6 @@
 //! let result = extract_table_operations(
 //!     &dialect,
 //!     "INSERT INTO orders (id) SELECT id FROM staging",
-//!     None,
 //! ).unwrap();
 //! let ops = result[0].as_ref().unwrap();
 //! assert_eq!(ops.statement_kind, StatementKind::Insert);
@@ -222,8 +221,12 @@ pub mod normalizer;
 mod resolver;
 
 // Dialect-aware identifier casing (case folding for table / alias /
-// column matching). Threaded into the binder and the extractors.
+// column matching). Threaded into the binder and the extractors. The
+// module stays private; the two configuration types are re-exported at
+// the crate root so consumers can override the dialect default via the
+// `*_with_options` extractors (through `ExtractorOptions::with_casing`).
 pub(crate) mod casing;
+pub use casing::{CaseRule, IdentifierCasing};
 
 // `reference` is intentionally private: the module name itself is not
 // stable enough to commit to as part of the public API. The two

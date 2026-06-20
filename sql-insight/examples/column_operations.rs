@@ -17,7 +17,7 @@ fn main() {
     let sql = "INSERT INTO orders (id, total) \
                SELECT order_id, SUM(amount) FROM staging GROUP BY order_id";
 
-    let results = extract_column_operations(&dialect, sql, None).unwrap();
+    let results = extract_column_operations(&dialect, sql).unwrap();
     let ops = results[0].as_ref().expect("ok");
 
     println!("--- {:?} ---", ops.statement_kind);

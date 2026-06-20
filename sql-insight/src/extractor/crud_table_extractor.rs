@@ -10,9 +10,10 @@
 use std::fmt;
 
 use crate::casing::IdentifierCasing;
+use crate::catalog::Catalog;
 use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
-use crate::extractor::{StatementKind, TableOperationExtractor};
+use crate::extractor::{ExtractorOptions, StatementKind, TableOperationExtractor};
 use crate::reference::TableReference;
 use sqlparser::ast::{MergeAction, Statement};
 use sqlparser::dialect::Dialect;
@@ -37,6 +38,17 @@ pub fn extract_crud_tables(
     sql: &str,
 ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
     CrudTableExtractor::extract(dialect, sql)
+}
+
+/// Like [`extract_crud_tables`] but with [`ExtractorOptions`] — a catalog
+/// and/or an identifier-casing override. With a catalog, the bucketed
+/// tables are canonicalized to their registered path.
+pub fn extract_crud_tables_with_options(
+    dialect: &dyn Dialect,
+    sql: &str,
+    options: ExtractorOptions,
+) -> Result<Vec<Result<CrudTables, Error>>, Error> {
+    CrudTableExtractor::extract_with_options(dialect, sql, options)
 }
 
 /// Per-statement output of [`extract_crud_tables`]: tables bucketed
@@ -82,19 +94,31 @@ impl CrudTableExtractor {
         dialect: &dyn Dialect,
         sql: &str,
     ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
+        Self::extract_with_options(dialect, sql, ExtractorOptions::new())
+    }
+
+    /// Like [`extract`](Self::extract) but with [`ExtractorOptions`] — a
+    /// catalog and/or an identifier-casing override. `dialect` still
+    /// drives parsing; the options govern only the analysis.
+    pub fn extract_with_options(
+        dialect: &dyn Dialect,
+        sql: &str,
+        options: ExtractorOptions,
+    ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
-        let casing = IdentifierCasing::for_dialect(dialect);
+        let casing = options.casing_for(dialect);
         Ok(statements
             .iter()
-            .map(|s| Self::extract_from_statement(s, casing))
+            .map(|s| Self::extract_from_statement(s, options.catalog, casing))
             .collect())
     }
 
     fn extract_from_statement(
         statement: &Statement,
+        catalog: Option<&Catalog>,
         casing: IdentifierCasing,
     ) -> Result<CrudTables, Error> {
-        let ops = TableOperationExtractor::extract_from_statement(statement, None, casing)?;
+        let ops = TableOperationExtractor::extract_from_statement(statement, catalog, casing)?;
         // CRUD buckets are identity-only — drop the per-read
         // `ResolutionKind` and keep the bare `TableReference`s.
         let reads: Vec<TableReference> = ops.reads.into_iter().map(|r| r.reference).collect();

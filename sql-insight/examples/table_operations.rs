@@ -19,7 +19,7 @@ fn main() {
         SELECT order_id, amount FROM staging; \
         DELETE FROM staging WHERE processed = true;";
 
-    let results = extract_table_operations(&dialect, sql, None).unwrap();
+    let results = extract_table_operations(&dialect, sql).unwrap();
 
     for (i, result) in results.iter().enumerate() {
         let ops = result.as_ref().expect("parse + resolve succeeded");

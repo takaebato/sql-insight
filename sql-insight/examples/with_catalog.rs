@@ -15,7 +15,10 @@
 //!    columns the catalog actively denies surface as `Unresolved`.
 
 use sql_insight::catalog::{Catalog, CatalogTable};
-use sql_insight::extractor::{extract_column_operations, ColumnTarget};
+use sql_insight::extractor::{
+    extract_column_operations, extract_column_operations_with_options, ColumnTarget,
+    ExtractorOptions,
+};
 use sql_insight::sqlparser::dialect::GenericDialect;
 use sql_insight::ResolutionKind;
 
@@ -37,7 +40,12 @@ fn main() {
     //    target column list so source projections pair positionally.
     {
         let sql = "INSERT INTO orders SELECT order_id, amount FROM staging";
-        let results = extract_column_operations(&dialect, sql, Some(&catalog)).unwrap();
+        let results = extract_column_operations_with_options(
+            &dialect,
+            sql,
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap();
         let ops = results[0].as_ref().unwrap();
         println!("--- 1. INSERT without explicit column list ---");
         for edge in &ops.lineage {
@@ -59,8 +67,13 @@ fn main() {
     //    catalog) or `Inferred` (without).
     {
         let sql = "SELECT a FROM t1 JOIN t2 ON t1.a = t2.a";
-        let with = extract_column_operations(&dialect, sql, Some(&catalog)).unwrap();
-        let without = extract_column_operations(&dialect, sql, None).unwrap();
+        let with = extract_column_operations_with_options(
+            &dialect,
+            sql,
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap();
+        let without = extract_column_operations(&dialect, sql).unwrap();
         println!("\n--- 2. ambiguous unqualified `a` ---");
         print_reads("with catalog", &with[0].as_ref().unwrap().reads);
         print_reads("without catalog", &without[0].as_ref().unwrap().reads);
@@ -73,8 +86,13 @@ fn main() {
     //    plausibly belong to t1).
     {
         let sql = "SELECT z FROM t1";
-        let with = extract_column_operations(&dialect, sql, Some(&catalog)).unwrap();
-        let without = extract_column_operations(&dialect, sql, None).unwrap();
+        let with = extract_column_operations_with_options(
+            &dialect,
+            sql,
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap();
+        let without = extract_column_operations(&dialect, sql).unwrap();
         println!("\n--- 3. catalog rejects unknown column `z` ---");
         print_reads("with catalog", &with[0].as_ref().unwrap().reads);
         print_reads("without catalog", &without[0].as_ref().unwrap().reads);

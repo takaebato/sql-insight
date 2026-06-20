@@ -9,9 +9,10 @@
 use core::fmt;
 
 use crate::casing::IdentifierCasing;
+use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
-use crate::extractor::{classify_statement, StatementKind};
+use crate::extractor::{classify_statement, ExtractorOptions, StatementKind};
 use crate::reference::TableReference;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
@@ -36,6 +37,18 @@ pub fn extract_tables(
     sql: &str,
 ) -> Result<Vec<Result<TableExtraction, Error>>, Error> {
     TableExtractor::extract(dialect, sql)
+}
+
+/// Like [`extract_tables`] but with [`ExtractorOptions`] — a catalog
+/// and/or an identifier-casing override. With a catalog, matched tables
+/// are canonicalized to their registered `catalog.schema.name` path, so
+/// the surfaced identities differ from the catalog-free list.
+pub fn extract_tables_with_options(
+    dialect: &dyn Dialect,
+    sql: &str,
+    options: ExtractorOptions,
+) -> Result<Vec<Result<TableExtraction, Error>>, Error> {
+    TableExtractor::extract_with_options(dialect, sql, options)
 }
 
 /// Per-statement output of [`extract_tables`]: the table list plus
@@ -72,24 +85,37 @@ impl TableExtractor {
         dialect: &dyn Dialect,
         sql: &str,
     ) -> Result<Vec<Result<TableExtraction, Error>>, Error> {
+        Self::extract_with_options(dialect, sql, ExtractorOptions::new())
+    }
+
+    /// Like [`extract`](Self::extract) but with [`ExtractorOptions`] — a
+    /// catalog and/or an identifier-casing override. `dialect` still
+    /// drives parsing; the options govern only the analysis.
+    pub fn extract_with_options(
+        dialect: &dyn Dialect,
+        sql: &str,
+        options: ExtractorOptions,
+    ) -> Result<Vec<Result<TableExtraction, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
-        let casing = IdentifierCasing::for_dialect(dialect);
+        let casing = options.casing_for(dialect);
         let results = statements
             .iter()
-            .map(|s| Self::extract_from_statement(s, casing))
+            .map(|s| Self::extract_from_statement(s, options.catalog, casing))
             .collect::<Vec<Result<TableExtraction, Error>>>();
         Ok(results)
     }
 
     fn extract_from_statement(
         statement: &Statement,
+        catalog: Option<&Catalog>,
         casing: IdentifierCasing,
     ) -> Result<TableExtraction, Error> {
-        // The flat table list is derived from the bound-plan engine. No
-        // catalog is consulted — this API surfaces no columns, so a catalog
-        // would not change the table list. An unsupported statement yields
-        // an empty list with a diagnostic; otherwise walk the plan for every
-        // referenced table and project the column diagnostics down.
+        // The flat table list is derived from the bound-plan engine. A
+        // catalog changes no column data (this API surfaces no columns) but
+        // does canonicalize matched table identities to their registered
+        // path. An unsupported statement yields an empty list with a
+        // diagnostic; otherwise walk the plan for every referenced table and
+        // project the column diagnostics down.
         if classify_statement(statement) == StatementKind::Unsupported {
             return Ok(TableExtraction {
                 tables: Vec::new(),
@@ -100,7 +126,7 @@ impl TableExtractor {
                 }],
             });
         }
-        let (plan, column_diagnostics) = crate::resolver::build(statement, None, casing);
+        let (plan, column_diagnostics) = crate::resolver::build(statement, catalog, casing);
         Ok(TableExtraction {
             tables: crate::resolver::flat_tables(&plan),
             diagnostics: column_diagnostics

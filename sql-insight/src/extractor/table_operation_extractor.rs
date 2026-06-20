@@ -23,17 +23,16 @@ use crate::casing::IdentifierCasing;
 use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
+use crate::extractor::ExtractorOptions;
 use crate::reference::{TableRead, TableReference};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
-/// Convenience function to extract table-level operations from SQL.
-///
-/// `catalog` is consulted opportunistically for relation-level enrichment
-/// (table schema lookup, future view expansion and synonym resolution).
-/// Pass `None` for the lightest path — table-level extraction works
-/// purely from the AST and never requires a catalog.
+/// Convenience function to extract table-level operations from SQL using
+/// the dialect defaults (no catalog, dialect-derived casing). For a
+/// catalog or a casing override, use
+/// [`extract_table_operations_with_options`].
 ///
 /// ## Example
 ///
@@ -42,7 +41,7 @@ use sqlparser::parser::Parser;
 /// use sql_insight::extractor::{extract_table_operations, StatementKind};
 ///
 /// let dialect = GenericDialect {};
-/// let result = extract_table_operations(&dialect, "SELECT * FROM users", None).unwrap();
+/// let result = extract_table_operations(&dialect, "SELECT * FROM users").unwrap();
 /// let ops = result[0].as_ref().unwrap();
 /// assert_eq!(ops.statement_kind, StatementKind::Select);
 /// assert_eq!(ops.reads.len(), 1);
@@ -52,9 +51,19 @@ use sqlparser::parser::Parser;
 pub fn extract_table_operations(
     dialect: &dyn Dialect,
     sql: &str,
-    catalog: Option<&Catalog>,
 ) -> Result<Vec<Result<TableOperation, Error>>, Error> {
-    TableOperationExtractor::extract(dialect, sql, catalog)
+    TableOperationExtractor::extract(dialect, sql)
+}
+
+/// Like [`extract_table_operations`] but with [`ExtractorOptions`] — a
+/// catalog and/or an identifier-casing override. `dialect` still drives
+/// parsing; the options govern only the analysis.
+pub fn extract_table_operations_with_options(
+    dialect: &dyn Dialect,
+    sql: &str,
+    options: ExtractorOptions,
+) -> Result<Vec<Result<TableOperation, Error>>, Error> {
+    TableOperationExtractor::extract_with_options(dialect, sql, options)
 }
 
 /// Operations performed by a single SQL statement.
@@ -192,13 +201,23 @@ impl TableOperationExtractor {
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,
-        catalog: Option<&Catalog>,
+    ) -> Result<Vec<Result<TableOperation, Error>>, Error> {
+        Self::extract_with_options(dialect, sql, ExtractorOptions::new())
+    }
+
+    /// Like [`extract`](Self::extract) but with [`ExtractorOptions`] — a
+    /// catalog and/or an identifier-casing override. `dialect` still
+    /// drives parsing; the options govern only the analysis.
+    pub fn extract_with_options(
+        dialect: &dyn Dialect,
+        sql: &str,
+        options: ExtractorOptions,
     ) -> Result<Vec<Result<TableOperation, Error>>, Error> {
         let statements = Parser::parse_sql(dialect, sql)?;
-        let casing = IdentifierCasing::for_dialect(dialect);
+        let casing = options.casing_for(dialect);
         Ok(statements
             .iter()
-            .map(|s| Self::extract_from_statement(s, catalog, casing))
+            .map(|s| Self::extract_from_statement(s, options.catalog, casing))
             .collect())
     }
 
@@ -427,7 +446,7 @@ mod tests {
         dialect: &dyn Dialect,
         expected: TableOperation,
     ) {
-        let result = extract_table_operations(dialect, sql, None).unwrap();
+        let result = extract_table_operations(dialect, sql).unwrap();
         let actual = result
             .into_iter()
             .nth(index)
@@ -1492,7 +1511,8 @@ mod tests {
         }
 
         fn ops_with_catalog(sql: &str, catalog: &Catalog) -> TableOperation {
-            extract_table_operations(&GenericDialect {}, sql, Some(catalog))
+            let options = ExtractorOptions::new().with_catalog(catalog);
+            extract_table_operations_with_options(&GenericDialect {}, sql, options)
                 .unwrap()
                 .remove(0)
                 .unwrap()

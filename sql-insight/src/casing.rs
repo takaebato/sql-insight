@@ -35,13 +35,15 @@ use sqlparser::dialect::{
     SQLiteDialect, SnowflakeDialect,
 };
 
-/// How a single identifier folds before an equality comparison.
+/// How one identifier class folds before an equality comparison — the
+/// per-class element of an [`IdentifierCasing`].
 ///
 /// The four cases the cross-dialect matrix reduces to once
 /// instance-specific models (filesystem-dependent, collation-dependent)
-/// are resolved to a concrete choice.
+/// are resolved to a concrete choice. Only matching folds through this
+/// rule; the surfaced identifier text is never rewritten by it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CaseRule {
+pub enum CaseRule {
     /// Unquoted → upper-case; quoted → preserved (exact). ANSI /
     /// Oracle / Snowflake / DB2.
     Upper,
@@ -77,19 +79,25 @@ impl CaseRule {
     }
 }
 
-/// The active dialect's identifier-folding policy, split by class.
+/// The identifier-casing policy for an analysis, split by identifier
+/// class. Build one with [`IdentifierCasing::for_dialect`] (the dialect's
+/// default), [`IdentifierCasing::uniform`] (one rule for every class), or
+/// the field literal, and pass it via `ExtractorOptions::with_casing` to a
+/// `*_with_options` extractor to override the dialect default — e.g. to
+/// model a deployment-specific collation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct IdentifierCasing {
+pub struct IdentifierCasing {
     /// catalog / schema / table names.
-    pub(crate) table: CaseRule,
+    pub table: CaseRule,
     /// Table aliases and CTE / derived / table-function names.
-    pub(crate) table_alias: CaseRule,
+    pub table_alias: CaseRule,
     /// Column names and column aliases.
-    pub(crate) column: CaseRule,
+    pub column: CaseRule,
 }
 
 impl IdentifierCasing {
-    const fn uniform(fold: CaseRule) -> Self {
+    /// One [`CaseRule`] applied to every identifier class.
+    pub const fn uniform(fold: CaseRule) -> Self {
         Self {
             table: fold,
             table_alias: fold,
@@ -108,7 +116,7 @@ impl IdentifierCasing {
     /// case-insensitive collation, MySQL table names to the
     /// false-merge-avoiding [`CaseRule::Sensitive`]. A future override
     /// API can refine these per deployment.
-    pub(crate) fn for_dialect(dialect: &dyn Dialect) -> Self {
+    pub fn for_dialect(dialect: &dyn Dialect) -> Self {
         if dialect.is::<PostgreSqlDialect>() || dialect.is::<RedshiftSqlDialect>() {
             Self::uniform(CaseRule::Lower)
         } else if dialect.is::<AnsiDialect>()

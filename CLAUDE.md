@@ -41,7 +41,7 @@ by hand.
   - `reads` / `origins` / `lineage` / `tables` — the extraction walkers
     backing the facade. `origins` is the `getColumnOrigins`-style value
     trace that `lineage` builds on; `tables` covers the write surfaces
-    and the legacy flat list. `classify_statement` (in `extractor`)
+    and the flat table list. `classify_statement` (in `extractor`)
     supplies the verb; column-level diagnostics project down to the
     table level via `ColumnLevelDiagnostic::to_table_level`.
 - `LogicalPlan` is a **standard relational-algebra tree** — recognizable
@@ -109,9 +109,9 @@ by hand.
   is **exact** (`scope_target` / `table_identity_eq`): bare `t1`
   merges with FROM `t1` but not FROM `mydb.t1`.
 - Extractors are thin wrappers around the plan engine:
-  - `table_extractor` — flat list of `TableReference`s (legacy API).
-  - `crud_table_extractor` — CRUD-bucketed tables (legacy API; a thin
-    shim over `TableOperationExtractor` that buckets reads/writes).
+  - `table_extractor` — flat list of `TableReference`s.
+  - `crud_table_extractor` — CRUD-bucketed tables (a thin shim over
+    `TableOperationExtractor` that buckets reads/writes).
   - `table_operation_extractor` — `extract_table_operations` returns
     `TableOperation { statement_kind, reads, writes,
     lineage, diagnostics }` per parsed statement.
@@ -120,6 +120,16 @@ by hand.
     writes, lineage, diagnostics }` at column granularity. `reads` /
     `writes` are plain occurrence lists; `lineage` edges carry
     `kind: ColumnLineageKind`.
+- Each extractor exposes the **`normalizer`-style pair**: a convenience
+  `extract_*(dialect, sql)` (dialect defaults — no catalog, dialect-derived
+  casing) and `extract_*_with_options(dialect, sql, options)` taking a
+  shared `ExtractorOptions { catalog, casing }` (in `extractor.rs`,
+  builder: `new` / `with_catalog` / `with_casing`). Catalog and casing are
+  *inputs* in the options, not positional args; all four extractors accept
+  a catalog this way (the flat / CRUD lists canonicalize matched tables
+  too). `casing: Option<IdentifierCasing>` is `None` = derive from dialect
+  (`casing_for`). `CaseRule` / `IdentifierCasing` are re-exported at the
+  crate root; `ExtractorOptions` lives in `extractor`.
 - Per-statement output convention: extractors return
   `Vec<Result<X, Error>>` so one bad statement does not kill the
   rest. The plan engine is **best-effort** — an unrepresentable
