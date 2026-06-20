@@ -96,13 +96,15 @@ pub(super) fn origins_of_expr<'a>(
             Binding::Derived => origins_into(input, c.qualifier.as_ref(), &c.name, ctx),
         },
         Expr::Call { args } => transform(args.iter().flat_map(|e| origins_of_expr(e, input, ctx))),
-        Expr::Case { then, else_, .. } => {
+        Expr::Case {
+            then, else_result, ..
+        } => {
             // `when` conditions are filter — only the results are value.
             let mut sources: Vec<_> = then
                 .iter()
                 .flat_map(|e| origins_of_expr(e, input, ctx))
                 .collect();
-            if let Some(e) = else_ {
+            if let Some(e) = else_result {
                 sources.extend(origins_of_expr(e, input, ctx));
             }
             transform(sources)
@@ -278,12 +280,14 @@ pub(super) fn conflict_value_origins<'a>(
             args.iter()
                 .flat_map(|e| conflict_value_origins(e, columns, source, ctx)),
         ),
-        Expr::Case { then, else_, .. } => {
+        Expr::Case {
+            then, else_result, ..
+        } => {
             let mut sources: Vec<_> = then
                 .iter()
                 .flat_map(|e| conflict_value_origins(e, columns, source, ctx))
                 .collect();
-            if let Some(e) = else_ {
+            if let Some(e) = else_result {
                 sources.extend(conflict_value_origins(e, columns, source, ctx));
             }
             transform(sources)

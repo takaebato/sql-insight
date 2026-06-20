@@ -338,9 +338,11 @@ fn expr_feeding<'a>(expr: &'a Expr, ctx: &mut Ctx<'a>, out: &mut Vec<TableRead>)
     match expr {
         Expr::Column(_) => {}
         Expr::Call { args } => args.iter().for_each(|e| expr_feeding(e, ctx, out)),
-        Expr::Case { then, else_, .. } => {
+        Expr::Case {
+            then, else_result, ..
+        } => {
             then.iter().for_each(|e| expr_feeding(e, ctx, out));
-            if let Some(e) = else_ {
+            if let Some(e) = else_result {
                 expr_feeding(e, ctx, out);
             }
         }

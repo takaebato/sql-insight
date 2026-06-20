@@ -58,9 +58,13 @@ fn expr_reads(expr: &Expr, out: &mut Vec<ColumnRead>) {
     match expr {
         Expr::Column(c) => out.extend(column_read(c)),
         Expr::Call { args } => args.iter().for_each(|e| expr_reads(e, out)),
-        Expr::Case { when, then, else_ } => {
+        Expr::Case {
+            when,
+            then,
+            else_result,
+        } => {
             when.iter().chain(then).for_each(|e| expr_reads(e, out));
-            if let Some(e) = else_ {
+            if let Some(e) = else_result {
                 expr_reads(e, out);
             }
         }

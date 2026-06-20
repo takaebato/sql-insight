@@ -190,7 +190,7 @@ impl<'a> Binder<'a> {
                 Expr::Case {
                     when,
                     then,
-                    else_: else_result
+                    else_result: else_result
                         .as_ref()
                         .map(|e| Box::new(self.bind_expr(e, scope))),
                 }

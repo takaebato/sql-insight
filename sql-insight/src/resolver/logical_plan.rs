@@ -298,11 +298,11 @@ pub(crate) enum Expr {
     /// A function / operator / cast — a transformation over its value `args`.
     Call { args: Vec<Expr> },
     /// `CASE`: the `when` conditions are filter (reads, not origins); the
-    /// `then` results and `else_` are value (origins).
+    /// `then` results and `else_result` are value (origins).
     Case {
         when: Vec<Expr>,
         then: Vec<Expr>,
-        else_: Option<Box<Expr>>,
+        else_result: Option<Box<Expr>>,
     },
     /// A window function: `arg` is value; the `partition` / `order` keys are
     /// filter (row positioning).
@@ -492,11 +492,15 @@ fn collect_subplans<'a>(expr: &'a Expr, out: &mut Vec<&'a LogicalPlan>) {
     match expr {
         Expr::Column(_) => {}
         Expr::Call { args } => args.iter().for_each(|e| collect_subplans(e, out)),
-        Expr::Case { when, then, else_ } => {
+        Expr::Case {
+            when,
+            then,
+            else_result,
+        } => {
             when.iter()
                 .chain(then)
                 .for_each(|e| collect_subplans(e, out));
-            if let Some(e) = else_ {
+            if let Some(e) = else_result {
                 collect_subplans(e, out);
             }
         }
