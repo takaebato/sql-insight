@@ -45,13 +45,13 @@ pub(crate) enum LogicalPlan {
     Drop(Drop),
 }
 
-/// A base-table scan (leaf). `columns` is the catalog-known list
-/// ([`Columns::Cataloged`]) or [`Columns::Unknown`] (catalog-free / miss / ambiguous);
-/// `resolution` is how the catalog identified the table.
+/// A base-table scan (leaf). `resolution` is how the catalog identified the
+/// table. Column resolution consults the relation's exposed column list in the
+/// binding scope ([`Columns`] on `Relation::Table`), not the scan, so the scan
+/// itself carries no column list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Scan {
     pub(crate) table: TableReference,
-    pub(crate) columns: Columns,
     pub(crate) resolution: ResolutionKind,
 }
 
@@ -79,14 +79,14 @@ pub(crate) struct Filter {
 }
 
 /// Join (⋈) of two inputs on `on`. Output is the concatenation of both
-/// inputs' columns. `lateral` marks a LATERAL / dependent join: the right
-/// resolves against the left (only then can the right reference left columns).
+/// inputs' columns. LATERAL / dependent joins are not marked here — the right
+/// side's visibility of the left is modelled at bind time via the correlation
+/// scope stack, so the bound tree needs no `lateral` flag.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Join {
     pub(crate) left: Box<LogicalPlan>,
     pub(crate) right: Box<LogicalPlan>,
     pub(crate) on: Vec<Expr>,
-    pub(crate) lateral: bool,
 }
 
 /// Aggregate (Γ): the `GROUP BY` grouping over its input, sitting below the
@@ -541,14 +541,4 @@ pub(super) fn peel_with(op: &LogicalPlan) -> &LogicalPlan {
         node = &w.body;
     }
     node
-}
-
-/// Identifier equality for matching a resolved reference against a producer's
-/// output / relation name. The binder already resolved the reference with the
-/// dialect's column / alias fold, and no dialect treats column or alias names
-/// case-*sensitively* (they fold Upper / Lower / Insensitive), so an ASCII
-/// case-insensitive compare matches every policy without threading the casing
-/// into the walk.
-pub(super) fn idents_eq(a: &Ident, b: &Ident) -> bool {
-    a.value.eq_ignore_ascii_case(&b.value)
 }

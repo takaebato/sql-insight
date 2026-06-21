@@ -68,10 +68,13 @@ pub struct FormatterOptions {
 }
 
 impl FormatterOptions {
+    /// Default options (single-line output — `pretty` off).
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Set [`pretty`](Self::pretty): `true` for the multi-line pretty-printed
+    /// form, `false` (the default) for single-line.
     pub fn with_pretty(mut self, pretty: bool) -> Self {
         self.pretty = pretty;
         self
