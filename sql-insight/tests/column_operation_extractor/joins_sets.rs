@@ -546,3 +546,110 @@ mod values_as_relation {
         );
     }
 }
+
+mod join_arm_coverage {
+    //! `join_constraint`'s `JoinOperator` arms: every constraint-carrying
+    //! join type still yields its `ON` predicate's reads, and the
+    //! constraint-less `CROSS APPLY` yields none. One terse case per
+    //! parseable variant, so a new sqlparser `JoinOperator` forces a case
+    //! here. SQL is qualified (`t.a`) for deterministic reads.
+    use super::*;
+    use sql_insight::sqlparser::dialect::{
+        Dialect, GenericDialect, MsSqlDialect, MySqlDialect, SnowflakeDialect,
+    };
+
+    fn join_reads(sql: &str, dialect: &dyn Dialect) -> Vec<ColumnRead> {
+        extract_column_operations(dialect, sql)
+            .unwrap()
+            .remove(0)
+            .unwrap()
+            .reads
+    }
+
+    /// The `ON t.id = u.id` constraint of any constraint-carrying join
+    /// surfaces both sides as reads, alongside the projection's `t.a`.
+    fn on_constraint_reads() -> Vec<ColumnRead> {
+        vec![read("t", "a"), read("t", "id"), read("u", "id")]
+    }
+
+    #[test]
+    fn semi_join() {
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT t.a FROM t SEMI JOIN u ON t.id = u.id",
+                &GenericDialect {}
+            ),
+            on_constraint_reads()
+        );
+    }
+
+    #[test]
+    fn anti_join() {
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT t.a FROM t ANTI JOIN u ON t.id = u.id",
+                &GenericDialect {}
+            ),
+            on_constraint_reads()
+        );
+    }
+
+    #[test]
+    fn left_semi_join() {
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT t.a FROM t LEFT SEMI JOIN u ON t.id = u.id",
+                &GenericDialect {}
+            ),
+            on_constraint_reads()
+        );
+    }
+
+    #[test]
+    fn left_anti_join() {
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT t.a FROM t LEFT ANTI JOIN u ON t.id = u.id",
+                &GenericDialect {}
+            ),
+            on_constraint_reads()
+        );
+    }
+
+    #[test]
+    fn straight_join() {
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT t.a FROM t STRAIGHT_JOIN u ON t.id = u.id",
+                &MySqlDialect {}
+            ),
+            on_constraint_reads()
+        );
+    }
+
+    #[test]
+    fn asof_join() {
+        // ASOF carries both a MATCH_CONDITION and an ON constraint;
+        // `join_constraint` returns the ON, so reads mirror the others.
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT t.a FROM t ASOF JOIN u MATCH_CONDITION (t.ts >= u.ts) ON t.id = u.id",
+                &SnowflakeDialect {},
+            ),
+            on_constraint_reads()
+        );
+    }
+
+    #[test]
+    fn cross_apply_has_no_constraint() {
+        // CROSS APPLY carries no `ON` (join_constraint → None); only the
+        // applied subquery's read and the projection surface.
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT t.a FROM t CROSS APPLY (SELECT u.id FROM u) sub",
+                &MsSqlDialect {},
+            ),
+            vec![read("t", "a"), read("u", "id")]
+        );
+    }
+}
