@@ -7,10 +7,10 @@
 //! plan- / AST-construction glue; the bind logic is split by concern across
 //! submodules, each adding an `impl Binder` block over the shared types:
 //!
-//! - [`Binder`] — the bind context (`catalog` / `casing` / the CTE and
-//!   correlation stacks / the shared diagnostics sink) and the small core
-//!   methods over it (child-binder construction, table-ref canonicalization,
-//!   diagnostic recording).
+//! - [`Binder`] — the bind context (`catalog` / `style`, the identifier
+//!   casing + surface quote / the CTE and correlation stacks / the shared
+//!   diagnostics sink) and the small core methods over it (child-binder
+//!   construction, table-ref canonicalization, diagnostic recording).
 //! - [`scope`] — the bind-time [`Scope`] model (FROM `relations` / `query_outputs`
 //!   / USING `merge_columns`) threaded bottom-up (`bind_* -> (LogicalPlan,
 //!   Scope)`), never stored on the tree.

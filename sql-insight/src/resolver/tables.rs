@@ -1,12 +1,12 @@
-//! The **write** surfaces over a [`LogicalPlan`] plus the legacy flat table
-//! list. These back the [`crate::resolver`] facade's `writes` / `table_writes`
+//! The **write** surfaces over a [`LogicalPlan`] plus the flat table list.
+//! These back the [`crate::resolver`] facade's `writes` / `table_writes`
 //! / `flat_tables` entry points:
 //!
 //! - `writes` — every column a DML root writes (INSERT columns, UPDATE SET
 //!   targets, CTAS / CREATE VIEW / ALTER columns, MERGE WHEN-clause writes),
 //!   qualified by the target relation.
 //! - `table_writes` — one entry per DML target.
-//! - `flat_tables` — every table the statement references, the legacy
+//! - `flat_tables` — every table the statement references, the
 //!   un-bucketed table surface.
 //!
 //! Write targets are trivially resolved by construction (they come straight
@@ -112,10 +112,10 @@ fn qualify(columns: &[Ident], target: &TableReference) -> Vec<ColumnReference> {
         .collect()
 }
 
-// ===== flat tables (legacy) ==============================================
+// ===== flat tables =======================================================
 
 /// The flat list of every table the statement references — one per relation
-/// binding (the legacy table surface). Backs [`crate::resolver::flat_tables`].
+/// binding (the un-bucketed table surface). Backs [`crate::resolver::flat_tables`].
 pub(super) fn collect_flat_tables(plan: &LogicalPlan) -> Vec<TableReference> {
     let mut out = Vec::new();
     collect_flat(plan, &mut out);

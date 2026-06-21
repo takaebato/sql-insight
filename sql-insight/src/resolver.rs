@@ -107,7 +107,7 @@ pub(crate) fn table_lineage(plan: &LogicalPlan) -> Vec<TableLineageEdge> {
 }
 
 /// The flat list of every table the statement references — one per relation
-/// binding (the legacy table surface). Returned in source order (by each
+/// binding (the un-bucketed table surface). Returned in source order (by each
 /// table's written token span).
 pub(crate) fn flat_tables(plan: &LogicalPlan) -> Vec<TableReference> {
     let mut tables = tables::collect_flat_tables(plan);
