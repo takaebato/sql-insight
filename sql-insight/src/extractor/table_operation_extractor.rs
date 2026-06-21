@@ -68,6 +68,7 @@ pub fn extract_table_operations_with_options(
 
 /// Operations performed by a single SQL statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TableOperation {
     /// What the statement does at a coarse level (Insert / Update /
     /// Merge / CTAS / …).
@@ -134,6 +135,7 @@ pub struct TableOperation {
 /// tables feed the target, and the self-reference terminates against
 /// the pre-bind stub without re-emitting the cycle.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TableLineageEdge {
     /// The feeding source table, paired with its catalog-match
     /// [`ResolutionKind`](crate::ResolutionKind).

@@ -16,11 +16,13 @@ use sqlparser::tokenizer::Span;
 /// when a [`span`](Self::span) is available, also embeds the location for
 /// log-line display.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TableLevelDiagnostic {
     pub kind: TableLevelDiagnosticKind,
     pub message: String,
     /// Source location of the offending token, when available. `None` when
     /// the originating AST node carries no span.
+    #[cfg_attr(feature = "serde", serde(skip_serializing))]
     pub span: Option<Span>,
 }
 
@@ -32,6 +34,7 @@ pub struct TableLevelDiagnostic {
 /// wildcards don't apply — a table's identity comes straight from the FROM
 /// clause and is unaffected by them.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum TableLevelDiagnosticKind {
     /// Statement variant the extractor does not understand well enough to
     /// extract operations from. `message` names the statement.
@@ -48,6 +51,7 @@ pub enum TableLevelDiagnosticKind {
 ///
 /// Carries the same `message` / `span` shape as [`TableLevelDiagnostic`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ColumnLevelDiagnostic {
     pub kind: ColumnLevelDiagnosticKind,
     pub message: String,
@@ -55,6 +59,7 @@ pub struct ColumnLevelDiagnostic {
     /// the originating AST node carries no span (sqlparser-rs coverage is
     /// patchy outside `Ident` / `Value` / tokens), or when the resolver
     /// couldn't reasonably attribute the diagnostic to a single span.
+    #[cfg_attr(feature = "serde", serde(skip_serializing))]
     pub span: Option<Span>,
 }
 
@@ -68,6 +73,7 @@ pub struct ColumnLevelDiagnostic {
 /// reads them off the reference rather than cross-referencing a parallel
 /// diagnostic stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum ColumnLevelDiagnosticKind {
     /// Statement variant the resolver / extractor does not understand
     /// well enough to extract operations from. `message` names the

@@ -28,9 +28,22 @@ use sqlparser::ast::{Ident, Insert, ObjectName, TableFactor, TableObject};
 /// [`same_table`](Self::same_table), which fold by a dialect's
 /// [`IdentifierCasing`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TableReference {
+    #[cfg_attr(
+        feature = "serde",
+        serde(serialize_with = "crate::serde_support::opt_ident")
+    )]
     pub catalog: Option<Ident>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(serialize_with = "crate::serde_support::opt_ident")
+    )]
     pub schema: Option<Ident>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(serialize_with = "crate::serde_support::ident")
+    )]
     pub name: Ident,
 }
 
@@ -62,6 +75,7 @@ pub struct TableReference {
 /// [`TableLineageEdge::source`]: crate::extractor::TableLineageEdge::source
 /// [`TableLineageEdge::target`]: crate::extractor::TableLineageEdge::target
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TableRead {
     pub reference: TableReference,
     pub resolution: ResolutionKind,
@@ -78,8 +92,13 @@ pub struct TableRead {
 /// equal, independent of where they appeared in the SQL or with what
 /// resolution the resolver placed them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ColumnReference {
     pub table: Option<TableReference>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(serialize_with = "crate::serde_support::ident")
+    )]
     pub name: Ident,
 }
 
@@ -101,6 +120,7 @@ pub struct ColumnReference {
 /// [`ColumnLineageEdge::source`]: crate::extractor::ColumnLineageEdge::source
 /// [`ColumnTarget::Relation`]: crate::extractor::ColumnTarget::Relation
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ColumnRead {
     pub reference: ColumnReference,
     pub resolution: ResolutionKind,
@@ -160,6 +180,7 @@ pub struct ColumnRead {
 ///   treat [`Ambiguous`](Self::Ambiguous) and
 ///   [`Unresolved`](Self::Unresolved) as "incomplete".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum ResolutionKind {
     /// Backed by a known schema that lists the column / names the
     /// table. On the public surface this means a catalog (or registry)

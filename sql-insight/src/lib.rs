@@ -220,6 +220,11 @@ pub mod normalizer;
 // extraction surfaces. Backs every public extractor.
 mod resolver;
 
+// `serde::Serialize` helpers for the sqlparser types (`Ident` / `Span`)
+// embedded in the public result types. Gated on the `serde` feature.
+#[cfg(feature = "serde")]
+mod serde_support;
+
 // Dialect-aware identifier casing (case folding for table / alias /
 // column matching). Threaded into the binder and the extractors. The
 // module stays private; the two configuration types are re-exported at

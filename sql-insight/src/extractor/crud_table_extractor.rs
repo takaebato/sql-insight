@@ -55,6 +55,7 @@ pub fn extract_crud_tables_with_options(
 /// by CRUD position plus non-fatal diagnostics. `Display` renders
 /// `"Create: [...], Read: [...], Update: [...], Delete: [...]"`.
 #[derive(Default, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CrudTables {
     pub create_tables: Vec<TableReference>,
     pub read_tables: Vec<TableReference>,

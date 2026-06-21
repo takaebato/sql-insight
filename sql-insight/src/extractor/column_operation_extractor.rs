@@ -150,6 +150,7 @@ pub fn extract_column_operations_with_options(
 /// with the same three surfaces — `reads`, `writes`, `lineage` — at
 /// column granularity.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ColumnOperation {
     pub statement_kind: StatementKind,
     /// Columns read by the statement. Occurrence-based: a column
@@ -196,6 +197,7 @@ pub struct ColumnOperation {
 /// — `INSERT INTO t1 (col) SELECT b FROM t2` emits `t2.b → t1.col`
 /// directly, with no intermediate query-output entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ColumnLineageEdge {
     /// The column the lineage edge flows from, paired with the
     /// resolver's [`ResolutionKind`](crate::ResolutionKind) in that placement.
@@ -221,6 +223,7 @@ pub struct ColumnLineageEdge {
 /// if the projection is a single column, otherwise `None`. `position`
 /// is always set so anonymous outputs can be identified.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum ColumnTarget {
     /// A column in a real relation receiving the inbound lineage edge — INSERT /
     /// UPDATE / MERGE target columns, or columns of the new relation
@@ -232,6 +235,10 @@ pub enum ColumnTarget {
     /// (`None` for expressions without a clear name); `position` is
     /// always set so anonymous outputs remain identifiable.
     QueryOutput {
+        #[cfg_attr(
+            feature = "serde",
+            serde(serialize_with = "crate::serde_support::opt_ident")
+        )]
         name: Option<Ident>,
         position: usize,
     },
@@ -256,6 +263,7 @@ pub enum ColumnTarget {
 /// case. A finer variant can be added later if a concrete consumer
 /// needs it (a breaking change while the crate is pre-1.0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum ColumnLineageKind {
     /// Source value is forwarded unchanged. Composition stays
     /// `Passthrough` only when every step in the chain is also

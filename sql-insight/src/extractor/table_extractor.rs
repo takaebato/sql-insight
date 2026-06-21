@@ -55,6 +55,7 @@ pub fn extract_tables_with_options(
 /// any non-fatal diagnostics surfaced during the walk. `Display`
 /// renders just the comma-joined table list.
 #[derive(Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TableExtraction {
     /// Every table the statement references, one entry per relation
     /// binding: a table that is both a write target and a row source

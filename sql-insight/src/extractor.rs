@@ -103,6 +103,7 @@ impl<'a> ExtractorOptions<'a> {
 /// to make at table granularity. Shared by every extractor (each surfaces
 /// it as `statement_kind`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum StatementKind {
     /// `SELECT ...` (and other read-only queries: `TABLE foo`, `VALUES`,
     /// `WITH ... SELECT ...`). Reads only — no writes, no lineage.
