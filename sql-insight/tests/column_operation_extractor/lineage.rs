@@ -453,6 +453,50 @@ mod collapse {
     }
 
     #[test]
+    fn cte_self_join_does_not_duplicate_lineage() {
+        // A CTE joined to itself under two aliases (`c x JOIN c y`): the output
+        // `x.id` is owned by exactly one reference, so it traces to a single
+        // `base.id → id` edge. Previously the demand-driven origin trace expanded
+        // the CTE body through *both* references — the `CteRef` node dropped its
+        // alias, so it could not prune the non-owning side — and emitted the edge
+        // twice, while `reads` (the body is walked once at the declaration) stayed
+        // folded; that asymmetry was the bug. A real-table self-join never
+        // duplicated (a base column is its own origin and never traces the join).
+        assert_column_ops(
+            "WITH c AS (SELECT id FROM base) SELECT x.id FROM c x JOIN c y ON x.id = y.id",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("base", "id")],
+                writes: vec![],
+                lineage: vec![passthrough(col("base", "id"), out("id", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_of_two_ctes_attributes_output_to_its_owner_only() {
+        // `x.id` is owned by CTE `c` (alias `x`); the joined CTE `d` (alias `y`)
+        // contributes `y.id` only in the ON predicate — filter position, a read
+        // but never a lineage origin. So the output traces to `base.id` alone:
+        // the qualifier prunes the non-owning `d` reference. (Before the
+        // alias-aware prune the trace expanded *both* CTE bodies and spuriously
+        // emitted `other.id → id`.) Both bodies are still walked once at the
+        // declaration, so `reads` keeps `base.id` and `other.id`.
+        assert_column_ops(
+            "WITH c AS (SELECT id FROM base), d AS (SELECT id FROM other) \
+             SELECT x.id FROM c x JOIN d y ON x.id = y.id",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("base", "id"), read("other", "id")],
+                writes: vec![],
+                lineage: vec![passthrough(col("base", "id"), out("id", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn recursive_cte_traces_through_to_the_real_table() {
         // A recursive CTE collapses through to the anchor's real table: the
         // outer `id` traces into the CTE body's set operation — the anchor

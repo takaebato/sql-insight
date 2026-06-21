@@ -194,20 +194,31 @@ fn origins_into<'a>(
         LogicalPlan::With(w) => {
             ctx.with_decls(&w.ctes, |ctx| origins_into(&w.body, qualifier, name, ctx))
         }
-        LogicalPlan::CteRef(r) => ctx
-            .enter_cte(&r.name, |ctx, body| {
-                // A VALUES-backed CTE has no traceable base columns — the
-                // exposed column is a synthetic source (cte.col).
-                if values_backed(body) {
-                    vec![(
-                        synthetic_source(&r.name, name),
-                        ColumnLineageKind::Passthrough,
-                    )]
-                } else {
-                    origins_into(body, None, name, ctx)
-                }
-            })
-            .unwrap_or_default(),
+        // Like `SubqueryAlias`, a `CteRef` is a relation boundary: a qualified
+        // trace only descends through the reference whose *exposed* name (its
+        // alias, else the CTE name) the qualifier matches. Without this guard a
+        // self-join of one CTE (`c x JOIN c y`) expands the body through *both*
+        // references and duplicates the edge.
+        LogicalPlan::CteRef(r) => {
+            let exposed = r.alias.as_ref().unwrap_or(&r.name);
+            if !qualifier.is_none_or(|q| idents_eq(q, exposed)) {
+                Vec::new()
+            } else {
+                ctx.enter_cte(&r.name, |ctx, body| {
+                    // A VALUES-backed CTE has no traceable base columns — the
+                    // exposed column is a synthetic source (cte.col).
+                    if values_backed(body) {
+                        vec![(
+                            synthetic_source(&r.name, name),
+                            ColumnLineageKind::Passthrough,
+                        )]
+                    } else {
+                        origins_into(body, None, name, ctx)
+                    }
+                })
+                .unwrap_or_default()
+            }
+        }
         // A `Derived` reference resolves at a producer's named output (a
         // `Projection` / `Aggregate` expr), never at a raw `Scan` — a reference to
         // a base column is `Binding::Base` and returns directly, not via this

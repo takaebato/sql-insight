@@ -149,8 +149,11 @@
 //!   can't be represented, so it's dropped and flagged
 //!   [`TooManyTableQualifiers`](diagnostic::ColumnLevelDiagnosticKind::TooManyTableQualifiers).
 //! - **No type checking**: the catalog is an enrichment input,
-//!   not a validator. Type compatibility, coercion, and nullability
-//!   are out of scope.
+//!   not a validator. Type compatibility, coercion, nullability, and
+//!   structural well-formedness (e.g. an `INSERT`'s column / value count
+//!   matching) are out of scope — a malformed statement is analysed as
+//!   written (columns and values pair positionally, extras dropped), not
+//!   rejected.
 //!
 //! ## Behavior notes
 //!

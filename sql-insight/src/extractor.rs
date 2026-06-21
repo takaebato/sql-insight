@@ -106,8 +106,10 @@ impl<'a> ExtractorOptions<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum StatementKind {
-    /// `SELECT ...` (and other read-only queries: `TABLE foo`, `VALUES`,
-    /// `WITH ... SELECT ...`). Reads only — no writes, no lineage.
+    /// `SELECT ...` (and other read-only queries: `VALUES (...)`,
+    /// `WITH ... SELECT ...`; a bare `TABLE foo` is read-only too but only
+    /// parses as a set-operation branch, not a standalone statement). Reads
+    /// only — no writes, no lineage.
     Select,
     /// `INSERT INTO ...`. Writes to one target table; reads from the
     /// `VALUES` / `SELECT` source. Emits source → target lineage.

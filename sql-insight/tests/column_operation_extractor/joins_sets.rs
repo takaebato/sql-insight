@@ -4,11 +4,12 @@ mod set_operations {
     use super::*;
 
     #[test]
-    fn union_two_branches_emit_query_output_per_branch() {
-        // Each branch contributes its own output-column list, so both
-        // branches' projections fan out independently into
-        // QueryOutput edges. Position is per-group, so both land at
-        // position 0; name follows each branch's own projection.
+    fn union_two_branches_target_left_branch_name() {
+        // A set operation has one result schema whose column names come from
+        // the LEFT branch (SQL's conventional rule). Both branches' projections
+        // feed that same result column, so each lineage edge targets the left
+        // branch's name (`a`) at position 0 — a right branch's local alias
+        // (`b`) names no result column.
         assert_column_ops(
             "SELECT a FROM t1 UNION SELECT b FROM t2",
             ColumnOperation {
@@ -17,7 +18,7 @@ mod set_operations {
                 writes: vec![],
                 lineage: vec![
                     passthrough(col("t1", "a"), out("a", 0)),
-                    passthrough(col("t2", "b"), out("b", 0)),
+                    passthrough(col("t2", "b"), out("a", 0)),
                 ],
                 diagnostics: vec![],
             },
@@ -36,7 +37,7 @@ mod set_operations {
                 writes: vec![],
                 lineage: vec![
                     passthrough(col("t1", "a"), out("a", 0)),
-                    passthrough(col("t2", "b"), out("b", 0)),
+                    passthrough(col("t2", "b"), out("a", 0)),
                 ],
                 diagnostics: vec![],
             },
@@ -53,7 +54,7 @@ mod set_operations {
                 writes: vec![],
                 lineage: vec![
                     passthrough(col("t1", "a"), out("a", 0)),
-                    passthrough(col("t2", "b"), out("b", 0)),
+                    passthrough(col("t2", "b"), out("a", 0)),
                 ],
                 diagnostics: vec![],
             },
@@ -70,7 +71,7 @@ mod set_operations {
                 writes: vec![],
                 lineage: vec![
                     passthrough(col("t1", "a"), out("a", 0)),
-                    passthrough(col("t2", "b"), out("b", 0)),
+                    passthrough(col("t2", "b"), out("a", 0)),
                 ],
                 diagnostics: vec![],
             },
@@ -82,6 +83,7 @@ mod set_operations {
         // Chained UNION parses left-associatively as
         // `(t1 UNION t2) UNION t3`, so the resolver recursively
         // visits each base SELECT and each contributes its own group.
+        // All branches target the left-most branch's name (`a`).
         assert_column_ops(
             "SELECT a FROM t1 UNION SELECT b FROM t2 UNION SELECT c FROM t3",
             ColumnOperation {
@@ -90,8 +92,8 @@ mod set_operations {
                 writes: vec![],
                 lineage: vec![
                     passthrough(col("t1", "a"), out("a", 0)),
-                    passthrough(col("t2", "b"), out("b", 0)),
-                    passthrough(col("t3", "c"), out("c", 0)),
+                    passthrough(col("t2", "b"), out("a", 0)),
+                    passthrough(col("t3", "c"), out("a", 0)),
                 ],
                 diagnostics: vec![],
             },
@@ -102,7 +104,7 @@ mod set_operations {
     fn union_with_where_classifies_per_branch_kind() {
         // Each branch's WHERE is its own filter scope, so each
         // branch produces a Projection read plus a Filter read for
-        // its own column.
+        // its own column. Both lineage edges target the left name (`a`).
         assert_column_ops(
             "SELECT a FROM t1 WHERE a > 0 UNION SELECT b FROM t2 WHERE b < 10",
             ColumnOperation {
@@ -116,7 +118,7 @@ mod set_operations {
                 writes: vec![],
                 lineage: vec![
                     passthrough(col("t1", "a"), out("a", 0)),
-                    passthrough(col("t2", "b"), out("b", 0)),
+                    passthrough(col("t2", "b"), out("a", 0)),
                 ],
                 diagnostics: vec![],
             },
@@ -258,7 +260,7 @@ mod set_operations {
                 writes: vec![],
                 lineage: vec![
                     passthrough(col("t1", "a"), out("a", 0)),
-                    passthrough(col("t2", "b"), out("b", 0)),
+                    passthrough(col("t2", "b"), out("a", 0)),
                 ],
                 diagnostics: vec![],
             },
@@ -276,7 +278,7 @@ mod set_operations {
                 writes: vec![],
                 lineage: vec![
                     passthrough(col("t1", "a"), out("a", 0)),
-                    passthrough(col("t2", "b"), out("b", 0)),
+                    passthrough(col("t2", "b"), out("a", 0)),
                 ],
                 diagnostics: vec![],
             },

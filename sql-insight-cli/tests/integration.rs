@@ -454,6 +454,24 @@ mod integration {
         }
 
         #[test]
+        fn test_extract_with_unparseable_ddl_file_is_labelled() {
+            // A parse error in the --ddl-file is prefixed with the DDL-file
+            // context, so it isn't mistaken for an error in the analysed query
+            // (whose own parse errors surface unprefixed, per-statement).
+            let mut schema = NamedTempFile::new().unwrap();
+            schema.write_all(b"CREATE TABL bad (id INT);").unwrap();
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("tables")
+                .arg("--ddl-file")
+                .arg(schema.path())
+                .arg("SELECT 1")
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("Failed to parse DDL file"));
+        }
+
+        #[test]
         fn test_extract_with_default_schema() {
             // An explicit --default-schema fills the bare query ref before
             // matching; the unqualified DDL table (schema-less) still matches.

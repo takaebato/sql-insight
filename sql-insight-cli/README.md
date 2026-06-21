@@ -15,7 +15,8 @@ cargo install sql-insight-cli
 
 ## Commands
 
-- `format` — pretty-print SQL to a standardized layout.
+- `format` — pretty-print SQL to a standardized layout (comments are not
+  preserved — the parser does not retain them in the AST).
 - `normalize` — abstract literals to placeholders (`--unify-in-list` /
   `--unify-values` collapse repetitive shapes).
 - `extract tables` — flat list of tables a statement references.

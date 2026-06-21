@@ -19,6 +19,13 @@
 //!   lists the column — a typo that would silently resolve becomes
 //!   `Unresolved`. Synthetic-origin refs (CTE / derived / table function)
 //!   drop from `reads`; only real-table or unresolved names surface.
+//! - **Table-only statements have no column surface.** A statement that
+//!   names a relation but no columns — `DROP` / `TRUNCATE`, an unconditional
+//!   `DELETE`, an `INSERT … DEFAULT VALUES` — yields empty `reads` / `writes`
+//!   / `lineage` here: there are no columns to enumerate (wildcards stay
+//!   unexpanded). The target relation is a *table*-level fact; read it from
+//!   [`extract_table_operations`](crate::extractor::extract_table_operations)
+//!   (its `writes`) or [`extract_tables`](crate::extractor::extract_tables).
 
 use crate::casing::IdentifierStyle;
 use crate::catalog::Catalog;

@@ -588,12 +588,13 @@ impl<'a> Binder<'a> {
                         })
                     {
                         let relation = Relation::Derived {
-                            alias: alias_name.or_else(|| Some(cte.name.clone())),
+                            alias: alias_name.clone().or_else(|| Some(cte.name.clone())),
                             columns: cte.columns.clone(),
                         };
                         return (
                             LogicalPlan::CteRef(CteRef {
                                 name: cte.name.clone(),
+                                alias: alias_name,
                             }),
                             Scope::single(relation),
                         );

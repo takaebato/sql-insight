@@ -216,7 +216,12 @@ impl ExtractExecutor {
                 let ddl = std::fs::read_to_string(path).map_err(|e| {
                     Error::ArgumentError(format!("Failed to read DDL file {path}: {e}"))
                 })?;
-                Catalog::from_ddl(dialect, &ddl)?
+                // Prefix the DDL-file context so a parse error in the catalog
+                // file isn't mistaken for one in the analysed query (whose own
+                // errors surface per-statement, unprefixed).
+                Catalog::from_ddl(dialect, &ddl).map_err(|e| {
+                    Error::ArgumentError(format!("Failed to parse DDL file {path}: {e}"))
+                })?
             }
             None => Catalog::new(),
         };

@@ -122,10 +122,22 @@ fn query_output_lineage<'a>(
     ctx: &mut Ctx<'a>,
     out: &mut Vec<ColumnLineageEdge>,
 ) {
-    for (outputs, input) in output_operands(op) {
+    let operands = output_operands(op);
+    // A set operation has one result schema whose column names come from the
+    // first (left-most) branch — SQL's conventional rule (see the crate-level
+    // "Set operations follow the left side"). Every branch's like-positioned
+    // output feeds that same result column, so the target name is the left
+    // branch's, never a right branch's local alias (which names no result
+    // column). Position already restarts per branch, aligning them; a plain
+    // query has a single operand, so this is a no-op there.
+    let result_names: Vec<Option<Ident>> = match operands.first() {
+        Some((outputs, _)) => outputs.iter().map(|ne| ne.name.clone()).collect(),
+        None => Vec::new(),
+    };
+    for (outputs, input) in operands {
         for (position, ne) in outputs.iter().enumerate() {
             let target = ColumnTarget::QueryOutput {
-                name: ne.name.clone(),
+                name: result_names.get(position).cloned().flatten(),
                 position,
             };
             emit_edges(origins_of_expr(&ne.expr, input, ctx), target, out);

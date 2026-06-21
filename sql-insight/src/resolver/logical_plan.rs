@@ -178,6 +178,15 @@ pub(crate) struct Cte {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CteRef {
     pub(crate) name: Ident,
+    /// The FROM-clause alias (`c AS x` → `x`), distinct from `name` (the
+    /// declared CTE it resolves to); `None` when referenced by its own name.
+    /// It is the *exposed* name a qualified origin trace must match, so two
+    /// references to one CTE under different aliases (`c x JOIN c y`) are told
+    /// apart — without it a qualified output column expands through *every*
+    /// reference and duplicates the lineage edge (`reads` already folds, as the
+    /// body is walked once at the declaration; `origins` is demand-driven, so
+    /// it needs the alias to prune the non-owning references).
+    pub(crate) alias: Option<Ident>,
 }
 
 /// A `VALUES` row set: synthesised rows with no base columns. The row
