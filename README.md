@@ -56,7 +56,6 @@ let dialect = GenericDialect {};
 let result = extract_table_operations(
     &dialect,
     "INSERT INTO t1 (a) SELECT a FROM t2",
-    None,
 ).unwrap();
 let ops = result[0].as_ref().unwrap();
 assert_eq!(ops.statement_kind, StatementKind::Insert);
@@ -80,7 +79,6 @@ let dialect = GenericDialect {};
 let result = extract_column_operations(
     &dialect,
     "INSERT INTO t1 (a, b) SELECT a, LOWER(b) FROM t2",
-    None,
 ).unwrap();
 let ops = result[0].as_ref().unwrap();
 // a → a (Passthrough), b → b (Transformation, via LOWER).
@@ -154,13 +152,37 @@ assert_eq!(normalized, ["SELECT * FROM t1 WHERE a = ?"]);
 `VALUES (1, 2, 3), (4, 5, 6)` → `VALUES (...)`, and
 `INSERT INTO t (c, b, a) VALUES (1, 2, 3)` → `INSERT INTO t (a, b, c) VALUES (...)`.
 
-## Catalog
+## Options: catalog & casing
+
+Each extractor has an `_with_options` twin taking
+[`ExtractorOptions`](https://docs.rs/sql-insight/latest/sql_insight/extractor/struct.ExtractorOptions.html)
+— a catalog and/or an identifier-casing override:
+
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+use sql_insight::catalog::Catalog;
+use sql_insight::extractor::{extract_column_operations_with_options, ExtractorOptions};
+
+let catalog = Catalog::from_ddl(
+    &GenericDialect {},
+    "CREATE TABLE users (id INT, name TEXT)",
+).unwrap();
+let options = ExtractorOptions::new().with_catalog(&catalog);
+let result = extract_column_operations_with_options(
+    &GenericDialect {},
+    "SELECT id FROM users",
+    options,
+).unwrap();
+```
 
 An optional [`Catalog`](https://docs.rs/sql-insight/latest/sql_insight/catalog/)
-makes column resolution strict (column refs not in the
-catalog-provided schema surface as `UnresolvedColumn`, INSERT
-positional values pair with target columns). Every extractor works
-catalog-free in best-effort mode.
+makes resolution strict: a column the schema doesn't list surfaces as
+`ResolutionKind::Unresolved`, and a column-list-less INSERT pairs its
+positional values with the catalog's target columns. Build one with
+`Catalog::from_ddl` or the `CatalogTable` builder. Identifier casing is
+dialect-derived by default; `with_casing` overrides it (e.g. to model a
+deployment-specific collation). Every extractor also works catalog-free in
+best-effort mode.
 
 ## Limitations
 
@@ -168,11 +190,25 @@ See the
 [Limitations](https://docs.rs/sql-insight/latest/sql_insight/#limitations)
 section of the crate docs.
 
+## JSON output
+
+Enable the `serde` feature to derive `Serialize` on the result types, so
+they (and their references / diagnostics) can be emitted as JSON or any
+serde format:
+
+```toml
+sql-insight = { version = "0.2.0", features = ["serde"] }
+```
+
+```rust,ignore
+let json = serde_json::to_string(&ops)?;
+```
+
 ## Examples
 
-See [`sql-insight/examples/`](sql-insight/examples) for runnable
-samples covering table-level operations, column-level lineage, and the
-catalog path. Run with `cargo run --example <name> -p sql-insight`.
+See [`sql-insight/examples/`](sql-insight/examples) for runnable samples
+covering table-level operations, column-level lineage, the catalog path,
+and casing overrides. Run with `cargo run --example <name> -p sql-insight`.
 
 ## Supported SQL Dialects
 
