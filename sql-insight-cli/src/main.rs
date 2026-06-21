@@ -108,10 +108,11 @@ struct ExtractArgs {
     /// catalog-aware analysis (canonicalized identities, strict columns).
     #[clap(long = "ddl-file")]
     ddl_file: Option<String>,
-    /// Query-side default schema (search-path-style fill before matching);
-    /// also names unqualified tables in the DDL. Without it, unqualified
-    /// DDL tables register under `public` and bare refs resolve by
-    /// right-anchoring. Only meaningful with --ddl-file.
+    /// Query-side default schema: a search-path-style fill applied to a
+    /// bare query reference before matching, so it surfaces qualified
+    /// (e.g. `users` -> `public.users`). Unqualified DDL tables register
+    /// schema-less regardless; without this they still match bare refs by
+    /// right-anchoring.
     #[clap(long)]
     default_schema: Option<String>,
     /// Query-side default catalog (search-path-style fill). Only
