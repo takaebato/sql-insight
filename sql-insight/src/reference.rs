@@ -380,6 +380,44 @@ impl TableReference {
     /// The dialect-aware [`TableIdentityKey`] for this reference: each
     /// segment folded by `casing`'s table rule. Equal keys denote the same
     /// table under that dialect's casing.
+    ///
+    /// This is the **catalog-free dedup key**. The structural `Eq` on
+    /// `TableReference` is exact (case- and quote-sensitive), so without a
+    /// catalog to canonicalize spellings it over-counts `users` and `USERS`
+    /// as two tables; folding by the dialect's casing collapses them.
+    ///
+    /// ```rust
+    /// use std::collections::HashSet;
+    /// use sql_insight::{CaseRule, IdentifierCasing, TableReference};
+    ///
+    /// let users = TableReference { catalog: None, schema: None, name: "users".into() };
+    /// let upper = TableReference { catalog: None, schema: None, name: "USERS".into() };
+    ///
+    /// // Structural equality is exact — these read as two different tables.
+    /// assert_ne!(users, upper);
+    ///
+    /// // Under a case-folding dialect (here lower-folding, e.g. PostgreSQL)
+    /// // they share one identity.
+    /// let casing = IdentifierCasing::uniform(CaseRule::Lower);
+    /// assert!(users.same_table(&upper, &casing));
+    ///
+    /// // So a fold-keyed set counts the table once, where a structural
+    /// // `HashSet<TableReference>` would count two.
+    /// let distinct: HashSet<_> = [&users, &upper]
+    ///     .iter()
+    ///     .map(|t| t.identity_key(&casing))
+    ///     .collect();
+    /// assert_eq!(distinct.len(), 1);
+    ///
+    /// // Identity, not wildcard: a bare name and a schema-qualified one stay
+    /// // distinct (different identities, not a prefix match).
+    /// let qualified = TableReference {
+    ///     catalog: None,
+    ///     schema: Some("public".into()),
+    ///     name: "users".into(),
+    /// };
+    /// assert!(!users.same_table(&qualified, &casing));
+    /// ```
     pub fn identity_key(&self, casing: &IdentifierCasing) -> TableIdentityKey {
         let fold = |ident: &Ident| casing.table.normalize(ident);
         TableIdentityKey {
@@ -400,6 +438,29 @@ impl ColumnReference {
     /// The dialect-aware [`ColumnIdentityKey`] for this reference: the
     /// owning table folded by the table rule, the column name by the column
     /// rule. Equal keys denote the same column under that dialect's casing.
+    ///
+    /// Like [`TableReference::identity_key`] this is the catalog-free dedup
+    /// key — folding both the owning table and the column name (by their
+    /// separate rules, which a dialect can set apart). The owning table is
+    /// part of the identity: same column name, different table → different
+    /// column.
+    ///
+    /// ```rust
+    /// use sql_insight::{CaseRule, ColumnReference, IdentifierCasing, TableReference};
+    ///
+    /// let owned = |t: &str| Some(TableReference { catalog: None, schema: None, name: t.into() });
+    /// let lower = ColumnReference { table: owned("users"), name: "id".into() };
+    /// let upper = ColumnReference { table: owned("USERS"), name: "ID".into() };
+    ///
+    /// // Structural equality is exact; a case-folding casing merges them.
+    /// assert_ne!(lower, upper);
+    /// let casing = IdentifierCasing::uniform(CaseRule::Insensitive);
+    /// assert!(lower.same_column(&upper, &casing));
+    ///
+    /// // A different owning table is a different column, same name or not.
+    /// let other = ColumnReference { table: owned("accounts"), name: "id".into() };
+    /// assert!(!lower.same_column(&other, &casing));
+    /// ```
     pub fn identity_key(&self, casing: &IdentifierCasing) -> ColumnIdentityKey {
         ColumnIdentityKey {
             table: self.table.as_ref().map(|t| t.identity_key(casing)),
