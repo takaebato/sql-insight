@@ -124,6 +124,34 @@ mod integration {
         }
 
         #[test]
+        fn test_normalize_with_alphabetize_insert_columns_option() {
+            // Alphabetize reorders the column list (only with --unify-values).
+            sql_insight_cmd()
+                .arg("normalize")
+                .arg("--unify-values")
+                .arg("--alphabetize-insert-columns")
+                .arg("INSERT INTO t (c, b, a) VALUES (1, 2, 3)")
+                .assert()
+                .success()
+                .stdout("INSERT INTO t (a, b, c) VALUES (...)\n")
+                .stderr("");
+        }
+
+        #[test]
+        fn test_normalize_alphabetize_without_unify_values_is_noop() {
+            // Without --unify-values the reorder doesn't apply (library gates
+            // it on a unified VALUES); only literal placeholders are applied.
+            sql_insight_cmd()
+                .arg("normalize")
+                .arg("--alphabetize-insert-columns")
+                .arg("INSERT INTO t (c, b, a) VALUES (1, 2, 3)")
+                .assert()
+                .success()
+                .stdout("INSERT INTO t (c, b, a) VALUES (?, ?, ?)\n")
+                .stderr("");
+        }
+
+        #[test]
         fn test_normalize_with_all_options() {
             sql_insight_cmd()
                 .arg("normalize")

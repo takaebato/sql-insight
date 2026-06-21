@@ -15,9 +15,6 @@ use std::process::ExitCode;
 #[command(name = "sql-insight")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Turn debugging information on
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    debug: u8,
     #[command(subcommand)]
     command: Commands,
 }
@@ -53,6 +50,9 @@ struct NormalizeCommandOptions {
     /// Unify VALUES lists to a single form when all elements are literal values. For example, `VALUES (1, 2, 3), (4, 5, 6)` becomes `VALUES (...)`.
     #[clap(long)]
     unify_values: bool,
+    /// Alphabetize INSERT column lists so column-order-only variants normalize alike. Only takes effect together with `--unify-values`: `INSERT INTO t (c, b, a) VALUES (1, 2, 3)` becomes `INSERT INTO t (a, b, c) VALUES (...)`.
+    #[clap(long)]
+    alphabetize_insert_columns: bool,
 }
 
 enum ProcessType {
@@ -329,7 +329,8 @@ impl Commands {
                 NormalizeExecutor::new(sql, opts.common_options.dialect.clone()).with_options(
                     NormalizerOptions::new()
                         .with_unify_in_list(opts.unify_in_list)
-                        .with_unify_values(opts.unify_values),
+                        .with_unify_values(opts.unify_values)
+                        .with_alphabetize_insert_columns(opts.alphabetize_insert_columns),
                 ),
             ),
             Commands::Extract { target } => target.executor(sql),

@@ -170,15 +170,17 @@
 //!   projections with the target's catalog columns. Catalog-free, every
 //!   relation is open (anything could belong), so reads are best-effort
 //!   [`ResolutionKind::Inferred`] / [`ResolutionKind::Ambiguous`].
-//! - **Per-statement isolation**: every extractor returns
-//!   `Vec<Result<X, Error>>` so a bad statement in a multi-statement
-//!   batch doesn't take the rest down.
-//! - **Fatal vs non-fatal split**: parser failures and structural
-//!   problems short-circuit as `Err`; tool-side coverage gaps
-//!   (unsupported statement, suppressed wildcards, over-qualified table
-//!   names) surface in the per-statement `diagnostics` list instead.
-//!   Per-reference resolution outcomes (ambiguous / unresolved columns)
-//!   are not diagnostics — they live on [`ColumnRead::resolution`].
+//! - **Per-statement isolation (post-parse)**: every extractor returns
+//!   `Vec<Result<X, Error>>` so one statement that fails to *extract*
+//!   doesn't sink the rest. A *parse* error is different — it fails the
+//!   whole call (the outer `Result`), since statements can't be separated
+//!   before parsing.
+//! - **Fatal vs non-fatal split**: a parse error or a per-statement
+//!   extraction failure is an `Err`; tool-side coverage gaps (unsupported
+//!   statement, suppressed wildcards, over-qualified table names) surface
+//!   in the per-statement `diagnostics` list instead. Per-reference
+//!   resolution outcomes (ambiguous / unresolved columns) are not
+//!   diagnostics — they live on [`ColumnRead::resolution`].
 //! - **[`TableReference`] / [`ColumnReference`] are identity-only**.
 //!   No `alias` field — alias is use-site decoration. `HashSet`
 //!   dedup behaves intuitively across statements.
