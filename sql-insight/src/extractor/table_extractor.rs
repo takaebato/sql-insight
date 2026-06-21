@@ -124,7 +124,7 @@ impl TableExtractor {
                 tables: Vec::new(),
                 diagnostics: vec![TableLevelDiagnostic {
                     kind: TableLevelDiagnosticKind::UnsupportedStatement,
-                    message: format!("Unsupported statement while inspecting SQL: {statement}"),
+                    message: format!("Unsupported statement: {statement}"),
                     span: None,
                 }],
             });

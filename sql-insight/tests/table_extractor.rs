@@ -132,7 +132,7 @@ mod basic {
         );
         assert!(extraction.diagnostics[0]
             .message
-            .contains("Unsupported statement while inspecting SQL"));
+            .contains("Unsupported statement"));
     }
 
     #[test]

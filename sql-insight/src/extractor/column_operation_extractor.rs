@@ -278,7 +278,7 @@ fn unsupported_column_operation(
         lineage: Vec::new(),
         diagnostics: vec![ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::UnsupportedStatement,
-            message: format!("Unsupported statement for plan-based extraction: {statement}"),
+            message: format!("Unsupported statement: {statement}"),
             span: None,
         }],
     }

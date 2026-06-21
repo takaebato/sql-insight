@@ -40,7 +40,7 @@ guessing.
 ## Examples
 
 ```bash
-$ sql-insight format "SELECT *  \n FROM users   WHERE id = 1;"
+$ sql-insight format "SELECT   *   FROM users   WHERE id = 1;"
 SELECT * FROM users WHERE id = 1
 
 $ sql-insight normalize "SELECT * FROM users WHERE id = 1"

@@ -217,6 +217,20 @@ mod integration {
         }
 
         #[test]
+        fn test_extract_crud_tables_surfaces_diagnostics_in_text() {
+            // The empty CRUD buckets alone can't be told apart from "nothing
+            // unusual"; the diagnostic line disambiguates an unsupported one.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("crud")
+                .arg("CREATE INDEX i ON t(a)")
+                .assert()
+                .success()
+                .stdout("Create: [], Read: [], Update: [], Delete: []\n  ! Unsupported statement: CREATE INDEX i ON t(a)\n")
+                .stderr("");
+        }
+
+        #[test]
         fn test_extract_crud_tables_with_dialect() {
             sql_insight_cmd()
                 .arg("extract").arg("crud")
@@ -269,6 +283,20 @@ mod integration {
                 .assert()
                 .success()
                 .stdout("t1, t2\nt1, t2\n")
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_tables_surfaces_diagnostics_in_text() {
+            // An unsupported statement has no tables; the text output must
+            // still surface the diagnostic rather than silently print nothing.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("tables")
+                .arg("CREATE INDEX i ON t(a)")
+                .assert()
+                .success()
+                .stdout("  ! Unsupported statement: CREATE INDEX i ON t(a)\n")
                 .stderr("");
         }
 
@@ -717,37 +745,39 @@ mod integration {
 
         #[test]
         fn test_over_qualified_name_is_best_effort() {
-            // Behavior change vs the legacy resolver: an over-qualified table
-            // name (more than `catalog.schema.name`) can't be represented as
-            // a `TableReference`. The resolver hard-errored ("Too many
-            // identifiers provided"); the bound-plan engine is best-effort,
-            // dropping the unrepresentable relation, so the statement yields
-            // an empty (no-table) line.
+            // An over-qualified table name (more than `catalog.schema.name`)
+            // can't be represented as a `TableReference`, so it is dropped —
+            // but best-effort, not a hard error. The text output surfaces the
+            // drop as a diagnostic rather than printing a silent empty line.
             sql_insight_cmd()
                 .arg("extract")
                 .arg("tables")
                 .arg("select * from catalog.schema.table.extra")
                 .assert()
                 .success()
-                .stdout("\n")
+                .stdout(predicate::str::contains(
+                    "! table reference `catalog.schema.table.extra`",
+                ))
+                .stdout(predicate::str::contains("too many qualifiers"))
                 .stderr("");
         }
 
         #[test]
         fn test_extract_crud_over_qualified_name_is_best_effort() {
-            // Behavior change vs the legacy resolver: an over-qualified table
-            // name (more than `catalog.schema.name`) can't be represented as
-            // a `TableReference`. The resolver hard-errored ("Too many
-            // identifiers provided"); the bound-plan engine is best-effort,
-            // so it drops the unrepresentable relation and reports an empty
-            // result instead of failing the statement.
+            // An over-qualified table name (more than `catalog.schema.name`)
+            // can't be represented as a `TableReference`, so it is dropped
+            // best-effort. The empty CRUD buckets are followed by a diagnostic
+            // line so the drop isn't silent.
             sql_insight_cmd()
                 .arg("extract")
                 .arg("crud")
                 .arg("select * from catalog.schema.table.extra")
                 .assert()
                 .success()
-                .stdout("Create: [], Read: [], Update: [], Delete: []\n")
+                .stdout(predicate::str::contains(
+                    "Create: [], Read: [], Update: [], Delete: []",
+                ))
+                .stdout(predicate::str::contains("too many qualifiers"))
                 .stderr("");
         }
 

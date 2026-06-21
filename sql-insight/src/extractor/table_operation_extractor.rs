@@ -244,7 +244,7 @@ fn unsupported_table_operation(
         lineage: Vec::new(),
         diagnostics: vec![TableLevelDiagnostic {
             kind: TableLevelDiagnosticKind::UnsupportedStatement,
-            message: format!("Unsupported statement for plan-based extraction: {statement}"),
+            message: format!("Unsupported statement: {statement}"),
             span: None,
         }],
     }

@@ -1,4 +1,5 @@
 use sql_insight::catalog::Catalog;
+use sql_insight::diagnostic::TableLevelDiagnostic;
 use sql_insight::error::Error;
 use sql_insight::extractor::{
     extract_column_operations_with_options, extract_crud_tables_with_options,
@@ -167,9 +168,11 @@ impl CliExecutable for ExtractExecutor {
         match (self.kind, self.format) {
             (ExtractKind::Tables, OutputFormat::Text) => Ok(render_display(
                 &extract_tables_with_options(dialect, sql, options)?,
+                |e| &e.diagnostics,
             )),
             (ExtractKind::Crud, OutputFormat::Text) => Ok(render_display(
                 &extract_crud_tables_with_options(dialect, sql, options)?,
+                |c| &c.diagnostics,
             )),
             (ExtractKind::TableOps, OutputFormat::Text) => Ok(render_statements(
                 &extract_table_operations_with_options(dialect, sql, options)?,
@@ -272,12 +275,27 @@ fn render_json<T: serde::Serialize>(results: &[Result<T, Error>]) -> Result<Vec<
 }
 
 /// Render the `Display`-backed extractors (`tables` / `crud`), one
-/// statement per line.
-fn render_display<T: std::fmt::Display>(results: &[Result<T, Error>]) -> Vec<String> {
+/// statement per line, appending any diagnostics as `! <message>` lines
+/// (the same marker the operation extractors use) so the text output never
+/// silently drops an unsupported / over-qualified statement.
+fn render_display<T: std::fmt::Display>(
+    results: &[Result<T, Error>],
+    diagnostics: impl Fn(&T) -> &[TableLevelDiagnostic],
+) -> Vec<String> {
     results
         .iter()
         .map(|r| match r {
-            Ok(value) => value.to_string(),
+            Ok(value) => {
+                let mut lines: Vec<String> = Vec::new();
+                let body = value.to_string();
+                if !body.is_empty() {
+                    lines.push(body);
+                }
+                for d in diagnostics(value) {
+                    lines.push(format!("  ! {}", d.message));
+                }
+                lines.join("\n")
+            }
             Err(e) => format!("Error: {e}"),
         })
         .collect()
