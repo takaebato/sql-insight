@@ -55,7 +55,27 @@ pub(super) fn collect_writes(plan: &LogicalPlan) -> Vec<ColumnReference> {
             .iter()
             .flat_map(|clause| merge_clause_writes(clause, &m.target))
             .collect(),
-        _ => Vec::new(),
+        // No column writes: read-only / structural query operators, the bare
+        // FROM-less / synthetic relations, and DML / DDL whose target rows go
+        // wholesale (DELETE / DROP / TRUNCATE) — none qualify a column with a
+        // write target. Listed explicitly so a new `LogicalPlan` variant
+        // forces a write-placement decision rather than silently emitting
+        // nothing here.
+        LogicalPlan::Scan(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Projection(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::SetOp(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::TableFunction(_)
+        | LogicalPlan::With(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::Delete(_)
+        | LogicalPlan::Drop(_) => Vec::new(),
     }
 }
 
@@ -97,7 +117,22 @@ pub(super) fn collect_table_writes(plan: &LogicalPlan) -> Vec<TableReference> {
         LogicalPlan::Merge(m) => vec![m.target.clone()],
         // DROP / TRUNCATE name their relations directly as write targets.
         LogicalPlan::Drop(d) => d.targets.clone(),
-        _ => Vec::new(),
+        // No write target: read-only / structural query operators and the
+        // FROM-less / synthetic relations. Listed explicitly so a new
+        // `LogicalPlan` variant forces a target decision here.
+        LogicalPlan::Scan(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Projection(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::SetOp(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::TableFunction(_)
+        | LogicalPlan::With(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty => Vec::new(),
     }
 }
 

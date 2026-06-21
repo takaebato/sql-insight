@@ -148,10 +148,32 @@ pub(super) fn origins_of_expr<'a>(
 fn values_backed(op: &LogicalPlan) -> bool {
     match op {
         LogicalPlan::Values(_) => true,
+        // Only the clause-layer wrappers `Values` can sit beneath are peeled —
+        // an ORDER BY / WHERE on a VALUES, and a leading WITH. Anything else
+        // is a real relation (a Scan, a Projection rewriting the row shape, a
+        // derived alias on top), and its columns *do* have a base to collapse
+        // to. Listed explicitly so a new operator added between `Values` and
+        // its clause layers needs an explicit decision here.
         LogicalPlan::Sort(s) => values_backed(&s.input),
         LogicalPlan::Filter(f) => values_backed(&f.input),
         LogicalPlan::With(w) => values_backed(&w.body),
-        _ => false,
+        LogicalPlan::Scan(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Projection(_)
+        | LogicalPlan::SetOp(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::TableFunction(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::Insert(_)
+        | LogicalPlan::Update(_)
+        | LogicalPlan::Delete(_)
+        | LogicalPlan::Merge(_)
+        | LogicalPlan::CreateTableAs(_)
+        | LogicalPlan::CreateView(_)
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => false,
     }
 }
 
@@ -380,7 +402,26 @@ pub(super) fn output_operands(op: &LogicalPlan) -> Vec<(&[NamedExpr], &LogicalPl
             operands.extend(output_operands(&so.right));
             operands
         }
-        _ => Vec::new(),
+        // No projection at this level — a relation that doesn't carry a
+        // SELECT list (a `Scan`, a join below a projection, a DML / DDL root,
+        // …) yields no operands. Listed explicitly so a new operator that
+        // *does* expose columns positionally forces an explicit handler.
+        LogicalPlan::Scan(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::TableFunction(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::Insert(_)
+        | LogicalPlan::Update(_)
+        | LogicalPlan::Delete(_)
+        | LogicalPlan::Merge(_)
+        | LogicalPlan::CreateTableAs(_)
+        | LogicalPlan::CreateView(_)
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => Vec::new(),
     }
 }
 

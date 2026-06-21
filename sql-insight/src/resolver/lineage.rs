@@ -112,8 +112,25 @@ pub(super) fn collect_column_lineage(
         }
         // A bare query (or unmodelled root): one `QueryOutput` group per
         // projection (a set operation has one per branch — positions restart
-        // per branch, mirroring the resolver).
-        _ => query_output_lineage(plan, &mut ctx, &mut edges),
+        // per branch, mirroring the resolver). DDL that names a table but
+        // moves no value (`AlterTable` / `Drop`) flows here too — it emits no
+        // lineage. Listed explicitly so a new `LogicalPlan` variant forces a
+        // routing decision rather than landing here by default.
+        LogicalPlan::Scan(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Projection(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::SetOp(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::TableFunction(_)
+        | LogicalPlan::With(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => query_output_lineage(plan, &mut ctx, &mut edges),
     }
     edges
 }
@@ -297,7 +314,26 @@ pub(super) fn collect_table_lineage(
             }
             &m.target
         }
-        _ => return Vec::new(),
+        // No table lineage: a bare query (no target), DDL that moves no value
+        // (`Drop` / `Truncate` modelled as `Drop` / `AlterTable`), and the
+        // structural / synthetic operators reached at root. Listed explicitly
+        // so a new `LogicalPlan` variant forces a target decision.
+        LogicalPlan::Scan(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Projection(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::SetOp(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::TableFunction(_)
+        | LogicalPlan::With(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::Delete(_)
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => return Vec::new(),
     };
     sources
         .into_iter()
