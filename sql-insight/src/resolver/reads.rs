@@ -15,7 +15,7 @@
 //! column instead.
 
 use super::logical_plan::{
-    children, own_expr_subplans, own_exprs, Binding, BoundColumn, Expr, LogicalPlan,
+    children, own_exprs, walk_plan, Binding, BoundColumn, Expr, LogicalPlan,
 };
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableRead};
 
@@ -32,7 +32,7 @@ pub(super) fn collect_reads(plan: &LogicalPlan) -> Vec<ColumnRead> {
 /// [`crate::resolver::table_reads`].
 pub(super) fn collect_table_reads(plan: &LogicalPlan) -> Vec<TableRead> {
     let mut out = Vec::new();
-    walk(plan, &mut |o| {
+    walk_plan(plan, &mut |o| {
         if let LogicalPlan::Scan(s) = o {
             out.push(TableRead {
                 reference: s.table.clone(),
@@ -114,23 +114,4 @@ pub(super) fn column_read(c: &BoundColumn) -> Option<ColumnRead> {
         },
         resolution,
     })
-}
-
-/// Pre-order walk of the structural tree (children + own-expression sub-plans +
-/// CTE bodies), invoking `f` at every operator.
-fn walk(op: &LogicalPlan, f: &mut impl FnMut(&LogicalPlan)) {
-    f(op);
-    for child in children(op) {
-        walk(child, f);
-    }
-    // Subqueries nested in this node's expressions (a `WHERE … IN (SELECT …)`
-    // / scalar subquery) are sub-plans too — their scans must surface.
-    for sub in own_expr_subplans(op) {
-        walk(sub, f);
-    }
-    if let LogicalPlan::With(w) = op {
-        for cte in &w.ctes {
-            walk(&cte.body, f);
-        }
-    }
 }

@@ -279,7 +279,7 @@ fn unsupported_column_operation(
         lineage: Vec::new(),
         diagnostics: vec![ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::UnsupportedStatement,
-            message: format!("Unsupported statement: {statement}"),
+            message: crate::extractor::unsupported_message(statement),
             span: None,
         }],
     }

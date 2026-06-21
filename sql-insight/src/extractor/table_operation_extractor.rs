@@ -263,7 +263,7 @@ fn unsupported_table_operation(
         lineage: Vec::new(),
         diagnostics: vec![TableLevelDiagnostic {
             kind: TableLevelDiagnosticKind::UnsupportedStatement,
-            message: format!("Unsupported statement: {statement}"),
+            message: crate::extractor::unsupported_message(statement),
             span: None,
         }],
     }

@@ -542,3 +542,23 @@ pub(super) fn peel_with(op: &LogicalPlan) -> &LogicalPlan {
     }
     node
 }
+
+/// Pre-order walk of the structural tree — structural children, the sub-plans
+/// nested in this node's own expressions (a `WHERE … IN (SELECT …)` / scalar
+/// subquery), and on a `With` each declared CTE body — invoking `f` at every
+/// operator. The shared shape every [`super`]-side walker that visits "every
+/// LogicalPlan reachable from a statement" can be a `f`-customisation over.
+pub(super) fn walk_plan(op: &LogicalPlan, f: &mut impl FnMut(&LogicalPlan)) {
+    f(op);
+    for child in children(op) {
+        walk_plan(child, f);
+    }
+    for sub in own_expr_subplans(op) {
+        walk_plan(sub, f);
+    }
+    if let LogicalPlan::With(w) = op {
+        for cte in &w.ctes {
+            walk_plan(&cte.body, f);
+        }
+    }
+}

@@ -14,7 +14,7 @@
 
 use sqlparser::ast::Ident;
 
-use super::logical_plan::{children, own_expr_subplans, peel_with, LogicalPlan, MergeClause};
+use super::logical_plan::{peel_with, walk_plan, LogicalPlan, MergeClause};
 use crate::reference::{ColumnReference, TableReference};
 
 // ===== writes ============================================================
@@ -118,92 +118,38 @@ fn qualify(columns: &[Ident], target: &TableReference) -> Vec<ColumnReference> {
 /// binding (the un-bucketed table surface). Backs [`crate::resolver::flat_tables`].
 pub(super) fn collect_flat_tables(plan: &LogicalPlan) -> Vec<TableReference> {
     let mut out = Vec::new();
-    collect_flat(plan, &mut out);
+    collect_flat_into(plan, &mut out);
     out
 }
 
-/// Walk the value sub-plans in a DML root's own expressions (a SET / WHEN /
-/// conflict-value scalar subquery's scans bind too, like the resolver counts
-/// them on the write input).
-fn collect_flat_subplans(op: &LogicalPlan, out: &mut Vec<TableReference>) {
-    for sub in own_expr_subplans(op) {
-        collect_flat(sub, out);
+/// Shared visitor over the structural [`walk_plan`]: at each operator, push
+/// whatever table binding it names (a `Scan` table, a DML / DDL root's write
+/// target). `walk_plan` already recurses children, value subplans, and CTE
+/// bodies, so a DML's target is pushed once at the root and the input's scans
+/// follow naturally. `DELETE` is the one shape this can't model — its target
+/// often coincides with a FROM scan already collected, so handled separately.
+fn collect_flat_into(plan: &LogicalPlan, out: &mut Vec<TableReference>) {
+    if let LogicalPlan::Delete(d) = plan {
+        let before = out.len();
+        collect_flat_into(&d.input, out);
+        let from: Vec<TableReference> = out[before..].to_vec();
+        for target in &d.targets {
+            if !from.contains(target) {
+                out.push(target.clone());
+            }
+        }
+        return;
     }
-}
-
-fn collect_flat(op: &LogicalPlan, out: &mut Vec<TableReference>) {
-    match op {
+    walk_plan(plan, &mut |op| match op {
         LogicalPlan::Scan(s) => out.push(s.table.clone()),
-        // DROP / TRUNCATE relations are bindings with no scan.
+        // DROP / TRUNCATE — multiple targets in one statement, no input.
         LogicalPlan::Drop(d) => out.extend(d.targets.iter().cloned()),
-        // A write target is external to the input (never a scan here): count it,
-        // then walk the source for its read scans.
-        LogicalPlan::Insert(i) => {
-            out.push(i.target.clone());
-            collect_flat(&i.input, out);
-            collect_flat_subplans(op, out);
-        }
-        LogicalPlan::Update(u) => {
-            out.push(u.target.clone());
-            collect_flat(&u.input, out);
-            collect_flat_subplans(op, out);
-        }
-        LogicalPlan::Merge(m) => {
-            out.push(m.target.clone());
-            collect_flat(&m.source, out);
-            collect_flat_subplans(op, out);
-        }
-        LogicalPlan::CreateTableAs(c) => {
-            out.push(c.target.clone());
-            collect_flat(&c.input, out);
-        }
-        LogicalPlan::CreateView(c) => {
-            out.push(c.target.clone());
-            collect_flat(&c.input, out);
-        }
+        LogicalPlan::Insert(i) => out.push(i.target.clone()),
+        LogicalPlan::Update(u) => out.push(u.target.clone()),
+        LogicalPlan::Merge(m) => out.push(m.target.clone()),
+        LogicalPlan::CreateTableAs(c) => out.push(c.target.clone()),
+        LogicalPlan::CreateView(c) => out.push(c.target.clone()),
         LogicalPlan::AlterTable(a) => out.push(a.target.clone()),
-        // A DELETE target often coincides with a FROM scan already collected;
-        // count only the targets that didn't merge into a row source.
-        LogicalPlan::Delete(d) => {
-            let before = out.len();
-            collect_flat(&d.input, out);
-            let from: Vec<TableReference> = out[before..].to_vec();
-            for target in &d.targets {
-                if !from.contains(target) {
-                    out.push(target.clone());
-                }
-            }
-        }
-        LogicalPlan::With(w) => {
-            collect_flat(&w.body, out);
-            for cte in &w.ctes {
-                collect_flat(&cte.body, out);
-            }
-        }
-        // A table function is opaque (not a table binding), but a PIVOT-style
-        // inner table below it and any scan in an argument subquery bind.
-        LogicalPlan::TableFunction(tf) => {
-            collect_flat(&tf.input, out);
-            collect_flat_subplans(op, out);
-        }
-        // A `VALUES` row's expressions can hold a subquery whose scans bind.
-        LogicalPlan::Values(_) => collect_flat_subplans(op, out),
-        LogicalPlan::CteRef(_) | LogicalPlan::Empty => {}
-        // Structural query operators: walk children and any expression
-        // sub-plans (a WHERE / scalar subquery's scans bind too).
-        LogicalPlan::Filter(_)
-        | LogicalPlan::Join(_)
-        | LogicalPlan::Aggregate(_)
-        | LogicalPlan::Projection(_)
-        | LogicalPlan::Sort(_)
-        | LogicalPlan::SetOp(_)
-        | LogicalPlan::SubqueryAlias(_) => {
-            for child in children(op) {
-                collect_flat(child, out);
-            }
-            for sub in own_expr_subplans(op) {
-                collect_flat(sub, out);
-            }
-        }
-    }
+        _ => {}
+    });
 }

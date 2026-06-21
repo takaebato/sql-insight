@@ -155,10 +155,7 @@ impl<'a> Binder<'a> {
     /// token's location (a zero-line span is treated as unknown).
     pub(super) fn record_wildcard_suppressed(&self, description: &str, span: Span) {
         let span = (span.start.line != 0).then_some(span);
-        let suffix = match span {
-            Some(s) => format!(" at L{}:C{}", s.start.line, s.start.column),
-            None => String::new(),
-        };
+        let suffix = span_suffix(span);
         self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::WildcardSuppressed,
             message: format!(
@@ -181,10 +178,7 @@ impl<'a> Binder<'a> {
             .and_then(|part| part.as_ident())
             .map(|ident| ident.span)
             .filter(|s| s.start.line != 0);
-        let suffix = match span {
-            Some(s) => format!(" at L{}:C{}", s.start.line, s.start.column),
-            None => String::new(),
-        };
+        let suffix = span_suffix(span);
         let reason = if name.0.iter().any(|part| part.as_ident().is_none()) {
             "is not a plain catalog.schema.name identifier path"
         } else {
@@ -209,6 +203,16 @@ impl<'a> Binder<'a> {
             ),
             span: None,
         });
+    }
+}
+
+/// Format a known span as the trailing " at L{line}:C{col}" suffix that
+/// embedded into a diagnostic message; empty when the span is unknown
+/// (the recorders elsewhere `filter` out zero-line spans before calling).
+fn span_suffix(span: Option<Span>) -> String {
+    match span {
+        Some(s) => format!(" at L{}:C{}", s.start.line, s.start.column),
+        None => String::new(),
     }
 }
 

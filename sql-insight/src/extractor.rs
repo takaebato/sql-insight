@@ -160,6 +160,14 @@ pub enum StatementKind {
     Unsupported,
 }
 
+/// The shared "Unsupported statement: …" diagnostic message — embeds the
+/// statement's `Display`. Both granularity-specific extractors use this so
+/// the wording stays in step (the kinds themselves split table- vs
+/// column-level via the [`diagnostic`](crate::diagnostic) types).
+pub(crate) fn unsupported_message(statement: &Statement) -> String {
+    format!("Unsupported statement: {statement}")
+}
+
 /// The shared `*_with_options` driver: parse `sql` once, then run
 /// `extract_from` on each parsed statement. A *parse* failure fails the whole
 /// call (`Err` on the outer `Result`) because statements can't be separated
