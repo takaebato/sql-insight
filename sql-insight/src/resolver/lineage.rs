@@ -227,58 +227,69 @@ fn merge_value_edges<'a>(
 // ===== table lineage =====================================================
 
 /// Table-level lineage: one `source → target` edge per read-role scan that
-/// **feeds data** into a DML target, occurrence-based. Feeding sources are the
-/// scans on the value / data path of the source — FROM / JOIN relations, value
-/// (projection) subqueries, and referenced CTE bodies — never predicate
-/// (filter) subqueries. A bare query, or a statement that moves no data, has
-/// no table lineage. Backs [`crate::resolver::table_lineage`].
+/// **feeds data** into a DML target. Occurrence-based on the *source* side
+/// (a real table joined twice contributes two edges), but a CTE body — one
+/// declaration shared by every `WITH … FROM c x JOIN c y` reference —
+/// contributes once (it is materialized once and feeds once); without that
+/// fold the same `base → target` edge would be emitted per reference,
+/// mirroring nothing in the bound relation (a `Derived` ref qualified ambiguously
+/// would still resolve once). Feeding sources are the scans on the value /
+/// data path of the source — FROM / JOIN relations, value (projection)
+/// subqueries, and referenced CTE bodies — never predicate (filter)
+/// subqueries. A bare query, or a statement that moves no data, has no table
+/// lineage. Backs [`crate::resolver::table_lineage`].
 pub(super) fn collect_table_lineage(
     plan: &LogicalPlan,
     casing: IdentifierCasing,
 ) -> Vec<TableLineageEdge> {
     // `Ctx::new` peels leading WITHs and keeps their CTE bodies, so a `CteRef`
-    // on the feeding path resolves to the body's feeding scans.
+    // on the feeding path resolves to the body's feeding scans. `expanded_ctes` is the
+    // already-expanded-CTE set: a CTE body materializes once, so it feeds the
+    // target once regardless of how many `CteRef`s point at it (the active-set
+    // on `ctx` terminates a *recursive* self-reference; this set folds
+    // *distinct* references — orthogonal concerns).
     let mut ctx = Ctx::new(plan, casing);
     let mut sources = Vec::new();
+    let mut expanded_ctes: Vec<String> = Vec::new();
     let target = match peel_with(plan) {
         LogicalPlan::Insert(i) => {
-            feeding_scans(&i.input, &mut ctx, &mut sources);
+            feeding_scans(&i.input, &mut ctx, &mut expanded_ctes, &mut sources);
             &i.target
         }
         // UPDATE feeds from the FROM relations (the read `input`) AND any value
         // subquery in a SET RHS; the WHERE predicate / a self-reference to the
         // target do not feed.
         LogicalPlan::Update(u) => {
-            feeding_scans(&u.input, &mut ctx, &mut sources);
+            feeding_scans(&u.input, &mut ctx, &mut expanded_ctes, &mut sources);
             for a in &u.assignments {
-                expr_feeding(&a.value, &mut ctx, &mut sources);
+                expr_feeding(&a.value, &mut ctx, &mut expanded_ctes, &mut sources);
             }
             &u.target
         }
         // CTAS / CREATE VIEW move data like INSERT; ALTER / DROP do not.
         LogicalPlan::CreateTableAs(c) => {
-            feeding_scans(&c.input, &mut ctx, &mut sources);
+            feeding_scans(&c.input, &mut ctx, &mut expanded_ctes, &mut sources);
             &c.target
         }
         LogicalPlan::CreateView(c) => {
-            feeding_scans(&c.input, &mut ctx, &mut sources);
+            feeding_scans(&c.input, &mut ctx, &mut expanded_ctes, &mut sources);
             &c.target
         }
         // MERGE feeds from the source relation plus each *written* WHEN value
         // (an UPDATE SET RHS; an INSERT value paired with a column). The ON /
         // predicate reads and an unpaired INSERT value do not feed.
         LogicalPlan::Merge(m) => {
-            feeding_scans(&m.source, &mut ctx, &mut sources);
+            feeding_scans(&m.source, &mut ctx, &mut expanded_ctes, &mut sources);
             for clause in &m.clauses {
                 match clause {
                     MergeClause::Update { assignments } => {
                         for a in assignments {
-                            expr_feeding(&a.value, &mut ctx, &mut sources);
+                            expr_feeding(&a.value, &mut ctx, &mut expanded_ctes, &mut sources);
                         }
                     }
                     MergeClause::Insert { columns, values } => {
                         for (_col, value) in columns.iter().zip(values) {
-                            expr_feeding(value, &mut ctx, &mut sources);
+                            expr_feeding(value, &mut ctx, &mut expanded_ctes, &mut sources);
                         }
                     }
                     MergeClause::Delete => {}
@@ -300,48 +311,67 @@ pub(super) fn collect_table_lineage(
 /// Collect the read-role scans that feed data up through `op` (a value / data
 /// path): a join feeds both sides, a filter passes only its input (its
 /// predicate subqueries do not feed), a projection also pulls its value
-/// subqueries. A `CteRef` resolves to the referenced CTE body's feeding scans;
-/// the `Ctx` active-set terminates a recursive self-reference.
-fn feeding_scans<'a>(op: &'a LogicalPlan, ctx: &mut Ctx<'a>, out: &mut Vec<TableRead>) {
+/// subqueries. A `CteRef` resolves to the referenced CTE body's feeding scans
+/// — but only the first reference does; the body is materialized once and
+/// `expanded_ctes` tracks which CTEs have already contributed. The `Ctx` active-set
+/// terminates a *recursive* self-reference (a separate concern).
+fn feeding_scans<'a>(
+    op: &'a LogicalPlan,
+    ctx: &mut Ctx<'a>,
+    expanded_ctes: &mut Vec<String>,
+    out: &mut Vec<TableRead>,
+) {
     match op {
         LogicalPlan::Scan(s) => out.push(TableRead {
             reference: s.table.clone(),
             resolution: s.resolution,
         }),
-        LogicalPlan::Filter(f) => feeding_scans(&f.input, ctx, out),
+        LogicalPlan::Filter(f) => feeding_scans(&f.input, ctx, expanded_ctes, out),
         LogicalPlan::Join(j) => {
-            feeding_scans(&j.left, ctx, out);
-            feeding_scans(&j.right, ctx, out);
+            feeding_scans(&j.left, ctx, expanded_ctes, out);
+            feeding_scans(&j.right, ctx, expanded_ctes, out);
         }
         LogicalPlan::Projection(p) => {
-            feeding_scans(&p.input, ctx, out);
+            feeding_scans(&p.input, ctx, expanded_ctes, out);
             for ne in &p.exprs {
-                expr_feeding(&ne.expr, ctx, out);
+                expr_feeding(&ne.expr, ctx, expanded_ctes, out);
             }
         }
-        LogicalPlan::Aggregate(a) => feeding_scans(&a.input, ctx, out),
-        LogicalPlan::Sort(s) => feeding_scans(&s.input, ctx, out),
-        LogicalPlan::SubqueryAlias(sa) => feeding_scans(&sa.input, ctx, out),
+        LogicalPlan::Aggregate(a) => feeding_scans(&a.input, ctx, expanded_ctes, out),
+        LogicalPlan::Sort(s) => feeding_scans(&s.input, ctx, expanded_ctes, out),
+        LogicalPlan::SubqueryAlias(sa) => feeding_scans(&sa.input, ctx, expanded_ctes, out),
         // A PIVOT / … feeds from its wrapped inner table; the function args
         // are filter-position reads and do not feed.
-        LogicalPlan::TableFunction(tf) => feeding_scans(&tf.input, ctx, out),
+        LogicalPlan::TableFunction(tf) => feeding_scans(&tf.input, ctx, expanded_ctes, out),
         LogicalPlan::SetOp(so) => {
-            feeding_scans(&so.left, ctx, out);
-            feeding_scans(&so.right, ctx, out);
+            feeding_scans(&so.left, ctx, expanded_ctes, out);
+            feeding_scans(&so.right, ctx, expanded_ctes, out);
         }
         LogicalPlan::With(w) => {
-            ctx.with_decls(&w.ctes, |ctx| feeding_scans(&w.body, ctx, out));
+            ctx.with_decls(&w.ctes, |ctx| {
+                feeding_scans(&w.body, ctx, expanded_ctes, out)
+            });
         }
         LogicalPlan::CteRef(r) => {
-            ctx.enter_cte(&r.name, |ctx, body| feeding_scans(body, ctx, out));
+            // A CTE body materializes once: the first reference expands it,
+            // any further reference is a no-op (it would emit a duplicate
+            // `cte-body-scan → target` edge while `reads` — the body is walked
+            // once at its declaration — stays folded).
+            if expanded_ctes.iter().any(|n| n == &r.name.value) {
+                return;
+            }
+            expanded_ctes.push(r.name.value.clone());
+            ctx.enter_cte(&r.name, |ctx, body| {
+                feeding_scans(body, ctx, expanded_ctes, out)
+            });
         }
         // A nested data-mover feeds through its source; DELETE / DROP / ALTER /
         // VALUES move no row data into a feeding path.
-        LogicalPlan::Insert(i) => feeding_scans(&i.input, ctx, out),
-        LogicalPlan::Update(u) => feeding_scans(&u.input, ctx, out),
-        LogicalPlan::CreateTableAs(c) => feeding_scans(&c.input, ctx, out),
-        LogicalPlan::CreateView(c) => feeding_scans(&c.input, ctx, out),
-        LogicalPlan::Merge(m) => feeding_scans(&m.source, ctx, out),
+        LogicalPlan::Insert(i) => feeding_scans(&i.input, ctx, expanded_ctes, out),
+        LogicalPlan::Update(u) => feeding_scans(&u.input, ctx, expanded_ctes, out),
+        LogicalPlan::CreateTableAs(c) => feeding_scans(&c.input, ctx, expanded_ctes, out),
+        LogicalPlan::CreateView(c) => feeding_scans(&c.input, ctx, expanded_ctes, out),
+        LogicalPlan::Merge(m) => feeding_scans(&m.source, ctx, expanded_ctes, out),
         LogicalPlan::Delete(_)
         | LogicalPlan::Drop(_)
         | LogicalPlan::AlterTable(_)
@@ -353,20 +383,28 @@ fn feeding_scans<'a>(op: &'a LogicalPlan, ctx: &mut Ctx<'a>, out: &mut Vec<Table
 /// The value-position subqueries of an expression feed table lineage (a scalar
 /// projection subquery), mirroring `origins_of_expr`: `when` conditions, window
 /// keys, and EXISTS / IN tests are filter position and do not feed.
-fn expr_feeding<'a>(expr: &'a Expr, ctx: &mut Ctx<'a>, out: &mut Vec<TableRead>) {
+fn expr_feeding<'a>(
+    expr: &'a Expr,
+    ctx: &mut Ctx<'a>,
+    expanded_ctes: &mut Vec<String>,
+    out: &mut Vec<TableRead>,
+) {
     match expr {
         Expr::Column(_) => {}
-        Expr::Call { args } => args.iter().for_each(|e| expr_feeding(e, ctx, out)),
+        Expr::Call { args } => args
+            .iter()
+            .for_each(|e| expr_feeding(e, ctx, expanded_ctes, out)),
         Expr::Case {
             then, else_result, ..
         } => {
-            then.iter().for_each(|e| expr_feeding(e, ctx, out));
+            then.iter()
+                .for_each(|e| expr_feeding(e, ctx, expanded_ctes, out));
             if let Some(e) = else_result {
-                expr_feeding(e, ctx, out);
+                expr_feeding(e, ctx, expanded_ctes, out);
             }
         }
-        Expr::Window { arg, .. } => expr_feeding(arg, ctx, out),
-        Expr::Subquery(plan) => feeding_scans(plan, ctx, out),
+        Expr::Window { arg, .. } => expr_feeding(arg, ctx, expanded_ctes, out),
+        Expr::Subquery(plan) => feeding_scans(plan, ctx, expanded_ctes, out),
         Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Filter(_) | Expr::Fanin(_) => {}
     }
 }

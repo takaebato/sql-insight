@@ -1101,6 +1101,61 @@ mod lineage {
     }
 
     #[test]
+    fn cte_referenced_twice_feeds_target_once() {
+        // A CTE body materializes once: a `FROM c x JOIN c y` joins one
+        // realised relation to itself and must therefore feed the target with
+        // a single `base → t` edge, not two (the bug before threading the
+        // expanded-CTE set: each `CteRef` re-expanded the body and emitted
+        // `base → t` per reference, while `reads` — body walked once at the
+        // declaration — stayed folded, an asymmetry).
+        assert_ops(
+            "WITH c AS (SELECT id FROM base) \
+             INSERT INTO t SELECT x.id FROM c x JOIN c y ON x.id = y.id",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("base")],
+                writes: vec![table("t")],
+                lineage: vec![edge("base", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn cte_referenced_thrice_still_feeds_target_once() {
+        // The fold is on declaration, not on reference count — three
+        // references collapse to the same one body, one feeding edge.
+        assert_ops(
+            "WITH c AS (SELECT id FROM base) \
+             INSERT INTO t SELECT x.id FROM c x JOIN c y ON 1=1 JOIN c z ON 1=1",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("base")],
+                writes: vec![table("t")],
+                lineage: vec![edge("base", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn distinct_ctes_each_feed_target_independently() {
+        // The fold is per *CTE name*, not per `CteRef` node — two different
+        // CTEs (each referenced once) each contribute their own edge.
+        assert_ops(
+            "WITH c AS (SELECT id FROM base), d AS (SELECT id FROM other) \
+             INSERT INTO t SELECT x.id FROM c x JOIN d y ON x.id = y.id",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("base"), read("other")],
+                writes: vec![table("t")],
+                lineage: vec![edge("base", "t"), edge("other", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn select_only_statement_emits_no_lineage() {
         assert_ops(
             "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",

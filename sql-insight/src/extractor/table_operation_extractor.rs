@@ -91,8 +91,10 @@ pub struct TableOperation {
     /// Lineage edges, only for statements that physically move data
     /// (`INSERT`, `UPDATE`, `MERGE` with an Insert / Update WHEN
     /// clause, CTAS, `CREATE VIEW`, `ALTER VIEW`). **In source order** of the
-    /// feeding source table (by its written token span); occurrence /
-    /// multiplicity is preserved.
+    /// feeding source table (by its written token span); occurrence is
+    /// preserved on the source side — a real table joined twice contributes
+    /// two edges — but a CTE body, the one declaration shared by every
+    /// `CteRef`, contributes once (it materializes once, so it feeds once).
     pub lineage: Vec<TableLineageEdge>,
     /// Non-fatal diagnostics from the walk; only
     /// `UnsupportedStatement` arises at this granularity.
