@@ -95,4 +95,31 @@ mod dialect_casing_coverage {
             vec![read_with_ref(bq_t1, "Id", ResolutionKind::Cataloged)]
         );
     }
+
+    #[test]
+    fn clickhouse_column_lookup_is_case_sensitive_in_lineage() {
+        // ClickHouse folds none of its identifier classes (Sensitive). A
+        // derived table exposes two aliases differing only in case (`X` and
+        // `x`); the outer `SELECT x` must trace to `a AS x`, not to the
+        // earlier `b AS X`. (Before threading the dialect column fold through
+        // the origin trace, the inner name lookup ASCII-ci-matched `X` first
+        // and emitted `t.b -> x` — a real ClickHouse-only bug.)
+        use sql_insight::sqlparser::dialect::ClickHouseDialect;
+        let ops = extract_column_operations(
+            &ClickHouseDialect {},
+            "SELECT x FROM (SELECT b AS X, a AS x FROM t) d",
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        assert_eq!(ops.lineage.len(), 1);
+        let edge = &ops.lineage[0];
+        assert_eq!(edge.source.reference.name.value, "a");
+        match &edge.target {
+            ColumnTarget::QueryOutput { name, .. } => {
+                assert_eq!(name.as_ref().unwrap().value, "x")
+            }
+            other => panic!("expected QueryOutput, got {other:?}"),
+        }
+    }
 }

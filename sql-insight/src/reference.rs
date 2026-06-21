@@ -212,24 +212,39 @@ pub enum ResolutionKind {
 
 impl TableReference {
     pub(crate) fn try_from_name(name: &ObjectName) -> Result<Self, Error> {
-        match name.0.len() {
-            0 => Err(Error::AnalysisError(
+        // Every part must be a plain identifier. A non-identifier part — e.g.
+        // Snowflake's `IDENTIFIER('t')`, a function-computed name — makes the
+        // reference unrepresentable; `as_ident` is `None` there, so the
+        // all-or-nothing `collect` yields `None` and we return `Err` rather
+        // than `unwrap`-panicking (callers drop it best-effort).
+        let parts = name
+            .0
+            .iter()
+            .map(|part| part.as_ident())
+            .collect::<Option<Vec<&Ident>>>()
+            .ok_or_else(|| {
+                Error::AnalysisError(format!(
+                    "table name `{name}` is not a plain identifier path"
+                ))
+            })?;
+        match parts.as_slice() {
+            [] => Err(Error::AnalysisError(
                 "ObjectName has no identifiers".to_string(),
             )),
-            1 => Ok(TableReference {
+            [n] => Ok(TableReference {
                 catalog: None,
                 schema: None,
-                name: name.0[0].as_ident().unwrap().clone(),
+                name: (*n).clone(),
             }),
-            2 => Ok(TableReference {
+            [schema, n] => Ok(TableReference {
                 catalog: None,
-                schema: Some(name.0[0].as_ident().unwrap().clone()),
-                name: name.0[1].as_ident().unwrap().clone(),
+                schema: Some((*schema).clone()),
+                name: (*n).clone(),
             }),
-            3 => Ok(TableReference {
-                catalog: Some(name.0[0].as_ident().unwrap().clone()),
-                schema: Some(name.0[1].as_ident().unwrap().clone()),
-                name: name.0[2].as_ident().unwrap().clone(),
+            [catalog, schema, n] => Ok(TableReference {
+                catalog: Some((*catalog).clone()),
+                schema: Some((*schema).clone()),
+                name: (*n).clone(),
             }),
             _ => Err(Error::AnalysisError(
                 "Too many identifiers provided".to_string(),

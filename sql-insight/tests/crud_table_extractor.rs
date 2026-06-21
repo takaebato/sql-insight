@@ -146,6 +146,28 @@ mod basic {
             TableLevelDiagnosticKind::TooManyTableQualifiers
         );
     }
+
+    #[test]
+    fn test_non_identifier_table_name_drops_with_diagnostic_not_panic() {
+        // Snowflake `IDENTIFIER('t')` parses to an `ObjectNamePart::Function`,
+        // not a plain identifier — `try_from_name` once `unwrap`-panicked on
+        // it. It must now drop the unrepresentable target best-effort with a
+        // diagnostic (never panic), the same path as an over-qualified name.
+        use sql_insight::diagnostic::TableLevelDiagnosticKind;
+        use sql_insight::sqlparser::dialect::SnowflakeDialect;
+        let sql = "SELECT a FROM IDENTIFIER('t1')";
+        let result = CrudTableExtractor::extract(&SnowflakeDialect {}, sql).unwrap();
+        let crud = result.into_iter().next().unwrap().unwrap();
+        assert_eq!(crud.create_tables, vec![]);
+        assert_eq!(crud.read_tables, vec![]);
+        assert_eq!(crud.update_tables, vec![]);
+        assert_eq!(crud.delete_tables, vec![]);
+        assert_eq!(crud.diagnostics.len(), 1);
+        assert_eq!(
+            crud.diagnostics[0].kind,
+            TableLevelDiagnosticKind::TooManyTableQualifiers
+        );
+    }
 }
 
 mod delete_statement {

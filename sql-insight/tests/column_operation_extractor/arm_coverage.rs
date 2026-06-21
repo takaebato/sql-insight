@@ -248,6 +248,25 @@ mod expr_arm_coverage {
     }
 
     #[test]
+    fn pipe_set_replaces_slot_case_insensitively() {
+        // `|> SET` rewrites a same-named output in place. The slot match folds
+        // by the dialect's column case, so on a case-insensitive dialect (here
+        // Generic) `SET COL` rewrites the `col` output — one column out, one
+        // lineage edge — rather than appending a second `COL`. (Byte-equality
+        // matching missed `COL` vs `col` and appended, duplicating the column.)
+        assert_column_ops(
+            "SELECT col FROM t |> SET COL = col + 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "col"), read("t", "col")],
+                writes: vec![],
+                lineage: vec![transformation(col("t", "col"), out("COL", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn pipe_extend() {
         assert_unordered_eq!(reads("FROM t |> EXTEND t.a + 1 AS x"), vec![c("a")]);
     }

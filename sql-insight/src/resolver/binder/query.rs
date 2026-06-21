@@ -319,10 +319,11 @@ impl<'a> Binder<'a> {
                     name: Some(column.clone()),
                     expr: self.bind_expr(&a.value, scope),
                 };
-                match exprs
-                    .iter_mut()
-                    .find(|e| e.name.as_ref().is_some_and(|n| n.value == column.value))
-                {
+                match exprs.iter_mut().find(|e| {
+                    e.name
+                        .as_ref()
+                        .is_some_and(|n| self.eq(self.style.casing.column, n, &column))
+                }) {
                     Some(slot) => *slot = ne,
                     None => exprs.push(ne),
                 }
@@ -554,7 +555,6 @@ impl<'a> Binder<'a> {
         };
         let scan = LogicalPlan::Scan(Scan {
             table: m.table.clone(),
-            columns: columns.clone(),
             resolution: m.resolution,
         });
         let relation = Relation::Table {

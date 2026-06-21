@@ -91,8 +91,11 @@ pub(crate) fn table_writes(plan: &LogicalPlan) -> Vec<TableReference> {
 /// its base columns (`QueryOutput` for a query, `Relation` for a DML target).
 /// Returned in source order of the contributing source column (by its written
 /// token span).
-pub(crate) fn column_lineage(plan: &LogicalPlan) -> Vec<ColumnLineageEdge> {
-    let mut edges = lineage::collect_column_lineage(plan);
+pub(crate) fn column_lineage(
+    plan: &LogicalPlan,
+    casing: crate::casing::IdentifierCasing,
+) -> Vec<ColumnLineageEdge> {
+    let mut edges = lineage::collect_column_lineage(plan, casing);
     edges.sort_by_key(|e| source_order(&e.source.reference.name));
     edges
 }
@@ -100,8 +103,11 @@ pub(crate) fn column_lineage(plan: &LogicalPlan) -> Vec<ColumnLineageEdge> {
 /// The `source → target` table-lineage edges: the read-role scans that feed
 /// data into a DML target. Returned in source order of the feeding source table
 /// (by its written token span).
-pub(crate) fn table_lineage(plan: &LogicalPlan) -> Vec<TableLineageEdge> {
-    let mut edges = lineage::collect_table_lineage(plan);
+pub(crate) fn table_lineage(
+    plan: &LogicalPlan,
+    casing: crate::casing::IdentifierCasing,
+) -> Vec<TableLineageEdge> {
+    let mut edges = lineage::collect_table_lineage(plan, casing);
     edges.sort_by_key(|e| source_order(&e.source.reference.name));
     edges
 }

@@ -144,7 +144,7 @@ impl<'a> Binder<'a> {
         match TableReference::try_from_name(name) {
             Ok(table) => Some(table),
             Err(_) => {
-                self.record_too_many_table_qualifiers(name);
+                self.record_unrepresentable_table(name);
                 None
             }
         }
@@ -168,9 +168,13 @@ impl<'a> Binder<'a> {
         });
     }
 
-    /// Record a `TooManyTableQualifiers` diagnostic for an over-qualified table
-    /// name (more than `catalog.schema.name`), carrying its location.
-    pub(super) fn record_too_many_table_qualifiers(&self, name: &ObjectName) {
+    /// Record a `TooManyTableQualifiers` diagnostic for a table name that can't
+    /// be represented as a `catalog.schema.name` [`TableReference`] and was
+    /// dropped — either over-qualified (> 3 segments) or carrying a
+    /// non-identifier part (a function-computed name like Snowflake's
+    /// `IDENTIFIER('t')`). The kind covers both "unrepresentable table ref"
+    /// cases; the message states which. Carries the name's location.
+    pub(super) fn record_unrepresentable_table(&self, name: &ObjectName) {
         let span = name
             .0
             .first()
@@ -181,11 +185,14 @@ impl<'a> Binder<'a> {
             Some(s) => format!(" at L{}:C{}", s.start.line, s.start.column),
             None => String::new(),
         };
+        let reason = if name.0.iter().any(|part| part.as_ident().is_none()) {
+            "is not a plain catalog.schema.name identifier path"
+        } else {
+            "has too many qualifiers (max catalog.schema.name)"
+        };
         self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::TooManyTableQualifiers,
-            message: format!(
-                "table reference `{name}`{suffix} has too many qualifiers (max catalog.schema.name) — dropped"
-            ),
+            message: format!("table reference `{name}`{suffix} {reason} — dropped"),
             span,
         });
     }
@@ -339,7 +346,6 @@ fn join(left: LogicalPlan, right: LogicalPlan, on: Vec<Expr>) -> LogicalPlan {
         left: Box::new(left),
         right: Box::new(right),
         on,
-        lateral: false,
     })
 }
 

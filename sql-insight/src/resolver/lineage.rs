@@ -13,6 +13,7 @@ use sqlparser::ast::Ident;
 
 use super::logical_plan::{peel_with, Expr, LogicalPlan, MergeClause, NamedExpr};
 use super::origins::{conflict_value_origins, enter_withs, origins_of_expr, output_operands, Ctx};
+use crate::casing::IdentifierCasing;
 use crate::extractor::{ColumnLineageEdge, ColumnLineageKind, ColumnTarget, TableLineageEdge};
 use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference};
 
@@ -25,8 +26,11 @@ use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference};
 /// columns and emits `source → Relation` edges. A leading `WITH` is peeled (its
 /// CTE bodies feed the root through `CteRef` expansion, they are not lineage
 /// roots). Backs [`crate::resolver::column_lineage`].
-pub(super) fn collect_column_lineage(plan: &LogicalPlan) -> Vec<ColumnLineageEdge> {
-    let mut ctx = Ctx::new(plan);
+pub(super) fn collect_column_lineage(
+    plan: &LogicalPlan,
+    casing: IdentifierCasing,
+) -> Vec<ColumnLineageEdge> {
+    let mut ctx = Ctx::new(plan, casing);
     let mut edges = Vec::new();
     match peel_with(plan) {
         // INSERT … <source>: pair the source's outputs with the target columns.
@@ -228,10 +232,13 @@ fn merge_value_edges<'a>(
 /// (projection) subqueries, and referenced CTE bodies — never predicate
 /// (filter) subqueries. A bare query, or a statement that moves no data, has
 /// no table lineage. Backs [`crate::resolver::table_lineage`].
-pub(super) fn collect_table_lineage(plan: &LogicalPlan) -> Vec<TableLineageEdge> {
+pub(super) fn collect_table_lineage(
+    plan: &LogicalPlan,
+    casing: IdentifierCasing,
+) -> Vec<TableLineageEdge> {
     // `Ctx::new` peels leading WITHs and keeps their CTE bodies, so a `CteRef`
     // on the feeding path resolves to the body's feeding scans.
-    let mut ctx = Ctx::new(plan);
+    let mut ctx = Ctx::new(plan, casing);
     let mut sources = Vec::new();
     let target = match peel_with(plan) {
         LogicalPlan::Insert(i) => {
@@ -395,7 +402,8 @@ mod tests {
     }
 
     fn lineage_strs(plan: &LogicalPlan) -> Vec<String> {
-        let mut v: Vec<String> = column_lineage(plan)
+        let casing = IdentifierCasing::for_dialect(&GenericDialect {});
+        let mut v: Vec<String> = column_lineage(plan, casing)
             .iter()
             .map(|e| {
                 let src = e

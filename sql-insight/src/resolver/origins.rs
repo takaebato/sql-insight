@@ -9,20 +9,25 @@
 
 use sqlparser::ast::Ident;
 
-use super::logical_plan::{idents_eq, Binding, BoundColumn, Cte, Expr, LogicalPlan, NamedExpr};
+use super::logical_plan::{Binding, BoundColumn, Cte, Expr, LogicalPlan, NamedExpr};
 use super::reads::column_read;
+use crate::casing::{CaseRule, IdentifierCasing};
 use crate::extractor::ColumnLineageKind;
 use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
 
 /// CTE environment for expanding `CteRef`s during a trace, plus the
-/// active-set that terminates a recursive self-reference.
+/// active-set that terminates a recursive self-reference and the dialect
+/// casing for name comparisons (alias matching vs column matching use
+/// different rules — e.g. ClickHouse folds neither, the generic dialect
+/// folds both).
 pub(super) struct Ctx<'a> {
     pub(super) ctes: Vec<&'a Cte>,
     pub(super) active: Vec<String>,
+    pub(super) casing: IdentifierCasing,
 }
 
 impl<'a> Ctx<'a> {
-    pub(super) fn new(op: &'a LogicalPlan) -> Self {
+    pub(super) fn new(op: &'a LogicalPlan, casing: IdentifierCasing) -> Self {
         // Collect leading `With` declarations so a `CteRef` on a traced path
         // resolves to its body.
         let mut ctes = Vec::new();
@@ -34,7 +39,20 @@ impl<'a> Ctx<'a> {
         Ctx {
             ctes,
             active: Vec::new(),
+            casing,
         }
+    }
+
+    /// Compare two identifiers under the dialect's *column* fold (output names,
+    /// EXCLUDED column matching) — sensitive on ClickHouse, otherwise lenient.
+    fn eq_column(&self, a: &Ident, b: &Ident) -> bool {
+        self.casing.column.normalize(a) == self.casing.column.normalize(b)
+    }
+
+    /// Compare two identifiers under the dialect's *alias / CTE* fold (CTE
+    /// names, derived-table / table-function / CTE-ref qualifiers).
+    fn eq_alias(&self, a: &Ident, b: &Ident) -> bool {
+        self.casing.table_alias.normalize(a) == self.casing.table_alias.normalize(b)
     }
 
     /// Run `f` with a `With`'s declarations pushed onto the CTE env, popping
@@ -65,11 +83,12 @@ impl<'a> Ctx<'a> {
         if self.active.iter().any(|n| n == &name.value) {
             return None; // recursive self-reference — terminate
         }
+        let alias_fold = self.casing.table_alias;
         let cte = self
             .ctes
             .iter()
             .rev()
-            .find(|c| idents_eq(&c.name, name))
+            .find(|c| alias_fold.normalize(&c.name) == alias_fold.normalize(name))
             .copied()?;
         self.active.push(name.value.clone());
         let r = f(self, &cte.body);
@@ -145,7 +164,7 @@ fn origins_into<'a>(
     ctx: &mut Ctx<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match op {
-        LogicalPlan::Projection(p) => match find_named(&p.exprs, name) {
+        LogicalPlan::Projection(p) => match find_named(&p.exprs, name, ctx.casing.column) {
             Some(ne) => origins_of_expr(&ne.expr, &p.input, ctx),
             None => Vec::new(),
         },
@@ -161,7 +180,7 @@ fn origins_into<'a>(
             o
         }
         LogicalPlan::SubqueryAlias(sa) => {
-            if !qualifier.is_none_or(|q| idents_eq(q, &sa.alias)) {
+            if !qualifier.is_none_or(|q| ctx.eq_alias(q, &sa.alias)) {
                 Vec::new()
             } else if values_backed(&sa.input) {
                 // A `(VALUES …) AS t(x)` relation synthesises rows with no base
@@ -178,7 +197,7 @@ fn origins_into<'a>(
         // through its alias is a synthetic lineage source (the alias as table)
         // — not collapsible to a base column.
         LogicalPlan::TableFunction(tf) => match &tf.alias {
-            Some(alias) if qualifier.is_none_or(|q| idents_eq(q, alias)) => {
+            Some(alias) if qualifier.is_none_or(|q| ctx.eq_alias(q, alias)) => {
                 vec![(
                     synthetic_source(alias, name),
                     ColumnLineageKind::Passthrough,
@@ -201,7 +220,7 @@ fn origins_into<'a>(
         // references and duplicates the edge.
         LogicalPlan::CteRef(r) => {
             let exposed = r.alias.as_ref().unwrap_or(&r.name);
-            if !qualifier.is_none_or(|q| idents_eq(q, exposed)) {
+            if !qualifier.is_none_or(|q| ctx.eq_alias(q, exposed)) {
                 Vec::new()
             } else {
                 ctx.enter_cte(&r.name, |ctx, body| {
@@ -269,7 +288,7 @@ pub(super) fn conflict_value_origins<'a>(
         // fanning out to every set-operation branch. A source with no
         // inspectable projection (VALUES) keeps the `EXCLUDED.col` pseudo-source.
         Expr::Column(c) if matches!(c.binding, Binding::Derived) => {
-            let Some(i) = columns.iter().position(|t| idents_eq(t, &c.name)) else {
+            let Some(i) = columns.iter().position(|t| ctx.eq_column(t, &c.name)) else {
                 return Vec::new();
             };
             let operands = output_operands(source);
@@ -390,8 +409,11 @@ fn transform(
         .collect()
 }
 
-fn find_named<'a>(exprs: &'a [NamedExpr], name: &Ident) -> Option<&'a NamedExpr> {
-    exprs
-        .iter()
-        .find(|ne| ne.name.as_ref().is_some_and(|n| idents_eq(n, name)))
+fn find_named<'a>(exprs: &'a [NamedExpr], name: &Ident, fold: CaseRule) -> Option<&'a NamedExpr> {
+    let target = fold.normalize(name);
+    exprs.iter().find(|ne| {
+        ne.name
+            .as_ref()
+            .is_some_and(|n| fold.normalize(n) == target)
+    })
 }
