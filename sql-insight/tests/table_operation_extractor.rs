@@ -708,6 +708,56 @@ mod lineage {
     }
 
     #[test]
+    fn aggregate_source_feeds_lineage() {
+        // The source projects an aggregate over a GROUP BY — feeding still
+        // traces through the `Aggregate` to the scanned table.
+        assert_ops(
+            "INSERT INTO t SELECT SUM(s.x) FROM s GROUP BY s.y",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s")],
+                writes: vec![table("t")],
+                lineage: vec![edge("s", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn scalar_subquery_in_projection_feeds_lineage() {
+        // A value-position scalar subquery feeds: both its inner table and
+        // the outer FROM are lineage sources of the target.
+        assert_ops(
+            "INSERT INTO t SELECT (SELECT max(u.z) FROM u) FROM s",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("u"), read("s")],
+                writes: vec![table("t")],
+                lineage: vec![edge("u", "t"), edge("s", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn case_branches_feed_their_scalar_subqueries() {
+        // A CASE in the projection: its `then` / `else` value branches feed,
+        // so both branch subqueries' tables are lineage sources (the `when`
+        // condition is filter position and does not).
+        assert_ops(
+            "INSERT INTO t SELECT CASE WHEN s.a > 0 THEN (SELECT z FROM u) \
+             ELSE (SELECT w FROM v) END FROM s",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("u"), read("v"), read("s")],
+                writes: vec![table("t")],
+                lineage: vec![edge("u", "t"), edge("v", "t"), edge("s", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn join_on_predicate_does_not_promote_to_lineage() {
         // t4 is in JOIN ON's predicate subquery — touches as read
         // but doesn't promote to a lineage edge (predicate position excluded

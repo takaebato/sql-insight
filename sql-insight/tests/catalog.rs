@@ -151,6 +151,35 @@ fn qualified_ddl_keeps_its_own_schema() {
 }
 
 #[test]
+fn three_segment_ddl_registers_catalog_schema_name() {
+    // `CREATE TABLE c.s.t` registers the full catalog.schema.name path; a
+    // matching three-part query resolves Cataloged and canonicalizes to it.
+    let reads = reads_with("CREATE TABLE c.s.t (id INT)", "SELECT id FROM c.s.t");
+    let read = find(&reads, "id");
+    assert_eq!(read.resolution, ResolutionKind::Cataloged);
+    let table = read.reference.table.as_ref().unwrap();
+    assert_eq!(table.catalog.as_ref().unwrap().value, "c");
+    assert_eq!(table.schema.as_ref().unwrap().value, "s");
+    assert_eq!(table.name.value, "t");
+}
+
+#[test]
+fn catalog_table_display_joins_present_segments() {
+    use sql_insight::catalog::CatalogTable;
+    assert_eq!(CatalogTable::unqualified("users").to_string(), "users");
+    assert_eq!(
+        CatalogTable::new("public", "users").to_string(),
+        "public.users"
+    );
+    assert_eq!(
+        CatalogTable::new("public", "users")
+            .catalog("db")
+            .to_string(),
+        "db.public.users"
+    );
+}
+
+#[test]
 fn column_resolution_is_strict_against_registered_columns() {
     // `missing` is not among the registered columns, so the catalog
     // rejects it: Unresolved (table dropped), not silently Inferred.

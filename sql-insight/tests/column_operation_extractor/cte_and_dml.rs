@@ -585,6 +585,51 @@ mod on_conflict {
         );
     }
 
+    #[test]
+    fn pg_on_conflict_set_value_case_traces_excluded_branches() {
+        // A CASE in the conflict value: its `then` / `else` branches are
+        // value operands, so `EXCLUDED.b` (collapsing to the source's
+        // position-1 projection `s.y`) feeds a Transformation edge.
+        assert_column_ops_with_dialect(
+            "INSERT INTO t (a, b) SELECT x, y FROM s \
+             ON CONFLICT (a) DO UPDATE SET b = CASE WHEN EXCLUDED.b > 0 THEN EXCLUDED.b ELSE 0 END",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "x"), read("s", "y")],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
+                lineage: vec![
+                    passthrough(col("s", "x"), relation("t", "a")),
+                    passthrough(col("s", "y"), relation("t", "b")),
+                    transformation(col("s", "y"), relation("t", "b")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn pg_on_conflict_set_value_scalar_subquery_traces_its_source() {
+        // A scalar subquery in the conflict value: its inner read (`u.z`)
+        // feeds the SET target through a Transformation edge.
+        assert_column_ops_with_dialect(
+            "INSERT INTO t (a, b) SELECT x, y FROM s \
+             ON CONFLICT (a) DO UPDATE SET b = (SELECT max(z) FROM u)",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "x"), read("s", "y"), read("u", "z")],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
+                lineage: vec![
+                    passthrough(col("s", "x"), relation("t", "a")),
+                    passthrough(col("s", "y"), relation("t", "b")),
+                    transformation(col("u", "z"), relation("t", "b")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
     // --- MySQL `INSERT … SET col = expr` (assignment form): like a
     // single-table UPDATE, each assignment writes its column and feeds
     // `RHS → target.col` lineage; the RHS resolves against the target.

@@ -257,6 +257,53 @@ mod expr_arm_coverage {
         assert_unordered_eq!(reads("FROM t |> CALL my_func(t.a)"), vec![c("a")]);
     }
 
+    #[test]
+    fn pipe_pivot() {
+        // The pivot's aggregate (`SUM(x)`) and value-source column (`k`) are
+        // reads; `x` also appears in the projection.
+        assert_unordered_eq!(
+            reads("SELECT x, k FROM t |> PIVOT (SUM(x) FOR k IN ('a', 'b'))"),
+            vec![c("x"), c("k"), c("x")]
+        );
+    }
+
+    #[test]
+    fn window_frame_bound() {
+        // A bounded `ROWS BETWEEN … PRECEDING AND … FOLLOWING` frame walks the
+        // bound exprs (here literals); the partition / order keys surface as
+        // reads.
+        assert_unordered_eq!(
+            reads("SELECT SUM(t.x) OVER (ORDER BY t.y ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t"),
+            vec![c("x"), c("y")]
+        );
+    }
+
+    #[test]
+    fn grouping_sets() {
+        // `GROUP BY GROUPING SETS ((a), (b))`: each set member is a key read.
+        assert_unordered_eq!(
+            reads("SELECT t.a FROM t GROUP BY GROUPING SETS ((t.a), (t.b))"),
+            vec![c("a"), c("a"), c("b")]
+        );
+    }
+
+    #[test]
+    fn limit_offset_comma() {
+        // The `LIMIT <offset>, <limit>` form (`OffsetCommaLimit`): both
+        // operands are filter-position reads (here literals).
+        assert_unordered_eq!(reads("SELECT t.a FROM t LIMIT 1, 2"), vec![c("a")]);
+    }
+
+    #[test]
+    fn aggregate_with_order_by_clause() {
+        // An aggregate's `ORDER BY` clause: the value arg (`x`) and the
+        // suppressed ordering key (`y`) both surface as reads.
+        assert_unordered_eq!(
+            reads("SELECT ARRAY_AGG(t.x ORDER BY t.y) FROM t"),
+            vec![c("x"), c("y")]
+        );
+    }
+
     // --- pipe output lineage: an output-producing pipe operator (SELECT /
     // EXTEND / AGGREGATE / SET) projects its value expressions, so they feed
     // `QueryOutput` lineage; filter operators (WHERE / ORDER BY / LIMIT /
@@ -689,6 +736,46 @@ mod relation_arm_coverage {
         assert_unordered_eq!(
             reads("SELECT x.c1 FROM (SELECT t.a FROM t) x (c1)"),
             vec![c("t", "a")]
+        );
+    }
+
+    #[test]
+    fn alias_columns_rename_through_sort_body() {
+        // A derived table with an alias column list whose body is ORDER-BY
+        // topped: the rename walks through the `Sort` to the projection.
+        assert_unordered_eq!(
+            reads("SELECT x.c1 FROM (SELECT t.a FROM t ORDER BY t.a) x (c1)"),
+            vec![c("t", "a"), c("t", "a")]
+        );
+    }
+
+    #[test]
+    fn alias_columns_rename_through_setop_body() {
+        // A CTE alias column list over a UNION body: the rename walks both
+        // `SetOp` branches.
+        assert_unordered_eq!(
+            reads("WITH cte (c1) AS (SELECT a FROM s1 UNION SELECT b FROM s2) SELECT c1 FROM cte"),
+            vec![c("s1", "a"), c("s2", "b")]
+        );
+    }
+
+    #[test]
+    fn alias_columns_rename_through_with_body() {
+        // A derived table whose body is a `WITH`: the rename walks through
+        // the `With` into its body projection.
+        assert_unordered_eq!(
+            reads("SELECT x.c1 FROM (WITH w AS (SELECT a FROM s) SELECT w.a FROM w) x (c1)"),
+            vec![c("s", "a")]
+        );
+    }
+
+    #[test]
+    fn pipe_union_branch_reads_surface() {
+        // A `|> UNION ALL (subquery)` pipe: the branch query's reads surface
+        // (modelled as a filter-position subquery) alongside the input's.
+        assert_unordered_eq!(
+            reads("SELECT t.a FROM t |> UNION ALL (SELECT u.b FROM u)"),
+            vec![c("t", "a"), c("u", "b")]
         );
     }
 
