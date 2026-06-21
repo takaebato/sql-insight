@@ -484,7 +484,9 @@ mod integration {
                 .assert()
                 .success()
                 .stdout(predicate::str::contains("\"value\": \"t1\""))
-                .stdout(predicate::str::contains("\"kind\": \"UnsupportedStatement\""))
+                .stdout(predicate::str::contains(
+                    "\"kind\": \"UnsupportedStatement\"",
+                ))
                 .stderr("");
         }
     }
