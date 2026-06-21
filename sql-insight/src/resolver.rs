@@ -120,3 +120,42 @@ pub(crate) fn flat_tables(plan: &LogicalPlan) -> Vec<TableReference> {
     tables.sort_by_key(|t| source_order(&t.name));
     tables
 }
+
+/// Which `WHEN` actions a `MERGE` carries — `Some` for a (possibly `WITH`-
+/// wrapped) `Merge` root, `None` otherwise. Derived from the binder's
+/// normalized [`logical_plan::MergeClause`] so callers don't re-walk the raw
+/// AST (and don't have to repeat the `Statement::Query(SetExpr::Merge)`
+/// unwrap that catches `WITH … MERGE`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MergeActions {
+    pub(crate) has_insert: bool,
+    pub(crate) has_update: bool,
+    pub(crate) has_delete: bool,
+}
+
+impl MergeActions {
+    /// `true` when at least one `WHEN` action physically writes a row into the
+    /// target (an `INSERT` or `UPDATE` clause). A MERGE that is only `DELETE`
+    /// clauses uses its source solely to pick target rows and moves no data.
+    pub(crate) fn writes_data(&self) -> bool {
+        self.has_insert || self.has_update
+    }
+}
+
+/// Summarize a `MERGE` root's `WHEN` clauses from the bound plan. Returns
+/// `None` for any non-MERGE root.
+pub(crate) fn merge_actions(plan: &LogicalPlan) -> Option<MergeActions> {
+    use logical_plan::{peel_with, MergeClause};
+    let LogicalPlan::Merge(merge) = peel_with(plan) else {
+        return None;
+    };
+    let mut actions = MergeActions::default();
+    for clause in &merge.clauses {
+        match clause {
+            MergeClause::Insert { .. } => actions.has_insert = true,
+            MergeClause::Update { .. } => actions.has_update = true,
+            MergeClause::Delete => actions.has_delete = true,
+        }
+    }
+    Some(actions)
+}

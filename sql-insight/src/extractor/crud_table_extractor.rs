@@ -23,7 +23,7 @@ use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::extractor::{ExtractorOptions, StatementKind, TableOperationExtractor};
 use crate::reference::TableReference;
-use sqlparser::ast::{MergeAction, SetExpr, Statement};
+use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
@@ -91,8 +91,9 @@ impl fmt::Display for CrudTables {
 /// Struct-style entry point. Equivalent to the free
 /// [`extract_crud_tables`] function. A thin shim over
 /// [`TableOperationExtractor`] that buckets `reads`/`writes` into the
-/// CRUD positions and consults the AST only for MERGE clauses (whose
-/// target placement depends on WHEN actions).
+/// CRUD positions, consulting the bind's normalized MERGE clause summary
+/// (rather than re-walking the raw AST) for the one verb-aware case —
+/// whose target placement depends on the WHEN actions.
 #[derive(Default, Debug)]
 pub struct CrudTableExtractor;
 
@@ -127,7 +128,8 @@ impl CrudTableExtractor {
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
     ) -> Result<CrudTables, Error> {
-        let ops = TableOperationExtractor::extract_from_statement(statement, catalog, style)?;
+        let (ops, merge_actions) =
+            TableOperationExtractor::extract_inner(statement, catalog, style)?;
         // CRUD buckets are identity-only — drop the per-read
         // `ResolutionKind` and keep the bare `TableReference`s.
         let reads: Vec<TableReference> = ops.reads.into_iter().map(|r| r.reference).collect();
@@ -153,30 +155,20 @@ impl CrudTableExtractor {
             }
             StatementKind::Merge => {
                 // MERGE target placement depends on which WHEN actions
-                // appear; reach into the AST for that one detail. The
-                // source comes from `reads` directly. A `WITH … MERGE` parses
-                // as `Statement::Query(SetExpr::Merge(inner))`, so unwrap that
-                // wrapper first (as `classify_statement` does) — else the
-                // target would silently fall out of every bucket.
-                if let Statement::Merge(merge) = unwrap_query_dml(statement) {
-                    let (mut inserted, mut updated, mut deleted) = (false, false, false);
-                    for clause in &merge.clauses {
-                        match &clause.action {
-                            MergeAction::Insert(_) => inserted = true,
-                            MergeAction::Update { .. } => updated = true,
-                            MergeAction::Delete { .. } => deleted = true,
-                        }
+                // appear — read that off the IR-derived `MergeActions` the
+                // bind produced, so this stays in step with the binder's
+                // model (and handles `WITH … MERGE` transparently; the
+                // facade peels the wrapper).
+                let actions = merge_actions.unwrap_or_default();
+                for target in &writes {
+                    if actions.has_insert {
+                        crud.create_tables.push(target.clone());
                     }
-                    for target in &writes {
-                        if inserted {
-                            crud.create_tables.push(target.clone());
-                        }
-                        if updated {
-                            crud.update_tables.push(target.clone());
-                        }
-                        if deleted {
-                            crud.delete_tables.push(target.clone());
-                        }
+                    if actions.has_update {
+                        crud.update_tables.push(target.clone());
+                    }
+                    if actions.has_delete {
+                        crud.delete_tables.push(target.clone());
                     }
                 }
                 crud.read_tables = reads;
@@ -216,22 +208,5 @@ impl CrudTableExtractor {
         }
 
         Ok(crud)
-    }
-}
-
-/// Reach the inner DML statement of a `WITH … <DML>`, which the parser wraps
-/// as `Statement::Query(SetExpr::{Insert,Update,Delete,Merge}(inner))` — the
-/// same unwrap [`classify_statement`](crate::extractor::classify_statement)
-/// does to recover the verb. Returns `statement` unchanged otherwise.
-fn unwrap_query_dml(statement: &Statement) -> &Statement {
-    match statement {
-        Statement::Query(query) => match query.body.as_ref() {
-            SetExpr::Insert(inner)
-            | SetExpr::Update(inner)
-            | SetExpr::Delete(inner)
-            | SetExpr::Merge(inner) => inner,
-            _ => statement,
-        },
-        _ => statement,
     }
 }

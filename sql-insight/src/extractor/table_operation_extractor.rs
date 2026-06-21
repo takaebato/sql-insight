@@ -25,6 +25,7 @@ use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
 use crate::extractor::{classify_statement, ExtractorOptions, StatementKind};
 use crate::reference::{TableRead, TableReference};
+use crate::resolver::MergeActions;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -115,12 +116,15 @@ pub struct TableOperation {
 /// `t` from `a JOIN b` emits two edges (`a → t`, `b → t`), not one entry
 /// with both sources.
 ///
-/// **Occurrence-based**: a statement using the same source more than
-/// once (`FROM s AS x JOIN s AS y`, repeated `FROM cte` across UNION
-/// branches) emits one entry per use, not one deduped entry. Matches
-/// [`ColumnLineageEdge`](crate::extractor::ColumnLineageEdge)
-/// on multiplicity. Consumers wanting set-union semantics dedup
-/// explicitly via `HashSet::from_iter`.
+/// **Occurrence on the source side**: a statement reading the same real
+/// table twice (`FROM s AS x JOIN s AS y`, repeated `FROM s` across UNION
+/// branches) emits one edge per occurrence. A CTE body — the one
+/// declaration shared by every `CteRef` — contributes once instead (it
+/// materializes once and feeds once), matching how `reads` walks the body
+/// at its declaration rather than at each reference. Consumers wanting
+/// set-union semantics dedup explicitly via `HashSet::from_iter`. Matches
+/// [`ColumnLineageEdge`](crate::extractor::ColumnLineageEdge) on the
+/// non-CTE multiplicity rule.
 ///
 /// Tables referenced only inside a predicate subquery are excluded:
 /// `INSERT INTO t SELECT FROM s WHERE id IN (SELECT id FROM x)` emits
@@ -178,33 +182,51 @@ impl TableOperationExtractor {
             .collect())
     }
 
-    /// Assemble the table operation from the bound plan: classify the verb,
-    /// bind the statement, walk the plan for `reads` / `writes`, and (for
-    /// data-moving statements only) `lineage`. Column-level diagnostics
-    /// project down to the table level. A kind the binder can't model
-    /// yields an empty operation with an `UnsupportedStatement` diagnostic.
+    /// Assemble the table operation from the bound plan: see
+    /// [`extract_inner`](Self::extract_inner). Public-facing callers want the
+    /// `TableOperation` alone.
     pub(crate) fn extract_from_statement(
         statement: &Statement,
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
     ) -> Result<TableOperation, Error> {
+        Self::extract_inner(statement, catalog, style).map(|(op, _)| op)
+    }
+
+    /// Bind the statement and walk the plan for `reads` / `writes` / (for
+    /// data-moving statements only) `lineage`; classify the verb; project the
+    /// column-level diagnostics down. Returns the assembled `TableOperation`
+    /// plus the bound plan's MERGE clause summary — `None` outside MERGE —
+    /// so a same-crate caller (the CRUD extractor) can bucket the target by
+    /// WHEN actions without re-walking the raw AST. An `Unsupported` kind
+    /// yields an empty operation with an `UnsupportedStatement` diagnostic
+    /// and no merge summary (the plan is never built).
+    pub(crate) fn extract_inner(
+        statement: &Statement,
+        catalog: Option<&Catalog>,
+        style: IdentifierStyle,
+    ) -> Result<(TableOperation, Option<MergeActions>), Error> {
         let statement_kind = classify_statement(statement);
         if statement_kind == StatementKind::Unsupported {
-            return Ok(unsupported_table_operation(statement_kind, statement));
+            return Ok((unsupported_table_operation(statement_kind, statement), None));
         }
         let (plan, column_diagnostics) = crate::resolver::build(statement, catalog, style);
+        let merge_actions = crate::resolver::merge_actions(&plan);
         // Lineage is only for statements that move data into a target. A
         // column-less INSERT and a DELETE both bind to a `Write`, so the
         // structural walk can't tell them apart — gate on the kind. A MERGE
         // whose WHEN clauses are only DELETEs uses its source solely to pick
         // target rows, so it moves no data even though the source is a
-        // feeding input — gate it out via `merge_moves_data`.
-        let lineage = if moves_data(&statement_kind) && merge_moves_data(statement) {
+        // feeding input — read that off the IR-derived `MergeActions` rather
+        // than re-walking the raw `Statement::Merge`.
+        let emits_lineage =
+            writes_data(&statement_kind) && merge_actions.is_none_or(|a| a.writes_data());
+        let lineage = if emits_lineage {
             crate::resolver::table_lineage(&plan, style.casing)
         } else {
             Vec::new()
         };
-        Ok(TableOperation {
+        let op = TableOperation {
             statement_kind,
             reads: crate::resolver::table_reads(&plan),
             writes: crate::resolver::table_writes(&plan),
@@ -216,14 +238,15 @@ impl TableOperationExtractor {
                 .iter()
                 .filter_map(|d| d.to_table_level())
                 .collect(),
-        })
+        };
+        Ok((op, merge_actions))
     }
 }
 
 /// Whether a statement physically moves data into its target (so it emits
 /// table lineage). `DELETE` / `DROP` / `TRUNCATE` / `ALTER TABLE` touch a
 /// target but feed it nothing; a bare `SELECT` has no target.
-fn moves_data(kind: &StatementKind) -> bool {
+fn writes_data(kind: &StatementKind) -> bool {
     matches!(
         kind,
         StatementKind::Insert
@@ -250,21 +273,4 @@ fn unsupported_table_operation(
             span: None,
         }],
     }
-}
-
-/// Whether a `MERGE` feeds data from its source into the target — true
-/// unless every WHEN clause is a `DELETE` (which only uses the source to
-/// pick target rows to remove). Non-`MERGE` statements are unaffected
-/// (returns `true`); the caller still gates them on [`moves_data`].
-fn merge_moves_data(statement: &Statement) -> bool {
-    use sqlparser::ast::MergeAction;
-    let Statement::Merge(merge) = statement else {
-        return true;
-    };
-    merge.clauses.iter().any(|clause| {
-        matches!(
-            clause.action,
-            MergeAction::Insert(_) | MergeAction::Update { .. }
-        )
-    })
 }
