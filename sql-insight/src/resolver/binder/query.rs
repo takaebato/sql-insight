@@ -481,17 +481,12 @@ impl<'a> Binder<'a> {
         if !sort_keys.is_empty() {
             node = sort(node, sort_keys);
         }
-        // `SELECT … INTO t` (MsSql / Postgres): the query also creates table `t`
-        // — wrap the projection as the create source so `t` is a write target.
-        if let Some(into) = &select.into {
-            if let Some(written) = self.table_ref(&into.name) {
-                node = LogicalPlan::CreateTableAs(CreateTableAs {
-                    target: self.table_match(&written).table,
-                    columns: Vec::new(),
-                    input: Box::new(node),
-                });
-            }
-        }
+        // `SELECT … INTO t` is *not* wrapped here: `INTO` rides the leading
+        // SELECT but targets the whole query (over a UNION it creates one table
+        // from the combined result), and it's only a real create at the
+        // statement root. The wrap happens once in `bind_statement` so a nested
+        // SELECT can't leak a `CreateTableAs` mid-tree (which the write walkers,
+        // peeling only a leading `WITH`, would miss while `flat_tables` saw it).
         (node, clause_scope)
     }
 

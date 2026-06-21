@@ -95,6 +95,20 @@ pub enum ColumnLevelDiagnosticKind {
     /// `table_writes`). Supply a [`Catalog`](crate::catalog::Catalog) to
     /// resolve it. `message` names the target.
     InsertColumnsUnresolved,
+    /// An `INSERT INTO t (a, b, c) <source>` whose explicit target column
+    /// count differs from the source query's projected column count. The
+    /// positional pairing zips to the shorter side, so the surplus target
+    /// columns get no `lineage` edge (their `writes` still surface) — a
+    /// silent truncation this flags. `message` states both counts.
+    InsertColumnsArityMismatch,
+    /// A `CREATE TABLE … AS` / `CREATE VIEW …` (without an explicit column
+    /// list) whose source projects one or more outputs with no derivable name —
+    /// unaliased expressions like `SELECT a + 1`. The created relation *does*
+    /// get those columns, but their names are engine-specific and not
+    /// recoverable from the SQL text (e.g. PostgreSQL `?column?`), so they can't
+    /// be named `writes` / `lineage` targets and are dropped. Alias the
+    /// expressions to surface them. `message` names the relation and the count.
+    AnonymousColumnsSuppressed,
 }
 
 impl ColumnLevelDiagnostic {
@@ -118,7 +132,9 @@ impl ColumnLevelDiagnostic {
                 TableLevelDiagnosticKind::TooManyTableQualifiers
             }
             ColumnLevelDiagnosticKind::WildcardSuppressed
-            | ColumnLevelDiagnosticKind::InsertColumnsUnresolved => return None,
+            | ColumnLevelDiagnosticKind::InsertColumnsUnresolved
+            | ColumnLevelDiagnosticKind::InsertColumnsArityMismatch
+            | ColumnLevelDiagnosticKind::AnonymousColumnsSuppressed => return None,
         };
         Some(TableLevelDiagnostic {
             kind,

@@ -261,15 +261,28 @@ pub(crate) enum MergeClause {
 }
 
 /// `CREATE TABLE target (columns) AS <input>`: like [`Insert`] (source
-/// columns pair with target columns) but creates the relation.
+/// columns pair with target columns) but creates the relation. `columns` holds
+/// only the *explicit* column list and is empty for the implicit form
+/// (`CREATE TABLE t AS …`); there the per-position target name is the source
+/// output's own inferred name, resolved at the write / lineage surface so both
+/// stay aligned with the source outputs (an anonymous output is unnameable, so
+/// it contributes no write / lineage edge without shifting later positions).
+///
+/// `schema_source` is the table a `CREATE TABLE t LIKE src` / `... CLONE src`
+/// copies its shape from (`input` is then [`LogicalPlan::Empty`]). It is a
+/// structural reference — the new table's *columns* aren't known here (no
+/// wildcard expansion) and no row data moves — so it surfaces only in the flat
+/// table list, never as a column read / write / lineage edge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreateTableAs {
     pub(crate) target: TableReference,
     pub(crate) columns: Vec<Ident>,
     pub(crate) input: Box<LogicalPlan>,
+    pub(crate) schema_source: Option<TableReference>,
 }
 
-/// `CREATE VIEW target (columns) AS <input>`.
+/// `CREATE VIEW target (columns) AS <input>`. `columns` is the explicit column
+/// list only (empty for the implicit form), resolved like [`CreateTableAs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreateView {
     pub(crate) target: TableReference,

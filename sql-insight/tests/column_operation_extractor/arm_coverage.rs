@@ -1111,12 +1111,17 @@ mod relation_arm_coverage {
 
     #[test]
     fn select_into() {
-        // `SELECT ... INTO new_t` binds `new_t` as a write target but
-        // generates no column-level writes (no projection pairing). The
-        // projection still surfaces as a read.
+        // `SELECT ... INTO new_t` lowers to the same `CreateTableAs` shape as
+        // `CREATE TABLE new_t AS SELECT ...` (they're equivalent), so it pairs
+        // the source outputs with the new relation's inferred column names:
+        // `new_t.a` is written and `t.a -> new_t.a` flows.
         let result = op("SELECT t.a INTO new_t FROM t");
         assert_unordered_eq!(result.reads, vec![c("t", "a")]);
-        assert_eq!(result.writes, vec![]);
+        assert_eq!(result.writes, vec![write("new_t", "a")]);
+        assert_unordered_eq!(
+            result.lineage,
+            vec![passthrough(c("t", "a"), relation("new_t", "a"))]
+        );
     }
 
     #[test]

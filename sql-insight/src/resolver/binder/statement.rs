@@ -8,7 +8,7 @@ use super::*;
 impl<'a> Binder<'a> {
     pub(super) fn bind_statement(&self, statement: &Statement) -> LogicalPlan {
         match statement {
-            Statement::Query(query) => self.bind_query(query).0,
+            Statement::Query(query) => self.bind_query_into(query),
             Statement::Insert(insert) => self.bind_insert(insert),
             Statement::Update(update) => self.bind_update(update),
             Statement::Delete(delete) => self.bind_delete(delete),
@@ -35,6 +35,7 @@ impl<'a> Binder<'a> {
                     target: self.table_match(&written).table,
                     columns: Vec::new(),
                     input: Box::new(LogicalPlan::Empty),
+                    schema_source: None,
                 }),
                 None => LogicalPlan::Empty,
             },
@@ -48,6 +49,28 @@ impl<'a> Binder<'a> {
             }),
             _ => LogicalPlan::Empty,
         }
+    }
+
+    /// Bind a top-level query, applying a leading `SELECT … INTO t` as a
+    /// `CreateTableAs` over the *whole* result (over a UNION it creates one
+    /// table from the combined branches). Only the statement root creates a
+    /// table — `INTO` nested in a subquery / CTE body isn't valid SQL there, so
+    /// it's ignored rather than leaking a mid-tree `CreateTableAs` that the
+    /// write walkers (which peel only a leading `WITH`) would miss.
+    fn bind_query_into(&self, query: &Query) -> LogicalPlan {
+        let plan = self.bind_query(query).0;
+        let Some(name) = leading_select_into(&query.body) else {
+            return plan;
+        };
+        let Some(written) = self.table_ref(name) else {
+            return plan;
+        };
+        LogicalPlan::CreateTableAs(CreateTableAs {
+            target: self.table_match(&written).table,
+            columns: Vec::new(),
+            input: Box::new(plan),
+            schema_source: None,
+        })
     }
 
     /// `INSERT INTO target (columns) <source>`: the source query's plan is the
@@ -97,6 +120,22 @@ impl<'a> Binder<'a> {
         // surfaces read as "couldn't analyze", not "nothing written".
         if columns.is_empty() && insert.source.is_some() {
             self.record_insert_columns_unresolved(&target);
+        }
+        // An *explicit* target column list whose count differs from the source
+        // query's projected columns: relation lineage zips to the shorter side,
+        // silently dropping the surplus. Flag it. (Only when the source exposes
+        // a determinate projection — a `VALUES` / pure-wildcard source yields no
+        // operands here and is covered elsewhere.)
+        if !insert.columns.is_empty() {
+            if let Some((outputs, _)) = output_operands(&input).first() {
+                if !outputs.is_empty() && outputs.len() != columns.len() {
+                    self.record_insert_columns_arity_mismatch(
+                        &target,
+                        columns.len(),
+                        outputs.len(),
+                    );
+                }
+            }
         }
         // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: extra writes + their
         // `value → target.col` lineage, plus the optional `DO UPDATE … WHERE`
@@ -559,8 +598,12 @@ impl<'a> Binder<'a> {
     }
 
     /// `CREATE TABLE dst AS <query>` (CTAS): the source query's reads, paired
-    /// with the new table's columns (explicit defs win, else the source output
-    /// names). A plain `CREATE TABLE t (cols)` (no query) is a target-only
+    /// with the new table's columns. `columns` carries only the *explicit*
+    /// column list (`CREATE TABLE t (a, b) AS …`), empty when none is written;
+    /// the implicit case (column names inherited from the source outputs, with
+    /// anonymous outputs dropped) is resolved positionally at the write /
+    /// lineage surface, so writes and lineage stay aligned with the source's
+    /// outputs. A plain `CREATE TABLE t (cols)` (no query) is a target-only
     /// create — its column definitions aren't writes — so it binds with no
     /// columns / input.
     pub(super) fn bind_create_table(&self, create: &CreateTable) -> LogicalPlan {
@@ -569,38 +612,50 @@ impl<'a> Binder<'a> {
         };
         let target = self.table_match(&written).table;
         let Some(query) = create.query.as_ref() else {
+            // No `AS <query>`: a target-only create. `LIKE src` / `CLONE src`
+            // copies another table's shape — capture that source so it still
+            // surfaces in the flat table list (it is a structural reference,
+            // not a row-data read; see `CreateTableAs::schema_source`).
+            let schema_source = create
+                .like
+                .as_ref()
+                .map(|k| match k {
+                    CreateTableLikeKind::Plain(l) | CreateTableLikeKind::Parenthesized(l) => {
+                        &l.name
+                    }
+                })
+                .or(create.clone.as_ref())
+                .and_then(|name| self.table_ref(name))
+                .map(|src| self.table_match(&src).table);
             return LogicalPlan::CreateTableAs(CreateTableAs {
                 target,
                 columns: Vec::new(),
                 input: Box::new(LogicalPlan::Empty),
+                schema_source,
             });
         };
-        let (input, scope) = self.bind_query(query);
-        let columns = if create.columns.is_empty() {
-            scope.exposed_columns(None)
-        } else {
-            create.columns.iter().map(|c| c.name.clone()).collect()
-        };
+        let (input, _) = self.bind_query(query);
+        let columns: Vec<Ident> = create.columns.iter().map(|c| c.name.clone()).collect();
+        self.flag_anonymous_relation_columns(&target, &columns, &input);
         LogicalPlan::CreateTableAs(CreateTableAs {
             target,
             columns,
             input: Box::new(input),
+            schema_source: None,
         })
     }
 
-    /// `CREATE VIEW v AS <query>`: like CTAS — the query's reads paired with
-    /// the view's columns (explicit list wins, else source names).
+    /// `CREATE VIEW v AS <query>`: like CTAS — `columns` is the explicit column
+    /// list only (empty when none); the implicit source-output names are
+    /// resolved at the write / lineage surface.
     pub(super) fn bind_create_view(&self, create: &SqlCreateView) -> LogicalPlan {
         let Some(written) = self.table_ref(&create.name) else {
             return LogicalPlan::Empty;
         };
         let target = self.table_match(&written).table;
-        let (input, scope) = self.bind_query(&create.query);
-        let columns = if create.columns.is_empty() {
-            scope.exposed_columns(None)
-        } else {
-            create.columns.iter().map(|c| c.name.clone()).collect()
-        };
+        let (input, _) = self.bind_query(&create.query);
+        let columns: Vec<Ident> = create.columns.iter().map(|c| c.name.clone()).collect();
+        self.flag_anonymous_relation_columns(&target, &columns, &input);
         LogicalPlan::CreateView(CreateView {
             target,
             columns,
@@ -609,7 +664,8 @@ impl<'a> Binder<'a> {
     }
 
     /// `ALTER VIEW v AS <query>`: a view replacement — bound like
-    /// [`bind_create_view`](Self::bind_create_view).
+    /// [`bind_create_view`](Self::bind_create_view) (`columns` = the explicit
+    /// list only).
     pub(super) fn bind_alter_view(
         &self,
         name: &ObjectName,
@@ -620,15 +676,11 @@ impl<'a> Binder<'a> {
             return LogicalPlan::Empty;
         };
         let target = self.table_match(&written).table;
-        let (input, scope) = self.bind_query(query);
-        let columns = if columns.is_empty() {
-            scope.exposed_columns(None)
-        } else {
-            columns.to_vec()
-        };
+        let (input, _) = self.bind_query(query);
+        self.flag_anonymous_relation_columns(&target, columns, &input);
         LogicalPlan::CreateView(CreateView {
             target,
-            columns,
+            columns: columns.to_vec(),
             input: Box::new(input),
         })
     }
@@ -672,5 +724,24 @@ impl<'a> Binder<'a> {
             .map(|written| self.table_match(&written).table)
             .collect();
         LogicalPlan::Drop(Drop { targets })
+    }
+}
+
+/// The target table of a query's leading `SELECT … INTO t`, if any. `INTO`
+/// rides the first SELECT — including the left branch of a top-level set
+/// operation, where it targets the combined result — so this follows the left
+/// spine. A non-leading SELECT (a right branch, a subquery) can't carry a
+/// statement-level `INTO`, so those arms yield `None`.
+fn leading_select_into(body: &SetExpr) -> Option<&ObjectName> {
+    match body {
+        SetExpr::Select(select) => select.into.as_ref().map(|into| &into.name),
+        SetExpr::Query(query) => leading_select_into(&query.body),
+        SetExpr::SetOperation { left, .. } => leading_select_into(left),
+        SetExpr::Values(_)
+        | SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_)
+        | SetExpr::Table(_) => None,
     }
 }

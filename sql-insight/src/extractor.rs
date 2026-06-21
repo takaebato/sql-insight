@@ -208,7 +208,16 @@ pub(crate) fn classify_statement(statement: &Statement) -> StatementKind {
             | SetExpr::Update(stmt)
             | SetExpr::Delete(stmt)
             | SetExpr::Merge(stmt) => classify_statement(stmt),
-            _ => StatementKind::Select,
+            // Read-only / row-producing bodies all classify as `Select`
+            // (`StatementKind::Select` documents that it covers `VALUES`,
+            // `WITH … SELECT`, `TABLE foo`, and set operations). Enumerated, not
+            // `_`-matched, so a future write-bearing `SetExpr` variant is a
+            // compile error here rather than silently bucketing as `Select`.
+            SetExpr::Select(_)
+            | SetExpr::Query(_)
+            | SetExpr::SetOperation { .. }
+            | SetExpr::Values(_)
+            | SetExpr::Table(_) => StatementKind::Select,
         },
         Statement::Insert(_) => StatementKind::Insert,
         Statement::Update(_) => StatementKind::Update,

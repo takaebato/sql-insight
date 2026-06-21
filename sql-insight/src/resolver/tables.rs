@@ -15,6 +15,7 @@
 use sqlparser::ast::Ident;
 
 use super::logical_plan::{peel_with, walk_plan, LogicalPlan, MergeClause};
+use super::origins::output_operands;
 use crate::reference::{ColumnReference, TableReference};
 
 // ===== writes ============================================================
@@ -45,8 +46,8 @@ pub(super) fn collect_writes(plan: &LogicalPlan) -> Vec<ColumnReference> {
             .collect(),
         // CTAS / CREATE VIEW write the new relation's columns; ALTER TABLE
         // writes its column-naming operations' columns.
-        LogicalPlan::CreateTableAs(c) => qualify(&c.columns, &c.target),
-        LogicalPlan::CreateView(c) => qualify(&c.columns, &c.target),
+        LogicalPlan::CreateTableAs(c) => created_relation_writes(&c.columns, &c.input, &c.target),
+        LogicalPlan::CreateView(c) => created_relation_writes(&c.columns, &c.input, &c.target),
         LogicalPlan::AlterTable(a) => qualify(&a.columns, &a.target),
         // MERGE writes each WHEN action's target columns (UPDATE SET targets;
         // INSERT columns paired with values).
@@ -147,6 +148,33 @@ fn qualify(columns: &[Ident], target: &TableReference) -> Vec<ColumnReference> {
         .collect()
 }
 
+/// The columns a CTAS / CREATE VIEW writes. An *explicit* column list
+/// (`CREATE TABLE t (a, b) AS …`) is authoritative; the implicit form takes
+/// each source output's inferred name (an anonymous output is unnameable, so
+/// dropped — never positionally shifting later columns). A set-op source takes
+/// its result schema from the left branch. Kept in step with
+/// [`super::lineage`]'s `created_relation_lineage` so writes and lineage agree.
+fn created_relation_writes(
+    explicit: &[Ident],
+    input: &LogicalPlan,
+    target: &TableReference,
+) -> Vec<ColumnReference> {
+    if !explicit.is_empty() {
+        return qualify(explicit, target);
+    }
+    match output_operands(input).first() {
+        Some((outputs, _)) => outputs
+            .iter()
+            .filter_map(|ne| ne.name.clone())
+            .map(|name| ColumnReference {
+                table: Some(target.clone()),
+                name,
+            })
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 // ===== flat tables =======================================================
 
 /// The flat list of every table the statement references — one per relation
@@ -182,9 +210,32 @@ fn collect_flat_into(plan: &LogicalPlan, out: &mut Vec<TableReference>) {
         LogicalPlan::Insert(i) => out.push(i.target.clone()),
         LogicalPlan::Update(u) => out.push(u.target.clone()),
         LogicalPlan::Merge(m) => out.push(m.target.clone()),
-        LogicalPlan::CreateTableAs(c) => out.push(c.target.clone()),
+        LogicalPlan::CreateTableAs(c) => {
+            out.push(c.target.clone());
+            // `LIKE` / `CLONE` schema template — a referenced table with no
+            // row-data role, surfaced only in this flat list.
+            out.extend(c.schema_source.clone());
+        }
         LogicalPlan::CreateView(c) => out.push(c.target.clone()),
         LogicalPlan::AlterTable(a) => out.push(a.target.clone()),
-        _ => {}
+        // Operators that name no table of their own: pure relational shape,
+        // CTE plumbing, synthetic leaves, and `Delete` (its targets are
+        // collected by the early-return above, before this walk). Listed
+        // explicitly — like the sibling write walkers — so a new
+        // table-naming `LogicalPlan` variant is a compile error here, not a
+        // silent omission from the flat list.
+        LogicalPlan::Filter(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Projection(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::SetOp(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::TableFunction(_)
+        | LogicalPlan::With(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::Delete(_) => {}
     });
 }

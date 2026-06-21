@@ -710,7 +710,7 @@ mod tests {
     /// catalog's defaults, **schema before catalog** — and catalog-fill is gated
     /// on a *present* schema, so `default_catalog` alone never touches a bare
     /// name. (Asserts segment values; the fill quote-wraps internally for
-    /// matching, which doesn't affect the resolved values.)
+    /// case-exact matching, which doesn't affect the resolved values.)
     ///
     /// | written     | defaults       | filled            |
     /// |-------------|----------------|-------------------|

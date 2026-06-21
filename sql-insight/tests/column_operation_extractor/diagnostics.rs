@@ -135,6 +135,76 @@ mod reported {
             },
         );
     }
+
+    #[test]
+    fn insert_column_count_mismatch_is_flagged() {
+        // 3 target columns but the source projects 1: `writes` still lists all
+        // three (they come from syntax), but lineage can only pair the first,
+        // so the surplus is silently dropped — flagged with an arity mismatch
+        // so the writes-vs-lineage gap reads as "couldn't pair", not "no source".
+        assert_column_ops(
+            "INSERT INTO t (a, b, c) SELECT x FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "x")],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "c")],
+                lineage: vec![passthrough(col("s", "x"), relation("t", "a"))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsArityMismatch)],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_matching_column_count_is_not_flagged() {
+        // The arity check must not fire on a well-formed INSERT.
+        assert_column_ops(
+            "INSERT INTO t (a, b) SELECT x, y FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "x"), read("s", "y")],
+                writes: vec![write("t", "a"), write("t", "b")],
+                lineage: vec![
+                    passthrough(col("s", "x"), relation("t", "a")),
+                    passthrough(col("s", "y"), relation("t", "b")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn unaliased_ctas_expression_column_is_flagged() {
+        // `a + 1` has no alias, so the created table's column can't be named
+        // from the SQL text (engines auto-name it, e.g. `?column?`). It's
+        // dropped from writes / lineage — but flagged, not silently lost. The
+        // source `s.a` still surfaces as a read.
+        assert_column_ops(
+            "CREATE TABLE t AS SELECT a + 1 FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("s", "a")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::AnonymousColumnsSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn aliased_ctas_expression_column_is_not_flagged() {
+        // Aliasing the expression names the column, so it surfaces in writes /
+        // lineage and nothing is flagged — the practical fix for the above.
+        assert_column_ops(
+            "CREATE TABLE t AS SELECT a + 1 AS x FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("s", "a")],
+                writes: vec![write("t", "x")],
+                lineage: vec![transformation(col("s", "a"), relation("t", "x"))],
+                diagnostics: vec![],
+            },
+        );
+    }
 }
 
 /// Coverage for the large "unsupported statement" dispatch arm in

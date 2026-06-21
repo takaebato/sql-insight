@@ -63,6 +63,53 @@ fn schema_less_table_matches_a_qualified_query_by_wildcard() {
 }
 
 #[test]
+fn default_schema_is_matched_case_exactly_against_the_registration() {
+    // A configured `default_schema` is a catalog-side schema *name* — the same
+    // kind of case-exact stored identifier `CatalogTable` registers — so it is
+    // matched case-exactly, not folded. Declaring `default_schema("public")`
+    // against a registered `public` table resolves a bare `users` (Cataloged);
+    // a mismatched-case default (`"PUBLIC"`) is a caller-side inconsistency and
+    // correctly *fails* to match (Inferred), even though an inline unquoted
+    // `PUBLIC.users` — query text, which folds — still hits. The two live on
+    // different layers (catalog config vs query text), so they need not agree.
+    use sql_insight::catalog::CatalogTable;
+    use sql_insight::sqlparser::dialect::PostgreSqlDialect;
+
+    let resolve = |default_schema: &str, query: &str| {
+        let catalog = Catalog::new()
+            .default_schema(default_schema)
+            .table(CatalogTable::new("public", "users").columns(["id"]));
+        let reads = extract_column_operations_with_options(
+            &PostgreSqlDialect {},
+            query,
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap()
+        .reads;
+        find(&reads, "id").resolution
+    };
+
+    // Matching-case default fills + resolves the bare ref.
+    assert_eq!(
+        resolve("public", "SELECT id FROM users"),
+        ResolutionKind::Cataloged
+    );
+    // Mismatched-case default is case-exact, so it doesn't match `public`.
+    assert_eq!(
+        resolve("PUBLIC", "SELECT id FROM users"),
+        ResolutionKind::Inferred
+    );
+    // An inline unquoted qualifier is query text and folds, so it still hits —
+    // regardless of the (here mismatched) default.
+    assert_eq!(
+        resolve("PUBLIC", "SELECT id FROM PUBLIC.users"),
+        ResolutionKind::Cataloged
+    );
+}
+
+#[test]
 fn catalog_table_unqualified_matches_bare_and_qualified_queries() {
     // `CatalogTable::unqualified` directly (not via DDL): a schema-less
     // entry matches both a bare and a qualified query by name.

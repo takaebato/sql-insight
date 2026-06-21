@@ -35,13 +35,13 @@
 
 use sqlparser::ast::{
     AlterTable as SqlAlterTable, AlterTableOperation, AssignmentTarget, CreateTable,
-    CreateView as SqlCreateView, Cte as SqlCte, Delete as SqlDelete, Expr as SqlExpr, FromTable,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier,
-    Ident, Insert as SqlInsert, JoinConstraint, JoinOperator, Merge as SqlMerge, MergeAction,
-    MergeInsertKind, ObjectName, ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr,
-    OrderByKind, PipeOperator, PivotValueSource, Query, Select, SelectItem, SetExpr, Statement,
-    TableAlias, TableFactor, TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind,
-    Values as SqlValues,
+    CreateTableLikeKind, CreateView as SqlCreateView, Cte as SqlCte, Delete as SqlDelete,
+    Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, GroupByWithModifier, Ident, Insert as SqlInsert, JoinConstraint, JoinOperator,
+    Merge as SqlMerge, MergeAction, MergeInsertKind, ObjectName, ObjectType, OnConflictAction,
+    OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource, Query, Select,
+    SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject, TableWithJoins,
+    Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
 };
 
 use std::cell::RefCell;
@@ -58,6 +58,7 @@ use super::logical_plan::{
     Cte, CteRef, Delete, Drop, Expr, Filter, Insert, Join, LogicalPlan, Merge, MergeClause,
     NamedExpr, Projection, Scan, SetOp, Sort, SubqueryAlias, TableFunction, Update, Values, With,
 };
+use super::origins::output_operands;
 use crate::casing::{CaseRule, IdentifierStyle};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
@@ -204,6 +205,58 @@ impl<'a> Binder<'a> {
             span: None,
         });
     }
+
+    /// Record an `InsertColumnsArityMismatch` for an `INSERT INTO t (cols)
+    /// <source>` whose explicit target column count differs from the source's
+    /// projected count: the positional pairing zips to the shorter side, so
+    /// surplus columns get no lineage edge.
+    pub(super) fn record_insert_columns_arity_mismatch(
+        &self,
+        target: &TableReference,
+        target_columns: usize,
+        source_columns: usize,
+    ) {
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::InsertColumnsArityMismatch,
+            message: format!(
+                "INSERT into `{target}` lists {target_columns} target column(s) but the source projects {source_columns} — lineage pairs only the first {min} and drops the rest",
+                min = target_columns.min(source_columns)
+            ),
+            span: None,
+        });
+    }
+
+    /// Flag a CTAS / CREATE VIEW (without an explicit column list) whose source
+    /// projects unaliased expressions: those columns have no name recoverable
+    /// from the SQL text, so they're dropped from column `writes` / `lineage`.
+    /// A no-op when an explicit column list names every column or when every
+    /// output is nameable. The set-op result schema follows the left branch, so
+    /// only the first operand is inspected (mirroring `created_relation_*`).
+    pub(super) fn flag_anonymous_relation_columns(
+        &self,
+        target: &TableReference,
+        explicit: &[Ident],
+        input: &LogicalPlan,
+    ) {
+        if !explicit.is_empty() {
+            return;
+        }
+        let operands = output_operands(input);
+        let Some((outputs, _)) = operands.first() else {
+            return;
+        };
+        let anonymous = outputs.iter().filter(|ne| ne.name.is_none()).count();
+        if anonymous == 0 {
+            return;
+        }
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::AnonymousColumnsSuppressed,
+            message: format!(
+                "`{target}` has {anonymous} unaliased expression column(s) with no name recoverable from the SQL text — dropped from column writes / lineage; alias them to surface"
+            ),
+            span: None,
+        });
+    }
 }
 
 /// Format a known span as the trailing " at L{line}:C{col}" suffix that
@@ -219,7 +272,14 @@ fn span_suffix(span: Option<Span>) -> String {
 // ===== catalog matching ==================================================
 
 /// Fill a query reference's missing prefix segments from the catalog's
-/// defaults (bare → schema then catalog).
+/// defaults (bare → schema then catalog) for **matching**. A configured
+/// default is a catalog-side schema / catalog *name* — the same kind of
+/// case-exact stored identifier [`CatalogTable`] registers — so it is filled
+/// **quoted**, matched case-exactly against the registration (a
+/// `default_schema("public")` must match a registered `public`; a mismatched
+/// case is a caller-side inconsistency, surfaced as a non-match, not folded
+/// away). This is the query side's *matching* form; the surfaced identity uses
+/// [`surface_with_defaults`] (plain).
 fn fill_query_defaults(written: &TableReference, catalog: &Catalog) -> TableReference {
     let mut filled = written.clone();
     if filled.schema.is_none() {
@@ -398,7 +458,57 @@ fn alter_table_op_target_columns(op: &AlterTableOperation) -> Vec<Ident> {
         AlterTableOperation::ChangeColumn { old_name, .. } => vec![old_name.clone()],
         AlterTableOperation::ModifyColumn { col_name, .. } => vec![col_name.clone()],
         AlterTableOperation::AlterColumn { column_name, .. } => vec![column_name.clone()],
-        _ => Vec::new(),
+        // Schema-level ops that name no column (constraints, indexes,
+        // partitions, projections, RLS / rule / trigger toggles, table rename /
+        // owner / cluster, engine knobs, …). Enumerated rather than `_`-matched
+        // so a future *column*-naming `AlterTableOperation` variant is a compile
+        // error here, not a silent gap in the column-write surface.
+        AlterTableOperation::AddConstraint { .. }
+        | AlterTableOperation::AddProjection { .. }
+        | AlterTableOperation::DropProjection { .. }
+        | AlterTableOperation::MaterializeProjection { .. }
+        | AlterTableOperation::ClearProjection { .. }
+        | AlterTableOperation::DisableRowLevelSecurity
+        | AlterTableOperation::DisableRule { .. }
+        | AlterTableOperation::DisableTrigger { .. }
+        | AlterTableOperation::DropConstraint { .. }
+        | AlterTableOperation::AttachPartition { .. }
+        | AlterTableOperation::DetachPartition { .. }
+        | AlterTableOperation::FreezePartition { .. }
+        | AlterTableOperation::UnfreezePartition { .. }
+        | AlterTableOperation::DropPrimaryKey { .. }
+        | AlterTableOperation::DropForeignKey { .. }
+        | AlterTableOperation::DropIndex { .. }
+        | AlterTableOperation::EnableAlwaysRule { .. }
+        | AlterTableOperation::EnableAlwaysTrigger { .. }
+        | AlterTableOperation::EnableReplicaRule { .. }
+        | AlterTableOperation::EnableReplicaTrigger { .. }
+        | AlterTableOperation::EnableRowLevelSecurity
+        | AlterTableOperation::ForceRowLevelSecurity
+        | AlterTableOperation::NoForceRowLevelSecurity
+        | AlterTableOperation::EnableRule { .. }
+        | AlterTableOperation::EnableTrigger { .. }
+        | AlterTableOperation::RenamePartitions { .. }
+        | AlterTableOperation::ReplicaIdentity { .. }
+        | AlterTableOperation::AddPartitions { .. }
+        | AlterTableOperation::DropPartitions { .. }
+        | AlterTableOperation::RenameTable { .. }
+        | AlterTableOperation::RenameConstraint { .. }
+        | AlterTableOperation::SwapWith { .. }
+        | AlterTableOperation::SetTblProperties { .. }
+        | AlterTableOperation::OwnerTo { .. }
+        | AlterTableOperation::ClusterBy { .. }
+        | AlterTableOperation::DropClusteringKey
+        | AlterTableOperation::SuspendRecluster
+        | AlterTableOperation::ResumeRecluster
+        | AlterTableOperation::Refresh { .. }
+        | AlterTableOperation::Suspend
+        | AlterTableOperation::Resume
+        | AlterTableOperation::Algorithm { .. }
+        | AlterTableOperation::Lock { .. }
+        | AlterTableOperation::AutoIncrement { .. }
+        | AlterTableOperation::ValidateConstraint { .. }
+        | AlterTableOperation::SetOptionsParens { .. } => Vec::new(),
     }
 }
 

@@ -916,6 +916,41 @@ mod ddl {
     }
 
     #[test]
+    fn test_create_table_like_surfaces_schema_source() {
+        // `CREATE TABLE t2 LIKE t1` copies t1's shape; t1 is a referenced
+        // table and must surface in the flat list (it used to vanish silently).
+        let sql = "CREATE TABLE t2 LIKE t1";
+        let expected = vec![ok_tables(vec![table("t2"), table("t1")])];
+        assert_table_extraction(sql, expected, generic_dialect());
+    }
+
+    #[test]
+    fn test_create_table_parenthesized_like_surfaces_schema_source() {
+        // The Redshift-style parenthesized form names the same source (only
+        // Redshift parses `(LIKE t1)` into the `like` clause — elsewhere the
+        // parens read as a column list).
+        let sql = "CREATE TABLE t2 (LIKE t1)";
+        let expected = vec![ok_tables(vec![table("t2"), table("t1")])];
+        assert_table_extraction(
+            sql,
+            expected,
+            one_dialect(sql_insight::sqlparser::dialect::RedshiftSqlDialect {}),
+        );
+    }
+
+    #[test]
+    fn test_create_table_clone_surfaces_schema_source() {
+        // Snowflake `CLONE` likewise references its source table.
+        let sql = "CREATE TABLE t2 CLONE t1";
+        let expected = vec![ok_tables(vec![table("t2"), table("t1")])];
+        assert_table_extraction(
+            sql,
+            expected,
+            one_dialect(sql_insight::sqlparser::dialect::SnowflakeDialect {}),
+        );
+    }
+
+    #[test]
     fn test_create_view_statement() {
         let sql = "CREATE VIEW t1 AS SELECT * FROM t2";
         let expected = vec![ok_tables(vec![table("t1"), table("t2")])];

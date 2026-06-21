@@ -479,6 +479,33 @@ mod lateral_and_correlation {
             },
         );
     }
+
+    #[test]
+    fn inner_with_shadows_outer_cte_of_the_same_name() {
+        // Two CTEs both named `c`: the outer one (over `t_outer`) and an inner
+        // one inside the derived table `sub` (over `t_inner`). Each reference
+        // must trace to its own in-scope declaration — `cte.a` to `t_outer.a`,
+        // `sub.a` to `t_inner.a`. (Regression: a name-keyed origin memo made
+        // whichever expanded first lock in its origins for the other, so both
+        // edges pointed at `t_outer.a`.)
+        assert_column_ops(
+            "WITH c AS (SELECT a FROM t_outer) \
+             SELECT cte.a, sub.a \
+             FROM c AS cte \
+             JOIN (WITH c AS (SELECT a FROM t_inner) SELECT a FROM c) sub \
+               ON cte.a = sub.a",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t_outer", "a"), read("t_inner", "a")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t_outer", "a"), out("a", 0)),
+                    passthrough(col("t_inner", "a"), out("a", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
 }
 
 mod values_as_relation {

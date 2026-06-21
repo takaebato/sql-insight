@@ -532,4 +532,43 @@ mod ddl {
             })]
         );
     }
+
+    #[test]
+    fn test_select_into_over_union_creates_one_table_from_both_branches() {
+        // `INTO` rides the leading SELECT but targets the whole query: over a
+        // UNION it creates one table fed by both branches. The create surfaces
+        // (it used to vanish from the write surfaces while the flat table list
+        // still showed it).
+        let sql = "SELECT a INTO new_t FROM src UNION SELECT b FROM other";
+        let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(CrudTables {
+                create_tables: vec![table("new_t")],
+                read_tables: vec![table("src"), table("other")],
+                update_tables: vec![],
+                delete_tables: vec![],
+                diagnostics: vec![],
+            })]
+        );
+    }
+
+    #[test]
+    fn test_select_into_nested_in_cte_body_is_ignored() {
+        // `INTO` is only a create at the statement root; nested in a CTE body
+        // (not valid SQL there) it's ignored rather than leaking a mid-tree
+        // create that only some surfaces would see. `t1` appears nowhere.
+        let sql = "WITH x AS (SELECT a INTO t1 FROM s) SELECT * FROM x";
+        let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(CrudTables {
+                create_tables: vec![],
+                read_tables: vec![table("s")],
+                update_tables: vec![],
+                delete_tables: vec![],
+                diagnostics: vec![],
+            })]
+        );
+    }
 }

@@ -75,15 +75,17 @@ pub(super) fn collect_column_lineage(
         // DELETE moves no data (rows go wholesale) — its only lineage is a
         // RETURNING projection of the deleted rows.
         LogicalPlan::Delete(d) => returning_lineage(&d.returning, &d.input, &mut ctx, &mut edges),
-        // CTAS / CREATE VIEW move data like INSERT: pair the source's outputs
-        // with the new relation's columns.
+        // CTAS / CREATE VIEW move data like INSERT, but the new relation's
+        // column *names* are the source outputs' own (unless an explicit list
+        // overrides) — so pair each output with its own name, not a separately
+        // derived list that could drift in length.
         LogicalPlan::CreateTableAs(c) => {
             let src = enter_withs(&c.input, &mut ctx);
-            relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
+            created_relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
         }
         LogicalPlan::CreateView(c) => {
             let src = enter_withs(&c.input, &mut ctx);
-            relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
+            created_relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
         }
         // MERGE: each WHEN action's value traces to its target column (an
         // UPDATE SET `RHS → target.col`; an INSERT `value → target.col`). A
@@ -200,6 +202,45 @@ fn relation_lineage<'a>(
             let tgt = ColumnTarget::Relation(ColumnReference {
                 table: Some(target.clone()),
                 name: target_column.clone(),
+            });
+            emit_edges(origins_of_expr(&ne.expr, src_input, ctx), tgt, out);
+        }
+    }
+}
+
+/// CTAS / CREATE VIEW relation lineage. Unlike [`relation_lineage`] (INSERT,
+/// whose target columns are an independent list), a created relation's column
+/// *names* come from the source itself: an explicit `(a, b)` list when written,
+/// else the result schema's inferred names. The schema follows the **left**
+/// (first) branch of a set operation (SQL's rule), so every branch's
+/// like-positioned output feeds that same target column. An anonymous output
+/// with no explicit name is unnameable, so it emits no edge — without shifting
+/// later positions, the bug a length-mismatched zip caused. Kept in step with
+/// [`super::tables`]'s `created_relation_writes`.
+fn created_relation_lineage<'a>(
+    explicit: &[Ident],
+    target: &TableReference,
+    input: &'a LogicalPlan,
+    ctx: &mut Ctx<'a>,
+    out: &mut Vec<ColumnLineageEdge>,
+) {
+    let operands = output_operands(input);
+    let result_names: Vec<Option<Ident>> = if explicit.is_empty() {
+        match operands.first() {
+            Some((outputs, _)) => outputs.iter().map(|ne| ne.name.clone()).collect(),
+            None => Vec::new(),
+        }
+    } else {
+        explicit.iter().cloned().map(Some).collect()
+    };
+    for (outputs, src_input) in operands {
+        for (position, ne) in outputs.iter().enumerate() {
+            let Some(name) = result_names.get(position).cloned().flatten() else {
+                continue;
+            };
+            let tgt = ColumnTarget::Relation(ColumnReference {
+                table: Some(target.clone()),
+                name,
             });
             emit_edges(origins_of_expr(&ne.expr, src_input, ctx), tgt, out);
         }

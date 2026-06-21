@@ -311,8 +311,10 @@ mod ctas_view {
 
     #[test]
     fn ctas_unnamed_projection_yields_no_paired_lineage() {
-        // `SELECT 1` has no column ref and no inferable name, so the
-        // CTAS source produces no lineage / no write for that slot.
+        // `SELECT 1` has no column ref and no inferable name, so the CTAS source
+        // produces no lineage / no write for that slot — and the created table's
+        // column can't be named from the text, so it's flagged (dropped, not
+        // silently lost).
         assert_column_ops(
             "CREATE TABLE t AS SELECT 1 FROM s",
             ColumnOperation {
@@ -320,7 +322,33 @@ mod ctas_view {
                 reads: vec![],
                 writes: vec![],
                 lineage: vec![],
-                diagnostics: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::AnonymousColumnsSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn create_view_anonymous_output_does_not_shift_named_columns() {
+        // An anonymous output (`a + 1`) *preceding* nameable ones must not
+        // shift the rest: the view's columns are the inferred names `b`, `c`
+        // and lineage pairs each source column with its OWN target (`s.b -> v.b`,
+        // `s.c -> v.c`). The anonymous slot is unnameable, so it contributes no
+        // write / lineage edge — it does not steal `b`'s name. (Regression: a
+        // length-mismatched zip used to emit `s.a -> v.b`, `s.b -> v.c`.)
+        assert_column_ops(
+            "CREATE VIEW v AS SELECT a + 1, b, c FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateView,
+                reads: vec![read("s", "a"), read("s", "b"), read("s", "c")],
+                writes: vec![write("v", "b"), write("v", "c")],
+                lineage: vec![
+                    passthrough(col("s", "b"), relation("v", "b")),
+                    passthrough(col("s", "c"), relation("v", "c")),
+                ],
+                // `a + 1` is unaliased: the view column exists but can't be
+                // named from the text, so it's dropped from writes / lineage
+                // and flagged (it does not steal `b`'s slot).
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::AnonymousColumnsSuppressed)],
             },
         );
     }
