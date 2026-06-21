@@ -420,13 +420,14 @@ impl<'a> Binder<'a> {
     }
 
     /// Bind a SELECT into the canonical operator chain `Scan → WHERE →
-    /// Aggregate (GROUP BY) → HAVING → Projection → SORT BY`, returning the
-    /// operator and its clause scope (FROM relations + projection outputs) for
-    /// a trailing ORDER BY to resolve against. The projection resolves against
-    /// the FROM scope (so a grouped column is a base read, counted, not traced
-    /// through the `Aggregate`); the grouping / HAVING / SORT clauses resolve
-    /// against the FROM relations *plus* the projection outputs (clause-alias
-    /// visibility) — a resolution-scope rule, independent of tree position.
+    /// Aggregate (GROUP BY) → HAVING → Projection → Sort (ORDER BY)`,
+    /// returning the operator and its clause scope (FROM relations + projection
+    /// outputs) for a trailing ORDER BY to resolve against. The projection
+    /// resolves against the FROM scope (so a grouped column is a base read,
+    /// counted, not traced through the `Aggregate`); the grouping / HAVING /
+    /// ORDER BY clauses resolve against the FROM relations *plus* the projection
+    /// outputs (clause-alias visibility) — a resolution-scope rule, independent
+    /// of tree position.
     pub(super) fn bind_select(&self, select: &Select) -> (LogicalPlan, Scope) {
         let (from, scope) = self.bind_from(&select.from);
         // WHERE + the WHERE-family auxiliary clauses (DISTINCT ON / TOP /
