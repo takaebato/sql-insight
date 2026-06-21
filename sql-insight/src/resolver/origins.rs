@@ -7,6 +7,8 @@
 //! operands (CASE conditions, window partition / order keys, EXISTS / IN tests)
 //! are *not* traced — they surface as reads, never as origins.
 
+use std::collections::HashMap;
+
 use sqlparser::ast::Ident;
 
 use super::logical_plan::{Binding, BoundColumn, Cte, Expr, LogicalPlan, NamedExpr};
@@ -24,6 +26,17 @@ pub(super) struct Ctx<'a> {
     pub(super) ctes: Vec<&'a Cte>,
     pub(super) active: Vec<String>,
     pub(super) casing: IdentifierCasing,
+    /// Memoized `CteRef` expansions, keyed by the dialect-folded `(cte name,
+    /// output column name)` pair. A CTE body materializes once: tracing
+    /// `cte.col` twice in one statement (`SELECT cte.col, cte.col …`, or the
+    /// same `cte.col` referenced across UNION branches) must yield the same
+    /// origins, so re-walking the body each time is duplicate work that goes
+    /// quadratic on a wide CTE referenced by many output columns. A recursive
+    /// self-reference (the `active`-set termination) returns an empty `Vec`
+    /// for that re-entry and is cached as such — which is correct, since the
+    /// outer call's recovered origins land in *its* cache slot, not this
+    /// inner one.
+    cte_origin_cache: HashMap<(String, String), Vec<(ColumnRead, ColumnLineageKind)>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -40,7 +53,18 @@ impl<'a> Ctx<'a> {
             ctes,
             active: Vec::new(),
             casing,
+            cte_origin_cache: HashMap::new(),
         }
+    }
+
+    /// The dialect-folded `(cte name, column name)` key used to memoize a
+    /// `CteRef` expansion. Names compared under the same fold the
+    /// matching arms use elsewhere on `Ctx` (`eq_alias` / `eq_column`).
+    fn cte_origin_key(&self, cte_name: &Ident, column: &Ident) -> (String, String) {
+        (
+            self.casing.table_alias.normalize(cte_name),
+            self.casing.column.normalize(column),
+        )
     }
 
     /// Compare two identifiers under the dialect's *column* fold (output names,
@@ -243,9 +267,20 @@ fn origins_into<'a>(
         LogicalPlan::CteRef(r) => {
             let exposed = r.alias.as_ref().unwrap_or(&r.name);
             if !qualifier.is_none_or(|q| ctx.eq_alias(q, exposed)) {
-                Vec::new()
-            } else {
-                ctx.enter_cte(&r.name, |ctx, body| {
+                return Vec::new();
+            }
+            // Memoize on the dialect-folded `(cte name, column name)`. The
+            // body materializes once and yields the same origins for the same
+            // column regardless of how many `CteRef`s in this statement ask
+            // for it — re-walking it once per output column makes wide CTEs
+            // quadratic. Active-set `None` (recursive self-reference) caches
+            // as an empty `Vec`, the same value `unwrap_or_default` produced.
+            let key = ctx.cte_origin_key(&r.name, name);
+            if let Some(cached) = ctx.cte_origin_cache.get(&key) {
+                return cached.clone();
+            }
+            let result = ctx
+                .enter_cte(&r.name, |ctx, body| {
                     // A VALUES-backed CTE has no traceable base columns — the
                     // exposed column is a synthetic source (cte.col).
                     if values_backed(body) {
@@ -257,8 +292,9 @@ fn origins_into<'a>(
                         origins_into(body, None, name, ctx)
                     }
                 })
-                .unwrap_or_default()
-            }
+                .unwrap_or_default();
+            ctx.cte_origin_cache.insert(key, result.clone());
+            result
         }
         // A `Derived` reference resolves at a producer's named output (a
         // `Projection` / `Aggregate` expr), never at a raw `Scan` — a reference to
