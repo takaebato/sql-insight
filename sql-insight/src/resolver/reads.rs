@@ -60,40 +60,32 @@ fn reads_into(op: &LogicalPlan, out: &mut Vec<ColumnRead>) {
 
 /// The reads of one expression: every column reference (value AND filter
 /// position — `reads` doesn't distinguish), plus the reads of nested
-/// subqueries. A `Derived` reference is dropped.
+/// subqueries. A `Derived` reference is dropped. A USING fan-in produces a
+/// read per owning side.
 fn expr_reads(expr: &Expr, out: &mut Vec<ColumnRead>) {
     match expr {
         Expr::Column(c) => out.extend(column_read(c)),
-        Expr::Call { args } => args.iter().for_each(|e| expr_reads(e, out)),
-        Expr::Case {
-            when,
-            then,
-            else_result,
-        } => {
-            when.iter().chain(then).for_each(|e| expr_reads(e, out));
-            if let Some(e) = else_result {
-                expr_reads(e, out);
-            }
-        }
-        Expr::Window {
-            arg,
-            partition,
-            order,
-        } => {
-            expr_reads(arg, out);
-            partition
-                .iter()
-                .chain(order)
-                .for_each(|e| expr_reads(e, out));
-        }
-        Expr::Subquery(plan) | Expr::Exists(plan) => reads_into(plan, out),
-        Expr::InSubquery { expr, subquery } => {
-            expr_reads(expr, out);
-            reads_into(subquery, out);
-        }
-        Expr::Filter(exprs) => exprs.iter().for_each(|e| expr_reads(e, out)),
         // A merge-column fan-in: every owning side is a read.
         Expr::Fanin(refs) => out.extend(refs.iter().filter_map(column_read)),
+        _ => {}
+    }
+    // Walk both positions' sub-plans and sub-expressions — `reads` doesn't
+    // distinguish value from filter; the classification lives in the
+    // structural accessors on `Expr`, so a new variant only needs to declare
+    // which lists its operands sit in.
+    for sub in expr
+        .value_subplans()
+        .into_iter()
+        .chain(expr.filter_subplans())
+    {
+        reads_into(sub, out);
+    }
+    for child in expr
+        .value_operands()
+        .into_iter()
+        .chain(expr.filter_operands())
+    {
+        expr_reads(child, out);
     }
 }
 

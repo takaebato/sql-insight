@@ -418,30 +418,21 @@ fn feeding_scans<'a>(
 
 /// The value-position subqueries of an expression feed table lineage (a scalar
 /// projection subquery), mirroring `origins_of_expr`: `when` conditions, window
-/// keys, and EXISTS / IN tests are filter position and do not feed.
+/// keys, and EXISTS / IN tests are filter position and do not feed. The
+/// classification lives on the structural accessors on `Expr`, so this walker
+/// reads cleanly off `value_subplans` and `value_operands` — a new `Expr`
+/// variant declares its operand lists once and this stays in step.
 fn expr_feeding<'a>(
     expr: &'a Expr,
     ctx: &mut Ctx<'a>,
     expanded_ctes: &mut Vec<String>,
     out: &mut Vec<TableRead>,
 ) {
-    match expr {
-        Expr::Column(_) => {}
-        Expr::Call { args } => args
-            .iter()
-            .for_each(|e| expr_feeding(e, ctx, expanded_ctes, out)),
-        Expr::Case {
-            then, else_result, ..
-        } => {
-            then.iter()
-                .for_each(|e| expr_feeding(e, ctx, expanded_ctes, out));
-            if let Some(e) = else_result {
-                expr_feeding(e, ctx, expanded_ctes, out);
-            }
-        }
-        Expr::Window { arg, .. } => expr_feeding(arg, ctx, expanded_ctes, out),
-        Expr::Subquery(plan) => feeding_scans(plan, ctx, expanded_ctes, out),
-        Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Filter(_) | Expr::Fanin(_) => {}
+    for sub in expr.value_subplans() {
+        feeding_scans(sub, ctx, expanded_ctes, out);
+    }
+    for child in expr.value_operands() {
+        expr_feeding(child, ctx, expanded_ctes, out);
     }
 }
 

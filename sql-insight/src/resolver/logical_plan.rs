@@ -342,6 +342,94 @@ pub(crate) enum Expr {
     Fanin(Vec<BoundColumn>),
 }
 
+/// Structural accessors over an [`Expr`]: which sub-expressions and sub-plans
+/// sit in *value* position (feed into the value the expression produces, so
+/// `origins` traces them) versus *filter* position (read but never originate
+/// a value — `CASE` conditions, window partition / order keys, `EXISTS` / `IN`
+/// tests). Mirrors the `own_exprs` / `children` shape the plan side already
+/// exposes: each walker chooses which combination it cares about (e.g. `reads`
+/// takes both positions, `lineage`'s `expr_feeding` takes only value sub-plans
+/// and value operands), so the value/filter classification lives in one place
+/// instead of being re-derived in every walker.
+impl Expr {
+    /// Operands in **value** position — the parts that feed into the value an
+    /// expression produces. `origins` traces these (composing them with the
+    /// arm's lineage kind); `reads` walks them like any other sub-expression.
+    pub(super) fn value_operands(&self) -> Vec<&Expr> {
+        match self {
+            Expr::Call { args } => args.iter().collect(),
+            Expr::Case {
+                then, else_result, ..
+            } => {
+                let mut v: Vec<&Expr> = then.iter().collect();
+                if let Some(e) = else_result {
+                    v.push(e);
+                }
+                v
+            }
+            Expr::Window { arg, .. } => vec![arg],
+            Expr::Column(_)
+            | Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::InSubquery { .. }
+            | Expr::Filter(_)
+            | Expr::Fanin(_) => Vec::new(),
+        }
+    }
+
+    /// Operands in **filter** position — reads but never value origins.
+    pub(super) fn filter_operands(&self) -> Vec<&Expr> {
+        match self {
+            Expr::Case { when, .. } => when.iter().collect(),
+            Expr::Window {
+                partition, order, ..
+            } => partition.iter().chain(order).collect(),
+            Expr::InSubquery { expr, .. } => vec![expr],
+            Expr::Filter(exprs) => exprs.iter().collect(),
+            Expr::Column(_)
+            | Expr::Call { .. }
+            | Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::Fanin(_) => Vec::new(),
+        }
+    }
+
+    /// Sub-plans in **value** position — a scalar `(SELECT …)` whose first
+    /// output column flows into the enclosing value (`origins` follows it
+    /// composed with `Transformation`; table lineage's `feeding_scans` follows
+    /// it for the source-table feed).
+    pub(super) fn value_subplans(&self) -> Vec<&LogicalPlan> {
+        match self {
+            Expr::Subquery(plan) => vec![plan],
+            Expr::Column(_)
+            | Expr::Call { .. }
+            | Expr::Case { .. }
+            | Expr::Window { .. }
+            | Expr::Exists(_)
+            | Expr::InSubquery { .. }
+            | Expr::Filter(_)
+            | Expr::Fanin(_) => Vec::new(),
+        }
+    }
+
+    /// Sub-plans in **filter** position — `EXISTS (subquery)` and the right
+    /// operand of `expr IN (subquery)`. Their scans are reads but feed no
+    /// value into the enclosing expression.
+    pub(super) fn filter_subplans(&self) -> Vec<&LogicalPlan> {
+        match self {
+            Expr::Exists(plan) => vec![plan],
+            Expr::InSubquery { subquery, .. } => vec![subquery],
+            Expr::Column(_)
+            | Expr::Call { .. }
+            | Expr::Case { .. }
+            | Expr::Window { .. }
+            | Expr::Subquery(_)
+            | Expr::Filter(_)
+            | Expr::Fanin(_) => Vec::new(),
+        }
+    }
+}
+
 /// A named output expression — a projection item, an aggregate, a group key,
 /// or a `RETURNING` item. `name` is the explicit alias, else the inferred
 /// name (a bare column's own name), else `None` (anonymous).
@@ -498,39 +586,17 @@ pub(super) fn own_expr_subplans(op: &LogicalPlan) -> Vec<&LogicalPlan> {
 }
 
 fn collect_subplans<'a>(expr: &'a Expr, out: &mut Vec<&'a LogicalPlan>) {
-    match expr {
-        Expr::Column(_) => {}
-        Expr::Call { args } => args.iter().for_each(|e| collect_subplans(e, out)),
-        Expr::Case {
-            when,
-            then,
-            else_result,
-        } => {
-            when.iter()
-                .chain(then)
-                .for_each(|e| collect_subplans(e, out));
-            if let Some(e) = else_result {
-                collect_subplans(e, out);
-            }
-        }
-        Expr::Window {
-            arg,
-            partition,
-            order,
-        } => {
-            collect_subplans(arg, out);
-            partition
-                .iter()
-                .chain(order)
-                .for_each(|e| collect_subplans(e, out));
-        }
-        Expr::Subquery(plan) | Expr::Exists(plan) => out.push(plan),
-        Expr::InSubquery { expr, subquery } => {
-            collect_subplans(expr, out);
-            out.push(subquery);
-        }
-        Expr::Filter(exprs) => exprs.iter().for_each(|e| collect_subplans(e, out)),
-        Expr::Fanin(_) => {}
+    // Every sub-plan at this expression (value + filter), then recurse through
+    // every sub-expression (value + filter) — `own_expr_subplans` wants the
+    // complete set of nested plans regardless of position.
+    out.extend(expr.value_subplans());
+    out.extend(expr.filter_subplans());
+    for child in expr
+        .value_operands()
+        .into_iter()
+        .chain(expr.filter_operands())
+    {
+        collect_subplans(child, out);
     }
 }
 
