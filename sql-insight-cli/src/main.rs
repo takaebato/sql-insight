@@ -8,7 +8,7 @@ use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use sql_insight::error::Error;
 use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::CaseRule;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 #[derive(Debug, Parser)]
@@ -23,9 +23,11 @@ struct Cli {
 }
 
 #[derive(Parser, Debug)]
-#[clap(group(ArgGroup::new("source").args(& ["sql", "file"]).required(false)))]
+#[clap(group(ArgGroup::new("source").args(& ["sql", "file", "interactive"]).required(false)))]
 struct CommonOptions {
-    /// The subject SQL to operate on
+    /// The subject SQL to operate on. If omitted (and not --interactive),
+    /// SQL is read from stdin when it is piped; an interactive terminal
+    /// with no input is an error.
     #[clap(value_parser, group = "source")]
     sql: Option<String>,
     /// The dialect of the input SQL. Might be required for parsing dialect-specific syntax.
@@ -36,6 +38,9 @@ struct CommonOptions {
     /// The file containing the SQL to operate on
     #[clap(short, long, value_parser, group = "source")]
     file: Option<String>,
+    /// Read statements interactively from a prompt (terminate each with `;`).
+    #[clap(short, long, group = "source")]
+    interactive: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -53,18 +58,33 @@ struct NormalizeCommandOptions {
 enum ProcessType {
     Sql(String),
     File(String),
+    /// Read the SQL from piped stdin (no explicit source given).
+    Stdin,
     Interactive,
 }
 
-impl From<&Commands> for ProcessType {
-    fn from(command: &Commands) -> Self {
+impl ProcessType {
+    /// Resolve the input source. The `source` ArgGroup already makes
+    /// `sql` / `--file` / `--interactive` mutually exclusive, so at most
+    /// one is set. With none, fall back to stdin when it's piped; an
+    /// interactive terminal with no input is an error (rather than the
+    /// old surprise of dropping into the REPL).
+    fn resolve(command: &Commands) -> Result<Self, Error> {
         let opts = command.common();
-        if let Some(sql) = &opts.sql {
-            ProcessType::Sql(sql.clone())
+        if opts.interactive {
+            Ok(ProcessType::Interactive)
+        } else if let Some(sql) = &opts.sql {
+            Ok(ProcessType::Sql(sql.clone()))
         } else if let Some(file) = &opts.file {
-            ProcessType::File(file.clone())
+            Ok(ProcessType::File(file.clone()))
+        } else if !io::stdin().is_terminal() {
+            Ok(ProcessType::Stdin)
         } else {
-            ProcessType::Interactive
+            Err(Error::ArgumentError(
+                "no SQL given — pass it as an argument, pipe it on stdin, \
+                 use --file <path>, or --interactive"
+                    .to_string(),
+            ))
         }
     }
 }
@@ -220,14 +240,23 @@ impl Commands {
     }
 
     fn execute(&self) -> Result<Vec<String>, Error> {
-        match ProcessType::from(self) {
+        match ProcessType::resolve(self)? {
             ProcessType::Sql(sql) => self.execute_sql(sql),
             ProcessType::File(file) => self.execute_file(file),
+            ProcessType::Stdin => self.execute_stdin(),
             ProcessType::Interactive => self.execute_interactive(),
         }
     }
 
     fn execute_sql(&self, sql: String) -> Result<Vec<String>, Error> {
+        self.executor(sql).execute()
+    }
+
+    fn execute_stdin(&self) -> Result<Vec<String>, Error> {
+        let mut sql = String::new();
+        io::stdin()
+            .read_to_string(&mut sql)
+            .map_err(|e| Error::IOError(e.to_string()))?;
         self.executor(sql).execute()
     }
 

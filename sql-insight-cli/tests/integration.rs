@@ -52,6 +52,31 @@ mod integration {
                 .stdout("SELECT * FROM t1\nINSERT INTO t2 (a) VALUES (1)\n")
                 .stderr("");
         }
+
+        #[test]
+        fn test_format_from_stdin() {
+            // No explicit source + piped stdin → read the SQL from stdin
+            // (not the old surprise of dropping into interactive mode).
+            sql_insight_cmd()
+                .arg("format")
+                .write_stdin("select * from t1")
+                .assert()
+                .success()
+                .stdout("SELECT * FROM t1\n")
+                .stderr("");
+        }
+
+        #[test]
+        fn test_source_flags_are_mutually_exclusive() {
+            // --interactive cannot combine with an inline SQL argument.
+            sql_insight_cmd()
+                .arg("format")
+                .arg("-i")
+                .arg("SELECT 1")
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("cannot be used with"));
+        }
     }
 
     mod normalize {
@@ -533,12 +558,12 @@ mod integration {
 
         #[tokio::test]
         async fn test_normalize_interactive() -> Result<(), Box<dyn std::error::Error>> {
-            // `normalize` reaches `ProcessType::Interactive` through a
-            // different match arm in `ProcessType::from` (via
-            // `common_options`), so the `format` interactive test alone
-            // does not cover this path.
+            // `normalize` reaches the interactive path through a different
+            // match arm (via `common_options`), so the `format` interactive
+            // test alone does not cover it.
             let mut child = Command::new(BIN_PATH)
                 .arg("normalize")
+                .arg("-i")
                 .stdin(process::Stdio::piped())
                 .stdout(process::Stdio::piped())
                 .stderr(process::Stdio::piped())
@@ -572,6 +597,7 @@ mod integration {
         async fn test_interactive() -> Result<(), Box<dyn std::error::Error>> {
             let mut child = Command::new(BIN_PATH)
                 .arg("format")
+                .arg("-i")
                 .stdin(process::Stdio::piped())
                 .stdout(process::Stdio::piped())
                 .stderr(process::Stdio::piped())
