@@ -6,6 +6,14 @@
 //! keeping the precise verb (Insert / Update / Delete / Merge),
 //! separating reads from writes, and per-statement lineage — see
 //! [`extract_table_operations`](crate::extractor::extract_table_operations).
+//!
+//! Write targets bucket by verb, so DDL lands where its effect is, not in
+//! `Read`: `INSERT`, `CREATE TABLE` / `CREATE VIEW`, and `SELECT … INTO` →
+//! Create, `UPDATE` and `ALTER` → Update, `DELETE` / `DROP` / `TRUNCATE` →
+//! Delete, and `MERGE` to each bucket its WHEN actions imply. A statement's
+//! read-role tables (a `SELECT`, a CTAS / view source, an `UPDATE … FROM`)
+//! always go to Read. A `WITH … <DML>` parses as a `Query`-wrapped DML, so
+//! the verb is recovered through that wrapper.
 
 use std::fmt;
 
@@ -15,7 +23,7 @@ use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::extractor::{ExtractorOptions, StatementKind, TableOperationExtractor};
 use crate::reference::TableReference;
-use sqlparser::ast::{MergeAction, Statement};
+use sqlparser::ast::{MergeAction, SetExpr, Statement};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
@@ -146,8 +154,11 @@ impl CrudTableExtractor {
             StatementKind::Merge => {
                 // MERGE target placement depends on which WHEN actions
                 // appear; reach into the AST for that one detail. The
-                // source comes from `reads` directly.
-                if let Statement::Merge(merge) = statement {
+                // source comes from `reads` directly. A `WITH … MERGE` parses
+                // as `Statement::Query(SetExpr::Merge(inner))`, so unwrap that
+                // wrapper first (as `classify_statement` does) — else the
+                // target would silently fall out of every bucket.
+                if let Statement::Merge(merge) = unwrap_query_dml(statement) {
                     let (mut inserted, mut updated, mut deleted) = (false, false, false);
                     for clause in &merge.clauses {
                         match &clause.action {
@@ -170,23 +181,57 @@ impl CrudTableExtractor {
                 }
                 crud.read_tables = reads;
             }
-            // Every touched table goes to `read_tables` (the catch-all for
-            // non-DML verbs). Listed explicitly (rather than `_ =>`) so a
-            // new `StatementKind` variant becomes a compile error here and
-            // forces a placement decision.
-            StatementKind::Select
-            | StatementKind::CreateTable
-            | StatementKind::CreateView
-            | StatementKind::AlterTable
-            | StatementKind::AlterView
-            | StatementKind::Drop
-            | StatementKind::Truncate
-            | StatementKind::Unsupported => {
+            // DDL write targets bucket by verb: CREATE → Create (a new
+            // object), ALTER → Update (modifies an existing one), DROP /
+            // TRUNCATE → Delete (removes it). A CTAS / CREATE-VIEW source
+            // still feeds `reads` (e.g. `CREATE TABLE t AS SELECT … FROM src`
+            // → Create: [t], Read: [src]).
+            StatementKind::CreateTable | StatementKind::CreateView => {
+                crud.create_tables = writes;
+                crud.read_tables = reads;
+            }
+            StatementKind::AlterTable | StatementKind::AlterView => {
+                crud.update_tables = writes;
+                crud.read_tables = reads;
+            }
+            StatementKind::Drop | StatementKind::Truncate => {
+                crud.delete_tables = writes;
+                crud.read_tables = reads;
+            }
+            // A plain `SELECT` writes nothing, but `SELECT … INTO new_t` binds
+            // as a CTAS, so its target surfaces in `writes` → Create (Create
+            // stays empty for a plain query); read-role tables go to Read.
+            StatementKind::Select => {
+                crud.create_tables = writes;
+                crud.read_tables = reads;
+            }
+            // An unsupported statement has no reliable write placement — fold
+            // everything into `read_tables` (best-effort). Listed explicitly
+            // (rather than `_ =>`) so a new `StatementKind` variant becomes a
+            // compile error here and forces a bucket decision.
+            StatementKind::Unsupported => {
                 crud.read_tables = reads;
                 crud.read_tables.extend(writes);
             }
         }
 
         Ok(crud)
+    }
+}
+
+/// Reach the inner DML statement of a `WITH … <DML>`, which the parser wraps
+/// as `Statement::Query(SetExpr::{Insert,Update,Delete,Merge}(inner))` — the
+/// same unwrap [`classify_statement`](crate::extractor::classify_statement)
+/// does to recover the verb. Returns `statement` unchanged otherwise.
+fn unwrap_query_dml(statement: &Statement) -> &Statement {
+    match statement {
+        Statement::Query(query) => match query.body.as_ref() {
+            SetExpr::Insert(inner)
+            | SetExpr::Update(inner)
+            | SetExpr::Delete(inner)
+            | SetExpr::Merge(inner) => inner,
+            _ => statement,
+        },
+        _ => statement,
     }
 }

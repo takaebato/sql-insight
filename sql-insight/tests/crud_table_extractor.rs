@@ -333,6 +333,28 @@ mod update_statement {
 
 mod merge {
     use super::*;
+    use sql_insight::sqlparser::dialect::GenericDialect;
+
+    #[test]
+    fn test_with_merge_unwraps_query_wrapper_to_bucket_target() {
+        // `WITH … MERGE` parses as `Statement::Query(SetExpr::Merge(..))`. The
+        // bucketing must unwrap that to reach the WHEN actions — otherwise the
+        // target silently falls out of every bucket (the bug this guards).
+        let sql = "WITH s AS (SELECT id, v FROM src) \
+                   MERGE INTO tgt USING s ON tgt.id = s.id \
+                   WHEN MATCHED THEN UPDATE SET v = s.v";
+        let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(CrudTables {
+                create_tables: vec![],
+                read_tables: vec![table("src")],
+                update_tables: vec![table("tgt")],
+                delete_tables: vec![],
+                diagnostics: vec![],
+            })]
+        );
+    }
 
     #[test]
     fn test_merge_statement() {
@@ -352,14 +374,20 @@ mod merge {
 }
 
 mod ddl {
+    //! DDL write targets bucket by verb, not into `Read`: CREATE → Create,
+    //! ALTER → Update, DROP / TRUNCATE → Delete. A CTAS / CREATE-VIEW source
+    //! still feeds Read. (Bucketing is dialect-independent, so the source-only
+    //! cases use a single dialect; the universal CREATE / ALTER TABLE forms
+    //! stay on the full dialect matrix.)
     use super::*;
+    use sql_insight::sqlparser::dialect::GenericDialect;
 
     #[test]
-    fn test_create_table_statement() {
+    fn test_create_table_buckets_as_create() {
         let sql = "CREATE TABLE t1 (a INT)";
         let expected = vec![Ok(CrudTables {
-            create_tables: vec![],
-            read_tables: vec![table("t1")],
+            create_tables: vec![table("t1")],
+            read_tables: vec![],
             update_tables: vec![],
             delete_tables: vec![],
             diagnostics: vec![],
@@ -368,15 +396,118 @@ mod ddl {
     }
 
     #[test]
-    fn test_alters_table_statement() {
+    fn test_create_table_as_select_buckets_target_as_create_source_as_read() {
+        // CTAS: the new table is a Create, the SELECT source a Read.
+        let sql = "CREATE TABLE new AS SELECT a FROM src";
+        let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(CrudTables {
+                create_tables: vec![table("new")],
+                read_tables: vec![table("src")],
+                update_tables: vec![],
+                delete_tables: vec![],
+                diagnostics: vec![],
+            })]
+        );
+    }
+
+    #[test]
+    fn test_create_view_buckets_target_as_create_source_as_read() {
+        let sql = "CREATE VIEW v AS SELECT a FROM src";
+        let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(CrudTables {
+                create_tables: vec![table("v")],
+                read_tables: vec![table("src")],
+                update_tables: vec![],
+                delete_tables: vec![],
+                diagnostics: vec![],
+            })]
+        );
+    }
+
+    #[test]
+    fn test_alter_table_buckets_as_update() {
         let sql = "ALTER TABLE t1 ADD COLUMN a INT";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![table("t1")],
-            update_tables: vec![],
+            read_tables: vec![],
+            update_tables: vec![table("t1")],
             delete_tables: vec![],
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_alter_view_buckets_target_as_update_source_as_read() {
+        // ALTER VIEW redefines an existing object → Update; its new SELECT
+        // body still supplies the Read source.
+        let sql = "ALTER VIEW v AS SELECT a FROM src";
+        let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(CrudTables {
+                create_tables: vec![],
+                read_tables: vec![table("src")],
+                update_tables: vec![table("v")],
+                delete_tables: vec![],
+                diagnostics: vec![],
+            })]
+        );
+    }
+
+    #[test]
+    fn test_drop_table_buckets_as_delete() {
+        // The destructive verb must not read as a harmless Read.
+        let sql = "DROP TABLE doomed";
+        let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(CrudTables {
+                create_tables: vec![],
+                read_tables: vec![],
+                update_tables: vec![],
+                delete_tables: vec![table("doomed")],
+                diagnostics: vec![],
+            })]
+        );
+    }
+
+    #[test]
+    fn test_truncate_table_buckets_as_delete() {
+        let sql = "TRUNCATE TABLE logs";
+        let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(CrudTables {
+                create_tables: vec![],
+                read_tables: vec![],
+                update_tables: vec![],
+                delete_tables: vec![table("logs")],
+                diagnostics: vec![],
+            })]
+        );
+    }
+
+    #[test]
+    fn test_select_into_buckets_target_as_create_source_as_read() {
+        // `SELECT … INTO new_t` has `StatementKind::Select` but binds as a
+        // CTAS, so the created table is a Create (not a Read) and the source
+        // a Read — a plain `SELECT` writes nothing, keeping Create empty.
+        let sql = "SELECT a INTO new_t FROM src";
+        let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(CrudTables {
+                create_tables: vec![table("new_t")],
+                read_tables: vec![table("src")],
+                update_tables: vec![],
+                delete_tables: vec![],
+                diagnostics: vec![],
+            })]
+        );
     }
 }

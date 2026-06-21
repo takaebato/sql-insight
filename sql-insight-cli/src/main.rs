@@ -28,7 +28,7 @@ struct CommonOptions {
     #[clap(value_parser, group = "source")]
     sql: Option<String>,
     /// The dialect of the input SQL. Might be required for parsing dialect-specific syntax.
-    /// Available dialects: ansi, bigquery, clickhouse, duckdb, generic, hive, mssql, mysql, postgres, redshift, snowflake, sqlite.
+    /// Available dialects: ansi, bigquery, clickhouse, databricks, duckdb, generic, hive, mssql, mysql, oracle, postgres, redshift, snowflake, sqlite.
     /// Default: generic.
     #[clap(short, long)]
     dialect: Option<String>,
