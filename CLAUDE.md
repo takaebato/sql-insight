@@ -371,6 +371,22 @@ by hand.
   Length is fine when it earns it.
 - **Inline `//` comments**: keep them concise and well-structured.
   Add a short example when it clarifies.
+- **Comment style** (applies to `///` / `//!` / `//`):
+  - **Each fact lives once, at its most specific level.** A module / crate
+    doc orients and links; per-construct detail belongs on the type /
+    field. Don't restate a field's contract in the module doc, or a
+    dialect→rule mapping in both a variant doc and the function that owns
+    it — duplicated docs drift (one side gets updated, the other rots).
+  - **Prefer structure over prose.** A bold lead-in (`**Foo.** …`) or a
+    hierarchical bullet list scans better and dedups better than a long
+    paragraph. Restructure, don't pad.
+  - **Keep docs true to the code.** Watch for drift: a renamed
+    symbol mentioned in prose, a behaviour that changed, a stale "we don't
+    yet …". `cargo doc` / `clippy` can't catch wrong-but-valid prose — a
+    human read is the only guard.
+  - **Trim redundancy, keep the load-bearing.** Cut what restates code or
+    repeats another doc; keep purpose, contract, edge cases, the *why*,
+    and worked examples (doctests are contract — never cut).
 - Prefer private modules; export through explicit re-exports in
   `lib.rs`.
 - Avoid `bool` or ambiguous `Option` parameters in new public APIs.
