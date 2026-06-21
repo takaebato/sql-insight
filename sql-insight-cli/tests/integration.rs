@@ -428,6 +428,67 @@ mod integration {
         }
     }
 
+    mod extract_json {
+        use super::*;
+
+        // JSON output is a single pretty array of per-statement results.
+        // Keys are sorted (serde_json `Value`) and identifiers serialize as
+        // `{value, quote}` (no source span), so the text is stable.
+
+        #[test]
+        fn test_tables_json() {
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("tables")
+                .arg("--format")
+                .arg("json")
+                .arg("SELECT a FROM t1")
+                .assert()
+                .success()
+                .stdout(
+                    "[\n  {\n    \"diagnostics\": [],\n    \"tables\": [\n      {\n        \"catalog\": null,\n        \"name\": {\n          \"quote\": null,\n          \"value\": \"t1\"\n        },\n        \"schema\": null\n      }\n    ]\n  }\n]\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_column_ops_json_has_lineage_kind() {
+            // Spot-check the rich surface: a transformation edge and the
+            // resolution tag are present, identifiers carry value (no span).
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("--format")
+                .arg("json")
+                .arg("SELECT a + b AS total FROM t1")
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("\"kind\": \"Transformation\""))
+                .stdout(predicate::str::contains("\"resolution\": \"Inferred\""))
+                .stdout(predicate::str::contains("\"value\": \"total\""))
+                .stdout(predicate::str::contains("\"span\"").not())
+                .stderr("");
+        }
+
+        #[test]
+        fn test_json_unsupported_statement_carries_a_diagnostic() {
+            // A best-effort batch keeps every statement: the unsupported
+            // `SET` surfaces as an element with an `UnsupportedStatement`
+            // diagnostic (not a dropped entry), alongside the resolved `t1`.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("tables")
+                .arg("--format")
+                .arg("json")
+                .arg("SELECT a FROM t1; SET x = 1")
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("\"value\": \"t1\""))
+                .stdout(predicate::str::contains("\"kind\": \"UnsupportedStatement\""))
+                .stderr("");
+        }
+    }
+
     mod interactive_mode {
         use super::*;
         use std::time::Duration;

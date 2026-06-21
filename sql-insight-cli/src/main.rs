@@ -2,6 +2,7 @@ mod executor;
 
 use crate::executor::{
     CasingOverride, CliExecutable, ExtractExecutor, ExtractKind, FormatExecutor, NormalizeExecutor,
+    OutputFormat,
 };
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use sql_insight::error::Error;
@@ -100,6 +101,9 @@ enum ExtractTarget {
 struct ExtractArgs {
     #[clap(flatten)]
     common: CommonOptions,
+    /// Output format: human-readable text (default) or JSON.
+    #[clap(long, value_enum, default_value_t = FormatArg::Text)]
+    format: FormatArg,
     /// SQL DDL file (CREATE TABLE statements) to resolve against — enables
     /// catalog-aware analysis (canonicalized identities, strict columns).
     #[clap(long = "ddl-file")]
@@ -148,6 +152,22 @@ impl From<CasingArg> for CaseRule {
     }
 }
 
+/// CLI surface of the executor's `OutputFormat`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FormatArg {
+    Text,
+    Json,
+}
+
+impl From<FormatArg> for OutputFormat {
+    fn from(arg: FormatArg) -> Self {
+        match arg {
+            FormatArg::Text => OutputFormat::Text,
+            FormatArg::Json => OutputFormat::Json,
+        }
+    }
+}
+
 impl ExtractTarget {
     fn args(&self) -> &ExtractArgs {
         match self {
@@ -183,6 +203,7 @@ impl ExtractTarget {
                 table_alias: args.casing_table_alias.map(Into::into),
                 column: args.casing_column.map(Into::into),
             },
+            format: args.format.into(),
         })
     }
 }

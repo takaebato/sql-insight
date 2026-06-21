@@ -71,6 +71,7 @@ impl CliExecutable for NormalizeExecutor {
 }
 
 /// Which extraction surface an [`ExtractExecutor`] produces.
+#[derive(Clone, Copy)]
 pub enum ExtractKind {
     Tables,
     Crud,
@@ -133,6 +134,18 @@ pub struct ExtractExecutor {
     pub default_schema: Option<String>,
     pub default_catalog: Option<String>,
     pub casing: CasingOverride,
+    pub format: OutputFormat,
+}
+
+/// How an extract command renders its result.
+#[derive(Clone, Copy, Default)]
+pub enum OutputFormat {
+    /// Human-readable text (the default).
+    #[default]
+    Text,
+    /// One JSON array of the per-statement results (each an `Ok` value or
+    /// an `{ "error": ... }` object), pretty-printed.
+    Json,
 }
 
 impl CliExecutable for ExtractExecutor {
@@ -151,21 +164,33 @@ impl CliExecutable for ExtractExecutor {
         }
 
         let sql = self.sql.as_ref();
-        match self.kind {
-            ExtractKind::Tables => Ok(render_display(&extract_tables_with_options(
-                dialect, sql, options,
-            )?)),
-            ExtractKind::Crud => Ok(render_display(&extract_crud_tables_with_options(
-                dialect, sql, options,
-            )?)),
-            ExtractKind::TableOps => Ok(render_statements(
+        match (self.kind, self.format) {
+            (ExtractKind::Tables, OutputFormat::Text) => Ok(render_display(
+                &extract_tables_with_options(dialect, sql, options)?,
+            )),
+            (ExtractKind::Crud, OutputFormat::Text) => Ok(render_display(
+                &extract_crud_tables_with_options(dialect, sql, options)?,
+            )),
+            (ExtractKind::TableOps, OutputFormat::Text) => Ok(render_statements(
                 &extract_table_operations_with_options(dialect, sql, options)?,
                 format_table_operation,
             )),
-            ExtractKind::ColumnOps => Ok(render_statements(
+            (ExtractKind::ColumnOps, OutputFormat::Text) => Ok(render_statements(
                 &extract_column_operations_with_options(dialect, sql, options)?,
                 format_column_operation,
             )),
+            (ExtractKind::Tables, OutputFormat::Json) => {
+                render_json(&extract_tables_with_options(dialect, sql, options)?)
+            }
+            (ExtractKind::Crud, OutputFormat::Json) => {
+                render_json(&extract_crud_tables_with_options(dialect, sql, options)?)
+            }
+            (ExtractKind::TableOps, OutputFormat::Json) => render_json(
+                &extract_table_operations_with_options(dialect, sql, options)?,
+            ),
+            (ExtractKind::ColumnOps, OutputFormat::Json) => render_json(
+                &extract_column_operations_with_options(dialect, sql, options)?,
+            ),
         }
     }
 }
@@ -226,6 +251,24 @@ fn render_statements<T>(
             Err(e) => format!("[{}] Error: {}", i + 1, e),
         })
         .collect()
+}
+
+/// Serialize the per-statement results to one pretty JSON array. Each
+/// element is the `Ok` value (the extractor's serde shape) or, for a failed
+/// statement, an `{ "error": "<message>" }` object — so one bad statement
+/// doesn't sink the batch and the array length still matches the input.
+fn render_json<T: serde::Serialize>(results: &[Result<T, Error>]) -> Result<Vec<String>, Error> {
+    let entries: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| match r {
+            Ok(value) => serde_json::to_value(value)
+                .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() })),
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        })
+        .collect();
+    let json = serde_json::to_string_pretty(&entries)
+        .map_err(|e| Error::AnalysisError(format!("failed to serialize result as JSON: {e}")))?;
+    Ok(vec![json])
 }
 
 /// Render the `Display`-backed extractors (`tables` / `crud`), one
