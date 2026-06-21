@@ -84,13 +84,14 @@ pub struct TableRead {
 /// A column-level identity reference: an optional owning table plus the
 /// column name.
 ///
-/// `table` is `Option` because some column references cannot be
-/// resolved structurally (ambiguous unqualified columns, references to
-/// derived tables we do not yet expand, etc.) — the accompanying
-/// [`ColumnRead::resolution`] surfaces *why*. Identity is name-based:
-/// two `ColumnReference`s with the same `table` and `name` compare
-/// equal, independent of where they appeared in the SQL or with what
-/// resolution the resolver placed them.
+/// `table` is `Option` because a column the resolver couldn't pin to a
+/// single owning table — [`Ambiguous`](ResolutionKind::Ambiguous) or
+/// [`Unresolved`](ResolutionKind::Unresolved) (see
+/// [`ColumnRead::resolution`] for *why*) — still surfaces its name with
+/// `table: None`. Identity is name-based: two `ColumnReference`s with the
+/// same `table` and `name` compare equal, independent of where they
+/// appeared in the SQL or how the resolver placed them. (For dialect-aware
+/// equality, see [`identity_key`](Self::identity_key).)
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ColumnReference {

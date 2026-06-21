@@ -250,13 +250,10 @@ fn unsupported_table_operation(
     }
 }
 
-/// `MERGE` is `is_data_moving` whenever it appears, but a MERGE
-/// whose WHEN clauses are only `DELETE` actions doesn't actually
-/// move data from the source into the target — the source is just
-/// used to pick which rows of the target to delete. Inspect the
-/// statement and report whether at least one WHEN clause is an
-/// INSERT or UPDATE, so the lineage path can short-circuit for the
-/// DELETE-only case.
+/// Whether a `MERGE` feeds data from its source into the target — true
+/// unless every WHEN clause is a `DELETE` (which only uses the source to
+/// pick target rows to remove). Non-`MERGE` statements are unaffected
+/// (returns `true`); the caller still gates them on [`moves_data`].
 fn merge_moves_data(statement: &Statement) -> bool {
     use sqlparser::ast::MergeAction;
     let Statement::Merge(merge) = statement else {

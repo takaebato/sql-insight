@@ -23,10 +23,11 @@
 //!   `table` nor `column` can stand in for it.
 //! - [`IdentifierCasing::column`] — column names and column aliases.
 //!
-//! Only matching uses the folded key; the surfaced
+//! Folding affects **matching only** — it never rewrites the surfaced
 //! [`TableReference`](crate::reference::TableReference) /
-//! [`ColumnReference`](crate::reference::ColumnReference) keep the
-//! original identifier text.
+//! [`ColumnReference`](crate::reference::ColumnReference). (Catalog
+//! canonicalization *does* rewrite a matched identity to its registered
+//! path, but that is a separate mechanism, not folding.)
 
 use sqlparser::ast::Ident;
 use sqlparser::dialect::{
@@ -40,27 +41,25 @@ use sqlparser::dialect::{
 ///
 /// The four cases the cross-dialect matrix reduces to once
 /// instance-specific models (filesystem-dependent, collation-dependent)
-/// are resolved to a concrete choice. Only matching folds through this
-/// rule; the surfaced identifier text is never rewritten by it.
+/// are resolved to a concrete choice. Which dialect gets which rule lives
+/// in [`IdentifierCasing::for_dialect`]; this enum describes only the
+/// folding each rule performs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaseRule {
-    /// Unquoted → upper-case; quoted → preserved (exact). ANSI /
-    /// Oracle / Snowflake / DB2.
+    /// Unquoted → upper-case; quoted → preserved (exact).
     Upper,
-    /// Unquoted → lower-case; quoted → preserved (exact). PostgreSQL,
-    /// and the generic default.
+    /// Unquoted → lower-case; quoted → preserved (exact).
     Lower,
-    /// Quoting ignored; comparison case-insensitive. DuckDB / Hive /
-    /// Databricks; MySQL / BigQuery columns; BigQuery aliases.
+    /// Quoting ignored; comparison case-insensitive.
     Insensitive,
-    /// Quoting ignored; comparison case-sensitive (exact). ClickHouse
-    /// (all identifiers) and BigQuery tables; also the safe fallback for
-    /// filesystem-dependent real *table names*, where over-matching (a
-    /// false merge of two distinct stored tables) is a data-correctness
-    /// risk. Statement-local aliases don't use this *as a fallback* —
-    /// they default lenient (see [`IdentifierCasing::table_alias`]) — but
-    /// an engine that is definitively case-sensitive (ClickHouse) folds
-    /// every class here.
+    /// Quoting ignored; comparison case-sensitive (exact).
+    ///
+    /// Used both by definitively case-sensitive engines and as the safe
+    /// fallback for filesystem-dependent real *table names*, where
+    /// over-matching (a false merge of two distinct stored tables) is a
+    /// data-correctness risk. Statement-local aliases don't take this
+    /// fallback — they default lenient (see
+    /// [`IdentifierCasing::table_alias`]).
     Sensitive,
 }
 
