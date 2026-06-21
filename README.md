@@ -1,7 +1,8 @@
 # sql-insight
 
-A utility for SQL query analysis, formatting, and transformation.
-Leveraging the comprehensive parsing capabilities of [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs), it can handle various SQL dialects.
+A utility for SQL query analysis, formatting, and transformation. Built on
+[sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs), it works
+across every SQL dialect sqlparser-rs supports.
 
 [![Crates.io](https://img.shields.io/crates/v/sql-insight.svg)](https://crates.io/crates/sql-insight)
 [![Docs.rs](https://docs.rs/sql-insight/badge.svg)](https://docs.rs/sql-insight)
@@ -11,90 +12,234 @@ Leveraging the comprehensive parsing capabilities of [sqlparser-rs](https://gith
 
 ## Features
 
-- **SQL Formatting**: Format SQL queries to standardized form, improving readability and maintainability.
-- **SQL Normalization**: Convert SQL queries into a normalized form, making them easier to analyze and process.
-- **Table Extraction**: Extract tables referenced in SQL queries, clarifying the data sources involved.
-- **CRUD Table Extraction**: Identify the create, read, update, and delete operations, along with the tables involved in each operation within SQL queries.
+- **Table-level Operation Extraction**: identify which tables a
+  statement reads, which it writes, and the lineage between sources
+  and targets. 
+- **Column-level Operation Extraction**: the same at column granularity
+  — track lineage from individual source columns to target columns,
+  distinguishing pure forwarding from value-changing expressions.
+- **Optional Catalog**: pass column schemas to tighten column
+  resolution and pair INSERT values with target columns by position.
+  Best-effort without one.
+- **Table Extraction**: flat list of tables a statement touches —
+  the lightest extraction when you don't need a read/write split or
+  lineage.
+- **CRUD Table Extraction**: tables bucketed by Create / Read /
+  Update / Delete role, for CRUD-style access analysis.
+- **SQL Formatting**: emit a query in a consistent layout (single-line
+  by default, multi-line pretty-print on demand).
+- **SQL Normalization**: collapse structurally identical queries to
+  the same string (placeholder-substitute literals, optionally
+  collapse repetitive shapes), useful for query fingerprinting and
+  deduplication.
 
-## Installation
-
-Add `sql_insight` to your `Cargo.toml` file:
+## Install
 
 ```toml
 [dependencies]
-sql-insight = { version = "0.2.0" }
+sql-insight = "0.2.0"
 ```
 
 ## Usage
 
-### SQL Formatting
+### Table-level Operation Extraction
 
-Format SQL queries according to different dialects:
-
-```rust
-use sql_insight::sqlparser::dialect::GenericDialect;
-
-let dialect = GenericDialect {};
-let formatted_sql = sql_insight::format(&dialect, "SELECT * \n from users   WHERE id = 1").unwrap();
-assert_eq!(formatted_sql, ["SELECT * FROM users WHERE id = 1"]);
-```
-
-### SQL Normalization
-
-Normalize SQL queries to abstract away literals:
+Get the statement kind plus three surfaces — `reads` (tables read),
+`writes` (tables written), and `lineage` (source → target edges, only
+for statements that physically move data) — in one call:
 
 ```rust
 use sql_insight::sqlparser::dialect::GenericDialect;
+use sql_insight::extractor::{extract_table_operations, StatementKind};
 
 let dialect = GenericDialect {};
-let normalized_sql = sql_insight::normalize(&dialect, "SELECT * \n from users   WHERE id = 1").unwrap();
-assert_eq!(normalized_sql, ["SELECT * FROM users WHERE id = ?"]);
+let result = extract_table_operations(
+    &dialect,
+    "INSERT INTO t1 (a) SELECT a FROM t2",
+).unwrap();
+let ops = result[0].as_ref().unwrap();
+assert_eq!(ops.statement_kind, StatementKind::Insert);
+assert_eq!(ops.reads.len(), 1);   // t2
+assert_eq!(ops.writes.len(), 1);  // t1
+assert_eq!(ops.lineage.len(), 1); // t2 → t1
 ```
 
-### Table Extraction
+### Column-level Operation Extraction
 
-Extract table references from SQL queries:
+Same surfaces, at column granularity. `reads` / `writes` are plain
+occurrence lists of column references; `lineage` edges carry a kind
+(`Passthrough` vs `Transformation`) describing how each source
+reaches its target:
 
 ```rust
 use sql_insight::sqlparser::dialect::GenericDialect;
+use sql_insight::extractor::extract_column_operations;
 
 let dialect = GenericDialect {};
-let tables = sql_insight::extract_tables(&dialect, "SELECT * FROM catalog.schema.`users` as users_alias").unwrap();
-println!("{:?}", tables);
+let result = extract_column_operations(
+    &dialect,
+    "INSERT INTO t1 (a, b) SELECT a, LOWER(b) FROM t2",
+).unwrap();
+let ops = result[0].as_ref().unwrap();
+// a → a (Passthrough), b → b (Transformation, via LOWER).
+assert_eq!(ops.lineage.len(), 2);
 ```
 
-This outputs:
+### Table Extraction (lightweight)
 
-```
-[Ok(Tables([TableReference { catalog: Some(Ident { value: "catalog", quote_style: None }), schema: Some(Ident { value: "schema", quote_style: None }), name: Ident { value: "users", quote_style: Some('`') }, alias: Some(Ident { value: "users_alias", quote_style: None }) }]))]
+Flat list of table references touched by a statement:
+
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+use sql_insight::extractor::extract_tables;
+
+let dialect = GenericDialect {};
+let extractions = extract_tables(&dialect, "SELECT * FROM catalog.schema.t1").unwrap();
+let extraction = extractions[0].as_ref().unwrap();
+assert_eq!(extraction.tables.len(), 1);
+assert_eq!(extraction.tables[0].to_string(), "catalog.schema.t1");
 ```
 
 ### CRUD Table Extraction
 
-Identify CRUD operations and the tables involved in each operation within SQL queries:
+Bucket tables by create / read / update / delete role:
+
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+use sql_insight::extractor::extract_crud_tables;
+
+let dialect = GenericDialect {};
+let result = extract_crud_tables(&dialect, "INSERT INTO t1 (a) SELECT a FROM t2").unwrap();
+let crud = result[0].as_ref().unwrap();
+assert_eq!(crud.create_tables.len(), 1); // t1
+assert_eq!(crud.read_tables.len(), 1);   // t2
+assert!(crud.update_tables.is_empty());
+assert!(crud.delete_tables.is_empty());
+```
+
+### SQL Formatting
 
 ```rust
 use sql_insight::sqlparser::dialect::GenericDialect;
 
 let dialect = GenericDialect {};
-let crud_tables = sql_insight::extract_crud_tables(&dialect, "INSERT INTO users (name) SELECT name FROM employees").unwrap();
-println!("{:?}", crud_tables);
+let formatted = sql_insight::formatter::format(
+    &dialect, "SELECT * \n from t1   WHERE a = 1"
+).unwrap();
+assert_eq!(formatted, ["SELECT * FROM t1 WHERE a = 1"]);
 ```
 
-This outputs:
+`format_with_options` + `FormatterOptions::pretty` switches to
+sqlparser's multi-line pretty-print.
 
+### SQL Normalization
+
+Substitute literals with placeholders so structurally identical
+queries hash to the same shape:
+
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+
+let dialect = GenericDialect {};
+let normalized = sql_insight::normalizer::normalize(
+    &dialect, "SELECT * \n from t1   WHERE a = 1"
+).unwrap();
+assert_eq!(normalized, ["SELECT * FROM t1 WHERE a = ?"]);
 ```
-[Ok(CrudTables { create_tables: [TableReference { catalog: None, schema: None, name: Ident { value: "users", quote_style: None }, alias: None }], read_tables: [TableReference { catalog: None, schema: None, name: Ident { value: "employees", quote_style: None }, alias: None }], update_tables: [], delete_tables: [] })]
+
+`normalize_with_options` adds three opt-in collapses:
+`IN (1, 2, 3)` → `IN (...)`,
+`VALUES (1, 2, 3), (4, 5, 6)` → `VALUES (...)`, and
+`INSERT INTO t (c, b, a) VALUES (1, 2, 3)` → `INSERT INTO t (a, b, c) VALUES (...)`.
+
+## Options: catalog & casing
+
+Each extractor has an `_with_options` twin taking
+[`ExtractorOptions`](https://docs.rs/sql-insight/latest/sql_insight/extractor/struct.ExtractorOptions.html)
+— a catalog and/or an identifier-casing override:
+
+```rust
+use sql_insight::sqlparser::dialect::GenericDialect;
+use sql_insight::catalog::Catalog;
+use sql_insight::extractor::{extract_column_operations_with_options, ExtractorOptions};
+
+let catalog = Catalog::from_ddl(
+    &GenericDialect {},
+    "CREATE TABLE users (id INT, name TEXT)",
+).unwrap();
+let options = ExtractorOptions::new().with_catalog(&catalog);
+let result = extract_column_operations_with_options(
+    &GenericDialect {},
+    "SELECT id FROM users",
+    options,
+).unwrap();
 ```
+
+An optional [`Catalog`](https://docs.rs/sql-insight/latest/sql_insight/catalog/)
+makes resolution strict: a column the schema doesn't list surfaces as
+`ResolutionKind::Unresolved`, and a column-list-less INSERT pairs its
+positional values with the catalog's target columns. Build one with
+`Catalog::from_ddl` or the `CatalogTable` builder. Identifier casing is
+dialect-derived by default; `with_casing` overrides it (e.g. to model a
+deployment-specific collation). Every extractor also works catalog-free in
+best-effort mode.
+
+## Limitations
+
+See the
+[Limitations](https://docs.rs/sql-insight/latest/sql_insight/#limitations)
+section of the crate docs.
+
+## JSON output
+
+Enable the `serde` feature to derive `Serialize` on the result types, so
+they (and their references / diagnostics) can be emitted as JSON or any
+serde format:
+
+```toml
+sql-insight = { version = "0.2.0", features = ["serde"] }
+```
+
+```rust,ignore
+let json = serde_json::to_string(&ops)?;
+```
+
+## Examples
+
+See [`sql-insight/examples/`](sql-insight/examples) for runnable samples
+covering table-level operations, column-level lineage, the catalog path,
+and casing overrides. Run with `cargo run --example <name> -p sql-insight`.
 
 ## Supported SQL Dialects
 
-`sql-insight` supports a comprehensive range of SQL dialects through [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs). For details on supported dialects, please refer to the [sqlparser-rs documentation](https://docs.rs/sqlparser/latest/sqlparser/dialect/index.html#structs).
+`sql-insight` supports a comprehensive range of SQL dialects through
+[sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs):
+
+- Generic
+- MySQL
+- PostgreSQL
+- Hive
+- SQLite
+- Snowflake
+- Redshift
+- Microsoft SQL Server
+- ClickHouse
+- BigQuery
+- ANSI
+- DuckDB
+- Databricks
+- Oracle
+
+See the
+[sqlparser-rs documentation](https://docs.rs/sqlparser/latest/sqlparser/dialect/index.html#structs)
+for dialect-specific details.
 
 ## Contributing
 
-Contributions to `sql-insight` are welcome! Whether it's adding new features, fixing bugs, or improving documentation, feel free to fork the repository and submit a pull request.
+Contributions to `sql-insight` are welcome! Whether it's adding new
+features, fixing bugs, or improving documentation, feel free to fork
+the repository and submit a pull request.
 
 ## License
 
-`sql-insight` is distributed under the [MIT license](https://github.com/takaebato/sql-insight/blob/master/LICENSE.txt).
+MIT — see [LICENSE.txt](LICENSE.txt).

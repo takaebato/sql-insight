@@ -4,7 +4,6 @@ on:
   push:
     branches: [ "master" ]
   pull_request:
-    branches: [ "master" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -91,17 +90,20 @@ jobs:
           toolchain: stable
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - name: Install Tarpaulin
+      - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2
         with:
-          tool: cargo-tarpaulin
+          tool: cargo-llvm-cov
           fallback: none
       - name: Coverage
-        run: cargo tarpaulin --workspace --follow-exec --engine Llvm -o Lcov --output-dir ./coverage
+        # `--codecov` (vs `--lcov`) preserves region coverage on Codecov's UI;
+        # `--lcov` collapses to line-only there.
+        run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6.0.2
         with:
-          files: ./coverage/lcov.info
+          files: codecov.json
+          fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
           slug: takaebato/sql-insight

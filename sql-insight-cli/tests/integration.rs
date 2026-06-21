@@ -52,6 +52,31 @@ mod integration {
                 .stdout("SELECT * FROM t1\nINSERT INTO t2 (a) VALUES (1)\n")
                 .stderr("");
         }
+
+        #[test]
+        fn test_format_from_stdin() {
+            // No explicit source + piped stdin → read the SQL from stdin
+            // (not the old surprise of dropping into interactive mode).
+            sql_insight_cmd()
+                .arg("format")
+                .write_stdin("select * from t1")
+                .assert()
+                .success()
+                .stdout("SELECT * FROM t1\n")
+                .stderr("");
+        }
+
+        #[test]
+        fn test_source_flags_are_mutually_exclusive() {
+            // --interactive cannot combine with an inline SQL argument.
+            sql_insight_cmd()
+                .arg("format")
+                .arg("-i")
+                .arg("SELECT 1")
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("cannot be used with"));
+        }
     }
 
     mod normalize {
@@ -95,6 +120,34 @@ mod integration {
                 .stdout(
                     "SELECT * FROM t1 WHERE a = ? AND b IN (?, ?)\nINSERT INTO t2 (a) VALUES (...)\n",
                 )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_normalize_with_alphabetize_insert_columns_option() {
+            // Alphabetize reorders the column list (only with --unify-values).
+            sql_insight_cmd()
+                .arg("normalize")
+                .arg("--unify-values")
+                .arg("--alphabetize-insert-columns")
+                .arg("INSERT INTO t (c, b, a) VALUES (1, 2, 3)")
+                .assert()
+                .success()
+                .stdout("INSERT INTO t (a, b, c) VALUES (...)\n")
+                .stderr("");
+        }
+
+        #[test]
+        fn test_normalize_alphabetize_without_unify_values_is_noop() {
+            // Without --unify-values the reorder doesn't apply (library gates
+            // it on a unified VALUES); only literal placeholders are applied.
+            sql_insight_cmd()
+                .arg("normalize")
+                .arg("--alphabetize-insert-columns")
+                .arg("INSERT INTO t (c, b, a) VALUES (1, 2, 3)")
+                .assert()
+                .success()
+                .stdout("INSERT INTO t (c, b, a) VALUES (?, ?, ?)\n")
                 .stderr("");
         }
 
@@ -155,7 +208,7 @@ mod integration {
         #[test]
         fn test_extract_crud_tables() {
             sql_insight_cmd()
-                .arg("extract-crud")
+                .arg("extract").arg("crud")
                 .arg("select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
                 .assert()
                 .success()
@@ -164,9 +217,23 @@ mod integration {
         }
 
         #[test]
+        fn test_extract_crud_tables_surfaces_diagnostics_in_text() {
+            // The empty CRUD buckets alone can't be told apart from "nothing
+            // unusual"; the diagnostic line disambiguates an unsupported one.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("crud")
+                .arg("CREATE INDEX i ON t(a)")
+                .assert()
+                .success()
+                .stdout("Create: [], Read: [], Update: [], Delete: []\n  ! Unsupported statement: CREATE INDEX i ON t(a)\n")
+                .stderr("");
+        }
+
+        #[test]
         fn test_extract_crud_tables_with_dialect() {
             sql_insight_cmd()
-                .arg("extract-crud")
+                .arg("extract").arg("crud")
                 .arg("--dialect")
                 .arg("mysql")
                 .arg("select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
@@ -177,13 +244,25 @@ mod integration {
         }
 
         #[test]
+        fn test_extract_crud_tables_with_cte() {
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("crud")
+                .arg("with t2 as (select id from t1) select * from t2;")
+                .assert()
+                .success()
+                .stdout("Create: [], Read: [t1], Update: [], Delete: []\n")
+                .stderr("");
+        }
+
+        #[test]
         fn test_extract_crud_tables_from_file() {
             let mut temp_file = NamedTempFile::new().unwrap();
             temp_file
                 .write_all(b"select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
                 .unwrap();
             sql_insight_cmd()
-                .arg("extract-crud")
+                .arg("extract").arg("crud")
                 .arg("--file")
                 .arg(temp_file.path())
                 .assert()
@@ -199,7 +278,7 @@ mod integration {
         #[test]
         fn test_extract_tables() {
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract").arg("tables")
                 .arg("select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
                 .assert()
                 .success()
@@ -208,21 +287,47 @@ mod integration {
         }
 
         #[test]
+        fn test_extract_tables_surfaces_diagnostics_in_text() {
+            // An unsupported statement has no tables; the text output must
+            // still surface the diagnostic rather than silently print nothing.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("tables")
+                .arg("CREATE INDEX i ON t(a)")
+                .assert()
+                .success()
+                .stdout("  ! Unsupported statement: CREATE INDEX i ON t(a)\n")
+                .stderr("");
+        }
+
+        #[test]
         fn test_extract_tables_with_full_identifiers_and_alis() {
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract").arg("tables")
                 .arg("select * from catalog.schema.t1 as t1 inner join catalog.schema.t2 as t2 using(id); \
                       insert into catalog.schema.t1 (a) select b from catalog.schema.t2;")
                 .assert()
                 .success()
-                .stdout("catalog.schema.t1 AS t1, catalog.schema.t2 AS t2\ncatalog.schema.t1, catalog.schema.t2\n")
+                .stdout("catalog.schema.t1, catalog.schema.t2\ncatalog.schema.t1, catalog.schema.t2\n")
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_tables_with_cte() {
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("tables")
+                .arg("with t2 as (select id from t1) select * from t2;")
+                .assert()
+                .success()
+                .stdout("t1\n")
                 .stderr("");
         }
 
         #[test]
         fn test_extract_tables_with_dialect() {
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract").arg("tables")
                 .arg("--dialect")
                 .arg("mysql")
                 .arg("select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
@@ -239,12 +344,248 @@ mod integration {
                 .write_all(b"select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
                 .unwrap();
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract")
+                .arg("tables")
                 .arg("--file")
                 .arg(temp_file.path())
                 .assert()
                 .success()
                 .stdout("t1, t2\nt1, t2\n")
+                .stderr("");
+        }
+    }
+
+    mod extract_table_ops {
+        use super::*;
+
+        #[test]
+        fn test_extract_table_ops() {
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("table-ops")
+                .arg("INSERT INTO orders SELECT id, amount FROM staging")
+                .assert()
+                .success()
+                .stdout(
+                    "[1] Insert\n  reads:   staging\n  writes:  orders\n  lineage: staging -> orders\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_table_ops_select_reads_only() {
+            // A SELECT has reads but no writes / lineage — empty surfaces
+            // are omitted from the block.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("table-ops")
+                .arg("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id")
+                .assert()
+                .success()
+                .stdout("[1] Select\n  reads:   t1, t2\n")
+                .stderr("");
+        }
+    }
+
+    mod extract_column_ops {
+        use super::*;
+
+        #[test]
+        fn test_extract_column_ops() {
+            // Transformations carry a `[transform]` marker; passthroughs don't.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("INSERT INTO orders (id, total) SELECT id, a + b AS total FROM staging")
+                .assert()
+                .success()
+                .stdout(
+                    "[1] Insert\n  \
+                     reads:   staging.id, staging.a, staging.b\n  \
+                     writes:  orders.id, orders.total\n  \
+                     lineage: staging.id -> orders.id\n           \
+                     staging.a -> orders.total [transform]\n           \
+                     staging.b -> orders.total [transform]\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_column_ops_ambiguous_marker() {
+            // Unqualified `a` is ambiguous between t1 / t2 → `(ambiguous)`;
+            // the qualified `t1.a` / `t2.a` are catalog-free Inferred (unmarked).
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("SELECT a FROM t1 JOIN t2 ON t1.a = t2.a")
+                .assert()
+                .success()
+                .stdout(
+                    "[1] Select\n  reads:   a (ambiguous), t1.a, t2.a\n  lineage: a (ambiguous) -> a\n",
+                )
+                .stderr("");
+        }
+    }
+
+    mod extract_options {
+        use super::*;
+
+        #[test]
+        fn test_extract_with_ddl_file() {
+            // A `--ddl-file` makes resolution catalog-aware. The unqualified
+            // `CREATE TABLE users` registers schema-less, so the read is
+            // `(cataloged)` and surfaces bare `users.name` (no fabricated schema).
+            let mut schema = NamedTempFile::new().unwrap();
+            schema
+                .write_all(b"CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("--ddl-file")
+                .arg(schema.path())
+                .arg("SELECT name FROM users")
+                .assert()
+                .success()
+                .stdout(
+                    "[1] Select\n  reads:   \"users\".name (cataloged)\n  lineage: \"users\".name (cataloged) -> name\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_with_unparseable_ddl_file_is_labelled() {
+            // A parse error in the --ddl-file is prefixed with the DDL-file
+            // context, so it isn't mistaken for an error in the analysed query
+            // (whose own parse errors surface unprefixed, per-statement).
+            let mut schema = NamedTempFile::new().unwrap();
+            schema.write_all(b"CREATE TABL bad (id INT);").unwrap();
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("tables")
+                .arg("--ddl-file")
+                .arg(schema.path())
+                .arg("SELECT 1")
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("Failed to parse DDL file"));
+        }
+
+        #[test]
+        fn test_extract_with_default_schema() {
+            // An explicit --default-schema fills the bare query ref before
+            // matching; the unqualified DDL table (schema-less) still matches.
+            let mut schema = NamedTempFile::new().unwrap();
+            schema.write_all(b"CREATE TABLE users (id INT);").unwrap();
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("--ddl-file")
+                .arg(schema.path())
+                .arg("--default-schema")
+                .arg("app")
+                .arg("SELECT id FROM users")
+                .assert()
+                .success()
+                .stdout("[1] Select\n  reads:   \"users\".id (cataloged)\n  lineage: \"users\".id (cataloged) -> id\n")
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_with_default_schema_only() {
+            // --default-schema without a --ddl-file: no tables to confirm, but
+            // the declared default still qualifies the bare ref — `users`
+            // surfaces as `public.users` (Inferred, so unmarked).
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("--default-schema")
+                .arg("public")
+                .arg("SELECT id FROM users")
+                .assert()
+                .success()
+                .stdout(
+                    "[1] Select\n  reads:   public.users.id\n  lineage: public.users.id -> id\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_with_casing_sensitive() {
+            // Case-sensitive override: lowercase `t2` no longer binds the
+            // uppercase CTE `T2`, so it surfaces as a distinct table.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("tables")
+                .arg("--casing")
+                .arg("sensitive")
+                .arg("WITH T2 AS (SELECT id FROM t1) SELECT * FROM t2")
+                .assert()
+                .success()
+                .stdout("t1, t2\n")
+                .stderr("");
+        }
+    }
+
+    mod extract_json {
+        use super::*;
+
+        // JSON output is a single pretty array of per-statement results.
+        // Keys are sorted (serde_json `Value`) and identifiers serialize as
+        // `{value, quote}` (no source span), so the text is stable.
+
+        #[test]
+        fn test_tables_json() {
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("tables")
+                .arg("--format")
+                .arg("json")
+                .arg("SELECT a FROM t1")
+                .assert()
+                .success()
+                .stdout(
+                    "[\n  {\n    \"diagnostics\": [],\n    \"tables\": [\n      {\n        \"catalog\": null,\n        \"name\": {\n          \"quote\": null,\n          \"value\": \"t1\"\n        },\n        \"schema\": null\n      }\n    ]\n  }\n]\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
+        fn test_column_ops_json_has_lineage_kind() {
+            // Spot-check the rich surface: a transformation edge and the
+            // resolution tag are present, identifiers carry value (no span).
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("--format")
+                .arg("json")
+                .arg("SELECT a + b AS total FROM t1")
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("\"kind\": \"Transformation\""))
+                .stdout(predicate::str::contains("\"resolution\": \"Inferred\""))
+                .stdout(predicate::str::contains("\"value\": \"total\""))
+                .stdout(predicate::str::contains("\"span\"").not())
+                .stderr("");
+        }
+
+        #[test]
+        fn test_json_unsupported_statement_carries_a_diagnostic() {
+            // A best-effort batch keeps every statement: the unsupported
+            // `SET` surfaces as an element with an `UnsupportedStatement`
+            // diagnostic (not a dropped entry), alongside the resolved `t1`.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("tables")
+                .arg("--format")
+                .arg("json")
+                .arg("SELECT a FROM t1; SET x = 1")
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("\"value\": \"t1\""))
+                .stdout(predicate::str::contains(
+                    "\"kind\": \"UnsupportedStatement\"",
+                ))
                 .stderr("");
         }
     }
@@ -256,7 +597,12 @@ mod integration {
         use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
         use tokio::time;
 
-        const BIN_PATH: &str = "../target/debug/sql-insight";
+        // Resolved by Cargo at compile time, so it tracks any
+        // `--target-dir` override the runner applies — notably
+        // `cargo-llvm-cov`, which builds into `target/llvm-cov-target/`.
+        // The hardcoded `../target/debug/sql-insight` form worked under
+        // tarpaulin only because tarpaulin reuses the default target dir.
+        const BIN_PATH: &str = env!("CARGO_BIN_EXE_sql-insight");
         const TIMEOUT_DURATION: Duration = Duration::from_secs(1);
 
         async fn write_to_stdin(
@@ -285,9 +631,47 @@ mod integration {
         }
 
         #[tokio::test]
+        async fn test_normalize_interactive() -> Result<(), Box<dyn std::error::Error>> {
+            // `normalize` reaches the interactive path through a different
+            // match arm (via `common_options`), so the `format` interactive
+            // test alone does not cover it.
+            let mut child = Command::new(BIN_PATH)
+                .arg("normalize")
+                .arg("-i")
+                .stdin(process::Stdio::piped())
+                .stdout(process::Stdio::piped())
+                .stderr(process::Stdio::piped())
+                .spawn()
+                .expect("Failed to spawn child process");
+
+            let stdin = child.stdin.as_mut().expect("Failed to open stdin");
+            let stdout = child.stdout.take().expect("Failed to open stdout");
+            let mut stdout_reader = BufReader::new(stdout).lines();
+
+            let initial_prompt = read_from_stdout(&mut stdout_reader).await?;
+            assert!(
+                initial_prompt.contains("Entering interactive mode."),
+                "Initial prompt not as expected: {initial_prompt:?}"
+            );
+
+            write_to_stdin(stdin, "SELECT * FROM t1 WHERE a = 1;\n").await?;
+            let query_result = read_from_stdout(&mut stdout_reader).await?;
+            assert!(
+                query_result.contains("SELECT * FROM t1 WHERE a = ?"),
+                "Query result not as expected: {query_result:?}"
+            );
+
+            write_to_stdin(stdin, "quit\n").await?;
+            child.wait().await?;
+
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn test_interactive() -> Result<(), Box<dyn std::error::Error>> {
             let mut child = Command::new(BIN_PATH)
                 .arg("format")
+                .arg("-i")
                 .stdin(process::Stdio::piped())
                 .stdout(process::Stdio::piped())
                 .stderr(process::Stdio::piped())
@@ -378,20 +762,48 @@ mod integration {
         }
 
         #[test]
-        fn test_fail_to_analyze_sql() {
+        fn test_over_qualified_name_is_best_effort() {
+            // An over-qualified table name (more than `catalog.schema.name`)
+            // can't be represented as a `TableReference`, so it is dropped —
+            // but best-effort, not a hard error. The text output surfaces the
+            // drop as a diagnostic rather than printing a silent empty line.
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract")
+                .arg("tables")
                 .arg("select * from catalog.schema.table.extra")
                 .assert()
                 .success()
-                .stdout("Error: Too many identifiers provided\n")
+                .stdout(predicate::str::contains(
+                    "! table reference `catalog.schema.table.extra`",
+                ))
+                .stdout(predicate::str::contains("too many qualifiers"))
+                .stderr("");
+        }
+
+        #[test]
+        fn test_extract_crud_over_qualified_name_is_best_effort() {
+            // An over-qualified table name (more than `catalog.schema.name`)
+            // can't be represented as a `TableReference`, so it is dropped
+            // best-effort. The empty CRUD buckets are followed by a diagnostic
+            // line so the drop isn't silent.
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("crud")
+                .arg("select * from catalog.schema.table.extra")
+                .assert()
+                .success()
+                .stdout(predicate::str::contains(
+                    "Create: [], Read: [], Update: [], Delete: []",
+                ))
+                .stdout(predicate::str::contains("too many qualifiers"))
                 .stderr("");
         }
 
         #[test]
         fn test_file_not_found() {
             sql_insight_cmd()
-                .arg("extract-tables")
+                .arg("extract")
+                .arg("tables")
                 .arg("--file")
                 .arg("non_existent_file.sql")
                 .assert()

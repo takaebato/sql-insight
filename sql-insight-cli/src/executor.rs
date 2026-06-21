@@ -1,6 +1,14 @@
+use sql_insight::catalog::Catalog;
+use sql_insight::diagnostic::TableLevelDiagnostic;
 use sql_insight::error::Error;
-use sql_insight::sqlparser::dialect;
-use sql_insight::NormalizerOptions;
+use sql_insight::extractor::{
+    extract_column_operations_with_options, extract_crud_tables_with_options,
+    extract_table_operations_with_options, extract_tables_with_options, ColumnLineageKind,
+    ColumnOperation, ColumnTarget, ExtractorOptions, TableOperation,
+};
+use sql_insight::normalizer::NormalizerOptions;
+use sql_insight::sqlparser::dialect::{self, Dialect};
+use sql_insight::{CaseRule, ColumnRead, IdentifierCasing, ResolutionKind, TableRead};
 
 pub trait CliExecutable {
     fn execute(&self) -> Result<Vec<String>, Error>;
@@ -25,7 +33,7 @@ impl FormatExecutor {
 
 impl CliExecutable for FormatExecutor {
     fn execute(&self) -> Result<Vec<String>, Error> {
-        sql_insight::format(
+        sql_insight::formatter::format(
             get_dialect(self.dialect_name.as_deref())?.as_ref(),
             self.sql.as_ref(),
         )
@@ -55,7 +63,7 @@ impl NormalizeExecutor {
 
 impl CliExecutable for NormalizeExecutor {
     fn execute(&self) -> Result<Vec<String>, Error> {
-        sql_insight::normalize_with_options(
+        sql_insight::normalizer::normalize_with_options(
             get_dialect(self.dialect_name.as_deref())?.as_ref(),
             self.sql.as_ref(),
             self.options.clone(),
@@ -63,56 +71,347 @@ impl CliExecutable for NormalizeExecutor {
     }
 }
 
-pub struct TableExtractExecutor {
+/// Which extraction surface an [`ExtractExecutor`] produces.
+#[derive(Clone, Copy)]
+pub enum ExtractKind {
+    Tables,
+    Crud,
+    TableOps,
+    ColumnOps,
+}
+
+/// Per-class identifier-casing overrides from the CLI. `all` is the
+/// uniform base; the per-class fields patch individual classes on top.
+/// All `None` = use the dialect default unchanged.
+#[derive(Default)]
+pub struct CasingOverride {
+    pub all: Option<CaseRule>,
+    pub table: Option<CaseRule>,
+    pub table_alias: Option<CaseRule>,
+    pub column: Option<CaseRule>,
+}
+
+impl CasingOverride {
+    /// Resolve to an [`IdentifierCasing`], or `None` when no override was
+    /// given (so the binder keeps the dialect default). Layering: dialect
+    /// default → uniform `all` → per-class patches.
+    fn resolve(&self, dialect: &dyn Dialect) -> Option<IdentifierCasing> {
+        if self.all.is_none()
+            && self.table.is_none()
+            && self.table_alias.is_none()
+            && self.column.is_none()
+        {
+            return None;
+        }
+        let mut casing = match self.all {
+            Some(rule) => IdentifierCasing::uniform(rule),
+            None => IdentifierCasing::for_dialect(dialect),
+        };
+        if let Some(rule) = self.table {
+            casing.table = rule;
+        }
+        if let Some(rule) = self.table_alias {
+            casing.table_alias = rule;
+        }
+        if let Some(rule) = self.column {
+            casing.column = rule;
+        }
+        Some(casing)
+    }
+}
+
+/// The single extractor entry point: builds the dialect, optional catalog
+/// (from a DDL file), and casing override once, then dispatches on `kind`.
+pub struct ExtractExecutor {
+    pub kind: ExtractKind,
     pub sql: String,
     pub dialect_name: Option<String>,
+    /// DDL file whose `CREATE TABLE`s populate the catalog.
+    pub ddl_file: Option<String>,
+    /// Query-side default schema / catalog (the search-path-style fill
+    /// used before matching). Set only when the user asked — a fallback
+    /// must not leak into query fill or it would break multi-schema
+    /// right-anchored resolution. Also names unqualified DDL tables.
+    pub default_schema: Option<String>,
+    pub default_catalog: Option<String>,
+    pub casing: CasingOverride,
+    pub format: OutputFormat,
 }
 
-impl TableExtractExecutor {
-    pub fn new(sql: String, dialect_name: Option<String>) -> Self {
-        Self { sql, dialect_name }
-    }
+/// How an extract command renders its result.
+#[derive(Clone, Copy, Default)]
+pub enum OutputFormat {
+    /// Human-readable text (the default).
+    #[default]
+    Text,
+    /// One JSON array of the per-statement results (each an `Ok` value or
+    /// an `{ "error": ... }` object), pretty-printed.
+    Json,
 }
 
-impl CliExecutable for TableExtractExecutor {
+impl CliExecutable for ExtractExecutor {
     fn execute(&self) -> Result<Vec<String>, Error> {
-        let result = sql_insight::extract_tables(
-            get_dialect(self.dialect_name.as_deref())?.as_ref(),
-            self.sql.as_ref(),
-        )?;
-        Ok(result
+        let dialect = get_dialect(self.dialect_name.as_deref())?;
+        let dialect = dialect.as_ref();
+        let catalog = self.load_catalog(dialect)?;
+        let casing = self.casing.resolve(dialect);
+
+        let mut options = ExtractorOptions::new();
+        if let Some(catalog) = &catalog {
+            options = options.with_catalog(catalog);
+        }
+        if let Some(casing) = casing {
+            options = options.with_casing(casing);
+        }
+
+        let sql = self.sql.as_ref();
+        match (self.kind, self.format) {
+            (ExtractKind::Tables, OutputFormat::Text) => Ok(render_display(
+                &extract_tables_with_options(dialect, sql, options)?,
+                |e| &e.diagnostics,
+            )),
+            (ExtractKind::Crud, OutputFormat::Text) => Ok(render_display(
+                &extract_crud_tables_with_options(dialect, sql, options)?,
+                |c| &c.diagnostics,
+            )),
+            (ExtractKind::TableOps, OutputFormat::Text) => Ok(render_statements(
+                &extract_table_operations_with_options(dialect, sql, options)?,
+                format_table_operation,
+            )),
+            (ExtractKind::ColumnOps, OutputFormat::Text) => Ok(render_statements(
+                &extract_column_operations_with_options(dialect, sql, options)?,
+                format_column_operation,
+            )),
+            (ExtractKind::Tables, OutputFormat::Json) => {
+                render_json(&extract_tables_with_options(dialect, sql, options)?)
+            }
+            (ExtractKind::Crud, OutputFormat::Json) => {
+                render_json(&extract_crud_tables_with_options(dialect, sql, options)?)
+            }
+            (ExtractKind::TableOps, OutputFormat::Json) => render_json(
+                &extract_table_operations_with_options(dialect, sql, options)?,
+            ),
+            (ExtractKind::ColumnOps, OutputFormat::Json) => render_json(
+                &extract_column_operations_with_options(dialect, sql, options)?,
+            ),
+        }
+    }
+}
+
+impl ExtractExecutor {
+    /// Build the catalog from the `--ddl-file` (if any) plus query-side
+    /// defaults. Returns `None` only when no catalog input was given at all
+    /// — defaults alone still build a (table-less) catalog, so a bare ref
+    /// qualifies to `--default-schema` even without a DDL file. Unqualified
+    /// DDL tables register schema-less (no fabricated schema).
+    fn load_catalog(&self, dialect: &dyn Dialect) -> Result<Option<Catalog>, Error> {
+        if self.ddl_file.is_none()
+            && self.default_schema.is_none()
+            && self.default_catalog.is_none()
+        {
+            return Ok(None);
+        }
+        let mut catalog = match &self.ddl_file {
+            Some(path) => {
+                let ddl = std::fs::read_to_string(path).map_err(|e| {
+                    Error::ArgumentError(format!("Failed to read DDL file {path}: {e}"))
+                })?;
+                // Prefix the DDL-file context so a parse error in the catalog
+                // file isn't mistaken for one in the analysed query (whose own
+                // errors surface per-statement, unprefixed).
+                Catalog::from_ddl(dialect, &ddl).map_err(|e| {
+                    Error::ArgumentError(format!("Failed to parse DDL file {path}: {e}"))
+                })?
+            }
+            None => Catalog::new(),
+        };
+        if let Some(schema) = &self.default_schema {
+            catalog = catalog.default_schema(schema.clone());
+        }
+        if let Some(cat) = &self.default_catalog {
+            catalog = catalog.default_catalog(cat.clone());
+        }
+        Ok(Some(catalog))
+    }
+}
+
+// ===== text rendering for the rich (operation) extractors =================
+//
+// One multi-line block per statement: `[N] <Kind>` header followed by the
+// non-empty `reads` / `writes` / `lineage` surfaces and any diagnostics.
+// Convention: a default is unmarked, a deviation is marked — `Inferred`
+// resolution and `Passthrough` lineage carry no marker, so the common
+// catalog-free SELECT stays clean while `(cataloged)` / `(ambiguous)` /
+// `(unresolved)` and `[transform]` stand out.
+
+/// Render each per-statement result, numbering from 1; an `Err` statement
+/// becomes a one-line `[N] Error: ...` so one bad statement doesn't sink
+/// the batch.
+fn render_statements<T>(
+    results: &[Result<T, Error>],
+    format_one: impl Fn(usize, &T) -> String,
+) -> Vec<String> {
+    results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| match r {
+            Ok(op) => format_one(i + 1, op),
+            Err(e) => format!("[{}] Error: {}", i + 1, e),
+        })
+        .collect()
+}
+
+/// Serialize the per-statement results to one pretty JSON array. Each
+/// element is the `Ok` value (the extractor's serde shape) or, for a failed
+/// statement, an `{ "error": "<message>" }` object — so one bad statement
+/// doesn't sink the batch and the array length still matches the input.
+fn render_json<T: serde::Serialize>(results: &[Result<T, Error>]) -> Result<Vec<String>, Error> {
+    let entries: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| match r {
+            Ok(value) => serde_json::to_value(value)
+                .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() })),
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        })
+        .collect();
+    let json = serde_json::to_string_pretty(&entries)
+        .map_err(|e| Error::AnalysisError(format!("failed to serialize result as JSON: {e}")))?;
+    Ok(vec![json])
+}
+
+/// Render the `Display`-backed extractors (`tables` / `crud`), one
+/// statement per line, appending any diagnostics as `! <message>` lines
+/// (the same marker the operation extractors use) so the text output never
+/// silently drops an unsupported / over-qualified statement.
+fn render_display<T: std::fmt::Display>(
+    results: &[Result<T, Error>],
+    diagnostics: impl Fn(&T) -> &[TableLevelDiagnostic],
+) -> Vec<String> {
+    results
+        .iter()
+        .map(|r| match r {
+            Ok(value) => {
+                let mut lines: Vec<String> = Vec::new();
+                let body = value.to_string();
+                if !body.is_empty() {
+                    lines.push(body);
+                }
+                for d in diagnostics(value) {
+                    lines.push(format!("  ! {}", d.message));
+                }
+                lines.join("\n")
+            }
+            Err(e) => format!("Error: {e}"),
+        })
+        .collect()
+}
+
+/// `  reads:    a, b` — labels pad to a fixed column so values align.
+fn labeled(label: &str, value: String) -> String {
+    format!("  {label:<8} {value}")
+}
+
+/// Marker for a non-default resolution; `Inferred` (the catalog-free
+/// default) is unmarked.
+fn resolution_marker(resolution: ResolutionKind) -> &'static str {
+    match resolution {
+        ResolutionKind::Inferred => "",
+        ResolutionKind::Cataloged => " (cataloged)",
+        ResolutionKind::Ambiguous => " (ambiguous)",
+        ResolutionKind::Unresolved => " (unresolved)",
+    }
+}
+
+fn table_read(read: &TableRead) -> String {
+    format!("{}{}", read.reference, resolution_marker(read.resolution))
+}
+
+fn column_read(read: &ColumnRead) -> String {
+    format!("{}{}", read.reference, resolution_marker(read.resolution))
+}
+
+fn column_target(target: &ColumnTarget) -> String {
+    match target {
+        ColumnTarget::Relation(reference) => reference.to_string(),
+        ColumnTarget::QueryOutput { name, position } => match name {
+            Some(name) => name.value.clone(),
+            None => format!("#{position}"),
+        },
+    }
+}
+
+/// Join `lineage` edges one per line, the first after the `lineage:` label
+/// and the rest aligned under it.
+fn lineage_block(edges: Vec<String>) -> String {
+    let pad = " ".repeat(labeled("lineage:", String::new()).len());
+    edges
+        .iter()
+        .enumerate()
+        .map(|(i, edge)| {
+            if i == 0 {
+                labeled("lineage:", edge.clone())
+            } else {
+                format!("{pad}{edge}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_table_operation(n: usize, op: &TableOperation) -> String {
+    let mut lines = vec![format!("[{n}] {:?}", op.statement_kind)];
+    if !op.reads.is_empty() {
+        let reads = op.reads.iter().map(table_read).collect::<Vec<_>>();
+        lines.push(labeled("reads:", reads.join(", ")));
+    }
+    if !op.writes.is_empty() {
+        let writes = op.writes.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        lines.push(labeled("writes:", writes.join(", ")));
+    }
+    if !op.lineage.is_empty() {
+        let edges = op
+            .lineage
             .iter()
-            .map(|r| match r {
-                Ok(tables) => format!("{}", tables),
-                Err(e) => format!("Error: {}", e),
-            })
-            .collect())
+            .map(|e| format!("{} -> {}", table_read(&e.source), e.target))
+            .collect();
+        lines.push(lineage_block(edges));
     }
-}
-
-pub struct CrudTableExtractExecutor {
-    sql: String,
-    dialect_name: Option<String>,
-}
-
-impl CrudTableExtractExecutor {
-    pub fn new(sql: String, dialect_name: Option<String>) -> Self {
-        Self { sql, dialect_name }
+    for d in &op.diagnostics {
+        lines.push(format!("  ! {}", d.message));
     }
+    lines.join("\n")
 }
 
-impl CliExecutable for CrudTableExtractExecutor {
-    fn execute(&self) -> Result<Vec<String>, Error> {
-        let result = sql_insight::extract_crud_tables(
-            get_dialect(self.dialect_name.as_deref())?.as_ref(),
-            self.sql.as_ref(),
-        )?;
-        Ok(result
+fn format_column_operation(n: usize, op: &ColumnOperation) -> String {
+    let mut lines = vec![format!("[{n}] {:?}", op.statement_kind)];
+    if !op.reads.is_empty() {
+        let reads = op.reads.iter().map(column_read).collect::<Vec<_>>();
+        lines.push(labeled("reads:", reads.join(", ")));
+    }
+    if !op.writes.is_empty() {
+        let writes = op.writes.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        lines.push(labeled("writes:", writes.join(", ")));
+    }
+    if !op.lineage.is_empty() {
+        let edges = op
+            .lineage
             .iter()
-            .map(|r| match r {
-                Ok(crud_tables) => format!("{}", crud_tables),
-                Err(e) => format!("Error: {}", e),
+            .map(|e| {
+                let transform = match e.kind {
+                    ColumnLineageKind::Transformation => " [transform]",
+                    ColumnLineageKind::Passthrough => "",
+                };
+                format!(
+                    "{} -> {}{transform}",
+                    column_read(&e.source),
+                    column_target(&e.target)
+                )
             })
-            .collect())
+            .collect();
+        lines.push(lineage_block(edges));
     }
+    for d in &op.diagnostics {
+        lines.push(format!("  ! {}", d.message));
+    }
+    lines.join("\n")
 }

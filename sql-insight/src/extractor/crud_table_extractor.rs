@@ -1,18 +1,33 @@
-//! A Extractor that extracts CRUD tables from SQL queries.
+//! CRUD-bucketed table extraction. See [`extract_crud_tables`] as
+//! the entry point.
 //!
-//! See [`extract_crud_tables`](crate::extract_crud_tables()) as the entry point for extracting CRUD tables from SQL.
+//! Buckets the tables touched by a statement into the four CRUD
+//! positions (Create / Read / Update / Delete). For finer detail —
+//! keeping the precise verb (Insert / Update / Delete / Merge),
+//! separating reads from writes, and per-statement lineage — see
+//! [`extract_table_operations`](crate::extractor::extract_table_operations).
+//!
+//! Write targets bucket by verb, so DDL lands where its effect is, not in
+//! `Read`: `INSERT`, `CREATE TABLE` / `CREATE VIEW`, and `SELECT … INTO` →
+//! Create, `UPDATE` and `ALTER` → Update, `DELETE` / `DROP` / `TRUNCATE` →
+//! Delete, and `MERGE` to each bucket its WHEN actions imply. A statement's
+//! read-role tables (a `SELECT`, a CTAS / view source, an `UPDATE … FROM`)
+//! always go to Read. A `WITH … <DML>` parses as a `Query`-wrapped DML, so
+//! the verb is recovered through that wrapper.
 
 use std::fmt;
-use std::ops::ControlFlow;
 
+use crate::casing::IdentifierStyle;
+use crate::catalog::Catalog;
+use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
-use crate::extractor::table_extractor::TableReference;
-use crate::{helper, TableExtractor};
-use sqlparser::ast::{Delete, MergeAction, Statement, Visit, Visitor};
+use crate::extractor::{ExtractorOptions, StatementKind, TableOperationExtractor};
+use crate::reference::TableReference;
+use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
-use sqlparser::parser::Parser;
 
-/// Convenience function to extract CRUD tables from SQL.
+/// Parse `sql` under `dialect` and return one [`CrudTables`] per
+/// statement.
 ///
 /// ## Example
 ///
@@ -21,7 +36,7 @@ use sqlparser::parser::Parser;
 ///
 /// let dialect = GenericDialect {};
 /// let sql = "INSERT INTO t1 (a) SELECT a FROM t2";
-/// let result = sql_insight::extract_crud_tables(&dialect, sql).unwrap();
+/// let result = sql_insight::extractor::extract_crud_tables(&dialect, sql).unwrap();
 /// println!("{:#?}", result);
 /// assert_eq!(result[0].as_ref().unwrap().to_string(), "Create: [t1], Read: [t2], Update: [], Delete: []");
 /// ```
@@ -32,711 +47,160 @@ pub fn extract_crud_tables(
     CrudTableExtractor::extract(dialect, sql)
 }
 
-/// [`CrudTables`] represents the tables involved in CRUD operations.
+/// Like [`extract_crud_tables`] but with [`ExtractorOptions`] — a catalog
+/// and/or an identifier-casing override. With a catalog, the bucketed
+/// tables are canonicalized to their registered path.
+pub fn extract_crud_tables_with_options(
+    dialect: &dyn Dialect,
+    sql: &str,
+    options: ExtractorOptions,
+) -> Result<Vec<Result<CrudTables, Error>>, Error> {
+    CrudTableExtractor::extract_with_options(dialect, sql, options)
+}
+
+/// Per-statement output of [`extract_crud_tables`]: tables bucketed
+/// by CRUD position plus non-fatal diagnostics. `Display` renders
+/// `"Create: [...], Read: [...], Update: [...], Delete: [...]"`.
 #[derive(Default, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CrudTables {
     pub create_tables: Vec<TableReference>,
     pub read_tables: Vec<TableReference>,
     pub update_tables: Vec<TableReference>,
     pub delete_tables: Vec<TableReference>,
+    /// Non-fatal diagnostics, forwarded from the underlying table-level
+    /// extraction (only [`UnsupportedStatement`](crate::diagnostic::TableLevelDiagnosticKind::UnsupportedStatement)
+    /// arises at this granularity).
+    pub diagnostics: Vec<TableLevelDiagnostic>,
 }
 
 impl fmt::Display for CrudTables {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let create_tables = self.format_tables(&self.create_tables);
-        let read_tables = self.format_tables(&self.read_tables);
-        let update_tables = self.format_tables(&self.update_tables);
-        let delete_tables = self.format_tables(&self.delete_tables);
         write!(
             f,
             "Create: [{}], Read: [{}], Update: [{}], Delete: [{}]",
-            create_tables, read_tables, update_tables, delete_tables
+            TableReference::format_list(&self.create_tables),
+            TableReference::format_list(&self.read_tables),
+            TableReference::format_list(&self.update_tables),
+            TableReference::format_list(&self.delete_tables),
         )
     }
 }
 
-impl CrudTables {
-    fn format_tables(&self, tables: &[TableReference]) -> String {
-        tables
-            .iter()
-            .map(|t| t.to_string())
-            .collect::<Vec<String>>()
-            .join(", ")
-    }
-}
-
-/// A visitor to extract CRUD tables from SQL.
+/// Struct-style entry point. Equivalent to the free
+/// [`extract_crud_tables`] function. A thin shim over
+/// [`TableOperationExtractor`] that buckets `reads`/`writes` into the
+/// CRUD positions, consulting the bind's normalized MERGE clause summary
+/// (rather than re-walking the raw AST) for the one verb-aware case —
+/// whose target placement depends on the WHEN actions.
 #[derive(Default, Debug)]
-pub struct CrudTableExtractor {
-    create_tables: Vec<TableReference>,
-    read_tables: Vec<TableReference>,
-    update_tables: Vec<TableReference>,
-    delete_tables: Vec<TableReference>,
-    possibly_aliased_delete_tables: Vec<TableReference>,
-}
-
-impl Visitor for CrudTableExtractor {
-    type Break = Error;
-
-    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
-        match statement {
-            Statement::Insert(insert) => {
-                match TableReference::try_from(insert) {
-                    Ok(table) => self.create_tables.push(table),
-                    Err(e) => return ControlFlow::Break(e),
-                }
-                self.read_tables = helper::calc_difference_of_tables(
-                    self.read_tables.clone(),
-                    self.create_tables.clone(),
-                );
-            }
-            Statement::Update(update) => {
-                match TableExtractor::extract_from_table_node(&update.table) {
-                    Ok(tables) => tables
-                        .0
-                        .into_iter()
-                        .for_each(|table| self.update_tables.push(table)),
-                    Err(e) => return ControlFlow::Break(e),
-                }
-                self.read_tables = helper::calc_difference_of_tables(
-                    self.read_tables.clone(),
-                    self.update_tables.clone(),
-                );
-            }
-            Statement::Delete(Delete { tables, from, .. }) => {
-                // When tables are present, deletion sqls are these tables,
-                // and from clause is used as a data source.
-                if !tables.is_empty() {
-                    for table in tables {
-                        match TableReference::try_from(table) {
-                            Ok(table) => self.possibly_aliased_delete_tables.push(table),
-                            Err(e) => return ControlFlow::Break(e),
-                        }
-                    }
-                } else {
-                    let from = match from {
-                        sqlparser::ast::FromTable::WithFromKeyword(items) => items,
-                        sqlparser::ast::FromTable::WithoutKeyword(items) => items,
-                    };
-                    for table_with_join in from {
-                        match TableExtractor::extract_from_table_node(table_with_join) {
-                            Ok(tables) => tables
-                                .0
-                                .into_iter()
-                                .for_each(|table| self.possibly_aliased_delete_tables.push(table)),
-                            Err(e) => return ControlFlow::Break(e),
-                        }
-                    }
-                }
-                self.delete_tables = helper::resolve_aliased_tables(
-                    self.possibly_aliased_delete_tables.clone(),
-                    self.read_tables.clone(),
-                );
-                self.read_tables = helper::calc_difference_of_tables(
-                    self.read_tables.clone(),
-                    self.delete_tables.clone(),
-                );
-            }
-            Statement::Merge(merge) => {
-                let target_table = match TableReference::try_from(&merge.table) {
-                    Ok(table) => table,
-                    Err(e) => return ControlFlow::Break(e),
-                };
-                let (mut inserted, mut updated, mut deleted) = (false, false, false);
-                merge.clauses.iter().for_each(|clause| match clause.action {
-                    MergeAction::Update { .. } => updated = true,
-                    MergeAction::Delete { .. } => deleted = true,
-                    MergeAction::Insert(_) => inserted = true,
-                });
-                if inserted {
-                    self.create_tables.push(target_table.clone());
-                }
-                if updated {
-                    self.update_tables.push(target_table.clone());
-                }
-                if deleted {
-                    self.delete_tables.push(target_table.clone());
-                }
-                self.read_tables =
-                    helper::calc_difference_of_tables(self.read_tables.clone(), vec![target_table]);
-            }
-            _ => {}
-        }
-        ControlFlow::Continue(())
-    }
-}
+pub struct CrudTableExtractor;
 
 impl CrudTableExtractor {
-    /// Extract CRUD tables from SQL.
+    /// Same as the free [`extract_crud_tables`] function — kept for
+    /// users who prefer the struct-style API.
     pub fn extract(
         dialect: &dyn Dialect,
         sql: &str,
     ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
-        let statements = Parser::parse_sql(dialect, sql)?;
-        let results = statements
-            .iter()
-            .map(Self::extract_from_statement)
-            .collect::<Vec<Result<CrudTables, Error>>>();
-        Ok(results)
+        Self::extract_with_options(dialect, sql, ExtractorOptions::new())
     }
 
-    fn extract_from_statement(statement: &Statement) -> Result<CrudTables, Error> {
-        let mut visitor = CrudTableExtractor {
-            read_tables: TableExtractor::extract_from_statement(statement)?.0,
+    /// Like [`extract`](Self::extract) but with [`ExtractorOptions`] — a
+    /// catalog and/or an identifier-casing override. `dialect` still
+    /// drives parsing; the options govern only the analysis.
+    pub fn extract_with_options(
+        dialect: &dyn Dialect,
+        sql: &str,
+        options: ExtractorOptions,
+    ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
+        crate::extractor::extract_each(dialect, sql, options, Self::extract_from_statement)
+    }
+
+    fn extract_from_statement(
+        statement: &Statement,
+        catalog: Option<&Catalog>,
+        style: IdentifierStyle,
+    ) -> Result<CrudTables, Error> {
+        let (ops, merge_actions) =
+            TableOperationExtractor::extract_inner(statement, catalog, style)?;
+        // CRUD buckets are identity-only — drop the per-read
+        // `ResolutionKind` and keep the bare `TableReference`s.
+        let reads: Vec<TableReference> = ops.reads.into_iter().map(|r| r.reference).collect();
+        let writes = ops.writes;
+        let diagnostics = ops.diagnostics;
+
+        let mut crud = CrudTables {
+            diagnostics,
             ..Default::default()
         };
-        match statement.visit(&mut visitor) {
-            ControlFlow::Break(e) => Err(e),
-            ControlFlow::Continue(()) => Ok(CrudTables {
-                create_tables: visitor.create_tables,
-                read_tables: visitor.read_tables,
-                update_tables: visitor.update_tables,
-                delete_tables: visitor.delete_tables,
-            }),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_utils::all_dialects;
-    use sqlparser::dialect::MySqlDialect;
-
-    fn assert_crud_table_extraction(
-        sql: &str,
-        expected: Vec<Result<CrudTables, Error>>,
-        dialects: Vec<Box<dyn Dialect>>,
-    ) {
-        for dialect in dialects {
-            let result = CrudTableExtractor::extract(dialect.as_ref(), sql)
-                .unwrap_or_else(|_| panic!("parse failed for dialect: {dialect:?}"));
-            assert_eq!(result, expected, "Failed for dialect: {dialect:?}")
-        }
-    }
-
-    #[test]
-    fn test_single_statement() {
-        let sql = "SELECT a FROM t1";
-        let expected = vec![Ok(CrudTables {
-            create_tables: vec![],
-            read_tables: vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            }],
-            update_tables: vec![],
-            delete_tables: vec![],
-        })];
-        assert_crud_table_extraction(sql, expected, all_dialects());
-    }
-
-    #[test]
-    fn test_multiple_statements() {
-        let sql = "SELECT a FROM t1; SELECT b FROM t2";
-        let expected = vec![
-            Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                }],
-                update_tables: vec![],
-                delete_tables: vec![],
-            }),
-            Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t2".into(),
-                    alias: None,
-                }],
-                update_tables: vec![],
-                delete_tables: vec![],
-            }),
-        ];
-        assert_crud_table_extraction(sql, expected, all_dialects());
-    }
-
-    #[test]
-    fn test_statement_with_alias() {
-        let sql = "SELECT a FROM t1 AS t1_alias";
-        let expected = vec![Ok(CrudTables {
-            create_tables: vec![],
-            read_tables: vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: Some("t1_alias".into()),
-            }],
-            update_tables: vec![],
-            delete_tables: vec![],
-        })];
-        assert_crud_table_extraction(sql, expected, all_dialects());
-    }
-
-    #[test]
-    fn test_statement_with_table_identifier() {
-        let sql = "SELECT a FROM catalog.schema.table";
-        let expected = vec![Ok(CrudTables {
-            create_tables: vec![],
-            read_tables: vec![TableReference {
-                catalog: Some("catalog".into()),
-                schema: Some("schema".into()),
-                name: "table".into(),
-                alias: None,
-            }],
-            update_tables: vec![],
-            delete_tables: vec![],
-        })];
-        assert_crud_table_extraction(sql, expected, all_dialects());
-    }
-
-    #[test]
-    fn test_statement_with_table_identifier_and_alias() {
-        let sql = "SELECT a FROM catalog.schema.table AS table_alias";
-        let expected = vec![Ok(CrudTables {
-            create_tables: vec![],
-            read_tables: vec![TableReference {
-                catalog: Some("catalog".into()),
-                schema: Some("schema".into()),
-                name: "table".into(),
-                alias: Some("table_alias".into()),
-            }],
-            update_tables: vec![],
-            delete_tables: vec![],
-        })];
-        assert_crud_table_extraction(sql, expected, all_dialects());
-    }
-
-    #[test]
-    fn test_statement_error_with_too_many_identifiers() {
-        let sql = "INSERT INTO catalog.schema.table.extra (a) VALUES (1)";
-        let expected = vec![Err(Error::AnalysisError(
-            "Too many identifiers provided".to_string(),
-        ))];
-        assert_crud_table_extraction(sql, expected, all_dialects());
-    }
-
-    mod delete_statement {
-        use crate::test_utils::all_dialects_except;
-
-        use super::*;
-
-        #[test]
-        fn test_delete_statement() {
-            let sql = "DELETE FROM t1";
-            let expected = vec![Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![],
-                update_tables: vec![],
-                delete_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                }],
-            })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
+        match ops.statement_kind {
+            StatementKind::Insert => {
+                crud.create_tables = writes;
+                crud.read_tables = reads;
+            }
+            StatementKind::Update => {
+                crud.update_tables = writes;
+                crud.read_tables = reads;
+            }
+            StatementKind::Delete => {
+                crud.delete_tables = writes;
+                crud.read_tables = reads;
+            }
+            StatementKind::Merge => {
+                // MERGE target placement depends on which WHEN actions
+                // appear — read that off the IR-derived `MergeActions` the
+                // bind produced, so this stays in step with the binder's
+                // model (and handles `WITH … MERGE` transparently; the
+                // facade peels the wrapper).
+                let actions = merge_actions.unwrap_or_default();
+                for target in &writes {
+                    if actions.has_insert {
+                        crud.create_tables.push(target.clone());
+                    }
+                    if actions.has_update {
+                        crud.update_tables.push(target.clone());
+                    }
+                    if actions.has_delete {
+                        crud.delete_tables.push(target.clone());
+                    }
+                }
+                crud.read_tables = reads;
+            }
+            // DDL write targets bucket by verb: CREATE → Create (a new
+            // object), ALTER → Update (modifies an existing one), DROP /
+            // TRUNCATE → Delete (removes it). A CTAS / CREATE-VIEW source
+            // still feeds `reads` (e.g. `CREATE TABLE t AS SELECT … FROM src`
+            // → Create: [t], Read: [src]).
+            StatementKind::CreateTable | StatementKind::CreateView => {
+                crud.create_tables = writes;
+                crud.read_tables = reads;
+            }
+            StatementKind::AlterTable | StatementKind::AlterView => {
+                crud.update_tables = writes;
+                crud.read_tables = reads;
+            }
+            StatementKind::Drop | StatementKind::Truncate => {
+                crud.delete_tables = writes;
+                crud.read_tables = reads;
+            }
+            // A plain `SELECT` writes nothing, but `SELECT … INTO new_t` binds
+            // as a CTAS, so its target surfaces in `writes` → Create (Create
+            // stays empty for a plain query); read-role tables go to Read.
+            StatementKind::Select => {
+                crud.create_tables = writes;
+                crud.read_tables = reads;
+            }
+            // An unsupported statement has no reliable write placement — fold
+            // everything into `read_tables` (best-effort). Listed explicitly
+            // (rather than `_ =>`) so a new `StatementKind` variant becomes a
+            // compile error here and forces a bucket decision.
+            StatementKind::Unsupported => {
+                crud.read_tables = reads;
+                crud.read_tables.extend(writes);
+            }
         }
 
-        #[test]
-        fn test_delete_statement_with_table_identifier() {
-            let sql = "DELETE FROM catalog.schema.t1";
-            let expected = vec![Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![],
-                update_tables: vec![],
-                delete_tables: vec![TableReference {
-                    catalog: Some("catalog".into()),
-                    schema: Some("schema".into()),
-                    name: "t1".into(),
-                    alias: None,
-                }],
-            })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
-        }
-
-        #[test]
-        fn test_delete_statement_with_alias() {
-            let sql = "DELETE FROM t1 AS t1_alias";
-            let expected = vec![Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![],
-                update_tables: vec![],
-                delete_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: Some("t1_alias".into()),
-                }],
-            })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
-        }
-
-        #[test]
-        fn test_delete_multiple_tables_syntax() {
-            let sql = "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3";
-            let expected = vec![Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                        alias: None,
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                        alias: None,
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t3".into(),
-                        alias: None,
-                    },
-                ],
-                update_tables: vec![],
-                delete_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                        alias: None,
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                        alias: None,
-                    },
-                ],
-            })];
-            // BigQuery and Generic do not support DELETE ... FROM
-            assert_crud_table_extraction(
-                sql,
-                expected,
-                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
-            );
-        }
-
-        #[test]
-        fn test_delete_multiple_tables_syntax_with_alias() {
-            let sql =
-                "DELETE t1_alias, t2_alias FROM t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
-            let expected = vec![Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                        alias: Some("t1_alias".into()),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                        alias: Some("t2_alias".into()),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t3".into(),
-                        alias: None,
-                    },
-                ],
-                update_tables: vec![],
-                delete_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                        alias: Some("t1_alias".into()),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                        alias: Some("t2_alias".into()),
-                    },
-                ],
-            })];
-            // BigQuery and Generic do not support DELETE ... FROM
-            assert_crud_table_extraction(
-                sql,
-                expected,
-                all_dialects_except(&vec!["GenericDialect", "BigQueryDialect"]),
-            );
-        }
-
-        #[test]
-        fn test_delete_multiple_tables_syntax_with_using() {
-            let sql = "DELETE FROM t1, t2 USING t1 INNER JOIN t2 INNER JOIN t3";
-            let expected = vec![Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                        alias: None,
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                        alias: None,
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t3".into(),
-                        alias: None,
-                    },
-                ],
-                update_tables: vec![],
-                delete_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                        alias: None,
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                        alias: None,
-                    },
-                ],
-            })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
-        }
-
-        #[test]
-        fn test_delete_multiple_tables_syntax_with_using_with_alias() {
-            let sql = "DELETE FROM t1_alias, t2_alias USING t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
-            let expected = vec![Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                        alias: Some("t1_alias".into()),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                        alias: Some("t2_alias".into()),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t3".into(),
-                        alias: None,
-                    },
-                ],
-                update_tables: vec![],
-                delete_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                        alias: Some("t1_alias".into()),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                        alias: Some("t2_alias".into()),
-                    },
-                ],
-            })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
-        }
-    }
-
-    mod insert_statement {
-        use super::*;
-
-        #[test]
-        fn test_insert_statement() {
-            let sql = "INSERT INTO t1 (a) VALUES (1)";
-            let expected = vec![Ok(CrudTables {
-                create_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                }],
-                read_tables: vec![],
-                update_tables: vec![],
-                delete_tables: vec![],
-            })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
-        }
-
-        #[test]
-        fn test_insert_select_statement() {
-            let sql = "INSERT INTO t1 (a) SELECT a FROM t2 AS t2_alias INNER JOIN t3 USING (id)";
-            let expected = vec![Ok(CrudTables {
-                create_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t1".into(),
-                    alias: None,
-                }],
-                read_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                        alias: Some("t2_alias".into()),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t3".into(),
-                        alias: None,
-                    },
-                ],
-                update_tables: vec![],
-                delete_tables: vec![],
-            })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
-        }
-    }
-
-    mod update_statemnet {
-        use super::*;
-
-        #[test]
-        fn test_update_statement() {
-            let sql = "UPDATE t1 SET a=1";
-            let result = CrudTableExtractor::extract(&MySqlDialect {}, sql).unwrap();
-            assert_eq!(
-                result,
-                vec![Ok(CrudTables {
-                    create_tables: vec![],
-                    read_tables: vec![],
-                    update_tables: vec![TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                        alias: None,
-                    }],
-                    delete_tables: vec![],
-                }),]
-            )
-        }
-
-        #[test]
-        fn test_update_statement_with_alias() {
-            let sql = "UPDATE t1 AS t1_alias INNER JOIN t2 ON t1_alias.a = t2.a SET t1_alias.b = t2.b WHERE t2.c = (SELECT c FROM t3)";
-            let expected = vec![Ok(CrudTables {
-                create_tables: vec![],
-                read_tables: vec![TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "t3".into(),
-                    alias: None,
-                }],
-                update_tables: vec![
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t1".into(),
-                        alias: Some("t1_alias".into()),
-                    },
-                    TableReference {
-                        catalog: None,
-                        schema: None,
-                        name: "t2".into(),
-                        alias: None,
-                    },
-                ],
-                delete_tables: vec![],
-            })];
-            assert_crud_table_extraction(sql, expected, all_dialects());
-        }
-    }
-
-    #[test]
-    fn test_merge_statement() {
-        let sql = "MERGE INTO t1 AS t1_alias USING t2 AS t2_alias ON t1_alias.a = t2_alias.a \
-                         WHEN MATCHED AND t2_alias.b = 1 THEN DELETE \
-                         WHEN MATCHED AND t2_alias.b = 2 THEN UPDATE SET t1_alias.b = t2_alias.b \
-                         WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2_alias.a, t2_alias.b)";
-        let expected = vec![Ok(CrudTables {
-            create_tables: vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: Some("t1_alias".into()),
-            }],
-            read_tables: vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t2".into(),
-                alias: Some("t2_alias".into()),
-            }],
-            update_tables: vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: Some("t1_alias".into()),
-            }],
-            delete_tables: vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: Some("t1_alias".into()),
-            }],
-        })];
-        assert_crud_table_extraction(sql, expected, all_dialects());
-    }
-
-    #[test]
-    fn test_create_table_statement() {
-        let sql = "CREATE TABLE t1 (a INT)";
-        let expected = vec![Ok(CrudTables {
-            create_tables: vec![],
-            read_tables: vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            }],
-            update_tables: vec![],
-            delete_tables: vec![],
-        })];
-        assert_crud_table_extraction(sql, expected, all_dialects());
-    }
-
-    #[test]
-    fn test_alters_table_statement() {
-        let sql = "ALTER TABLE t1 ADD COLUMN a INT";
-        let expected = vec![Ok(CrudTables {
-            create_tables: vec![],
-            read_tables: vec![TableReference {
-                catalog: None,
-                schema: None,
-                name: "t1".into(),
-                alias: None,
-            }],
-            update_tables: vec![],
-            delete_tables: vec![],
-        })];
-        assert_crud_table_extraction(sql, expected, all_dialects());
+        Ok(crud)
     }
 }
