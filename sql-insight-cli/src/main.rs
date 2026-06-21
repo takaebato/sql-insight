@@ -8,7 +8,7 @@ use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use sql_insight::error::Error;
 use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::CaseRule;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
 
 #[derive(Debug, Parser)]
@@ -280,48 +280,46 @@ impl Commands {
             "Entering interactive mode. Type sql statement end with `;` to execute. \
              Type `exit` or `quit` to exit."
         );
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
+        let mut editor =
+            rustyline::DefaultEditor::new().map_err(|e| Error::IOError(e.to_string()))?;
+
         let mut input_buffer = String::new();
-        let mut new_input = true;
         loop {
-            if new_input {
-                print!("sql> ");
+            let prompt = if input_buffer.is_empty() {
+                "sql> "
             } else {
-                print!("  -> ");
-            }
-            stdout.flush().map_err(|e| Error::IOError(e.to_string()))?;
-            let mut line = String::new();
-            stdin
-                .read_line(&mut line)
-                .map_err(|e| Error::IOError(e.to_string()))?;
-            let line = line.trim();
-            if line.is_empty() {
+                "  -> "
+            };
+            let line = match editor.readline(prompt) {
+                Ok(line) => line,
+                // Ctrl-C clears the in-progress statement; Ctrl-D / EOF exits.
+                Err(rustyline::error::ReadlineError::Interrupted) => {
+                    input_buffer.clear();
+                    continue;
+                }
+                Err(rustyline::error::ReadlineError::Eof) => break,
+                Err(e) => return Err(Error::IOError(e.to_string())),
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            if line.to_lowercase() == "exit" || line.to_lowercase() == "quit" {
-                println!("Bye");
-                break Ok(());
+            let _ = editor.add_history_entry(trimmed);
+            if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
+                break;
             }
-            input_buffer.push_str(line);
+            input_buffer.push_str(trimmed);
             input_buffer.push('\n');
-            if line.ends_with(';') {
-                match self.executor(input_buffer.clone()).execute() {
-                    Ok(result) => {
-                        for r in result {
-                            println!("{}", r);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Error: {}", e);
-                    }
+            if trimmed.ends_with(';') {
+                match self.executor(std::mem::take(&mut input_buffer)).execute() {
+                    Ok(result) => result.iter().for_each(|r| println!("{r}")),
+                    Err(e) => eprintln!("Error: {e}"),
                 }
-                input_buffer.clear();
-                new_input = true;
-            } else {
-                new_input = false;
             }
         }
+
+        println!("Bye");
+        Ok(())
     }
 
     fn executor(&self, sql: String) -> Box<dyn CliExecutable> {
