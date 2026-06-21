@@ -12,9 +12,8 @@ use sqlparser::tokenizer::Span;
 
 /// A non-fatal diagnostic from table-level extraction.
 ///
-/// Carried by the table-level surfaces. `message` is human-readable and,
-/// when a [`span`](Self::span) is available, also embeds the location for
-/// log-line display.
+/// `message` is a human-readable description; [`span`](Self::span) carries
+/// the source location when the offending node has one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TableLevelDiagnostic {

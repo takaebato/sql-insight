@@ -14,8 +14,7 @@
 //! consumer — owns identifier matching: a query reference matches a
 //! registered table by **right-anchored, dialect-cased** comparison
 //! (a bare `users` matches a registered `mydb.users`), so consumers
-//! don't reimplement that subtlety. The resolver performs the matching
-//! itself when it walks a statement.
+//! don't reimplement that subtlety.
 //!
 //! **Open-world.** A table the catalog doesn't contain is taken as
 //! *schema unknown*, not *nonexistent* — it still surfaces as an
@@ -170,9 +169,10 @@ impl FromIterator<CatalogTable> for Catalog {
 /// catalog layer omit the catalog. An omitted segment matches *any* query
 /// value there (right-anchored, the same wildcard rule a query reference
 /// gets for its own omitted qualifiers), so a schema-less `users` matches
-/// both a bare `users` and a qualified `public.users`. All identifiers are
-/// stored verbatim and matched exactly (see the module docs); `columns`
-/// may be empty when the table is known but its columns aren't.
+/// both a bare `users` and a qualified `public.users`. Identifiers are
+/// stored verbatim; a *present* segment compares exactly (folding only
+/// under case-insensitive dialects — see the module docs). `columns` may
+/// be empty when the table is known but its columns aren't.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogTable {
     catalog: Option<String>,
