@@ -25,7 +25,6 @@ use crate::extractor::{ExtractorOptions, StatementKind, TableOperationExtractor}
 use crate::reference::TableReference;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
-use sqlparser::parser::Parser;
 
 /// Parse `sql` under `dialect` and return one [`CrudTables`] per
 /// statement.
@@ -115,12 +114,7 @@ impl CrudTableExtractor {
         sql: &str,
         options: ExtractorOptions,
     ) -> Result<Vec<Result<CrudTables, Error>>, Error> {
-        let statements = Parser::parse_sql(dialect, sql)?;
-        let style = options.identifier_style(dialect);
-        Ok(statements
-            .iter()
-            .map(|s| Self::extract_from_statement(s, options.catalog, style))
-            .collect())
+        crate::extractor::extract_each(dialect, sql, options, Self::extract_from_statement)
     }
 
     fn extract_from_statement(

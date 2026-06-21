@@ -28,7 +28,6 @@ use crate::reference::{TableRead, TableReference};
 use crate::resolver::MergeActions;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
-use sqlparser::parser::Parser;
 
 /// Convenience function to extract table-level operations from SQL using
 /// the dialect defaults (no catalog, dialect-derived casing). For a
@@ -174,12 +173,7 @@ impl TableOperationExtractor {
         sql: &str,
         options: ExtractorOptions,
     ) -> Result<Vec<Result<TableOperation, Error>>, Error> {
-        let statements = Parser::parse_sql(dialect, sql)?;
-        let style = options.identifier_style(dialect);
-        Ok(statements
-            .iter()
-            .map(|s| Self::extract_from_statement(s, options.catalog, style))
-            .collect())
+        crate::extractor::extract_each(dialect, sql, options, Self::extract_from_statement)
     }
 
     /// Assemble the table operation from the bound plan: see

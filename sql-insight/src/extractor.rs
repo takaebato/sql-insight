@@ -32,8 +32,10 @@ pub use table_operation_extractor::*;
 
 use crate::casing::{IdentifierCasing, IdentifierStyle};
 use crate::catalog::Catalog;
+use crate::error::Error;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
+use sqlparser::parser::Parser;
 
 /// Optional inputs shared by every `*_with_options` extractor. Defaults
 /// to no catalog and the dialect-derived identifier casing — i.e. the
@@ -156,6 +158,29 @@ pub enum StatementKind {
     /// Statement is outside the operation-extraction scope. The
     /// accompanying `diagnostics` list explains why.
     Unsupported,
+}
+
+/// The shared `*_with_options` driver: parse `sql` once, then run
+/// `extract_from` on each parsed statement. A *parse* failure fails the whole
+/// call (`Err` on the outer `Result`) because statements can't be separated
+/// without the parser; a per-statement failure stays inside that statement's
+/// inner `Result` so the rest of a multi-statement batch still surfaces. Each
+/// sub-extractor's public `extract*_with_options` is a one-liner over this.
+pub(crate) fn extract_each<T, F>(
+    dialect: &dyn Dialect,
+    sql: &str,
+    options: ExtractorOptions,
+    extract_from: F,
+) -> Result<Vec<Result<T, Error>>, Error>
+where
+    F: Fn(&Statement, Option<&Catalog>, IdentifierStyle) -> Result<T, Error>,
+{
+    let statements = Parser::parse_sql(dialect, sql)?;
+    let style = options.identifier_style(dialect);
+    Ok(statements
+        .iter()
+        .map(|s| extract_from(s, options.catalog, style))
+        .collect())
 }
 
 /// Classify a parsed statement into its [`StatementKind`]. Shared by the

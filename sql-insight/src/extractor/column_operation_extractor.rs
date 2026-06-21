@@ -35,7 +35,6 @@ use crate::extractor::{classify_statement, ExtractorOptions, StatementKind};
 use crate::reference::{ColumnRead, ColumnReference};
 use sqlparser::ast::{Ident, Statement};
 use sqlparser::dialect::Dialect;
-use sqlparser::parser::Parser;
 
 /// Convenience function to extract column-level operations from SQL using
 /// the dialect defaults (no catalog, dialect-derived casing). For a
@@ -240,12 +239,7 @@ impl ColumnOperationExtractor {
         sql: &str,
         options: ExtractorOptions,
     ) -> Result<Vec<Result<ColumnOperation, Error>>, Error> {
-        let statements = Parser::parse_sql(dialect, sql)?;
-        let style = options.identifier_style(dialect);
-        Ok(statements
-            .iter()
-            .map(|s| Self::extract_from_statement(s, options.catalog, style))
-            .collect())
+        crate::extractor::extract_each(dialect, sql, options, Self::extract_from_statement)
     }
 
     /// Assemble the column operation from the bound plan: classify the

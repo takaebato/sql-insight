@@ -16,7 +16,6 @@ use crate::extractor::{classify_statement, ExtractorOptions, StatementKind};
 use crate::reference::TableReference;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
-use sqlparser::parser::Parser;
 
 /// Parse `sql` under `dialect` and return one [`TableExtraction`] per
 /// statement.
@@ -99,13 +98,7 @@ impl TableExtractor {
         sql: &str,
         options: ExtractorOptions,
     ) -> Result<Vec<Result<TableExtraction, Error>>, Error> {
-        let statements = Parser::parse_sql(dialect, sql)?;
-        let style = options.identifier_style(dialect);
-        let results = statements
-            .iter()
-            .map(|s| Self::extract_from_statement(s, options.catalog, style))
-            .collect::<Vec<Result<TableExtraction, Error>>>();
-        Ok(results)
+        crate::extractor::extract_each(dialect, sql, options, Self::extract_from_statement)
     }
 
     fn extract_from_statement(
