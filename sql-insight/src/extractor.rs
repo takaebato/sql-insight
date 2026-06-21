@@ -14,10 +14,11 @@
 //!   granularity, plus per-column lineage kinds
 //!   (Passthrough / Transformation).
 //!
-//! Each extractor returns `Vec<Result<X, Error>>` so one malformed
-//! statement does not kill the rest of a multi-statement SQL
-//! string. Sub-modules are private; the public items reach users
-//! through the wildcard re-exports below.
+//! Each extractor returns `Vec<Result<X, Error>>` so one statement that
+//! fails to extract doesn't sink the rest of a multi-statement string. (A
+//! *parse* error fails the whole call — the outer `Result` — since
+//! statements can't be separated before parsing.) Sub-modules are private;
+//! the public items reach users through the wildcard re-exports below.
 
 mod column_operation_extractor;
 mod crud_table_extractor;

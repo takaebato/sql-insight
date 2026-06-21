@@ -160,19 +160,9 @@ pub struct ColumnLineageEdge {
     pub kind: ColumnLineageKind,
 }
 
-/// The target endpoint of a [`ColumnLineageEdge`].
-///
-/// `Relation` covers columns that live in a named relation — a table
-/// or a view, both modelled identically as a `table`-qualified
-/// `ColumnReference` — and receive a value from the statement (INSERT
-/// target, UPDATE SET target, MERGE INSERT/UPDATE target, CTAS / CREATE
-/// VIEW output column).
-///
-/// `QueryOutput` covers transient columns produced by a top-level
-/// SELECT projection that is not piped into a named relation. `name`
-/// follows the projection: the alias if explicit, the bare column name
-/// if the projection is a single column, otherwise `None`. `position`
-/// is always set so anonymous outputs can be identified.
+/// The target endpoint of a [`ColumnLineageEdge`] — a column in a named
+/// relation ([`Relation`](Self::Relation)) or a transient SELECT output
+/// ([`QueryOutput`](Self::QueryOutput)).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum ColumnTarget {
@@ -196,33 +186,27 @@ pub enum ColumnTarget {
 }
 
 /// How a source column contributes to its target — the one clean,
-/// exclusive distinction: is the value forwarded unchanged, or
-/// derived?
-///
-/// - `Passthrough` — the source value is forwarded unchanged
-///   (`SELECT a FROM t1`, `INSERT INTO t1 (a) SELECT b FROM t2`). A
-///   rename (`SELECT a AS b`) is still `Passthrough`; detect it by
-///   comparing the source `name` to the target `name`.
-/// - `Transformation` — the source feeds any expression that changes
-///   the value: arithmetic, function calls, CASE branches, casts,
-///   aggregates (`SUM`, `STRING_AGG`), window functions, etc.
+/// exclusive distinction: is the value forwarded unchanged, or derived?
 ///
 /// Finer sub-classification of `Transformation` (aggregate vs scalar,
-/// cardinality, etc.) is deliberately not modelled here — it is lossy
-/// for edge cases (window aggregates, value-preserving `STRING_AGG`)
-/// and not load-bearing for the core dependency / impact-analysis use
-/// case. A finer variant can be added later if a concrete consumer
-/// needs it (a breaking change while the crate is pre-1.0).
+/// cardinality, etc.) is deliberately not modelled — it is lossy for edge
+/// cases (window aggregates, value-preserving `STRING_AGG`) and not
+/// load-bearing for the core dependency / impact-analysis use case. A finer
+/// variant can be added later if a concrete consumer needs it (a breaking
+/// change while the crate is pre-1.0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum ColumnLineageKind {
-    /// Source value is forwarded unchanged. Composition stays
-    /// `Passthrough` only when every step in the chain is also
-    /// `Passthrough`.
+    /// Source value forwarded unchanged (`SELECT a FROM t1`,
+    /// `INSERT INTO t1 (a) SELECT b FROM t2`). A rename (`SELECT a AS b`)
+    /// is still `Passthrough` — detect it by comparing source / target
+    /// `name`. Composition stays `Passthrough` only when every step in the
+    /// chain is.
     Passthrough,
-    /// Source feeds an expression that changes the value. Composition
-    /// yields `Transformation` whenever any step in the chain is a
-    /// transformation.
+    /// Source feeds an expression that changes the value: arithmetic,
+    /// function calls, CASE branches, casts, aggregates (`SUM`,
+    /// `STRING_AGG`), window functions, etc. Composition yields
+    /// `Transformation` whenever any step in the chain is one.
     Transformation,
 }
 

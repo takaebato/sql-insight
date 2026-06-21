@@ -170,10 +170,10 @@ impl CrudTableExtractor {
                 }
                 crud.read_tables = reads;
             }
-            // Every touched table goes to `read_tables`, matching the
-            // legacy catch-all behavior. Listed explicitly (rather
-            // than `_ =>`) so a new `StatementKind` variant becomes a
-            // compile error here and forces a placement decision.
+            // Every touched table goes to `read_tables` (the catch-all for
+            // non-DML verbs). Listed explicitly (rather than `_ =>`) so a
+            // new `StatementKind` variant becomes a compile error here and
+            // forces a placement decision.
             StatementKind::Select
             | StatementKind::CreateTable
             | StatementKind::CreateView
