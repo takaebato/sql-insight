@@ -22,34 +22,20 @@
 //! - **Table-level Operation Extraction** — `reads` / `writes` /
 //!   `lineage` surfaces with [`extractor::StatementKind`] classification.
 //!   See [`extractor::extract_table_operations`].
-//! - **Column-level Operation Extraction** — the same three
-//!   surfaces at column granularity. `reads` is a list of
-//!   [`ColumnRead`]s (occurrence-based, each pairing a
-//!   [`ColumnReference`] identity with the resolver's
-//!   [`ResolutionKind`]); `writes` is a plain occurrence list of
-//!   [`ColumnReference`]s; `lineage` forms a source → target graph
-//!   carrying [`extractor::ColumnLineageKind`] (`Passthrough` vs
-//!   `Transformation`). The value-vs-filter distinction is
-//!   structural: a value contributor is a `lineage` source, a
-//!   filter-only column is in `reads` but not `lineage`. See
-//!   [`extractor::extract_column_operations`].
-//! - **Optional [`catalog::Catalog`]** — supply a schema provider to
-//!   make resolution strict. Catalog-confirmed placements surface as
-//!   [`ResolutionKind::Cataloged`] reads; refs the catalog actively
-//!   denies surface as [`ResolutionKind::Unresolved`]. INSERT without an
-//!   explicit column list also uses the catalog to pair positional
-//!   values with target columns. Every extractor works catalog-free
-//!   in best-effort mode (catalog-less reads surface as
-//!   [`ResolutionKind::Inferred`] / [`ResolutionKind::Ambiguous`] /
-//!   [`ResolutionKind::Unresolved`]).
+//! - **Column-level Operation Extraction** — the same three surfaces at
+//!   column granularity, with `lineage` carrying
+//!   [`extractor::ColumnLineageKind`] (`Passthrough` vs `Transformation`).
+//!   The value-vs-filter distinction is structural: a value contributor is
+//!   a `lineage` source, a filter-only column is in `reads` but not
+//!   `lineage`. See [`extractor::extract_column_operations`].
+//! - **Optional [`catalog::Catalog`]** — supply a schema provider to make
+//!   resolution strict (each read's [`ResolutionKind`] records how it
+//!   matched); every extractor also works catalog-free in best-effort mode.
 //! - **Diagnostics** ([`diagnostic::TableLevelDiagnostic`] /
-//!   [`diagnostic::ColumnLevelDiagnostic`]) — non-fatal issues surface
-//!   alongside the extraction result rather than failing the whole call.
-//!   The kinds are tool-side coverage gaps: unsupported statements,
-//!   suppressed wildcards, over-qualified table names, and column-list-less
-//!   `INSERT`s that need a catalog. Per-reference resolution outcomes live
-//!   on [`ColumnRead::resolution`] instead, so the diagnostic stream stays
-//!   reserved for those gaps.
+//!   [`diagnostic::ColumnLevelDiagnostic`]) — non-fatal coverage gaps
+//!   surface alongside the result rather than failing the call.
+//!   Per-reference resolution outcomes live on [`ColumnRead::resolution`]
+//!   instead, keeping the diagnostic stream for tool-side gaps.
 //!
 //! ## Quick Start
 //!

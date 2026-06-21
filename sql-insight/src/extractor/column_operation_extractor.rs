@@ -1,73 +1,24 @@
 //! Extracts the column-level operations a SQL statement performs.
 //!
-//! Where [`extract_table_operations`](crate::extractor::extract_table_operations)
-//! answers "what tables does this statement touch / write / lineage", this
-//! module answers the same questions at column granularity.
+//! The column-granularity counterpart to
+//! [`extract_table_operations`](crate::extractor::extract_table_operations):
+//! the same three surfaces — `reads`, `writes`, `lineage` — as
+//! [`ColumnOperation`], each lineage edge tagged
+//! [`Passthrough` or `Transformation`](ColumnLineageKind). Per-surface
+//! detail (which constructs fill each) lives on `ColumnOperation`'s fields.
 //!
-//! The output mirrors `TableOperation` — three parallel
-//! surfaces (`reads`, `writes`, `lineage`) — plus a small enrichment on
-//! lineage edges to distinguish passthrough projections from
-//! value-changing transformations.
+//! Two cross-cutting behaviours, stated once here:
 //!
-//! **Current coverage** (column tracking is rolling in incrementally):
-//! - `reads`: qualified column references decompose directly to
-//!   `TableReference + name`; unqualified ones are resolved against
-//!   the scope chain at walk time. A unique candidate binding wins;
-//!   0 or 2+ candidates leave `table: None` (the column name still
-//!   surfaces). References whose walk-time owning binding was a CTE,
-//!   derived table, or table function (synthetic relations, not
-//!   real storage) are dropped from reads — only references to real
-//!   tables or unresolved names surface. `reads` is a plain
-//!   occurrence list of `ColumnReference`s in source order: a column
-//!   referenced more than once appears more than once, with no
-//!   syntactic clause tag. (Whether a reference contributes a value
-//!   or merely influences the result — e.g. a `WHERE` predicate — is
-//!   recovered structurally: value contributors are `lineage` sources,
-//!   filter-only columns are in `reads` but not `lineage`.)
-//! - `writes`: INSERT target columns (explicit list when given;
-//!   when omitted and the catalog provides the target's schema,
-//!   the columns the resolver paired with source projections via
-//!   the catalog), UPDATE SET targets scoped to the UPDATE table,
-//!   CTAS / CREATE VIEW / ALTER VIEW target columns (explicit
-//!   column list when provided, else the names the resolver derived
-//!   from the source projection), and MERGE WHEN-clause writes
-//!   (UPDATE SET targets and INSERT column lists, with the same
-//!   catalog fallback for column-list-less INSERT).
-//! - `lineage`: per-output-column edges for SELECT (target =
-//!   `QueryOutput { name, position }`), positionally paired
-//!   `source-column → target-column` edges for INSERT (explicit
-//!   column list, or — when the catalog provides the target's
-//!   schema — the catalog columns; one branch per UNION arm, each
-//!   paired against the same target columns), and
-//!   per-assignment edges for
-//!   UPDATE SET. Sources that reference CTEs or derived tables are
-//!   collapsed end-to-end — references recurse through the
-//!   synthetic's body projections, so a SELECT through a chain of
-//!   CTEs surfaces lineage whose sources are the underlying real
-//!   tables. Each edge is tagged with a `ColumnLineageKind`:
-//!   `Passthrough` (the value is forwarded unchanged — a bare column
-//!   ref, rename included) or `Transformation` (any expression that
-//!   changes the value: arithmetic, function calls, aggregates,
-//!   window functions, CASE, casts, …). Composition yields
-//!   `Transformation` whenever any step in a CTE / derived chain is a
-//!   transformation. CTAS / CREATE
-//!   VIEW / ALTER VIEW emit `Relation`-target lineage from source
-//!   projections to the created relation's columns. MERGE emits
-//!   per-clause `Relation`-target lineage for WHEN MATCHED UPDATE
-//!   (per assignment) and
-//!   WHEN NOT MATCHED INSERT VALUES (positional pair with the INSERT
-//!   column list); DELETE actions emit nothing. A column-list-less
-//!   INSERT / MERGE-INSERT without a catalog can't pair its columns, so
-//!   it emits no column `writes` / `lineage` and is flagged
-//!   [`InsertColumnsUnresolved`](crate::diagnostic::ColumnLevelDiagnosticKind::InsertColumnsUnresolved).
-//!
-//! **Strictness scales with the catalog.** Without a catalog, Table
-//! bindings have `Unknown` schemas and unqualified refs to a
-//! single-table scope resolve unconditionally (best-effort, matches
-//! the implicit promise of `catalog: None`). With a catalog, Table
-//! schemas come back `Cataloged(cols)` and unqualified refs only resolve
-//! when the candidate's schema actually lists the column — column
-//! typos that would otherwise silently resolve become unresolved.
+//! - **Value vs filter is structural.** A column that contributes a value
+//!   is a `lineage` source; one that only influences the result (e.g. a
+//!   `WHERE` predicate) is in `reads` but not `lineage`.
+//! - **Strictness scales with the catalog.** Catalog-free, a `Table`
+//!   binding's schema is `Unknown` and an unqualified ref to a single-table
+//!   scope resolves unconditionally (best-effort). With a catalog it's
+//!   `Cataloged`, so an unqualified ref resolves only when that schema
+//!   lists the column — a typo that would silently resolve becomes
+//!   `Unresolved`. Synthetic-origin refs (CTE / derived / table function)
+//!   drop from `reads`; only real-table or unresolved names surface.
 
 use crate::casing::IdentifierStyle;
 use crate::catalog::Catalog;
