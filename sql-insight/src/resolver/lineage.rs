@@ -312,6 +312,13 @@ pub(super) fn collect_table_lineage(
     let target = match peel_with(plan) {
         LogicalPlan::Insert(i) => {
             feeding_scans(&i.input, &mut ctx, &mut expanded_ctes, &mut sources);
+            // ON CONFLICT DO UPDATE SET col = value: a value-position subquery
+            // (`= (SELECT … FROM other)`) feeds the target, like an UPDATE SET
+            // RHS. An `EXCLUDED.x` ref feeds nothing new — it names the INSERT
+            // source row, already collected from `i.input`.
+            for a in &i.on_conflict {
+                expr_feeding(&a.value, &mut ctx, &mut expanded_ctes, &mut sources);
+            }
             &i.target
         }
         // UPDATE feeds from the FROM relations (the read `input`) AND any value

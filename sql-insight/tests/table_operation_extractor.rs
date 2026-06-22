@@ -918,6 +918,44 @@ mod lineage {
     }
 
     #[test]
+    fn insert_on_conflict_value_subquery_feeds_lineage() {
+        // ON CONFLICT DO UPDATE SET col = (SELECT … FROM other): the value
+        // subquery feeds the target like an UPDATE SET RHS — so `other` is a
+        // lineage source alongside the INSERT source `src`.
+        assert_ops_with(
+            "INSERT INTO dst (id) SELECT id FROM src \
+             ON CONFLICT (id) DO UPDATE SET id = (SELECT y FROM other)",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("src"), read("other")],
+                writes: vec![table("dst")],
+                lineage: vec![edge("src", "dst"), edge("other", "dst")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_on_conflict_excluded_value_adds_no_lineage() {
+        // An `EXCLUDED.x` conflict value names the INSERT source row (already
+        // fed via the source), so it introduces no new feeding table — only
+        // `src → dst`, no double-count.
+        assert_ops_with(
+            "INSERT INTO dst (id) SELECT id FROM src \
+             ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("src")],
+                writes: vec![table("dst")],
+                lineage: vec![edge("src", "dst")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn create_table_as_select_emits_lineage() {
         assert_ops(
             "CREATE TABLE t1 AS SELECT * FROM t2",
