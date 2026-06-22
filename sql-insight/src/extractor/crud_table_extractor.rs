@@ -184,9 +184,11 @@ impl CrudTableExtractor {
                 crud.delete_tables = writes;
                 crud.read_tables = reads;
             }
-            // A plain `SELECT` writes nothing, but `SELECT … INTO new_t` binds
-            // as a CTAS, so its target surfaces in `writes` → Create (Create
-            // stays empty for a plain query); read-role tables go to Read.
+            // A plain `SELECT` writes nothing, so Create stays empty and the
+            // read-role tables go to Read. (`SELECT … INTO t` is *not* here — it
+            // classifies as `CreateTable`, handled above; its target surfaces in
+            // `writes` → Create. The `writes` passthrough here is harmless: a
+            // plain query has none.)
             StatementKind::Select => {
                 crud.create_tables = writes;
                 crud.read_tables = reads;

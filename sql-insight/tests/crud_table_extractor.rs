@@ -516,9 +516,10 @@ mod ddl {
 
     #[test]
     fn test_select_into_buckets_target_as_create_source_as_read() {
-        // `SELECT … INTO new_t` has `StatementKind::Select` but binds as a
-        // CTAS, so the created table is a Create (not a Read) and the source
-        // a Read — a plain `SELECT` writes nothing, keeping Create empty.
+        // `SELECT … INTO new_t` classifies as `StatementKind::CreateTable`
+        // (the binder lowers it to a CTAS), so the created table is a Create
+        // (not a Read) and the source a Read — a plain `SELECT` writes nothing,
+        // keeping Create empty.
         let sql = "SELECT a INTO new_t FROM src";
         let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
         assert_eq!(

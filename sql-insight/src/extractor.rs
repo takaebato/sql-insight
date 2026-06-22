@@ -208,6 +208,14 @@ pub(crate) fn classify_statement(statement: &Statement) -> StatementKind {
             | SetExpr::Update(stmt)
             | SetExpr::Delete(stmt)
             | SetExpr::Merge(stmt) => classify_statement(stmt),
+            // A leading `SELECT … INTO t` creates a table: the binder lowers it
+            // to `CreateTableAs`, so classify it as `CreateTable` — keeping the
+            // verb (and the table-lineage gate that keys on it) in step with the
+            // writes / column-lineage surfaces, which already treat it as a
+            // create. This guarded arm still leaves the enumerated arm below to
+            // enforce exhaustiveness, so a new `SetExpr` variant is a compile
+            // error rather than silently bucketing here.
+            body if has_leading_select_into(body) => StatementKind::CreateTable,
             // Read-only / row-producing bodies all classify as `Select`
             // (`StatementKind::Select` documents that it covers `VALUES`,
             // `WITH … SELECT`, `TABLE foo`, and set operations). Enumerated, not
@@ -239,5 +247,26 @@ pub(crate) fn classify_statement(statement: &Statement) -> StatementKind {
         // fall through to Unsupported so the caller still gets a clear
         // diagnostic.
         _ => StatementKind::Unsupported,
+    }
+}
+
+/// Whether a query body carries a leading `SELECT … INTO t` — the table-creating
+/// `SELECT INTO` (T-SQL / Postgres), which the binder lowers to `CreateTableAs`.
+/// `INTO` rides the left spine (through a parenthesised query and the left
+/// branch of a set operation, where it targets the combined result), so this
+/// mirrors the binder's `leading_select_into`; the two must stay in step. The
+/// match is exhaustive so a new `SetExpr` variant forces a decision here too.
+fn has_leading_select_into(body: &sqlparser::ast::SetExpr) -> bool {
+    use sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(select) => select.into.is_some(),
+        SetExpr::Query(query) => has_leading_select_into(&query.body),
+        SetExpr::SetOperation { left, .. } => has_leading_select_into(left),
+        SetExpr::Values(_)
+        | SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_)
+        | SetExpr::Table(_) => false,
     }
 }

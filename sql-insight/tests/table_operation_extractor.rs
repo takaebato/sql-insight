@@ -956,6 +956,24 @@ mod lineage {
     }
 
     #[test]
+    fn select_into_classifies_as_create_and_emits_lineage() {
+        // `SELECT … INTO t2` binds as a CTAS, so it classifies as `CreateTable`
+        // (not `Select`) and emits table lineage from the source — the verb,
+        // the lineage gate, and `writes` now agree (previously the `Select`
+        // verb gated lineage off while `writes` still showed the target).
+        assert_ops(
+            "SELECT a INTO t2 FROM t1",
+            TableOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("t1")],
+                writes: vec![table("t2")],
+                lineage: vec![edge("t1", "t2")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn create_table_as_select_emits_lineage() {
         assert_ops(
             "CREATE TABLE t1 AS SELECT * FROM t2",

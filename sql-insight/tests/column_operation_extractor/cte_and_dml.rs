@@ -230,6 +230,24 @@ mod ctas_view {
     }
 
     #[test]
+    fn select_into_classifies_as_create_and_pairs_target_columns() {
+        // `SELECT … INTO t2` (T-SQL / Postgres) creates a table: the binder
+        // lowers it to a CTAS, so it classifies as `CreateTable` and pairs the
+        // source projection with the created relation's columns — identical to
+        // `CREATE TABLE t2 AS SELECT a FROM t1`.
+        assert_column_ops(
+            "SELECT a INTO t2 FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("t1", "a")],
+                writes: vec![write("t2", "a")],
+                lineage: vec![passthrough(col("t1", "a"), relation("t2", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn ctas_with_explicit_columns_overrides_projection_names() {
         // Explicit column list wins over inferred names.
         assert_column_ops(
