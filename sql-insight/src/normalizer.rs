@@ -169,13 +169,25 @@ impl VisitorMut for Normalizer {
     }
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        // A unary op directly over a literal collapses to a *single*
+        // placeholder (`-9` → `?`, not `-?`). Every other literal — including
+        // a plain `Expr::Value` — is normalized by `pre_visit_value` on
+        // descent, so it needs no arm here.
         if let Expr::UnaryOp { op: _, expr: child } = expr {
             if matches!(**child, Expr::Value(_)) {
                 *expr = Expr::Value(Value::Placeholder("?".into()).with_empty_span());
             }
-        } else if let Expr::Value(value) = expr {
-            *value = Value::Placeholder("?".into()).with_empty_span();
         }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_value(&mut self, value: &mut Value) -> ControlFlow<Self::Break> {
+        // The base contract: *every* literal `Value` becomes `?`, wherever the
+        // AST holds it. `pre_visit_expr` only catches an `Expr::Value`; a
+        // literal kept in a bare `Value` field — `DATE '…'` / `TIMESTAMP '…'`
+        // (`TypedString`), a `LIKE … ESCAPE '!'` char, a `MATCH … AGAINST '…'`
+        // search string — is reached only through this hook.
+        *value = Value::Placeholder("?".into());
         ControlFlow::Continue(())
     }
 
