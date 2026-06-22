@@ -199,6 +199,29 @@ mod expr_arm_coverage {
     }
 
     #[test]
+    fn match_against() {
+        // MySQL full-text `MATCH (cols) AGAINST ('lit')`: the search columns
+        // are reads (the search string is a literal). In value position they
+        // also originate the (anonymous) relevance score.
+        assert_unordered_eq!(
+            reads("SELECT MATCH(t.title, t.body) AGAINST ('x') FROM t"),
+            vec![c("title"), c("body")]
+        );
+        assert_unordered_eq!(
+            lineage("SELECT MATCH(t.title, t.body) AGAINST ('x') FROM t"),
+            vec![
+                transformation(c("title"), out_anon(0)),
+                transformation(c("body"), out_anon(0)),
+            ]
+        );
+        // Filter position (`WHERE`): the columns are reads, originate nothing.
+        assert_unordered_eq!(
+            reads("SELECT t.id FROM t WHERE MATCH(t.title, t.body) AGAINST ('x')"),
+            vec![c("id"), c("title"), c("body")]
+        );
+    }
+
+    #[test]
     fn subscript_index() {
         assert_unordered_eq!(reads("SELECT arr[1] FROM t"), vec![c("arr")]);
     }

@@ -244,10 +244,24 @@ impl<'a> Binder<'a> {
                 expr: Box::new(self.bind_expr(expr, scope)),
                 subquery: Box::new(self.bind_subquery(subquery, scope)),
             },
+            // `MATCH (col, …) AGAINST ('…')`: a full-text relevance value
+            // computed from the named columns (the search string is a literal,
+            // so no column there). Model it as a call over those columns, so
+            // they surface as reads — and, in value position, as origins of the
+            // relevance score; in filter position (a `WHERE`) they stay reads.
+            SqlExpr::MatchAgainst { columns, .. } => Expr::Call {
+                args: columns
+                    .iter()
+                    .map(|name| {
+                        let parts: Vec<Ident> =
+                            name.0.iter().filter_map(|p| p.as_ident().cloned()).collect();
+                        self.resolve_expr(&parts, scope)
+                    })
+                    .collect(),
+            },
             // Literals and forms with no column references.
             SqlExpr::Value(_)
             | SqlExpr::TypedString(_)
-            | SqlExpr::MatchAgainst { .. }
             | SqlExpr::Wildcard(_)
             | SqlExpr::QualifiedWildcard(_, _) => Expr::Call { args: Vec::new() },
         }
