@@ -227,10 +227,29 @@ fn origins_into<'a>(
             }
             _ => Vec::new(),
         },
-        LogicalPlan::SetOp(so) => {
-            let mut o = origins_into(&so.left, qualifier, name, ctx);
-            o.extend(origins_into(&so.right, qualifier, name, ctx));
-            o
+        // A set operation merges its branches **positionally** — the result
+        // column names come from the leftmost branch. A `Derived` trace reaches
+        // here with `name` = an exposed (leftmost-branch) output name, so find
+        // that name's position in the first branch and trace the like-positioned
+        // output of *every* branch. A per-branch *name* match (the old shape)
+        // would drop a branch whose output name differs and misattribute when a
+        // later branch happens to reuse the name at a different position. The
+        // positional fan-out matches the EXCLUDED trace in
+        // `conflict_value_origins`, and `output_operands` flattens nested
+        // set-ops so an N-way `A UNION B UNION C` traces all branches at once.
+        LogicalPlan::SetOp(_) => {
+            let operands = output_operands(op);
+            let Some(i) = operands.first().and_then(|&(outs, _)| {
+                outs.iter()
+                    .position(|ne| ne.name.as_ref().is_some_and(|n| ctx.eq_column(n, name)))
+            }) else {
+                return Vec::new();
+            };
+            operands
+                .iter()
+                .filter_map(|&(outs, input)| outs.get(i).map(|ne| (ne, input)))
+                .flat_map(|(ne, input)| origins_of_expr(&ne.expr, input, ctx))
+                .collect()
         }
         LogicalPlan::With(w) => {
             ctx.with_decls(&w.ctes, |ctx| origins_into(&w.body, qualifier, name, ctx))
@@ -284,18 +303,18 @@ fn origins_into<'a>(
 }
 
 /// The origins of a (sub)query's first output column (a scalar subquery's
-/// value).
+/// value) — fanning across **every** set-operation branch (each branch's
+/// position-0 output), not just the leftmost, since the branches merge
+/// positionally.
 fn scalar_subquery_origins<'a>(
     op: &'a LogicalPlan,
     ctx: &mut Ctx<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
-    match output_operands(op).first() {
-        Some((outputs, input)) => match outputs.first() {
-            Some(ne) => origins_of_expr(&ne.expr, input, ctx),
-            None => Vec::new(),
-        },
-        None => Vec::new(),
-    }
+    output_operands(op)
+        .iter()
+        .filter_map(|&(outputs, input)| outputs.first().map(|ne| (ne, input)))
+        .flat_map(|(ne, input)| origins_of_expr(&ne.expr, input, ctx))
+        .collect()
 }
 
 /// The origins of an ON CONFLICT DO UPDATE value. Like [`origins_of_expr`],

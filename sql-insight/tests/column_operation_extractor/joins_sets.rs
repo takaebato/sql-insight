@@ -203,6 +203,98 @@ mod set_operations {
     }
 
     #[test]
+    fn union_in_subquery_differing_right_name_collapses_both_branches() {
+        // Regression: the result column name comes from the LEFT branch (`x`),
+        // and the branches merge POSITIONALLY — the right branch's own output
+        // name (`b`, no `AS x`) names no result column. Tracing `x` must still
+        // reach the right branch's like-positioned column. (A per-branch name
+        // match dropped `t2.b`, since only the left branch carries `x`. The
+        // sibling `union_in_subquery_collapses_both_branches_to_outer` hides
+        // this by aliasing BOTH branches to `x`.)
+        assert_column_ops(
+            "SELECT x FROM (SELECT a AS x FROM t1 UNION SELECT b FROM t2) sub",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a"), read("t2", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t1", "a"), out("x", 0)),
+                    passthrough(col("t2", "b"), out("x", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn union_in_cte_differing_right_name_collapses_both_branches() {
+        // The same regression across a CTE boundary: the right branch
+        // (`SELECT b`, no `AS x`) still feeds the result column `x`.
+        assert_column_ops(
+            "WITH cte AS (SELECT a AS x FROM t1 UNION SELECT b FROM t2) \
+             SELECT x FROM cte",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a"), read("t2", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t1", "a"), out("x", 0)),
+                    passthrough(col("t2", "b"), out("x", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn union_in_subquery_traces_by_position_not_reused_name() {
+        // Both branches expose two columns; the right branch REUSES the name
+        // `x` at a DIFFERENT position (0) than the left (1). The trace must
+        // follow POSITION: left `x` is position 1, so the right's position 1
+        // (`e AS y` = t2.e) feeds it — NOT the right's own `x` (position 0 =
+        // t2.c), which a name match would misattribute.
+        assert_column_ops(
+            "SELECT x FROM \
+             (SELECT a AS p, b AS x FROM t1 UNION SELECT c AS x, e AS y FROM t2) sub",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("t1", "a"),
+                    read("t1", "b"),
+                    read("t2", "c"),
+                    read("t2", "e"),
+                ],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t1", "b"), out("x", 0)),
+                    passthrough(col("t2", "e"), out("x", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn scalar_subquery_over_union_feeds_all_branches() {
+        // A scalar subquery whose body is a set operation feeds EVERY branch's
+        // position-0 output to the output column (`s`), not just the leftmost.
+        // Both flow as Transformation (a scalar-subquery value).
+        assert_column_ops(
+            "SELECT (SELECT a FROM x UNION SELECT b FROM y) AS s FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("x", "a"), read("y", "b")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("x", "a"), out("s", 0)),
+                    transformation(col("y", "b"), out("s", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn ctas_with_union_body_pairs_left_branch_names_for_all_branches() {
         // CTAS schema follows the LEFT branch's projection names
         // (SQL standard). The inferred-name path uses the first
