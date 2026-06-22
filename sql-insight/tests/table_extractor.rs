@@ -792,6 +792,26 @@ mod delete_statement {
         let expected = vec![ok_tables(vec![table("t1"), table("t2"), table("t3")])];
         assert_table_extraction(sql, expected, all_dialects());
     }
+
+    #[test]
+    fn test_cte_prefixed_delete_keeps_target() {
+        // A CTE-prefixed DELETE binds as `With { body: Delete }`; the flat list
+        // must still include the DELETE target (the CTE body here names no
+        // table). Regression: the target was dropped because the DELETE
+        // special-case ran on the raw root and missed the leading WITH, while
+        // `table_writes` (which peels WITH) still showed it.
+        let sql = "WITH x AS (SELECT 1) DELETE FROM t1";
+        let expected = vec![ok_tables(vec![table("t1")])];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_cte_prefixed_delete_collects_cte_body_and_target() {
+        // Both the CTE body's tables and the DELETE target surface.
+        let sql = "WITH x AS (SELECT a FROM src) DELETE FROM t1 USING x";
+        let expected = vec![ok_tables(vec![table("src"), table("t1")])];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
 }
 
 mod insert_statement {

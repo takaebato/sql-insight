@@ -192,10 +192,21 @@ pub(super) fn collect_flat_tables(plan: &LogicalPlan) -> Vec<TableReference> {
 /// follow naturally. `DELETE` is the one shape this can't model — its target
 /// often coincides with a FROM scan already collected, so handled separately.
 fn collect_flat_into(plan: &LogicalPlan, out: &mut Vec<TableReference>) {
-    if let LogicalPlan::Delete(d) = plan {
-        let before = out.len();
+    // A CTE-prefixed DELETE binds as `With { body: Delete }`, so peel the
+    // leading WITH(s) to reach it (mirroring the sibling write walkers'
+    // `peel_with`) — walking their CTE bodies into the flat list first. The
+    // target is deduped against the DELETE's own FROM input only (where it may
+    // recur as a scan); a same-named table in a CTE body is a distinct binding
+    // and stays listed separately.
+    if let LogicalPlan::Delete(d) = peel_with(plan) {
+        let mut node = plan;
+        while let LogicalPlan::With(w) = node {
+            w.ctes.iter().for_each(|c| collect_flat_into(&c.body, out));
+            node = &w.body;
+        }
+        let from_start = out.len();
         collect_flat_into(&d.input, out);
-        let from: Vec<TableReference> = out[before..].to_vec();
+        let from: Vec<TableReference> = out[from_start..].to_vec();
         for target in &d.targets {
             if !from.contains(target) {
                 out.push(target.clone());
@@ -220,7 +231,8 @@ fn collect_flat_into(plan: &LogicalPlan, out: &mut Vec<TableReference>) {
         LogicalPlan::AlterTable(a) => out.push(a.target.clone()),
         // Operators that name no table of their own: pure relational shape,
         // CTE plumbing, synthetic leaves, and `Delete` (its targets are
-        // collected by the early-return above, before this walk). Listed
+        // collected by the peel-aware early-return above, before this walk).
+        // Listed
         // explicitly — like the sibling write walkers — so a new
         // table-naming `LogicalPlan` variant is a compile error here, not a
         // silent omission from the flat list.
