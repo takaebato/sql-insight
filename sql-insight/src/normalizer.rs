@@ -169,12 +169,15 @@ impl VisitorMut for Normalizer {
     }
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-        // A unary op directly over a literal collapses to a *single*
-        // placeholder (`-9` → `?`, not `-?`). Every other literal — including
-        // a plain `Expr::Value` — is normalized by `pre_visit_value` on
-        // descent, so it needs no arm here.
+        // A unary op over a literal — directly (`-9`) or through a chain of
+        // unary ops (`- -9`, `+ -9`) — collapses to a *single* placeholder
+        // (`?`, not `-?`). A parenthesised operand (`NOT (TRUE)`) is an
+        // `Expr::Nested`, not a chain, so it isn't collapsed — only its inner
+        // value is, by `pre_visit_value` on descent. Every other literal —
+        // including a plain `Expr::Value` — is normalized by `pre_visit_value`,
+        // so it needs no arm here.
         if let Expr::UnaryOp { op: _, expr: child } = expr {
-            if matches!(**child, Expr::Value(_)) {
+            if Self::is_unary_chain_over_value(child) {
                 *expr = Expr::Value(Value::Placeholder("?".into()).with_empty_span());
             }
         }
@@ -230,6 +233,18 @@ impl Normalizer {
             .into_iter()
             .map(|statement| statement.to_string())
             .collect::<Vec<String>>())
+    }
+
+    /// Whether `expr` is a literal `Value`, or a chain of unary ops bottoming
+    /// out in one (`-9`, `- -9`, `+ -9`). Such a chain collapses to a single
+    /// `?`; a parenthesised operand (`Expr::Nested`) is *not* a chain, so it
+    /// stops the recursion and its inner value is placeholdered separately.
+    fn is_unary_chain_over_value(expr: &Expr) -> bool {
+        match expr {
+            Expr::Value(_) => true,
+            Expr::UnaryOp { expr: child, .. } => Self::is_unary_chain_over_value(child),
+            _ => false,
+        }
     }
 
     /// Check if an expression contains only tuples of constants, recursively.

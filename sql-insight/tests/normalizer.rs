@@ -41,6 +41,16 @@ fn test_unary_operators_preceding_constants() {
 }
 
 #[test]
+fn test_nested_unary_operators_collapse_to_single_placeholder() {
+    // A chain of unary ops over a literal collapses to one `?` (not `-?`), so
+    // `- -9` matches `-9` and `9`. A parenthesised operand (`Expr::Nested`)
+    // stops the chain — only its inner value is placeholdered.
+    let sql = "SELECT * FROM t WHERE a = - -9 AND b = + -9 AND c = -(9)";
+    let expected = vec!["SELECT * FROM t WHERE a = ? AND b = ? AND c = -(?)".into()];
+    assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
+}
+
+#[test]
 fn test_unary_operators_preceding_booleans() {
     let sql = "SELECT * FROM t1 WHERE a=TRUE AND b=NOT TRUE AND c=NOT(TRUE)";
     let expected = vec!["SELECT * FROM t1 WHERE a = ? AND b = ? AND c = NOT (?)".into()];
