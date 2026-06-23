@@ -411,33 +411,48 @@ impl<'a> Binder<'a> {
                     if let Some(predicate) = &insert.insert_predicate {
                         on.push(self.bind_expr(predicate, &scope));
                     }
-                    if let MergeInsertKind::Values(values) = &insert.kind {
-                        let explicit: Vec<Ident> = insert
-                            .columns
-                            .iter()
-                            .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
-                            .collect();
-                        let columns = if explicit.is_empty() {
-                            self.catalog_columns(&target)
-                        } else {
-                            explicit
-                        };
-                        // A MERGE INSERT is a single VALUES row.
-                        let row: Vec<Expr> = values
-                            .rows
-                            .iter()
-                            .flatten()
-                            .map(|e| self.bind_expr(e, &scope))
-                            .collect();
-                        // Column-list-less and no catalog to fill the target
-                        // columns: the values can't be paired (see `bind_insert`).
-                        if columns.is_empty() && !row.is_empty() {
-                            self.record_insert_columns_unresolved(&target);
+                    match &insert.kind {
+                        MergeInsertKind::Values(values) => {
+                            let explicit: Vec<Ident> = insert
+                                .columns
+                                .iter()
+                                .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
+                                .collect();
+                            let columns = if explicit.is_empty() {
+                                self.catalog_columns(&target)
+                            } else {
+                                explicit
+                            };
+                            // A MERGE INSERT is a single VALUES row.
+                            let row: Vec<Expr> = values
+                                .rows
+                                .iter()
+                                .flatten()
+                                .map(|e| self.bind_expr(e, &scope))
+                                .collect();
+                            // Column-list-less and no catalog to fill the target
+                            // columns: the values can't be paired (see `bind_insert`).
+                            if columns.is_empty() && !row.is_empty() {
+                                self.record_insert_columns_unresolved(&target);
+                            }
+                            clauses.push(MergeClause::Insert {
+                                columns,
+                                values: row,
+                            });
                         }
-                        clauses.push(MergeClause::Insert {
-                            columns,
-                            values: row,
-                        });
+                        // BigQuery `INSERT ROW`: insert the full source row, with
+                        // no explicit column / value lists. The column pairing
+                        // isn't recoverable from SQL text, so push a column-less
+                        // Insert — the target still surfaces (CRUD create +
+                        // `table_lineage` source → target) while the column-level
+                        // writes / lineage are a flagged coverage gap.
+                        MergeInsertKind::Row => {
+                            self.record_merge_insert_row_unresolved(&target);
+                            clauses.push(MergeClause::Insert {
+                                columns: Vec::new(),
+                                values: Vec::new(),
+                            });
+                        }
                     }
                 }
                 MergeAction::Update(update) => {

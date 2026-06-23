@@ -151,6 +151,25 @@ mod merge {
     }
 
     #[test]
+    fn merge_insert_row_drops_columns_but_flags() {
+        // BigQuery `WHEN NOT MATCHED THEN INSERT ROW` inserts the full source
+        // row; its column pairing isn't recoverable from SQL text, so column
+        // writes / lineage are dropped and flagged with `InsertColumnsUnresolved`
+        // (the table still surfaces in `table_writes` / `table_lineage`). The
+        // only reads are the ON predicate's.
+        assert_column_ops(
+            "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT ROW",
+            ColumnOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![read("t", "id"), read("s", "id")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsUnresolved)],
+            },
+        );
+    }
+
+    #[test]
     fn merge_delete_action_emits_no_lineage_no_write() {
         assert_column_ops(
             "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",

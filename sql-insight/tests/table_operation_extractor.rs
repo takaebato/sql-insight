@@ -1034,6 +1034,24 @@ mod lineage {
     }
 
     #[test]
+    fn merge_insert_row_emits_lineage() {
+        // BigQuery `WHEN NOT MATCHED THEN INSERT ROW` inserts the full source
+        // row: the column pairing isn't recoverable, but the source still
+        // feeds the target at the table level (the column-level coverage gap
+        // is flagged on the column surface, not here).
+        assert_ops(
+            "MERGE INTO t1 USING t2 ON t1.id = t2.id WHEN NOT MATCHED THEN INSERT ROW",
+            TableOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![read("t2")],
+                writes: vec![table("t1")],
+                lineage: vec![edge("t2", "t1")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn merge_with_only_delete_action_emits_no_lineage() {
         // WHEN MATCHED THEN DELETE doesn't move data — the source
         // is only used to pick which target rows to delete. A

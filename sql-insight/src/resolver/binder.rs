@@ -206,6 +206,22 @@ impl<'a> Binder<'a> {
         });
     }
 
+    /// Record an `InsertColumnsUnresolved` diagnostic for a BigQuery
+    /// `MERGE … WHEN NOT MATCHED THEN INSERT ROW`: it inserts the full source
+    /// row, whose column pairing isn't recoverable from SQL text (and a catalog
+    /// wouldn't help — the source columns aren't expanded), so its column-level
+    /// `writes` / `lineage` are dropped. The target still surfaces in
+    /// `table_writes` and feeds `table_lineage`.
+    pub(super) fn record_merge_insert_row_unresolved(&self, target: &TableReference) {
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::InsertColumnsUnresolved,
+            message: format!(
+                "MERGE INSERT ROW into `{target}` inserts the full source row — its column writes / lineage can't be recovered from SQL text and are dropped"
+            ),
+            span: None,
+        });
+    }
+
     /// Record an `InsertColumnsArityMismatch` for an `INSERT INTO t (cols)
     /// <source>` whose explicit target column count differs from the source's
     /// projected count: the positional pairing zips to the shorter side, so

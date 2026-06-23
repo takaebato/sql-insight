@@ -379,6 +379,27 @@ mod merge {
     }
 
     #[test]
+    fn test_merge_insert_row_buckets_target_as_create() {
+        // BigQuery `WHEN NOT MATCHED THEN INSERT ROW`: the target is an insert
+        // target (Create), the source a Read. Regression — the unhandled ROW
+        // kind left `has_insert` false, so the target fell out of every bucket.
+        // The column-level coverage gap is flagged on the column surface only,
+        // so no table-level diagnostic surfaces here.
+        let sql = "MERGE INTO tgt USING src ON tgt.id = src.id WHEN NOT MATCHED THEN INSERT ROW";
+        let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(CrudTables {
+                create_tables: vec![table("tgt")],
+                read_tables: vec![table("src")],
+                update_tables: vec![],
+                delete_tables: vec![],
+                diagnostics: vec![],
+            })]
+        );
+    }
+
+    #[test]
     fn test_merge_statement() {
         let sql = "MERGE INTO t1 AS t1_alias USING t2 AS t2_alias ON t1_alias.a = t2_alias.a \
                      WHEN MATCHED AND t2_alias.b = 1 THEN DELETE \
