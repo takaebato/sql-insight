@@ -273,6 +273,56 @@ impl<'a> Binder<'a> {
             span: None,
         });
     }
+
+    /// Diagnose a created relation's column list (CTAS / CREATE VIEW / ALTER
+    /// VIEW) against its source projection: an *implicit* list flags an
+    /// unaliased source output (`flag_anonymous_relation_columns`); an
+    /// *explicit* list whose count differs from the source projection flags an
+    /// arity mismatch — mirroring [`Self::bind_insert`]'s check. The arity check
+    /// is skipped for a wildcard-bearing source (the count is then
+    /// indeterminate; the wildcard is flagged separately and the lineage walker
+    /// drops the unreliable pairing).
+    pub(super) fn diagnose_created_columns(
+        &self,
+        target: &TableReference,
+        explicit: &[Ident],
+        input: &LogicalPlan,
+        source_wildcard: bool,
+    ) {
+        if explicit.is_empty() {
+            self.flag_anonymous_relation_columns(target, explicit, input);
+            return;
+        }
+        if source_wildcard {
+            return;
+        }
+        if let Some((outputs, _)) = output_operands(input).first() {
+            if !outputs.is_empty() && outputs.len() != explicit.len() {
+                self.record_created_columns_arity_mismatch(target, explicit.len(), outputs.len());
+            }
+        }
+    }
+
+    /// Record an `InsertColumnsArityMismatch` for a created relation (CTAS /
+    /// CREATE VIEW / ALTER VIEW) whose explicit column count differs from the
+    /// source projection — the positional pairing zips to the shorter side, so
+    /// the surplus columns get no lineage edge (their `writes` still surface).
+    /// Shares the kind with the INSERT form; the message names the relation.
+    pub(super) fn record_created_columns_arity_mismatch(
+        &self,
+        target: &TableReference,
+        target_columns: usize,
+        source_columns: usize,
+    ) {
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::InsertColumnsArityMismatch,
+            message: format!(
+                "created relation `{target}` lists {target_columns} column(s) but the source projects {source_columns} — lineage pairs only the first {min} and drops the rest",
+                min = target_columns.min(source_columns)
+            ),
+            span: None,
+        });
+    }
 }
 
 /// Format a known span as the trailing " at L{line}:C{col}" suffix that

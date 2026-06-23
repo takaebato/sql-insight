@@ -88,11 +88,15 @@ pub(super) fn collect_column_lineage(
         // derived list that could drift in length.
         LogicalPlan::CreateTableAs(c) => {
             let src = enter_withs(&c.input, &mut ctx);
-            created_relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
+            if pairs_positionally(c.source_wildcard, &c.columns) {
+                created_relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
+            }
         }
         LogicalPlan::CreateView(c) => {
             let src = enter_withs(&c.input, &mut ctx);
-            created_relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
+            if pairs_positionally(c.source_wildcard, &c.columns) {
+                created_relation_lineage(&c.columns, &c.target, src, &mut ctx, &mut edges);
+            }
         }
         // MERGE: each WHEN action's value traces to its target column (an
         // UPDATE SET `RHS → target.col`; an INSERT `value → target.col`). A
@@ -213,6 +217,16 @@ fn relation_lineage<'a>(
             emit_edges(origins_of_expr(&ne.expr, src_input, ctx), tgt, out);
         }
     }
+}
+
+/// Whether a created relation's (CTAS / CREATE VIEW) column lineage can be
+/// paired safely. An *explicit* column list pairs positionally with the source
+/// projection, so an unexpanded wildcard makes those positions indeterminate —
+/// skip, like INSERT. The *implicit* form follows the source outputs' own
+/// names, so a wildcard there merely omits the unexpanded columns without
+/// misattributing — keep it.
+fn pairs_positionally(source_wildcard: bool, explicit: &[Ident]) -> bool {
+    !source_wildcard || explicit.is_empty()
 }
 
 /// CTAS / CREATE VIEW relation lineage. Unlike [`relation_lineage`] (INSERT,

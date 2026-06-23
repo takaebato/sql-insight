@@ -243,6 +243,74 @@ mod reported {
             },
         );
     }
+
+    #[test]
+    fn ctas_explicit_column_count_mismatch_is_flagged() {
+        // 3 explicit columns but the source projects 1: like the INSERT form,
+        // `writes` lists all three (from syntax) but lineage pairs only the
+        // first, so the surplus is flagged with an arity mismatch.
+        assert_column_ops(
+            "CREATE TABLE t (a INT, b INT, c INT) AS SELECT x FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("s", "x")],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "c")],
+                lineage: vec![passthrough(col("s", "x"), relation("t", "a"))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsArityMismatch)],
+            },
+        );
+    }
+
+    #[test]
+    fn create_view_explicit_column_count_mismatch_is_flagged() {
+        // CREATE VIEW with an explicit column list shares the arity check.
+        assert_column_ops(
+            "CREATE VIEW v (a, b, c) AS SELECT x FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateView,
+                reads: vec![read("s", "x")],
+                writes: vec![write("v", "a"), write("v", "b"), write("v", "c")],
+                lineage: vec![passthrough(col("s", "x"), relation("v", "a"))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsArityMismatch)],
+            },
+        );
+    }
+
+    #[test]
+    fn ctas_explicit_columns_with_wildcard_source_drops_lineage_no_arity() {
+        // An explicit column list pairs positionally; a wildcard source makes
+        // positions indeterminate, so lineage is dropped and the arity check
+        // skipped (no false mismatch) — matching the INSERT form. Writes still
+        // surface; `WildcardSuppressed` flags the gap.
+        assert_column_ops(
+            "CREATE TABLE t (a INT, b INT) AS SELECT *, y FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("s", "y")],
+                writes: vec![write("t", "a"), write("t", "b")],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn ctas_implicit_columns_with_wildcard_source_keeps_name_followed_lineage() {
+        // The implicit form takes each source output's own name, so a wildcard
+        // there merely omits the unexpanded columns — the named `y` still maps
+        // to its same-named target column (no misattribution), unlike the
+        // explicit case above.
+        assert_column_ops(
+            "CREATE TABLE t AS SELECT *, y FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("s", "y")],
+                writes: vec![write("t", "y")],
+                lineage: vec![passthrough(col("s", "y"), relation("t", "y"))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
 }
 
 /// Coverage for the large "unsupported statement" dispatch arm in

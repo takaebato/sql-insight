@@ -282,21 +282,31 @@ pub(crate) enum MergeClause {
 /// structural reference — the new table's *columns* aren't known here (no
 /// wildcard expansion) and no row data moves — so it surfaces only in the flat
 /// table list, never as a column read / write / lineage edge.
+///
+/// `source_wildcard` mirrors [`Insert::source_wildcard`]: the source projection
+/// holds an unexpanded wildcard, so an *explicit* column list can't be paired
+/// positionally (the lineage walker skips it then). The implicit form follows
+/// the source outputs' own names, so a wildcard there merely omits the
+/// unexpanded columns without misattributing — `source_wildcard` only gates the
+/// explicit case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreateTableAs {
     pub(crate) target: TableReference,
     pub(crate) columns: Vec<Ident>,
     pub(crate) input: Box<LogicalPlan>,
     pub(crate) schema_source: Option<TableReference>,
+    pub(crate) source_wildcard: bool,
 }
 
 /// `CREATE VIEW target (columns) AS <input>`. `columns` is the explicit column
 /// list only (empty for the implicit form), resolved like [`CreateTableAs`].
+/// `source_wildcard` plays the same role as on [`CreateTableAs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreateView {
     pub(crate) target: TableReference,
     pub(crate) columns: Vec<Ident>,
     pub(crate) input: Box<LogicalPlan>,
+    pub(crate) source_wildcard: bool,
 }
 
 /// `ALTER TABLE target ...`: the column-naming operations' `columns` are

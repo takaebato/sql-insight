@@ -36,6 +36,7 @@ impl<'a> Binder<'a> {
                     columns: Vec::new(),
                     input: Box::new(LogicalPlan::Empty),
                     schema_source: None,
+                    source_wildcard: false,
                 }),
                 None => LogicalPlan::Empty,
             },
@@ -69,13 +70,15 @@ impl<'a> Binder<'a> {
         // `SELECT … INTO` lowers to a CTAS with no explicit column list, so an
         // unaliased source expression (`SELECT a + 1 INTO t`) is an unnameable
         // column dropped from `writes` / `lineage` — flag it, like the
-        // `CREATE TABLE … AS` path.
-        self.flag_anonymous_relation_columns(&target, &[], &plan);
+        // `CREATE TABLE … AS` path. (No explicit list, so no arity check.)
+        let source_wildcard = source_has_wildcard(query);
+        self.diagnose_created_columns(&target, &[], &plan, source_wildcard);
         LogicalPlan::CreateTableAs(CreateTableAs {
             target,
             columns: Vec::new(),
             input: Box::new(plan),
             schema_source: None,
+            source_wildcard,
         })
     }
 
@@ -665,16 +668,19 @@ impl<'a> Binder<'a> {
                 columns: Vec::new(),
                 input: Box::new(LogicalPlan::Empty),
                 schema_source,
+                source_wildcard: false,
             });
         };
         let (input, _) = self.bind_query(query);
         let columns: Vec<Ident> = create.columns.iter().map(|c| c.name.clone()).collect();
-        self.flag_anonymous_relation_columns(&target, &columns, &input);
+        let source_wildcard = source_has_wildcard(query);
+        self.diagnose_created_columns(&target, &columns, &input, source_wildcard);
         LogicalPlan::CreateTableAs(CreateTableAs {
             target,
             columns,
             input: Box::new(input),
             schema_source: None,
+            source_wildcard,
         })
     }
 
@@ -688,11 +694,13 @@ impl<'a> Binder<'a> {
         let target = self.table_match(&written).table;
         let (input, _) = self.bind_query(&create.query);
         let columns: Vec<Ident> = create.columns.iter().map(|c| c.name.clone()).collect();
-        self.flag_anonymous_relation_columns(&target, &columns, &input);
+        let source_wildcard = source_has_wildcard(&create.query);
+        self.diagnose_created_columns(&target, &columns, &input, source_wildcard);
         LogicalPlan::CreateView(CreateView {
             target,
             columns,
             input: Box::new(input),
+            source_wildcard,
         })
     }
 
@@ -710,11 +718,13 @@ impl<'a> Binder<'a> {
         };
         let target = self.table_match(&written).table;
         let (input, _) = self.bind_query(query);
-        self.flag_anonymous_relation_columns(&target, columns, &input);
+        let source_wildcard = source_has_wildcard(query);
+        self.diagnose_created_columns(&target, columns, &input, source_wildcard);
         LogicalPlan::CreateView(CreateView {
             target,
             columns: columns.to_vec(),
             input: Box::new(input),
+            source_wildcard,
         })
     }
 
