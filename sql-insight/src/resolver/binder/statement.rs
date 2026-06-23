@@ -121,12 +121,21 @@ impl<'a> Binder<'a> {
         if columns.is_empty() && insert.source.is_some() {
             self.record_insert_columns_unresolved(&target);
         }
+        // A wildcard in the source projection (`SELECT *, y`) leaves the column
+        // count / positions indeterminate (wildcards aren't expanded), so
+        // neither the arity check nor positional relation-lineage can trust the
+        // visible outputs. Flagged via `source_wildcard` below; the arity check
+        // here and the lineage walker both skip when set.
+        let source_wildcard = insert
+            .source
+            .as_ref()
+            .is_some_and(|q| source_has_wildcard(q));
         // An *explicit* target column list whose count differs from the source
         // query's projected columns: relation lineage zips to the shorter side,
         // silently dropping the surplus. Flag it. (Only when the source exposes
         // a determinate projection — a `VALUES` / pure-wildcard source yields no
-        // operands here and is covered elsewhere.)
-        if !insert.columns.is_empty() {
+        // operands here, and a wildcard-bearing source is indeterminate.)
+        if !insert.columns.is_empty() && !source_wildcard {
             if let Some((outputs, _)) = output_operands(&input).first() {
                 if !outputs.is_empty() && outputs.len() != columns.len() {
                     self.record_insert_columns_arity_mismatch(
@@ -154,6 +163,7 @@ impl<'a> Binder<'a> {
             returning,
             on_conflict,
             conflict_predicate,
+            source_wildcard,
         })
     }
 
@@ -193,6 +203,8 @@ impl<'a> Binder<'a> {
             returning,
             on_conflict,
             conflict_predicate,
+            // The MySQL SET form has no source query, so no wildcard.
+            source_wildcard: false,
         })
     }
 
@@ -740,6 +752,35 @@ impl<'a> Binder<'a> {
             .collect();
         LogicalPlan::Drop(Drop { targets })
     }
+}
+
+/// Whether a query's output projection contains an (unexpanded) wildcard
+/// (`*` / `t.*`), anywhere a set operation's branches or a parenthesised
+/// subquery reach. An INSERT source with one has an indeterminate column count
+/// / positions, so positional pairing with the target columns can't be trusted
+/// (see [`Insert::source_wildcard`](super::super::logical_plan::Insert)). The
+/// `SetExpr` / `SelectItem` matches are exhaustive so a new variant forces a
+/// decision here.
+fn source_has_wildcard(query: &Query) -> bool {
+    fn body_has_wildcard(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Select(select) => select.projection.iter().any(|item| match item {
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => true,
+                SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => false,
+            }),
+            SetExpr::Query(q) => body_has_wildcard(&q.body),
+            SetExpr::SetOperation { left, right, .. } => {
+                body_has_wildcard(left) || body_has_wildcard(right)
+            }
+            SetExpr::Values(_)
+            | SetExpr::Insert(_)
+            | SetExpr::Update(_)
+            | SetExpr::Delete(_)
+            | SetExpr::Merge(_)
+            | SetExpr::Table(_) => false,
+        }
+    }
+    body_has_wildcard(&query.body)
 }
 
 /// The target table of a query's leading `SELECT … INTO t`, if any. `INTO`

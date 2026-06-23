@@ -173,6 +173,26 @@ mod reported {
     }
 
     #[test]
+    fn insert_with_wildcard_source_drops_lineage_and_skips_arity_diagnostic() {
+        // A wildcard in the source projection (`SELECT *, y`) makes the column
+        // count / positions indeterminate (wildcards aren't expanded), so the
+        // positional pairing can't be trusted: relation lineage is dropped and
+        // the arity check is skipped (no false `InsertColumnsArityMismatch`).
+        // The target columns still surface as `writes`, with `WildcardSuppressed`
+        // flagging the gap — matching a pure `SELECT *` source.
+        assert_column_ops(
+            "INSERT INTO t (a, b) SELECT *, y FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "y")],
+                writes: vec![write("t", "a"), write("t", "b")],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
     fn unaliased_ctas_expression_column_is_flagged() {
         // `a + 1` has no alias, so the created table's column can't be named
         // from the SQL text (engines auto-name it, e.g. `?column?`). It's

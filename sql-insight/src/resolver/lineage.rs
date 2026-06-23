@@ -39,7 +39,14 @@ pub(super) fn collect_column_lineage(
         // `enter_withs` pushes its CTEs into the ctx so a `CteRef` resolves.
         LogicalPlan::Insert(i) => {
             let src = enter_withs(&i.input, &mut ctx);
-            relation_lineage(&i.columns, &i.target, src, &mut ctx, &mut edges);
+            // A wildcard in the source projection makes positions indeterminate,
+            // so positional pairing would mis-attribute (`SELECT *, y` → which
+            // target does `y` feed?). Drop the relation lineage — the target
+            // columns still surface as `writes`, flagged by `WildcardSuppressed`
+            // — matching a pure `SELECT *` source (no operands to pair).
+            if !i.source_wildcard {
+                relation_lineage(&i.columns, &i.target, src, &mut ctx, &mut edges);
+            }
             // ON CONFLICT DO UPDATE SET col = value: each `value → target.col`,
             // an `EXCLUDED.x` ref mapped to the source's like-positioned output.
             for a in &i.on_conflict {

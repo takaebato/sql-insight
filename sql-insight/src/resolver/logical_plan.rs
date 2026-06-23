@@ -205,6 +205,14 @@ pub(crate) struct Values {
 /// reference the `EXCLUDED` pseudo-table (the proposed row) — resolved to a
 /// `Derived` ref qualified `excluded`, traced to the source's like-positioned
 /// output column.
+///
+/// `source_wildcard` flags that the source projection contains an (unexpanded)
+/// wildcard (`SELECT *, y`): its column count and positions are then
+/// indeterminate, so positional pairing with `columns` would mis-attribute and
+/// the arity check would mis-fire. The relation-lineage walker and the arity
+/// check skip when it is set — the target columns still surface as `writes`,
+/// the `WildcardSuppressed` diagnostic signals the gap, matching a pure
+/// `SELECT *` source (which yields no operands to pair at all).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Insert {
     pub(crate) target: TableReference,
@@ -213,6 +221,7 @@ pub(crate) struct Insert {
     pub(crate) returning: Vec<NamedExpr>,
     pub(crate) on_conflict: Vec<Assignment>,
     pub(crate) conflict_predicate: Vec<Expr>,
+    pub(crate) source_wildcard: bool,
 }
 
 /// `UPDATE target SET assignments [FROM ...] WHERE ...`: `input` carries the
