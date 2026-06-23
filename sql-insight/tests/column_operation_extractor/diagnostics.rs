@@ -225,6 +225,24 @@ mod reported {
             },
         );
     }
+
+    #[test]
+    fn unaliased_select_into_expression_column_is_flagged() {
+        // `SELECT … INTO` lowers to a CTAS, so an unaliased expression column is
+        // unnameable and dropped — and now flagged, like `CREATE TABLE … AS`
+        // (the two are equivalent; the SELECT INTO path previously dropped it
+        // silently).
+        assert_column_ops(
+            "SELECT a + 1 INTO t2 FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("t1", "a")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::AnonymousColumnsSuppressed)],
+            },
+        );
+    }
 }
 
 /// Coverage for the large "unsupported statement" dispatch arm in

@@ -65,8 +65,14 @@ impl<'a> Binder<'a> {
         let Some(written) = self.table_ref(name) else {
             return plan;
         };
+        let target = self.table_match(&written).table;
+        // `SELECT … INTO` lowers to a CTAS with no explicit column list, so an
+        // unaliased source expression (`SELECT a + 1 INTO t`) is an unnameable
+        // column dropped from `writes` / `lineage` — flag it, like the
+        // `CREATE TABLE … AS` path.
+        self.flag_anonymous_relation_columns(&target, &[], &plan);
         LogicalPlan::CreateTableAs(CreateTableAs {
-            target: self.table_match(&written).table,
+            target,
             columns: Vec::new(),
             input: Box::new(plan),
             schema_source: None,
