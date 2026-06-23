@@ -245,6 +245,37 @@ mod reported {
     }
 
     #[test]
+    fn insert_columns_unresolved_message_reflects_the_cause() {
+        // A `SELECT *` source can't be paired even with a catalog (its arity is
+        // unknown), so the message blames the wildcard, not a missing catalog.
+        let wildcard = extract("INSERT INTO dst SELECT * FROM src");
+        let msg = wildcard
+            .diagnostics
+            .iter()
+            .find(|d| d.kind == ColumnLevelDiagnosticKind::InsertColumnsUnresolved)
+            .expect("expected InsertColumnsUnresolved")
+            .message
+            .clone();
+        assert!(msg.contains("SELECT *"), "wildcard cause should mention `SELECT *`: {msg}");
+        assert!(
+            !msg.contains("without a catalog"),
+            "wildcard cause must not blame the catalog: {msg}"
+        );
+
+        // A determinate source with no catalog genuinely can't fill the target
+        // columns — there the message does cite the missing catalog.
+        let no_catalog = extract("INSERT INTO dst SELECT a FROM src");
+        let msg2 = no_catalog
+            .diagnostics
+            .iter()
+            .find(|d| d.kind == ColumnLevelDiagnosticKind::InsertColumnsUnresolved)
+            .expect("expected InsertColumnsUnresolved")
+            .message
+            .clone();
+        assert!(msg2.contains("without a catalog"), "no-catalog cause should say so: {msg2}");
+    }
+
+    #[test]
     fn ctas_explicit_column_count_mismatch_is_flagged() {
         // 3 explicit columns but the source projects 1: like the INSERT form,
         // `writes` lists all three (from syntax) but lineage pairs only the

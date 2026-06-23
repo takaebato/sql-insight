@@ -193,15 +193,29 @@ impl<'a> Binder<'a> {
     }
 
     /// Record an `InsertColumnsUnresolved` diagnostic for a column-list-less
-    /// INSERT / MERGE-INSERT whose target columns couldn't be filled from a
-    /// catalog, so its column-level `writes` / `lineage` are dropped (the
-    /// table still surfaces in `table_writes`).
-    pub(super) fn record_insert_columns_unresolved(&self, target: &TableReference) {
+    /// INSERT / MERGE-INSERT whose target columns couldn't be determined, so
+    /// its column-level `writes` / `lineage` are dropped (the table still
+    /// surfaces in `table_writes`). The message names the actual cause: a
+    /// `SELECT *` source can't be paired even *with* a catalog (its arity is
+    /// unknown), so blaming a missing catalog there would mislead — that's
+    /// reserved for a determinate source with no catalog to fill the target.
+    pub(super) fn record_insert_columns_unresolved(
+        &self,
+        target: &TableReference,
+        source_wildcard: bool,
+    ) {
+        let message = if source_wildcard {
+            format!(
+                "column-list-less INSERT into `{target}`: the `SELECT *` source isn't expanded, so its columns can't be paired with the target — column writes / lineage dropped"
+            )
+        } else {
+            format!(
+                "column-list-less INSERT into `{target}` can't pair source columns to target columns without a catalog — column writes / lineage dropped"
+            )
+        };
         self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::InsertColumnsUnresolved,
-            message: format!(
-                "column-list-less INSERT into `{target}` can't pair source columns to target columns without a catalog — column writes / lineage dropped"
-            ),
+            message,
             span: None,
         });
     }

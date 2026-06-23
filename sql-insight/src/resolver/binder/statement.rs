@@ -124,21 +124,23 @@ impl<'a> Binder<'a> {
         } else {
             insert.columns.clone()
         };
-        // A column-list-less INSERT whose target columns can't be filled (no
-        // catalog) drops its column writes / lineage — flag it so the empty
-        // surfaces read as "couldn't analyze", not "nothing written".
-        if columns.is_empty() && insert.source.is_some() {
-            self.record_insert_columns_unresolved(&target);
-        }
         // A wildcard in the source projection (`SELECT *, y`) leaves the column
         // count / positions indeterminate (wildcards aren't expanded), so
         // neither the arity check nor positional relation-lineage can trust the
-        // visible outputs. Flagged via `source_wildcard` below; the arity check
-        // here and the lineage walker both skip when set.
+        // visible outputs. Carried on `source_wildcard`; the arity check and the
+        // lineage walker both skip when set, and it words the diagnostic below.
         let source_wildcard = insert
             .source
             .as_ref()
             .is_some_and(|q| source_has_wildcard(q));
+        // A column-list-less INSERT whose target columns can't be determined
+        // drops its column writes / lineage — flag it so the empty surfaces
+        // read as "couldn't analyze", not "nothing written". The cause is the
+        // wildcard when present (a catalog wouldn't help), else a missing
+        // catalog.
+        if columns.is_empty() && insert.source.is_some() {
+            self.record_insert_columns_unresolved(&target, source_wildcard);
+        }
         // An *explicit* target column list whose count differs from the source
         // query's projected columns: relation lineage zips to the shorter side,
         // silently dropping the surplus. Flag it. (Only when the source exposes
@@ -457,8 +459,10 @@ impl<'a> Binder<'a> {
                                 .collect();
                             // Column-list-less and no catalog to fill the target
                             // columns: the values can't be paired (see `bind_insert`).
+                            // A MERGE INSERT VALUES has no wildcard, so the cause
+                            // is always the missing catalog.
                             if columns.is_empty() && !row.is_empty() {
-                                self.record_insert_columns_unresolved(&target);
+                                self.record_insert_columns_unresolved(&target, false);
                             }
                             clauses.push(MergeClause::Insert {
                                 columns,
