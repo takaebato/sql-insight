@@ -206,6 +206,21 @@ impl<'a> Binder<'a> {
         });
     }
 
+    /// Flag a MERGE whose target is not a plain table — a derived table /
+    /// subquery / table function, which can't be a write target. The whole
+    /// statement then binds to nothing, so an `UnsupportedStatement` (it
+    /// projects to the table level) signals the empty surfaces are a coverage
+    /// gap, not "nothing there". `message` shows the offending target.
+    pub(super) fn record_unsupported_merge_target(&self, factor: &TableFactor) {
+        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+            kind: ColumnLevelDiagnosticKind::UnsupportedStatement,
+            message: format!(
+                "MERGE target `{factor}` is not a plain table (a derived table / subquery / table function) — the statement can't be analyzed and is dropped"
+            ),
+            span: None,
+        });
+    }
+
     /// Record an `InsertColumnsUnresolved` diagnostic for a BigQuery
     /// `MERGE … WHEN NOT MATCHED THEN INSERT ROW`: it inserts the full source
     /// row, whose column pairing isn't recoverable from SQL text (and a catalog

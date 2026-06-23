@@ -170,6 +170,24 @@ mod merge {
     }
 
     #[test]
+    fn merge_into_subquery_target_is_flagged() {
+        // A non-table MERGE target (a derived table / subquery) can't be a
+        // write target — the statement binds to nothing, flagged as
+        // `UnsupportedStatement` rather than dropped silently.
+        assert_column_ops(
+            "MERGE INTO (SELECT a FROM t) AS d USING s ON d.id = s.id \
+             WHEN MATCHED THEN UPDATE SET d.a = s.a",
+            ColumnOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
     fn merge_delete_action_emits_no_lineage_no_write() {
         assert_column_ops(
             "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",

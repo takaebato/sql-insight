@@ -415,6 +415,10 @@ impl<'a> Binder<'a> {
     /// from the catalog (empty without one — the values are then reads only).
     pub(super) fn bind_merge(&self, merge: &SqlMerge) -> LogicalPlan {
         let Some((target_relation, target)) = self.target_relation(&merge.table) else {
+            // A non-table MERGE target (derived table / subquery / table
+            // function) can't be a write target — flag it rather than dropping
+            // the whole statement silently (best-effort drop + flag).
+            self.record_unsupported_merge_target(&merge.table);
             return LogicalPlan::Empty;
         };
         let mut scope = Scope::single(target_relation);

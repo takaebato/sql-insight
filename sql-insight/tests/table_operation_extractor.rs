@@ -1071,6 +1071,25 @@ mod lineage {
     }
 
     #[test]
+    fn merge_into_subquery_target_is_flagged_not_silently_dropped() {
+        // A MERGE whose target is a derived table / subquery can't be a write
+        // target, so the statement binds to nothing — flagged as
+        // UnsupportedStatement (it projects to the table level) rather than
+        // dropped silently.
+        assert_ops(
+            "MERGE INTO (SELECT a FROM t) AS d USING s ON d.id = s.id \
+             WHEN MATCHED THEN UPDATE SET d.a = s.a",
+            TableOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(TableLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
     fn cte_data_reaches_write_target() {
         assert_ops(
             "INSERT INTO t1 WITH cte AS (SELECT * FROM s) SELECT * FROM cte",
