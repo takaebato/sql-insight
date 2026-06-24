@@ -1233,7 +1233,7 @@ mod lineage {
 
     #[test]
     fn distinct_ctes_each_feed_target_independently() {
-        // The fold is per *CTE name*, not per `CteRef` node — two different
+        // The fold is per *declaration*, not per `CteRef` node — two different
         // CTEs (each referenced once) each contribute their own edge.
         assert_ops(
             "WITH c AS (SELECT id FROM base), d AS (SELECT id FROM other) \
@@ -1243,6 +1243,27 @@ mod lineage {
                 reads: vec![read("base"), read("other")],
                 writes: vec![table("t")],
                 lineage: vec![edge("base", "t"), edge("other", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn same_name_shadowing_ctes_each_feed_target() {
+        // Two distinct CTEs sharing the name `q` (an inner one shadowing an
+        // outer across scopes) are separate declarations, so each feeds the
+        // target. The fold keys on the resolved body's identity, not the name —
+        // a name key collapsed the two and dropped one declaration's source.
+        assert_ops(
+            "INSERT INTO dst (c) \
+             WITH q AS (SELECT k FROM base1) \
+             SELECT k FROM (WITH q AS (SELECT k FROM base2) SELECT k FROM q) sub \
+             UNION ALL SELECT k FROM q",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("base1"), read("base2")],
+                writes: vec![table("dst")],
+                lineage: vec![edge("base1", "dst"), edge("base2", "dst")],
                 diagnostics: vec![],
             },
         );
