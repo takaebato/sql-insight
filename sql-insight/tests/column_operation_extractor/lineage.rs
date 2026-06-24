@@ -632,4 +632,62 @@ mod lambda {
             },
         );
     }
+
+    #[test]
+    fn lambda_param_does_not_shadow_a_subquery_own_column() {
+        // A subquery in the body has its own innermost scope: a bare `x` in
+        // `(SELECT x FROM t2)` resolves to the subquery's own `t2.x`, not the
+        // (enclosing) lambda parameter — the parameter sits at its lexical depth
+        // in the resolution stack and doesn't over-shadow an inner scope. Both
+        // the array arg (`t1.arr`) and the body value (`t2.x`) flow to the
+        // anonymous output as a transformation.
+        assert_column_ops(
+            "SELECT transform(arr, x -> (SELECT x FROM t2)) FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "arr"), read("t2", "x")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t1", "arr"), out_anon(0)),
+                    transformation(col("t2", "x"), out_anon(0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn lambda_param_resolves_at_the_right_depth_when_deeply_nested() {
+        // Two levels of nested subquery: the innermost (`t3`) is the innermost
+        // scope, so a bare `x` resolves to `t3.x`. A flat "parameter checked
+        // first" rule would have wrongly shadowed both `t2` and `t3`; the frame
+        // stack places the parameter at its correct depth.
+        assert_column_ops(
+            "SELECT transform(arr, x -> (SELECT (SELECT x FROM t3) FROM t2)) FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "arr"), read("t3", "x")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t1", "arr"), out_anon(0)),
+                    transformation(col("t3", "x"), out_anon(0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn lambda_param_shadowed_by_a_cte_column_in_the_body() {
+        // Inside the body, the CTE `c` exposes a column `x` (renamed from `k`),
+        // so the subquery `SELECT x FROM c` resolves `x` to the CTE column
+        // (→ s.k), shadowing the lambda parameter — the parameter is not a false
+        // read. (Asserting reads only: the body value's lineage to the output is
+        // subject to a separate limitation — a scalar subquery with a leading
+        // WITH currently drops its column lineage.)
+        let op = extract(
+            "SELECT transform(arr, x -> (WITH c AS (SELECT k AS x FROM s) SELECT x FROM c)) FROM t1",
+        );
+        assert_unordered_eq!(op.reads, vec![read("t1", "arr"), read("s", "k")]);
+    }
 }

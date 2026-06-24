@@ -89,12 +89,28 @@ pub(crate) fn build_with_diagnostics(
         catalog,
         style,
         ctes: Vec::new(),
-        outer: Vec::new(),
-        locals: Vec::new(),
+        enclosing: Vec::new(),
         diagnostics: &diagnostics,
     }
     .bind_statement(statement);
     (op, diagnostics.into_inner())
+}
+
+/// One frame of the column-resolution stack — the enclosing scopes a bare
+/// reference falls through to, innermost last. Unifies what used to be two
+/// side-by-side mechanisms (a relation correlation stack + a flat lambda-param
+/// list) into a single ordered stack, so precedence is managed in one place:
+/// `resolve` walks it innermost-first, and a frame sits at exactly its lexical
+/// depth (a lambda parameter is outside any subquery in the body but inside the
+/// enclosing query). CTEs are *not* here — they are a separate (table) namespace
+/// resolved in `bind_table_factor`.
+enum Frame {
+    /// An enclosing query level's FROM relations (a subquery / the query the
+    /// current one is correlated into).
+    Relations(Vec<Relation>),
+    /// A lambda's parameters (`x` in `x -> …`): a bare reference resolves to
+    /// [`Binding::Local`] — not a table column.
+    Lambda(Vec<Ident>),
 }
 
 struct Binder<'a> {
@@ -102,13 +118,11 @@ struct Binder<'a> {
     style: IdentifierStyle,
     /// CTEs in scope (declaration order, innermost `WITH` last).
     ctes: Vec<CteDecl>,
-    /// Enclosing queries' relations (the correlation stack, outermost first)
-    /// that an inner subquery's references fall through to.
-    outer: Vec<Vec<Relation>>,
-    /// Lambda parameters in scope (`x` in `x -> …`), innermost last. A bare
-    /// reference to one resolves to [`Binding::Local`] — not a table column —
-    /// shadowing any real column of the same name within the lambda body.
-    locals: Vec<Ident>,
+    /// The enclosing column-resolution stack (outermost first, innermost last)
+    /// a bare reference falls through to after the current `Scope`: enclosing
+    /// query relations (correlation) and lambda parameters, each at its lexical
+    /// depth. See [`Frame`].
+    enclosing: Vec<Frame>,
     /// Shared diagnostic buffer (child binders for subqueries / CTEs push into
     /// the same one, so a nested suppressed wildcard surfaces).
     diagnostics: &'a RefCell<Vec<ColumnLevelDiagnostic>>,
@@ -116,46 +130,53 @@ struct Binder<'a> {
 
 impl<'a> Binder<'a> {
     /// A child binder with a different CTE environment (sharing catalog /
-    /// style / correlation stack / lambda locals / diagnostics).
+    /// style / enclosing stack / diagnostics).
     pub(super) fn with_ctes(&self, ctes: Vec<CteDecl>) -> Binder<'a> {
         Binder {
             catalog: self.catalog,
             style: self.style,
             ctes,
-            outer: self.outer.clone(),
-            locals: self.locals.clone(),
+            enclosing: self.enclosing_clone(),
             diagnostics: self.diagnostics,
         }
     }
 
-    /// A child binder with one more enclosing scope on the correlation stack
-    /// (used when descending into a subquery in an expression / a LATERAL
-    /// factor).
+    /// A child binder with one more enclosing relation frame on the stack (used
+    /// when descending into a subquery in an expression / a LATERAL factor).
     pub(super) fn with_outer(&self, relations: Vec<Relation>) -> Binder<'a> {
-        let mut outer = self.outer.clone();
-        outer.push(relations);
-        Binder {
-            catalog: self.catalog,
-            style: self.style,
-            ctes: self.ctes.clone(),
-            outer,
-            locals: self.locals.clone(),
-            diagnostics: self.diagnostics,
-        }
+        self.pushing(Frame::Relations(relations))
     }
 
-    /// A child binder with `params` added as in-scope lambda locals (used to
-    /// bind a lambda body, so its parameter references resolve to
-    /// [`Binding::Local`] rather than table columns).
-    pub(super) fn with_locals(&self, params: impl IntoIterator<Item = Ident>) -> Binder<'a> {
-        let mut locals = self.locals.clone();
-        locals.extend(params);
+    /// A child binder with the lambda `params` pushed as a frame (used to bind a
+    /// lambda body, so its parameter references resolve to [`Binding::Local`]
+    /// rather than table columns). Push *after* the enclosing relations
+    /// (`with_outer`) so the parameters sit inside the enclosing query but
+    /// outside any subquery in the body.
+    pub(super) fn with_lambda(&self, params: impl IntoIterator<Item = Ident>) -> Binder<'a> {
+        self.pushing(Frame::Lambda(params.into_iter().collect()))
+    }
+
+    /// Clone the enclosing stack (a frame's `Relations` / `Lambda` payload is
+    /// cloned). Shared by the child-binder constructors.
+    fn enclosing_clone(&self) -> Vec<Frame> {
+        self.enclosing
+            .iter()
+            .map(|frame| match frame {
+                Frame::Relations(r) => Frame::Relations(r.clone()),
+                Frame::Lambda(p) => Frame::Lambda(p.clone()),
+            })
+            .collect()
+    }
+
+    /// A child binder with `frame` pushed onto the enclosing stack (innermost).
+    fn pushing(&self, frame: Frame) -> Binder<'a> {
+        let mut enclosing = self.enclosing_clone();
+        enclosing.push(frame);
         Binder {
             catalog: self.catalog,
             style: self.style,
             ctes: self.ctes.clone(),
-            outer: self.outer.clone(),
-            locals,
+            enclosing,
             diagnostics: self.diagnostics,
         }
     }

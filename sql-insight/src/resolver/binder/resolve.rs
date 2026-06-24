@@ -19,21 +19,6 @@ impl<'a> Binder<'a> {
     /// by [`pick`](Self::pick).
     pub(super) fn resolve(&self, parts: &[Ident], scope: &Scope) -> BoundColumn {
         let name = parts.last().expect("a reference has at least one segment");
-        // A bare reference to an in-scope lambda parameter is a *local* binding,
-        // not a column — it shadows any real column of the same name within the
-        // lambda body, so it is checked first (innermost scope).
-        if parts.len() == 1
-            && self
-                .locals
-                .iter()
-                .any(|p| self.eq(self.style.casing.column, p, name))
-        {
-            return BoundColumn {
-                qualifier: None,
-                name: name.clone(),
-                binding: Binding::Local,
-            };
-        }
         // Clause-alias visibility (GROUP BY / HAVING / ORDER BY): a bare ref
         // naming an *introduced* output alias resolves to that output
         // (`Derived`, dropped from reads — the real dependency is at the
@@ -55,14 +40,22 @@ impl<'a> Binder<'a> {
             }
         }
         // Resolve against the current scope, then fall through the enclosing
-        // scopes (correlation), innermost first, before giving up.
+        // stack innermost-first: a `Relations` frame resolves a column
+        // (correlation); a `Lambda` frame matches a bare parameter name to a
+        // `Binding::Local` (not a column). The first frame to claim the name
+        // wins, so a parameter sits at its lexical depth — outside any subquery
+        // in the lambda body, inside the enclosing query.
         let binding = self
             .resolve_in(parts, &scope.relations)
             .or_else(|| {
-                self.outer
-                    .iter()
-                    .rev()
-                    .find_map(|relations| self.resolve_in(parts, relations))
+                self.enclosing.iter().rev().find_map(|frame| match frame {
+                    Frame::Relations(relations) => self.resolve_in(parts, relations),
+                    Frame::Lambda(params) => (parts.len() == 1
+                        && params
+                            .iter()
+                            .any(|p| self.eq(self.style.casing.column, p, name)))
+                    .then_some(Binding::Local),
+                })
             })
             .unwrap_or(Binding::Unresolved);
         BoundColumn {
@@ -316,8 +309,7 @@ mod tests {
             catalog,
             style: IdentifierStyle { casing, quote: '"' },
             ctes: Vec::new(),
-            outer: Vec::new(),
-            locals: Vec::new(),
+            enclosing: Vec::new(),
             diagnostics,
         }
     }

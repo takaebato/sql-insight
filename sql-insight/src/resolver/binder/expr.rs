@@ -230,12 +230,16 @@ impl<'a> Binder<'a> {
                 args: self.bind_exprs(&array.elem, scope),
             },
             SqlExpr::Interval(interval) => self.call([interval.value.as_ref()], scope),
-            // A lambda's body is bound with its parameters in scope as locals,
-            // so a bare parameter reference (`x` in `x -> x + 1`) resolves to
-            // `Binding::Local` (no read / no origin) rather than a table column.
+            // A lambda's body is bound against a fresh (empty) scope, with the
+            // enclosing relations pushed as a frame and the parameters as a
+            // `Lambda` frame on top. So a bare parameter (`x` in `x -> x + 1`)
+            // resolves to `Binding::Local` (no read / no origin), while the
+            // parameter sits at its lexical depth: a subquery in the body
+            // resolves its own columns first, the enclosing query last.
             SqlExpr::Lambda(lambda) => self
-                .with_locals(lambda.params.iter().cloned())
-                .call([lambda.body.as_ref()], scope),
+                .with_outer(scope.relations.clone())
+                .with_lambda(lambda.params.iter().cloned())
+                .call([lambda.body.as_ref()], &Scope::default()),
             SqlExpr::MemberOf(member_of) => {
                 self.call([member_of.value.as_ref(), member_of.array.as_ref()], scope)
             }
