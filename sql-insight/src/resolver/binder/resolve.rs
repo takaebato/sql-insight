@@ -19,6 +19,21 @@ impl<'a> Binder<'a> {
     /// by [`pick`](Self::pick).
     pub(super) fn resolve(&self, parts: &[Ident], scope: &Scope) -> BoundColumn {
         let name = parts.last().expect("a reference has at least one segment");
+        // A bare reference to an in-scope lambda parameter is a *local* binding,
+        // not a column — it shadows any real column of the same name within the
+        // lambda body, so it is checked first (innermost scope).
+        if parts.len() == 1
+            && self
+                .locals
+                .iter()
+                .any(|p| self.eq(self.style.casing.column, p, name))
+        {
+            return BoundColumn {
+                qualifier: None,
+                name: name.clone(),
+                binding: Binding::Local,
+            };
+        }
         // Clause-alias visibility (GROUP BY / HAVING / ORDER BY): a bare ref
         // naming an *introduced* output alias resolves to that output
         // (`Derived`, dropped from reads — the real dependency is at the
@@ -302,6 +317,7 @@ mod tests {
             style: IdentifierStyle { casing, quote: '"' },
             ctes: Vec::new(),
             outer: Vec::new(),
+            locals: Vec::new(),
             diagnostics,
         }
     }

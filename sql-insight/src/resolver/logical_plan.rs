@@ -490,9 +490,10 @@ pub(crate) struct BoundColumn {
 }
 
 /// What a column reference resolved to, decided at bind. `reads` keeps
-/// `Base` / `Unresolved` / `Ambiguous` and drops `Derived` (the physical read
-/// was counted at the inner producer); the origin traversal follows all four
-/// (`Derived` recurses into the producing relation, collapsing lazily).
+/// `Base` / `Unresolved` / `Ambiguous`, drops `Derived` (the physical read was
+/// counted at the inner producer) and `Local` (not a column at all); the origin
+/// traversal traces `Derived` into its producer and treats the rest as
+/// terminal (`Local` contributing nothing).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Binding {
     /// A real base-table column (the table is canonicalised; `resolution` is
@@ -508,6 +509,11 @@ pub(crate) enum Binding {
     Unresolved,
     /// Several candidate owners.
     Ambiguous,
+    /// A lambda parameter (`x` in `x -> x + 1`) — a *local* binding, not a
+    /// table column, so it is neither a read nor a lineage origin. Bare
+    /// references to an in-scope lambda parameter resolve here, shadowing any
+    /// real column of the same name within the lambda body.
+    Local,
 }
 
 // ===== tree navigation ====================================================

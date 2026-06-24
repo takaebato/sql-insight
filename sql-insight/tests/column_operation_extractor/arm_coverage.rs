@@ -138,8 +138,18 @@ mod expr_arm_coverage {
 
     #[test]
     fn lambda() {
+        // A real column in the body is read; the lambda parameter is a local,
+        // not a column.
         assert_unordered_eq!(
             reads("SELECT transform(t.arr, x -> t.a) FROM t"),
+            vec![c("arr"), c("a")]
+        );
+        // A bare reference to the parameter `x` adds no read (a previous
+        // version wrongly read `t.x`).
+        assert_unordered_eq!(reads("SELECT transform(t.arr, x -> x + 1) FROM t"), vec![c("arr")]);
+        // Mixed: the parameter is suppressed, the real column `t.a` stays.
+        assert_unordered_eq!(
+            reads("SELECT transform(t.arr, x -> x + t.a) FROM t"),
             vec![c("arr"), c("a")]
         );
     }

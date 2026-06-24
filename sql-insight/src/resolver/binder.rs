@@ -90,6 +90,7 @@ pub(crate) fn build_with_diagnostics(
         style,
         ctes: Vec::new(),
         outer: Vec::new(),
+        locals: Vec::new(),
         diagnostics: &diagnostics,
     }
     .bind_statement(statement);
@@ -104,6 +105,10 @@ struct Binder<'a> {
     /// Enclosing queries' relations (the correlation stack, outermost first)
     /// that an inner subquery's references fall through to.
     outer: Vec<Vec<Relation>>,
+    /// Lambda parameters in scope (`x` in `x -> …`), innermost last. A bare
+    /// reference to one resolves to [`Binding::Local`] — not a table column —
+    /// shadowing any real column of the same name within the lambda body.
+    locals: Vec<Ident>,
     /// Shared diagnostic buffer (child binders for subqueries / CTEs push into
     /// the same one, so a nested suppressed wildcard surfaces).
     diagnostics: &'a RefCell<Vec<ColumnLevelDiagnostic>>,
@@ -111,13 +116,14 @@ struct Binder<'a> {
 
 impl<'a> Binder<'a> {
     /// A child binder with a different CTE environment (sharing catalog /
-    /// style / correlation stack / diagnostics).
+    /// style / correlation stack / lambda locals / diagnostics).
     pub(super) fn with_ctes(&self, ctes: Vec<CteDecl>) -> Binder<'a> {
         Binder {
             catalog: self.catalog,
             style: self.style,
             ctes,
             outer: self.outer.clone(),
+            locals: self.locals.clone(),
             diagnostics: self.diagnostics,
         }
     }
@@ -133,6 +139,23 @@ impl<'a> Binder<'a> {
             style: self.style,
             ctes: self.ctes.clone(),
             outer,
+            locals: self.locals.clone(),
+            diagnostics: self.diagnostics,
+        }
+    }
+
+    /// A child binder with `params` added as in-scope lambda locals (used to
+    /// bind a lambda body, so its parameter references resolve to
+    /// [`Binding::Local`] rather than table columns).
+    pub(super) fn with_locals(&self, params: impl IntoIterator<Item = Ident>) -> Binder<'a> {
+        let mut locals = self.locals.clone();
+        locals.extend(params);
+        Binder {
+            catalog: self.catalog,
+            style: self.style,
+            ctes: self.ctes.clone(),
+            outer: self.outer.clone(),
+            locals,
             diagnostics: self.diagnostics,
         }
     }

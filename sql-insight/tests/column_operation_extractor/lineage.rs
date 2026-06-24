@@ -610,3 +610,26 @@ mod cte_derived_rename {
         );
     }
 }
+
+mod lambda {
+    use super::*;
+
+    #[test]
+    fn lambda_param_is_not_traced_into_a_same_named_derived_column() {
+        // The lambda parameter `x` shadows the derived table's column `x`
+        // within the body: it's a local, so it neither reads nor originates
+        // `s.x`. Only the array argument (`arr` → `s.arr`) flows to the output.
+        // (A `Derived` binding instead of a dedicated `Local` would mis-trace
+        // `x` into the derived subquery and emit a spurious `s.x → r`.)
+        assert_column_ops(
+            "SELECT transform(arr, x -> x) AS r FROM (SELECT arr, x FROM s) d",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "arr"), read("s", "x")],
+                writes: vec![],
+                lineage: vec![transformation(col("s", "arr"), out("r", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+}

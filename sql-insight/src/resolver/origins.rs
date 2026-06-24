@@ -150,6 +150,8 @@ fn origins_of_ref<'a>(
             .map(|r| vec![(r, ColumnLineageKind::Passthrough)])
             .unwrap_or_default(),
         Binding::Derived => origins_into(input, c.qualifier.as_ref(), &c.name, ctx),
+        // A lambda parameter is a local with no base column — no origin.
+        Binding::Local => Vec::new(),
     }
 }
 
