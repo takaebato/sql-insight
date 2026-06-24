@@ -301,26 +301,38 @@ impl<'a> Binder<'a> {
     }
 
     /// A relation's contribution to a merge-column fan-in: a real table owns
-    /// the column if `Unknown` (catalog-free → `Inferred`) or its `Cataloged` schema
-    /// lists it (`Cataloged`); a derived / function relation doesn't.
+    /// the column if `Unknown` (catalog-free → `Inferred`) or its `Cataloged`
+    /// schema lists it (`Cataloged`) — a `Base` ref. A derived table / CTE owns
+    /// it when its exposed columns list it — a `Derived` ref (qualified by its
+    /// alias) the origin trace follows into the producing subquery. An opaque
+    /// table function (dynamic columns) still doesn't own a merge column.
     pub(super) fn fanin_owner(&self, rel: &Relation, name: &Ident) -> Option<BoundColumn> {
-        let (table, resolution) = match rel {
+        let binding = match rel {
             Relation::Table {
                 table,
                 columns: Columns::Unknown,
                 ..
-            } => (table, ResolutionKind::Inferred),
+            } => base(table, ResolutionKind::Inferred),
             Relation::Table {
                 table,
                 columns: Columns::Cataloged(cols),
                 ..
-            } if self.list_has(cols, name) => (table, ResolutionKind::Cataloged),
+            } if self.list_has(cols, name) => base(table, ResolutionKind::Cataloged),
+            // A derived / CTE side that exposes the column: a `Derived` ref the
+            // trace resolves through its alias into the producing subquery.
+            Relation::Derived { alias, columns } if self.list_has(columns, name) => {
+                return Some(BoundColumn {
+                    qualifier: alias.clone(),
+                    name: name.clone(),
+                    binding: Binding::Derived,
+                });
+            }
             _ => return None,
         };
         Some(BoundColumn {
             qualifier: None,
             name: name.clone(),
-            binding: base(table, resolution),
+            binding,
         })
     }
 

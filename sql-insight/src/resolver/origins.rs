@@ -106,14 +106,7 @@ pub(super) fn origins_of_expr<'a>(
     ctx: &mut Ctx<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match expr {
-        Expr::Column(c) => match &c.binding {
-            // Base / unresolved / ambiguous refs are their own origin.
-            Binding::Base { .. } | Binding::Unresolved | Binding::Ambiguous => column_read(c)
-                .map(|r| vec![(r, ColumnLineageKind::Passthrough)])
-                .unwrap_or_default(),
-            // A derived ref traces through the producer that defines it.
-            Binding::Derived => origins_into(input, c.qualifier.as_ref(), &c.name, ctx),
-        },
+        Expr::Column(c) => origins_of_ref(c, input, ctx),
         Expr::Call { args } => transform(args.iter().flat_map(|e| origins_of_expr(e, input, ctx))),
         Expr::Case {
             then, else_result, ..
@@ -132,13 +125,31 @@ pub(super) fn origins_of_expr<'a>(
         Expr::Window { arg, .. } => transform(origins_of_expr(arg, input, ctx)),
         // A scalar subquery's first output column flows as a transformation.
         Expr::Subquery(plan) => transform(scalar_subquery_origins(plan, ctx)),
-        // A merge-column fan-in: each owning side is a `Passthrough` origin.
-        Expr::Fanin(refs) => refs
-            .iter()
-            .filter_map(|c| column_read(c).map(|r| (r, ColumnLineageKind::Passthrough)))
-            .collect(),
+        // A merge-column fan-in: each owning side is its own origin, traced
+        // like a column ref — a real-table side is a `Passthrough` base read,
+        // a derived / CTE side traces into its producing subquery (so a
+        // `(SELECT id FROM s) d JOIN t USING (id)` yields both `s.id` and
+        // `t.id`, not just one).
+        Expr::Fanin(refs) => refs.iter().flat_map(|c| origins_of_ref(c, input, ctx)).collect(),
         // Tests / suppressed operands contribute no value origin (reads only).
         Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Filter(_) => Vec::new(),
+    }
+}
+
+/// The origins of a single bound column reference (shared by the `Column` and
+/// `Fanin` arms): a `Base` / unresolved / ambiguous ref is its own
+/// `Passthrough` origin; a `Derived` ref traces through the producer that
+/// defines it (composing the lineage kind end-to-end).
+fn origins_of_ref<'a>(
+    c: &'a BoundColumn,
+    input: &'a LogicalPlan,
+    ctx: &mut Ctx<'a>,
+) -> Vec<(ColumnRead, ColumnLineageKind)> {
+    match &c.binding {
+        Binding::Base { .. } | Binding::Unresolved | Binding::Ambiguous => column_read(c)
+            .map(|r| vec![(r, ColumnLineageKind::Passthrough)])
+            .unwrap_or_default(),
+        Binding::Derived => origins_into(input, c.qualifier.as_ref(), &c.name, ctx),
     }
 }
 

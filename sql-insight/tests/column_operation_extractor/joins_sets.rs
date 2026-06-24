@@ -472,6 +472,66 @@ mod join_using_and_natural {
     }
 
     #[test]
+    fn join_using_fans_in_to_a_derived_side_and_a_real_table() {
+        // A derived table that exposes the merge column is a fan-in owner too:
+        // `id` fans in to both `d` (traced into its subquery → `s.id`) and the
+        // real table `t`. Previously only the derived side surfaced and `t.id`
+        // was dropped at the column level.
+        assert_column_ops(
+            "SELECT id FROM (SELECT id FROM s) d JOIN t USING (id)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "id"), read("t", "id")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("s", "id"), out("id", 0)),
+                    passthrough(col("t", "id"), out("id", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_using_fans_in_to_a_cte_side_and_a_real_table() {
+        // Same fan-in across a CTE side: the CTE body's `s.id` and the real
+        // table `t.id` both feed the merged output column.
+        assert_column_ops(
+            "WITH c AS (SELECT id FROM s) SELECT id FROM c JOIN t USING (id)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "id"), read("t", "id")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("s", "id"), out("id", 0)),
+                    passthrough(col("t", "id"), out("id", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_using_derived_side_traces_through_its_alias_rename() {
+        // The derived side renames its source (`a AS id`), so the fan-in member
+        // traces through the alias to `s.a` — still a Passthrough (a rename
+        // doesn't transform the value), as is the real table side `t.id`.
+        assert_column_ops(
+            "SELECT id FROM (SELECT a AS id FROM s) d JOIN t USING (id)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "a"), read("t", "id")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("s", "a"), out("id", 0)),
+                    passthrough(col("t", "id"), out("id", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn natural_join_no_catalog_leaves_unqualified_refs_unresolved() {
         // NATURAL JOIN's merge set comes from the intersection of
         // both tables' column lists — only knowable with a
