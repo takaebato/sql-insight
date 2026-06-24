@@ -357,7 +357,14 @@ impl<'a> Binder<'a> {
     /// index / slice bounds).
     pub(super) fn bind_access(&self, access: &AccessExpr, scope: &Scope) -> Vec<Expr> {
         match access {
-            AccessExpr::Dot(expr) => vec![self.bind_expr(expr, scope)],
+            // A `.field` step accesses a struct / JSON field of the *value* to
+            // its left (`a[1].b`, `(a).b`), so the field name is not a table
+            // column — it contributes no read. (A pure `a.b.c` is a
+            // `CompoundIdentifier`, resolved as a qualified column elsewhere;
+            // only mixed subscript-and-dot access reaches here.)
+            AccessExpr::Dot(_) => Vec::new(),
+            // A subscript index / slice bound, by contrast, is a real value
+            // expression (`a[idx]` reads `idx`), so it is bound.
             AccessExpr::Subscript(Subscript::Index { index }) => vec![self.bind_expr(index, scope)],
             AccessExpr::Subscript(Subscript::Slice {
                 lower_bound,

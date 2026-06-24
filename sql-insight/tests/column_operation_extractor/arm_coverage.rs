@@ -233,7 +233,11 @@ mod expr_arm_coverage {
 
     #[test]
     fn dot_access() {
-        assert_unordered_eq!(reads("SELECT (t.a).b FROM t"), vec![c("a"), c("b")]);
+        // `(t.a).b` accesses field `b` of the value `t.a` — `b` is a struct /
+        // JSON field, not a column of `t`, so only `t.a` is read (a previous
+        // version wrongly read `t.b` too). Chained dots add no further reads.
+        assert_unordered_eq!(reads("SELECT (t.a).b FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT (t.a).b.c FROM t"), vec![c("a")]);
     }
 
     #[test]
