@@ -787,6 +787,18 @@ mod delete_statement {
     }
 
     #[test]
+    fn test_delete_target_recurring_in_predicate_subquery_counts_twice() {
+        // The DELETE target `t` and a same-named table inside a WHERE-predicate
+        // subquery are distinct occurrences: the target is deduped only against
+        // the DELETE's direct FROM relations, not predicate subqueries, so both
+        // surface — matching the occurrence semantics of an equivalent
+        // UPDATE / INSERT (which list `t` twice here too).
+        let sql = "DELETE FROM t WHERE id IN (SELECT id FROM t WHERE flag)";
+        let expected = vec![ok_tables(vec![table("t"), table("t")])];
+        assert_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
     fn test_delete_from_statement_with_alias() {
         let sql = "DELETE FROM t1_alias, t2_alias USING t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
         let expected = vec![ok_tables(vec![table("t1"), table("t2"), table("t3")])];
