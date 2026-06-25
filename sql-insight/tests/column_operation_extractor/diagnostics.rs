@@ -256,7 +256,10 @@ mod reported {
             .expect("expected InsertColumnsUnresolved")
             .message
             .clone();
-        assert!(msg.contains("SELECT *"), "wildcard cause should mention `SELECT *`: {msg}");
+        assert!(
+            msg.contains("SELECT *"),
+            "wildcard cause should mention `SELECT *`: {msg}"
+        );
         assert!(
             !msg.contains("without a catalog"),
             "wildcard cause must not blame the catalog: {msg}"
@@ -272,7 +275,10 @@ mod reported {
             .expect("expected InsertColumnsUnresolved")
             .message
             .clone();
-        assert!(msg2.contains("without a catalog"), "no-catalog cause should say so: {msg2}");
+        assert!(
+            msg2.contains("without a catalog"),
+            "no-catalog cause should say so: {msg2}"
+        );
     }
 
     #[test]

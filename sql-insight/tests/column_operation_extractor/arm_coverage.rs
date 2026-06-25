@@ -146,7 +146,10 @@ mod expr_arm_coverage {
         );
         // A bare reference to the parameter `x` adds no read (a previous
         // version wrongly read `t.x`).
-        assert_unordered_eq!(reads("SELECT transform(t.arr, x -> x + 1) FROM t"), vec![c("arr")]);
+        assert_unordered_eq!(
+            reads("SELECT transform(t.arr, x -> x + 1) FROM t"),
+            vec![c("arr")]
+        );
         // Mixed: the parameter is suppressed, the real column `t.a` stays.
         assert_unordered_eq!(
             reads("SELECT transform(t.arr, x -> x + t.a) FROM t"),
@@ -258,7 +261,10 @@ mod expr_arm_coverage {
         // A `[expr]` bracket key in the path is a value expression and is read
         // (the column `idx`); the `:field` dot key is not (a previous version
         // dropped the whole path, losing `idx`).
-        assert_unordered_eq!(reads("SELECT a:b[t.idx] AS r FROM t"), vec![c("a"), c("idx")]);
+        assert_unordered_eq!(
+            reads("SELECT a:b[t.idx] AS r FROM t"),
+            vec![c("a"), c("idx")]
+        );
     }
 
     #[test]

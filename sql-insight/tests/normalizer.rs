@@ -186,7 +186,8 @@ fn test_typed_string_literal_value_is_normalized() {
     // A `DATE` / `TIMESTAMP '…'` literal is a `TypedString`, whose value is a
     // bare `Value` field (not an `Expr::Value`) — it must still normalize so
     // queries differing only in the date / timestamp collapse together.
-    let sql = "SELECT * FROM t WHERE d = DATE '2020-01-01' AND ts > TIMESTAMP '2020-01-01 00:00:00'";
+    let sql =
+        "SELECT * FROM t WHERE d = DATE '2020-01-01' AND ts > TIMESTAMP '2020-01-01 00:00:00'";
     let expected = vec!["SELECT * FROM t WHERE d = DATE ? AND ts > TIMESTAMP ?".into()];
     assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
 }

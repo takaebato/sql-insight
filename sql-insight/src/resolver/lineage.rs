@@ -457,9 +457,7 @@ fn feeding_scans<'a>(
             feeding_scans(&so.right, ctx, fed_ctes, out);
         }
         LogicalPlan::With(w) => {
-            ctx.with_decls(&w.ctes, |ctx| {
-                feeding_scans(&w.body, ctx, fed_ctes, out)
-            });
+            ctx.with_decls(&w.ctes, |ctx| feeding_scans(&w.body, ctx, fed_ctes, out));
         }
         LogicalPlan::CteRef(r) => {
             // A CTE body materializes once: the first reference to a given

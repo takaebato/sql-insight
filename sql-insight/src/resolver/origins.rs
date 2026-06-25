@@ -130,7 +130,10 @@ pub(super) fn origins_of_expr<'a>(
         // a derived / CTE side traces into its producing subquery (so a
         // `(SELECT id FROM s) d JOIN t USING (id)` yields both `s.id` and
         // `t.id`, not just one).
-        Expr::Fanin(refs) => refs.iter().flat_map(|c| origins_of_ref(c, input, ctx)).collect(),
+        Expr::Fanin(refs) => refs
+            .iter()
+            .flat_map(|c| origins_of_ref(c, input, ctx))
+            .collect(),
         // Tests / suppressed operands contribute no value origin (reads only).
         Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Filter(_) => Vec::new(),
     }
