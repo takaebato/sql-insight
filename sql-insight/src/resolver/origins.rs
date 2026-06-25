@@ -323,6 +323,14 @@ fn scalar_subquery_origins<'a>(
     op: &'a LogicalPlan,
     ctx: &mut Ctx<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
+    // A leading `WITH` on the subquery must register its CTE declarations so a
+    // `CteRef` in the body resolves during the trace: `output_operands` peels
+    // the `With` for shape but doesn't push its CTEs (and `Ctx::new` only
+    // registers the statement's *top-level* leading WITH, not a nested
+    // subquery's own). `with_decls` balances the push/pop.
+    if let LogicalPlan::With(w) = op {
+        return ctx.with_decls(&w.ctes, |ctx| scalar_subquery_origins(&w.body, ctx));
+    }
     output_operands(op)
         .iter()
         .filter_map(|&(outputs, input)| outputs.first().map(|ne| (ne, input)))

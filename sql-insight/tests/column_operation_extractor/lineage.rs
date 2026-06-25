@@ -609,6 +609,26 @@ mod cte_derived_rename {
             },
         );
     }
+
+    #[test]
+    fn scalar_subquery_with_leading_with_keeps_column_lineage() {
+        // A scalar subquery with its *own* leading WITH: the CTE `c` is
+        // registered during the origins trace, so the body's `CteRef` resolves
+        // and `s.k` flows to the output `r`. (The trace peels the WITH for shape
+        // via `output_operands`; it must also push the CTE declarations, which a
+        // nested subquery's WITH otherwise misses — only the statement's
+        // top-level WITH is pre-registered.)
+        assert_column_ops(
+            "SELECT (WITH c AS (SELECT k AS x FROM s) SELECT x FROM c) AS r FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "k")],
+                writes: vec![],
+                lineage: vec![transformation(col("s", "k"), out("r", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
 }
 
 mod lambda {
@@ -682,12 +702,20 @@ mod lambda {
         // Inside the body, the CTE `c` exposes a column `x` (renamed from `k`),
         // so the subquery `SELECT x FROM c` resolves `x` to the CTE column
         // (→ s.k), shadowing the lambda parameter — the parameter is not a false
-        // read. (Asserting reads only: the body value's lineage to the output is
-        // subject to a separate limitation — a scalar subquery with a leading
-        // WITH currently drops its column lineage.)
-        let op = extract(
+        // read. Both the array arg (`t1.arr`) and the body value (`s.k`, through
+        // the CTE) flow to the anonymous output.
+        assert_column_ops(
             "SELECT transform(arr, x -> (WITH c AS (SELECT k AS x FROM s) SELECT x FROM c)) FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "arr"), read("s", "k")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t1", "arr"), out_anon(0)),
+                    transformation(col("s", "k"), out_anon(0)),
+                ],
+                diagnostics: vec![],
+            },
         );
-        assert_unordered_eq!(op.reads, vec![read("t1", "arr"), read("s", "k")]);
     }
 }
