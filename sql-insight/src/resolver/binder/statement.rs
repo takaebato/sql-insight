@@ -281,13 +281,18 @@ impl<'a> Binder<'a> {
     /// (each `RHS → target.col` for lineage / writes). RETURNING / the MySQL
     /// multi-table form's exotic shapes are later bricks.
     pub(super) fn bind_update(&self, update: &SqlUpdate) -> LogicalPlan {
-        let Some((target_relation, target)) = self.target_relation(&update.table.relation) else {
+        // Flatten a parenthesized join target `UPDATE (t1 JOIN t2 …) SET …`:
+        // the innermost table is the write target, the joins are read relations
+        // — so the parenthesized form behaves like the non-paren MySQL
+        // `UPDATE t1 JOIN t2 …` form (whose joins live on `update.table.joins`).
+        let (target_factor, joins) = flatten_dml_target(&update.table);
+        let Some((target_relation, target)) = self.target_relation(target_factor) else {
             return LogicalPlan::Empty;
         };
         let mut scope = Scope::single(target_relation);
         let mut input = LogicalPlan::Empty;
         // Joins on the UPDATE target clause are read relations.
-        for j in &update.table.joins {
+        for j in joins {
             let (node, jscope) = self.bind_table_factor(&j.relation, &scope.relations);
             scope.relations.extend(jscope.relations);
             let on = join_on(&j.join_operator)
@@ -416,6 +421,14 @@ impl<'a> Binder<'a> {
     /// `value → target.col` drive writes / lineage. A column-less INSERT fills
     /// from the catalog (empty without one — the values are then reads only).
     pub(super) fn bind_merge(&self, merge: &SqlMerge) -> LogicalPlan {
+        // A parenthesized *join* target `MERGE INTO (t1 JOIN t2) …` can't be a
+        // write target (you merge into one table) — flag it rather than
+        // silently picking the first relation. A parenthesized *single* table
+        // `(t1)` is fine and resolves below.
+        if is_join_factor(&merge.table) {
+            self.record_unsupported_merge_target(&merge.table);
+            return LogicalPlan::Empty;
+        }
         let Some((target_relation, target)) = self.target_relation(&merge.table) else {
             // A non-table MERGE target (derived table / subquery / table
             // function) can't be a write target — flag it rather than dropping
@@ -775,6 +788,36 @@ impl<'a> Binder<'a> {
             .map(|written| self.table_match(&written).table)
             .collect();
         LogicalPlan::Drop(Drop { targets })
+    }
+}
+
+/// Flatten a DML target's `TableWithJoins` through any parenthesised
+/// (`NestedJoin`) wrapper: the innermost table factor is the write target, and
+/// every join (inner-parens joins first, then the outer joins) is a read
+/// relation — so a parenthesised `(t1 JOIN t2 …)` target behaves like the
+/// non-paren `t1 JOIN t2 …` form.
+fn flatten_dml_target(twj: &TableWithJoins) -> (&TableFactor, Vec<&sqlparser::ast::Join>) {
+    let mut relation = &twj.relation;
+    let mut joins: Vec<&sqlparser::ast::Join> = twj.joins.iter().collect();
+    while let TableFactor::NestedJoin {
+        table_with_joins, ..
+    } = relation
+    {
+        joins = table_with_joins.joins.iter().chain(joins).collect();
+        relation = &table_with_joins.relation;
+    }
+    (relation, joins)
+}
+
+/// Whether a table factor is a parenthesised *join* (two or more relations) —
+/// a `(t1 JOIN t2)`, not a parenthesised single table `(t1)`. Used to reject a
+/// join as a MERGE target.
+fn is_join_factor(factor: &TableFactor) -> bool {
+    match factor {
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => !table_with_joins.joins.is_empty() || is_join_factor(&table_with_joins.relation),
+        _ => false,
     }
 }
 

@@ -918,6 +918,23 @@ mod lineage {
     }
 
     #[test]
+    fn update_parenthesized_join_target_keeps_all_relations() {
+        // `UPDATE (t1 JOIN t2 …) SET …`: the parenthesized join target is
+        // flattened — t1 is the write target, t2 a joined read — so it behaves
+        // like the non-paren `UPDATE t1 JOIN t2 …` form (t2 used to be dropped).
+        assert_ops(
+            "UPDATE (t1 JOIN t2 ON t1.a = t2.a) SET t1.b = t2.b",
+            TableOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t2")],
+                writes: vec![table("t1")],
+                lineage: vec![edge("t2", "t1")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn insert_on_conflict_value_subquery_feeds_lineage() {
         // ON CONFLICT DO UPDATE SET col = (SELECT … FROM other): the value
         // subquery feeds the target like an UPDATE SET RHS — so `other` is a
@@ -1079,6 +1096,24 @@ mod lineage {
         assert_ops(
             "MERGE INTO (SELECT a FROM t) AS d USING s ON d.id = s.id \
              WHEN MATCHED THEN UPDATE SET d.a = s.a",
+            TableOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(TableLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
+    fn merge_into_parenthesized_join_target_is_flagged() {
+        // You merge into one table, not a join — a `(t1 JOIN t2)` MERGE target
+        // is flagged as UnsupportedStatement rather than silently picking the
+        // first relation. (A parenthesized single table `(t1)` is fine.)
+        assert_ops(
+            "MERGE INTO (t1 JOIN t2 ON t1.id = t2.id) USING s ON s.id = t1.id \
+             WHEN MATCHED THEN UPDATE SET t1.a = s.a",
             TableOperation {
                 statement_kind: StatementKind::Merge,
                 reads: vec![],
