@@ -94,8 +94,20 @@ impl<'a> Binder<'a> {
             | SqlExpr::Floor { expr, .. }
             | SqlExpr::Collate { expr, .. }
             | SqlExpr::Prefixed { value: expr, .. }
-            | SqlExpr::Named { expr, .. }
-            | SqlExpr::JsonAccess { value: expr, .. } => self.call([expr.as_ref()], scope),
+            | SqlExpr::Named { expr, .. } => self.call([expr.as_ref()], scope),
+            // `value : path` JSON access (`a:b['idx']`): the accessed value plus
+            // any `[expr]` bracket key in the path (a value expression that may
+            // reference a column). A `.field` dot key is a literal field name,
+            // not a column — like the `Dot` step in `CompoundFieldAccess`.
+            SqlExpr::JsonAccess { value, path } => {
+                let mut args = vec![self.bind_expr(value, scope)];
+                for elem in &path.path {
+                    if let JsonPathElem::Bracket { key } = elem {
+                        args.push(self.bind_expr(key, scope));
+                    }
+                }
+                Expr::Call { args }
+            }
             SqlExpr::CompoundFieldAccess { root, access_chain } => {
                 let mut args = vec![self.bind_expr(root, scope)];
                 for access in access_chain {

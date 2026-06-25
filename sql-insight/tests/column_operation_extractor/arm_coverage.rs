@@ -252,7 +252,13 @@ mod expr_arm_coverage {
 
     #[test]
     fn json_access() {
+        // The accessed value is read; a string / `.field` path key is a literal
+        // field name, not a column.
         assert_unordered_eq!(reads("SELECT t.a -> 'b' FROM t"), vec![c("a")]);
+        // A `[expr]` bracket key in the path is a value expression and is read
+        // (the column `idx`); the `:field` dot key is not (a previous version
+        // dropped the whole path, losing `idx`).
+        assert_unordered_eq!(reads("SELECT a:b[t.idx] AS r FROM t"), vec![c("a"), c("idx")]);
     }
 
     #[test]
