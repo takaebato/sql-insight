@@ -871,8 +871,12 @@ mod relation_arm_coverage {
 
     #[test]
     fn unpivot() {
+        // `UNPIVOT (v FOR n IN (t.a, t.b))`: `v` (value) and `n` (name) are
+        // generated output column names, not source columns — only the IN-list
+        // columns `t.a` / `t.b` are read (a previous version wrongly read the
+        // value name `t.v`).
         let result = op("SELECT * FROM t UNPIVOT(v FOR n IN (t.a, t.b))");
-        assert_unordered_eq!(result.reads, vec![c("t", "v"), c("t", "a"), c("t", "b")]);
+        assert_unordered_eq!(result.reads, vec![c("t", "a"), c("t", "b")]);
     }
 
     #[test]

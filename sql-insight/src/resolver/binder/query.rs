@@ -733,18 +733,20 @@ impl<'a> Binder<'a> {
             }
             TableFactor::Unpivot {
                 table,
-                value,
                 columns,
                 alias,
                 ..
             } => {
                 let (inner, inner_scope) = self.bind_table_factor(table, left);
-                let mut args = vec![self.bind_expr(value, &inner_scope)];
-                args.extend(
-                    columns
-                        .iter()
-                        .map(|c| self.bind_expr(&c.expr, &inner_scope)),
-                );
+                // `value` (the new value column) and `name` (the new name
+                // column) are *generated* output column names, not source
+                // columns — only the IN-list `columns` are read. (PIVOT differs:
+                // its `value_column` is an existing source column, so that arm
+                // binds it.)
+                let args = columns
+                    .iter()
+                    .map(|c| self.bind_expr(&c.expr, &inner_scope))
+                    .collect();
                 self.opaque(inner, args, alias.as_ref())
             }
             TableFactor::MatchRecognize {
