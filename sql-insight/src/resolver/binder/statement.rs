@@ -123,28 +123,35 @@ impl<'a> Binder<'a> {
             Some(source) => self.bind_query(source),
             None => (LogicalPlan::Empty, Scope::default()),
         };
-        // A column-less INSERT fills from the target's catalog columns — reuse
-        // the list from the `table_match` above rather than re-matching via
-        // `catalog_columns`. They are quote-wrapped for folded resolution; the
-        // written column list takes the plain identifier.
-        let columns = if insert.columns.is_empty() {
+        // A wildcard in the source projection (`SELECT *, y`) leaves the column
+        // count / positions indeterminate (wildcards aren't expanded), so
+        // neither the arity check nor positional relation-lineage can trust the
+        // visible outputs. Carried on `source_wildcard`; the arity check and the
+        // lineage walker both skip when set, it words the diagnostic below, and
+        // a column-list-less INSERT can't fill from the catalog under it (next).
+        let source_wildcard = insert
+            .source
+            .as_ref()
+            .is_some_and(|q| source_has_wildcard(q));
+        // The written column list: an explicit `(a, b)` wins; otherwise a
+        // column-less INSERT fills from the target's catalog columns (reusing
+        // the `table_match` list above, plain identifiers), truncated to the
+        // source's projected arity. But a wildcard source has indeterminate
+        // arity — the `*` isn't in `query_outputs`, so the visible count is too
+        // low — and the catalog columns can't be positionally paired: leave the
+        // list empty so the drop + flag guard below fires rather than
+        // mis-truncating to the undercounted outputs.
+        let columns = if !insert.columns.is_empty() {
+            insert.columns.clone()
+        } else if source_wildcard {
+            Vec::new()
+        } else {
             m.columns
                 .iter()
                 .take(scope.query_outputs.len())
                 .map(|c| Ident::new(&c.value))
                 .collect()
-        } else {
-            insert.columns.clone()
         };
-        // A wildcard in the source projection (`SELECT *, y`) leaves the column
-        // count / positions indeterminate (wildcards aren't expanded), so
-        // neither the arity check nor positional relation-lineage can trust the
-        // visible outputs. Carried on `source_wildcard`; the arity check and the
-        // lineage walker both skip when set, and it words the diagnostic below.
-        let source_wildcard = insert
-            .source
-            .as_ref()
-            .is_some_and(|q| source_has_wildcard(q));
         // A column-list-less INSERT whose target columns can't be determined
         // drops its column writes / lineage — flag it so the empty surfaces
         // read as "couldn't analyze", not "nothing written". The cause is the

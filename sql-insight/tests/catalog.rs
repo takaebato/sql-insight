@@ -266,3 +266,49 @@ fn non_create_table_statements_are_ignored() {
 fn invalid_ddl_returns_error() {
     assert!(Catalog::from_ddl(&GenericDialect {}, "CREATE TABLE").is_err());
 }
+
+#[test]
+fn columnless_insert_from_wildcard_source_drops_writes_and_flags() {
+    // A column-list-less INSERT whose source carries a wildcard can't pair the
+    // target's catalog columns positionally — the `*` count is indeterminate
+    // (wildcards aren't expanded), so the visible-output count is too low.
+    // Surface no writes and flag `InsertColumnsUnresolved` rather than
+    // mis-truncating the catalog list to the undercounted outputs.
+    use sql_insight::diagnostic::ColumnLevelDiagnosticKind;
+    let ddl = "CREATE TABLE t (a INT, b INT, c INT, d INT); CREATE TABLE s (p INT, q INT, r INT)";
+    let op = |q: &str| {
+        let catalog = Catalog::from_ddl(&GenericDialect {}, ddl).unwrap();
+        extract_column_operations_with_options(
+            &GenericDialect {},
+            q,
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap()
+    };
+
+    let wild = op("INSERT INTO t SELECT *, now() FROM s");
+    assert!(
+        wild.writes.is_empty(),
+        "wildcard source → no determinate writes, got {:?}",
+        wild.writes
+    );
+    assert!(
+        wild.diagnostics
+            .iter()
+            .any(|d| d.kind == ColumnLevelDiagnosticKind::InsertColumnsUnresolved),
+        "should flag InsertColumnsUnresolved, got {:?}",
+        wild.diagnostics
+    );
+
+    // A determinate projection still fills from the catalog (first two columns).
+    let plain = op("INSERT INTO t SELECT p, q FROM s");
+    let written: Vec<_> = plain.writes.iter().map(|w| w.name.value.as_str()).collect();
+    assert_eq!(written, ["a", "b"]);
+    assert!(
+        plain.diagnostics.is_empty(),
+        "determinate fill → no diagnostic, got {:?}",
+        plain.diagnostics
+    );
+}
