@@ -91,6 +91,16 @@ impl<'a> Binder<'a> {
     /// [`LogicalPlan::Values`] (the rows are reads, but synthesise no traceable
     /// output, so there is no column lineage). RETURNING / ON CONFLICT / the
     /// MySQL `SET` form are later bricks.
+    ///
+    /// The Hive `PARTITION (…)` spec (`insert.partitioned`) is intentionally
+    /// not extracted: a partition clause is write-side metadata whose value is
+    /// normally a constant (`PARTITION (dt = '2020-01-01')`) or a dynamic
+    /// column name (`PARTITION (dt)`), contributing no read / lineage
+    /// dependency — and a partition value has no FROM scope to resolve a column
+    /// reference against, so binding it would surface a bogus target-column
+    /// read and an unresolved ref rather than a real edge. A non-trivial value
+    /// expression is dropped (not flagged: it isn't an analyzable-info loss the
+    /// common, constant case would false-alarm on).
     pub(super) fn bind_insert(&self, insert: &SqlInsert) -> LogicalPlan {
         let name = match &insert.table {
             TableObject::TableName(name) => name,
