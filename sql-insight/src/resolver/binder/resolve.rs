@@ -40,22 +40,26 @@ impl<'a> Binder<'a> {
             }
         }
         // Resolve against the current scope, then fall through the enclosing
-        // stack innermost-first: a `Relations` frame resolves a column
-        // (correlation); a `Lambda` frame matches a bare parameter name to a
-        // `Binding::Local` (not a column). The first frame to claim the name
+        // stack innermost-first: a `Relations` level resolves a column
+        // (correlation); a `Lambda` level matches a bare parameter name to a
+        // `Binding::Local` (not a column). The first level to claim the name
         // wins, so a parameter sits at its lexical depth — outside any subquery
         // in the lambda body, inside the enclosing query.
         let binding = self
             .resolve_in(parts, &scope.relations)
             .or_else(|| {
-                self.enclosing.iter().rev().find_map(|frame| match frame {
-                    Frame::Relations(relations) => self.resolve_in(parts, relations),
-                    Frame::Lambda(params) => (parts.len() == 1
-                        && params
-                            .iter()
-                            .any(|p| self.eq(self.style.casing.column, p, name)))
-                    .then_some(Binding::Local),
-                })
+                self.context
+                    .outer
+                    .iter()
+                    .rev()
+                    .find_map(|level| match level {
+                        Level::Relations(relations) => self.resolve_in(parts, relations),
+                        Level::Lambda(params) => (parts.len() == 1
+                            && params
+                                .iter()
+                                .any(|p| self.eq(self.style.casing.column, p, name)))
+                        .then_some(Binding::Local),
+                    })
             })
             .unwrap_or(Binding::Unresolved);
         BoundColumn {
@@ -296,21 +300,15 @@ mod tests {
     use super::*;
     use crate::casing::IdentifierCasing;
 
-    /// A minimal `Binder` over a borrowed diagnostics sink (no CTEs / outer
-    /// scopes — those don't affect the pure resolution helpers tested here).
-    /// The surface quote defaults to the standard `"`; these helpers test
-    /// matching, which is quote-char-agnostic.
-    fn binder<'a>(
-        diagnostics: &'a RefCell<Vec<ColumnLevelDiagnostic>>,
-        catalog: Option<&'a Catalog>,
-        casing: IdentifierCasing,
-    ) -> Binder<'a> {
+    /// A minimal `Binder` (no CTEs / outer scopes — those don't affect the pure
+    /// resolution helpers tested here). The surface quote defaults to the
+    /// standard `"`; these helpers test matching, which is quote-char-agnostic.
+    fn binder<'a>(catalog: Option<&'a Catalog>, casing: IdentifierCasing) -> Binder<'a> {
         Binder {
             catalog,
             style: IdentifierStyle { casing, quote: '"' },
-            ctes: Vec::new(),
-            enclosing: Vec::new(),
-            diagnostics,
+            diagnostics: Vec::new(),
+            context: Context::default(),
         }
     }
 
@@ -356,8 +354,7 @@ mod tests {
     /// | `public.orders`    | `public.users`     | ✗       |
     #[test]
     fn right_anchored_qualifier_matrix() {
-        let diagnostics = RefCell::new(Vec::new());
-        let binder = binder(&diagnostics, None, IdentifierCasing::default());
+        let binder = binder(None, IdentifierCasing::default());
 
         // (qualifier, table, expected)
         let cases: &[(TableReference, TableReference, bool)] = &[
@@ -436,13 +433,12 @@ mod tests {
             (CaseRule::Insensitive, true),
             (CaseRule::Sensitive, false),
         ] {
-            let diagnostics = RefCell::new(Vec::new());
             // Only the `table` fold matters for qualifier matching.
             let casing = IdentifierCasing {
                 table: fold,
                 ..IdentifierCasing::default()
             };
-            let binder = binder(&diagnostics, None, casing);
+            let binder = binder(None, casing);
             assert_eq!(
                 binder.qualifier_matches_table(&qualifier, &table),
                 expected,
@@ -485,8 +481,7 @@ mod tests {
     /// | `[Derived, Base a Cataloged]`        | `Ambiguous` (two witnesses)   |
     #[test]
     fn candidate_tiebreaker() {
-        let diagnostics = RefCell::new(Vec::new());
-        let binder = binder(&diagnostics, None, IdentifierCasing::default());
+        let binder = binder(None, IdentifierCasing::default());
 
         let cases: Vec<(Vec<Binding>, Binding)> = vec![
             (vec![], Binding::Unresolved),
@@ -544,8 +539,7 @@ mod tests {
             .table(CatalogTable::new("public", "users").columns(["id", "name"]))
             .table(CatalogTable::new("public", "orders").columns(["id"]))
             .table(CatalogTable::new("sales", "users").columns(["x"]));
-        let diagnostics = RefCell::new(Vec::new());
-        let binder = binder(&diagnostics, Some(&catalog), IdentifierCasing::default());
+        let binder = binder(Some(&catalog), IdentifierCasing::default());
 
         // (written, expected resolution, expected canonical / kept table)
         let cases: &[(TableReference, ResolutionKind, TableReference)] = &[
@@ -608,8 +602,7 @@ mod tests {
                     .catalog("db")
                     .columns(["id"]),
             );
-        let diagnostics = RefCell::new(Vec::new());
-        let binder = binder(&diagnostics, Some(&catalog), IdentifierCasing::default());
+        let binder = binder(Some(&catalog), IdentifierCasing::default());
 
         let m = binder.table_match(&tref(None, None, "users"));
         assert_eq!(m.resolution, ResolutionKind::Cataloged);
@@ -696,14 +689,13 @@ mod tests {
         ];
 
         for (fold, query, expected) in cases {
-            let diagnostics = RefCell::new(Vec::new());
             // Keep the default (`Lower`) table fold so `users` resolves; vary
             // only the column fold that `list_has` consults.
             let casing = IdentifierCasing {
                 column: *fold,
                 ..IdentifierCasing::default()
             };
-            let binder = binder(&diagnostics, Some(&catalog), casing);
+            let binder = binder(Some(&catalog), casing);
             // The columns come from the catalog (quote-wrapped by `table_match`).
             let columns = binder.table_match(&tref(None, None, "users")).columns;
             assert_eq!(

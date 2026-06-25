@@ -6,7 +6,7 @@
 use super::*;
 
 impl<'a> Binder<'a> {
-    pub(super) fn bind_statement(&self, statement: &Statement) -> LogicalPlan {
+    pub(super) fn bind_statement(&mut self, statement: &Statement) -> LogicalPlan {
         match statement {
             Statement::Query(query) => self.bind_query_into(query),
             Statement::Insert(insert) => self.bind_insert(insert),
@@ -40,14 +40,16 @@ impl<'a> Binder<'a> {
                 }),
                 None => LogicalPlan::Empty,
             },
-            Statement::Truncate(truncate) => LogicalPlan::Drop(Drop {
-                targets: truncate
+            Statement::Truncate(truncate) => {
+                let written: Vec<_> = truncate
                     .table_names
                     .iter()
                     .filter_map(|t| self.table_ref(&t.name))
-                    .map(|written| self.table_match(&written).table)
-                    .collect(),
-            }),
+                    .collect();
+                LogicalPlan::Drop(Drop {
+                    targets: written.iter().map(|w| self.table_match(w).table).collect(),
+                })
+            }
             _ => LogicalPlan::Empty,
         }
     }
@@ -58,7 +60,7 @@ impl<'a> Binder<'a> {
     /// table — `INTO` nested in a subquery / CTE body isn't valid SQL there, so
     /// it's ignored rather than leaking a mid-tree `CreateTableAs` that the
     /// write walkers (which peel only a leading `WITH`) would miss.
-    fn bind_query_into(&self, query: &Query) -> LogicalPlan {
+    fn bind_query_into(&mut self, query: &Query) -> LogicalPlan {
         let plan = self.bind_query(query).0;
         let Some(name) = leading_select_into(&query.body) else {
             return plan;
@@ -101,7 +103,7 @@ impl<'a> Binder<'a> {
     /// read and an unresolved ref rather than a real edge. A non-trivial value
     /// expression is dropped (not flagged: it isn't an analyzable-info loss the
     /// common, constant case would false-alarm on).
-    pub(super) fn bind_insert(&self, insert: &SqlInsert) -> LogicalPlan {
+    pub(super) fn bind_insert(&mut self, insert: &SqlInsert) -> LogicalPlan {
         let name = match &insert.table {
             TableObject::TableName(name) => name,
             TableObject::TableFunction(function) => &function.name,
@@ -193,7 +195,7 @@ impl<'a> Binder<'a> {
     /// (resolved against the target's own columns), placed in a `Projection` so the
     /// `value → target.col` lineage reuses the relation-lineage machinery.
     pub(super) fn bind_insert_set(
-        &self,
+        &mut self,
         insert: &SqlInsert,
         target: TableReference,
     ) -> LogicalPlan {
@@ -237,7 +239,7 @@ impl<'a> Binder<'a> {
     /// self-references the target). Returns the conflict assignments (extra
     /// writes + lineage) and the optional `DO UPDATE … WHERE` (filter reads).
     pub(super) fn bind_conflict(
-        &self,
+        &mut self,
         on: &OnInsert,
         target: &TableReference,
         columns: &[Ident],
@@ -290,7 +292,7 @@ impl<'a> Binder<'a> {
     /// WHERE predicate as a `Filter`. The SET assignments are the value path
     /// (each `RHS → target.col` for lineage / writes). RETURNING / the MySQL
     /// multi-table form's exotic shapes are later bricks.
-    pub(super) fn bind_update(&self, update: &SqlUpdate) -> LogicalPlan {
+    pub(super) fn bind_update(&mut self, update: &SqlUpdate) -> LogicalPlan {
         // Flatten a parenthesized join target `UPDATE (t1 JOIN t2 …) SET …`:
         // the innermost table is the write target, the joins are read relations
         // — so the parenthesized form behaves like the non-paren MySQL
@@ -362,7 +364,7 @@ impl<'a> Binder<'a> {
     ///   `DELETE t1, t2 FROM src`       → FROM are reads, the list are targets
     /// A target is in scope for the predicate but never scanned (so it isn't a
     /// read). There are no column writes / lineage — rows go wholesale.
-    pub(super) fn bind_delete(&self, delete: &SqlDelete) -> LogicalPlan {
+    pub(super) fn bind_delete(&mut self, delete: &SqlDelete) -> LogicalPlan {
         let from_tables = match &delete.from {
             FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
         };
@@ -430,7 +432,7 @@ impl<'a> Binder<'a> {
     /// a `MergeClause`: an UPDATE SET's `RHS → target.col` and an INSERT's
     /// `value → target.col` drive writes / lineage. A column-less INSERT fills
     /// from the catalog (empty without one — the values are then reads only).
-    pub(super) fn bind_merge(&self, merge: &SqlMerge) -> LogicalPlan {
+    pub(super) fn bind_merge(&mut self, merge: &SqlMerge) -> LogicalPlan {
         // A parenthesized *join* target `MERGE INTO (t1 JOIN t2) …` can't be a
         // write target (you merge into one table) — flag it rather than
         // silently picking the first relation. A parenthesized *single* table
@@ -546,7 +548,7 @@ impl<'a> Binder<'a> {
     /// resolving SET / WHERE against the target's columns) and its canonical
     /// write-target identity. Returns `None` for a non-table factor.
     pub(super) fn target_relation(
-        &self,
+        &mut self,
         factor: &TableFactor,
     ) -> Option<(Relation, TableReference)> {
         // Reuse the table-factor binder for catalog matching / column
@@ -578,7 +580,7 @@ impl<'a> Binder<'a> {
     /// in-scope relation), so consult the scope first; otherwise canonicalise
     /// it as written.
     pub(super) fn resolve_delete_target(
-        &self,
+        &mut self,
         name: &ObjectName,
         scope: &Scope,
     ) -> Option<TableReference> {
@@ -653,7 +655,7 @@ impl<'a> Binder<'a> {
     /// contributes target reads and a `QueryOutput` lineage edge. A wildcard is
     /// suppressed (its diagnostic is a later brick).
     pub(super) fn bind_returning(
-        &self,
+        &mut self,
         returning: &Option<Vec<SelectItem>>,
         scope: &Scope,
     ) -> Vec<NamedExpr> {
@@ -673,7 +675,7 @@ impl<'a> Binder<'a> {
     /// outputs. A plain `CREATE TABLE t (cols)` (no query) is a target-only
     /// create — its column definitions aren't writes — so it binds with no
     /// columns / input.
-    pub(super) fn bind_create_table(&self, create: &CreateTable) -> LogicalPlan {
+    pub(super) fn bind_create_table(&mut self, create: &CreateTable) -> LogicalPlan {
         let Some(written) = self.table_ref(&create.name) else {
             return LogicalPlan::Empty;
         };
@@ -718,7 +720,7 @@ impl<'a> Binder<'a> {
     /// `CREATE VIEW v AS <query>`: like CTAS — `columns` is the explicit column
     /// list only (empty when none); the implicit source-output names are
     /// resolved at the write / lineage surface.
-    pub(super) fn bind_create_view(&self, create: &SqlCreateView) -> LogicalPlan {
+    pub(super) fn bind_create_view(&mut self, create: &SqlCreateView) -> LogicalPlan {
         let Some(written) = self.table_ref(&create.name) else {
             return LogicalPlan::Empty;
         };
@@ -739,7 +741,7 @@ impl<'a> Binder<'a> {
     /// [`bind_create_view`](Self::bind_create_view) (`columns` = the explicit
     /// list only).
     pub(super) fn bind_alter_view(
-        &self,
+        &mut self,
         name: &ObjectName,
         columns: &[Ident],
         query: &Query,
@@ -763,7 +765,7 @@ impl<'a> Binder<'a> {
     /// column-naming operation contributes its column(s) as writes (RENAME /
     /// CHANGE surface both names). Schema-level ops name no columns. No reads
     /// or lineage — ALTER restructures, it doesn't move row data.
-    pub(super) fn bind_alter_table(&self, alter: &SqlAlterTable) -> LogicalPlan {
+    pub(super) fn bind_alter_table(&mut self, alter: &SqlAlterTable) -> LogicalPlan {
         let Some(written) = self.table_ref(&alter.name) else {
             return LogicalPlan::Empty;
         };
@@ -780,7 +782,7 @@ impl<'a> Binder<'a> {
     /// write targets. Other object types (index / schema / …) name no
     /// relations — unbound (`LogicalPlan::Empty`).
     pub(super) fn bind_drop(
-        &self,
+        &mut self,
         object_type: &ObjectType,
         names: &[ObjectName],
         table: Option<&ObjectName>,
@@ -791,12 +793,12 @@ impl<'a> Binder<'a> {
         ) {
             return LogicalPlan::Empty;
         }
-        let targets = names
+        let written: Vec<_> = names
             .iter()
             .chain(table)
             .filter_map(|name| self.table_ref(name))
-            .map(|written| self.table_match(&written).table)
             .collect();
+        let targets = written.iter().map(|w| self.table_match(w).table).collect();
         LogicalPlan::Drop(Drop { targets })
     }
 }

@@ -5,7 +5,11 @@
 use super::*;
 
 impl<'a> Binder<'a> {
-    pub(super) fn bind_select_item(&self, item: &SelectItem, scope: &Scope) -> Option<NamedExpr> {
+    pub(super) fn bind_select_item(
+        &mut self,
+        item: &SelectItem,
+        scope: &Scope,
+    ) -> Option<NamedExpr> {
         match item {
             SelectItem::UnnamedExpr(expr) => Some(NamedExpr {
                 name: inferred_name(expr),
@@ -56,7 +60,7 @@ impl<'a> Binder<'a> {
     /// ([`Expr::Call`]), with the predicate / row-positioning parts in a filter
     /// position ([`Expr::Filter`] / [`Expr::Case`] / [`Expr::Exists`] /
     /// [`Expr::InSubquery`]) so they read but never originate a value.
-    pub(super) fn bind_expr(&self, expr: &SqlExpr, scope: &Scope) -> Expr {
+    pub(super) fn bind_expr(&mut self, expr: &SqlExpr, scope: &Scope) -> Expr {
         match expr {
             SqlExpr::Identifier(id) => self.resolve_expr(std::slice::from_ref(id), scope),
             SqlExpr::CompoundIdentifier(parts) => self.resolve_expr(parts, scope),
@@ -243,15 +247,16 @@ impl<'a> Binder<'a> {
             },
             SqlExpr::Interval(interval) => self.call([interval.value.as_ref()], scope),
             // A lambda's body is bound against a fresh (empty) scope, with the
-            // enclosing relations pushed as a frame and the parameters as a
-            // `Lambda` frame on top. So a bare parameter (`x` in `x -> x + 1`)
+            // enclosing relations pushed as a level and the parameters as a
+            // `Lambda` level on top. So a bare parameter (`x` in `x -> x + 1`)
             // resolves to `Binding::Local` (no read / no origin), while the
             // parameter sits at its lexical depth: a subquery in the body
             // resolves its own columns first, the enclosing query last.
-            SqlExpr::Lambda(lambda) => self
-                .with_outer(scope.relations.clone())
-                .with_lambda(lambda.params.iter().cloned())
-                .call([lambda.body.as_ref()], &Scope::default()),
+            SqlExpr::Lambda(lambda) => self.in_lambda(
+                scope.relations.clone(),
+                lambda.params.iter().cloned(),
+                |b| b.call([lambda.body.as_ref()], &Scope::default()),
+            ),
             SqlExpr::MemberOf(member_of) => {
                 self.call([member_of.value.as_ref(), member_of.array.as_ref()], scope)
             }
@@ -274,8 +279,11 @@ impl<'a> Binder<'a> {
                 args: columns
                     .iter()
                     .map(|name| {
-                        let parts: Vec<Ident> =
-                            name.0.iter().filter_map(|p| p.as_ident().cloned()).collect();
+                        let parts: Vec<Ident> = name
+                            .0
+                            .iter()
+                            .filter_map(|p| p.as_ident().cloned())
+                            .collect();
                         self.resolve_expr(&parts, scope)
                     })
                     .collect(),
@@ -359,7 +367,7 @@ impl<'a> Binder<'a> {
 
     /// A transformation over the given value operands (`Expr::Call`).
     pub(super) fn call<'e>(
-        &self,
+        &mut self,
         exprs: impl IntoIterator<Item = &'e SqlExpr>,
         scope: &Scope,
     ) -> Expr {
@@ -374,7 +382,7 @@ impl<'a> Binder<'a> {
     /// A filter-position bucket over the given operands (`Expr::Filter`): read
     /// but never a value origin.
     pub(super) fn suppress<'e>(
-        &self,
+        &mut self,
         exprs: impl IntoIterator<Item = &'e SqlExpr>,
         scope: &Scope,
     ) -> Expr {
@@ -388,7 +396,7 @@ impl<'a> Binder<'a> {
 
     /// Bind a field-access step's value expressions (a `.field` / subscript
     /// index / slice bounds).
-    pub(super) fn bind_access(&self, access: &AccessExpr, scope: &Scope) -> Vec<Expr> {
+    pub(super) fn bind_access(&mut self, access: &AccessExpr, scope: &Scope) -> Vec<Expr> {
         match access {
             // A `.field` step accesses a struct / JSON field of the *value* to
             // its left (`a[1].b`, `(a).b`), so the field name is not a table
@@ -415,7 +423,7 @@ impl<'a> Binder<'a> {
     /// suppressed parts (an aggregate `FILTER` / `WITHIN GROUP`, a window
     /// `OVER (…)` spec's partition / order / frame keys — all row-positioning,
     /// never value sources) gathered into one [`Expr::Filter`].
-    pub(super) fn bind_function(&self, function: &Function, scope: &Scope) -> Expr {
+    pub(super) fn bind_function(&mut self, function: &Function, scope: &Scope) -> Expr {
         let mut args = Vec::new();
         if let FunctionArguments::List(list) = &function.parameters {
             args.extend(self.bind_function_arg_list(&list.args, scope));
@@ -511,11 +519,12 @@ impl<'a> Binder<'a> {
     /// Bind a subquery nested in an expression: its references resolve against
     /// its own FROM plus the containing scope's relations (pushed onto the
     /// correlation stack), so a correlated reference reaches outward.
-    pub(super) fn bind_subquery(&self, query: &Query, scope: &Scope) -> LogicalPlan {
-        self.with_outer(scope.relations.clone()).bind_query(query).0
+    pub(super) fn bind_subquery(&mut self, query: &Query, scope: &Scope) -> LogicalPlan {
+        self.in_outer(scope.relations.clone(), |b| b.bind_query(query))
+            .0
     }
 
-    pub(super) fn bind_function_args(&self, function: &Function, scope: &Scope) -> Vec<Expr> {
+    pub(super) fn bind_function_args(&mut self, function: &Function, scope: &Scope) -> Vec<Expr> {
         match &function.args {
             FunctionArguments::List(list) => self.bind_function_arg_list(&list.args, scope),
             _ => Vec::new(),
@@ -525,7 +534,11 @@ impl<'a> Binder<'a> {
     /// Bind a function-argument list's value expressions (dropping `*` and
     /// other non-expression args). Shared by scalar functions and table
     /// functions (`FROM f(args)`).
-    pub(super) fn bind_function_arg_list(&self, args: &[FunctionArg], scope: &Scope) -> Vec<Expr> {
+    pub(super) fn bind_function_arg_list(
+        &mut self,
+        args: &[FunctionArg],
+        scope: &Scope,
+    ) -> Vec<Expr> {
         args.iter()
             .filter_map(|arg| match arg {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
@@ -543,7 +556,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Bind several expressions against `scope`.
-    pub(super) fn bind_exprs(&self, exprs: &[SqlExpr], scope: &Scope) -> Vec<Expr> {
+    pub(super) fn bind_exprs(&mut self, exprs: &[SqlExpr], scope: &Scope) -> Vec<Expr> {
         exprs.iter().map(|e| self.bind_expr(e, scope)).collect()
     }
 
@@ -551,7 +564,7 @@ impl<'a> Binder<'a> {
     /// keys, `TOP n`, Hive `LATERAL VIEW`, `PREWHERE`, `QUALIFY`, `CONNECT BY`
     /// / `START WITH`, `CLUSTER BY` / `DISTRIBUTE BY`, named `WINDOW` specs),
     /// resolved against the FROM scope. None feed values.
-    pub(super) fn select_clause_reads(&self, select: &Select, scope: &Scope) -> Vec<Expr> {
+    pub(super) fn select_clause_reads(&mut self, select: &Select, scope: &Scope) -> Vec<Expr> {
         let mut reads = Vec::new();
         if let Some(Distinct::On(exprs)) = &select.distinct {
             reads.extend(self.bind_exprs(exprs, scope));
@@ -589,7 +602,7 @@ impl<'a> Binder<'a> {
 
     /// A window `OVER (…)` spec's reads (PARTITION BY / ORDER BY keys + frame
     /// bounds) — all row-positioning, never value sources.
-    pub(super) fn window_spec_reads(&self, spec: &WindowSpec, scope: &Scope) -> Vec<Expr> {
+    pub(super) fn window_spec_reads(&mut self, spec: &WindowSpec, scope: &Scope) -> Vec<Expr> {
         let mut reads = self.bind_exprs(&spec.partition_by, scope);
         reads.extend(spec.order_by.iter().map(|o| self.bind_expr(&o.expr, scope)));
         if let Some(frame) = &spec.window_frame {
@@ -608,7 +621,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Filter-position reads from a query's `LIMIT` / `OFFSET` / `LIMIT BY`.
-    pub(super) fn limit_reads(&self, limit: &LimitClause, scope: &Scope) -> Vec<Expr> {
+    pub(super) fn limit_reads(&mut self, limit: &LimitClause, scope: &Scope) -> Vec<Expr> {
         let mut reads = Vec::new();
         match limit {
             LimitClause::LimitOffset {
@@ -636,7 +649,7 @@ impl<'a> Binder<'a> {
 
     /// The GROUP BY key expressions (plain + GROUPING SETS members), resolved
     /// against the clause scope. These are reads, not lineage origins.
-    pub(super) fn group_by_keys(&self, group_by: &GroupByExpr, scope: &Scope) -> Vec<Expr> {
+    pub(super) fn group_by_keys(&mut self, group_by: &GroupByExpr, scope: &Scope) -> Vec<Expr> {
         let mut keys = Vec::new();
         if let GroupByExpr::Expressions(exprs, modifiers) = group_by {
             let members = exprs.iter().chain(modifiers.iter().filter_map(|m| match m {
@@ -651,7 +664,7 @@ impl<'a> Binder<'a> {
     }
 
     /// The ORDER BY key expressions (a trailing `query.order_by`).
-    pub(super) fn order_by_keys(&self, order_by: &OrderBy, scope: &Scope) -> Vec<Expr> {
+    pub(super) fn order_by_keys(&mut self, order_by: &OrderBy, scope: &Scope) -> Vec<Expr> {
         let OrderByKind::Expressions(exprs) = &order_by.kind else {
             return Vec::new();
         };
@@ -660,7 +673,7 @@ impl<'a> Binder<'a> {
 
     /// Bind a list of order-by expressions (`query.order_by` members or a
     /// `SELECT … SORT BY` list) as clause reads.
-    pub(super) fn order_by_expr_keys(&self, exprs: &[OrderByExpr], scope: &Scope) -> Vec<Expr> {
+    pub(super) fn order_by_expr_keys(&mut self, exprs: &[OrderByExpr], scope: &Scope) -> Vec<Expr> {
         exprs
             .iter()
             .map(|e| self.bind_expr(&e.expr, scope))

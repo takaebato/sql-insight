@@ -7,13 +7,16 @@
 //! plan- / AST-construction glue; the bind logic is split by concern across
 //! submodules, each adding an `impl Binder` block over the shared types:
 //!
-//! - [`Binder`] — the bind context (`catalog` / `style`, the identifier
-//!   casing + surface quote / the CTE and correlation stacks / the shared
-//!   diagnostics sink) and the small core methods over it (child-binder
-//!   construction, table-ref canonicalization, diagnostic recording).
+//! - [`Binder`] — the bind context: `catalog` / `style` (identifier casing +
+//!   surface quote), the appended-to diagnostics sink, and the downward
+//!   [`Context`] (in-scope CTEs + the enclosing resolution stack), swapped per
+//!   scope by [`Binder::in_scope`]. Plus the small core methods over it
+//!   (scoped binding, table-ref canonicalization, diagnostic recording).
 //! - [`scope`] — the bind-time [`Scope`] model (FROM `relations` / `query_outputs`
 //!   / USING `merge_columns`) threaded bottom-up (`bind_* -> (LogicalPlan,
 //!   Scope)`), never stored on the tree.
+//! - [`context`] — the `Context` (in-scope CTEs + the enclosing resolution
+//!   stack) threaded top-down, swapped per scope by the `in_scope` family.
 //! - [`statement`] — the DML / DDL roots (INSERT / UPDATE / DELETE / MERGE /
 //!   CREATE / ALTER / DROP) and write-target resolution.
 //! - [`query`] — `WITH` / CTEs, set operations, `VALUES`, SELECT, the FROM
@@ -39,13 +42,10 @@ use sqlparser::ast::{
     Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
     GroupByExpr, GroupByWithModifier, Ident, Insert as SqlInsert, JoinConstraint, JoinOperator,
     JsonPathElem, Merge as SqlMerge, MergeAction, MergeInsertKind, ObjectName, ObjectType,
-    OnConflictAction,
-    OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource, Query, Select,
-    SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject, TableWithJoins,
-    Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
+    OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource,
+    Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject,
+    TableWithJoins, Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
 };
-
-use std::cell::RefCell;
 
 use sqlparser::ast::{
     AccessExpr, ConnectByKind, Distinct, FunctionArgumentClause, LimitClause, ListAggOnOverflow,
@@ -68,12 +68,14 @@ use crate::reference::{ResolutionKind, TableReference};
 // The bind pass is split by concern; each submodule adds an `impl Binder`
 // block over the shared types — the `Binder` context and free helpers here,
 // the `Scope` relation / output model in `scope`.
+mod context;
 mod expr;
 mod query;
 mod resolve;
 mod scope;
 mod statement;
 
+use context::*;
 use scope::*;
 
 /// Bind a statement into an [`LogicalPlan`] tree plus the column-level
@@ -85,108 +87,71 @@ pub(crate) fn build_with_diagnostics(
     catalog: Option<&Catalog>,
     style: IdentifierStyle,
 ) -> (LogicalPlan, Vec<ColumnLevelDiagnostic>) {
-    let diagnostics = RefCell::new(Vec::new());
-    let op = Binder {
+    let mut binder = Binder {
         catalog,
         style,
-        ctes: Vec::new(),
-        enclosing: Vec::new(),
-        diagnostics: &diagnostics,
-    }
-    .bind_statement(statement);
-    (op, diagnostics.into_inner())
-}
-
-/// One frame of the column-resolution stack — the enclosing scopes a bare
-/// reference falls through to, innermost last. Unifies what used to be two
-/// side-by-side mechanisms (a relation correlation stack + a flat lambda-param
-/// list) into a single ordered stack, so precedence is managed in one place:
-/// `resolve` walks it innermost-first, and a frame sits at exactly its lexical
-/// depth (a lambda parameter is outside any subquery in the body but inside the
-/// enclosing query). CTEs are *not* here — they are a separate (table) namespace
-/// resolved in `bind_table_factor`.
-enum Frame {
-    /// An enclosing query level's FROM relations (a subquery / the query the
-    /// current one is correlated into).
-    Relations(Vec<Relation>),
-    /// A lambda's parameters (`x` in `x -> …`): a bare reference resolves to
-    /// [`Binding::Local`] — not a table column.
-    Lambda(Vec<Ident>),
+        diagnostics: Vec::new(),
+        context: Context::default(),
+    };
+    let op = binder.bind_statement(statement);
+    (op, binder.diagnostics)
 }
 
 struct Binder<'a> {
     catalog: Option<&'a Catalog>,
     style: IdentifierStyle,
-    /// CTEs in scope (declaration order, innermost `WITH` last).
-    ctes: Vec<CteDecl>,
-    /// The enclosing column-resolution stack (outermost first, innermost last)
-    /// a bare reference falls through to after the current `Scope`: enclosing
-    /// query relations (correlation) and lambda parameters, each at its lexical
-    /// depth. See [`Frame`].
-    enclosing: Vec<Frame>,
-    /// Shared diagnostic buffer (child binders for subqueries / CTEs push into
-    /// the same one, so a nested suppressed wildcard surfaces).
-    diagnostics: &'a RefCell<Vec<ColumnLevelDiagnostic>>,
+    /// The accumulated diagnostics (a write-only sink, appended as binding
+    /// proceeds). The binder is a single `&mut` entity, so this is a plain
+    /// `Vec` — no interior mutability needed.
+    diagnostics: Vec<ColumnLevelDiagnostic>,
+    /// The current downward binding environment (CTEs + enclosing stack),
+    /// swapped per scope by [`in_scope`](Self::in_scope).
+    context: Context,
 }
 
 impl<'a> Binder<'a> {
-    /// A child binder with a different CTE environment (sharing catalog /
-    /// style / enclosing stack / diagnostics).
-    pub(super) fn with_ctes(&self, ctes: Vec<CteDecl>) -> Binder<'a> {
-        Binder {
-            catalog: self.catalog,
-            style: self.style,
-            ctes,
-            enclosing: self.enclosing_clone(),
-            diagnostics: self.diagnostics,
-        }
+    /// Bind within a child [`Context`] (a subquery / CTE body / lambda body):
+    /// install `child`, run `f`, then restore the previous context. The restore
+    /// is structural (it always runs after `f` returns), so an early return
+    /// inside `f` can't leak the child context to a sibling — the leak-proofness
+    /// the old cloned-child-binder gave, without a per-call parameter.
+    fn in_scope<R>(&mut self, child: Context, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = std::mem::replace(&mut self.context, child);
+        let r = f(self);
+        self.context = saved;
+        r
     }
 
-    /// A child binder with one more enclosing relation frame on the stack (used
-    /// when descending into a subquery in an expression / a LATERAL factor).
-    pub(super) fn with_outer(&self, relations: Vec<Relation>) -> Binder<'a> {
-        self.pushing(Frame::Relations(relations))
+    /// Bind `f` with a replaced CTE environment in scope (a `WITH` body / CTE).
+    fn in_ctes<R>(&mut self, ctes: Vec<CteDecl>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let child = self.context.with_ctes(ctes);
+        self.in_scope(child, f)
     }
 
-    /// A child binder with the lambda `params` pushed as a frame (used to bind a
-    /// lambda body, so its parameter references resolve to [`Binding::Local`]
-    /// rather than table columns). Push *after* the enclosing relations
-    /// (`with_outer`) so the parameters sit inside the enclosing query but
-    /// outside any subquery in the body.
-    pub(super) fn with_lambda(&self, params: impl IntoIterator<Item = Ident>) -> Binder<'a> {
-        self.pushing(Frame::Lambda(params.into_iter().collect()))
+    /// Bind `f` with `relations` pushed as an enclosing correlation level (a
+    /// subquery in an expression / a LATERAL derived table).
+    fn in_outer<R>(&mut self, relations: Vec<Relation>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let child = self.context.with_outer(relations);
+        self.in_scope(child, f)
     }
 
-    /// Clone the enclosing stack (a frame's `Relations` / `Lambda` payload is
-    /// cloned). Shared by the child-binder constructors.
-    fn enclosing_clone(&self) -> Vec<Frame> {
-        self.enclosing
-            .iter()
-            .map(|frame| match frame {
-                Frame::Relations(r) => Frame::Relations(r.clone()),
-                Frame::Lambda(p) => Frame::Lambda(p.clone()),
-            })
-            .collect()
-    }
-
-    /// A child binder with `frame` pushed onto the enclosing stack (innermost).
-    fn pushing(&self, frame: Frame) -> Binder<'a> {
-        let mut enclosing = self.enclosing_clone();
-        enclosing.push(frame);
-        Binder {
-            catalog: self.catalog,
-            style: self.style,
-            ctes: self.ctes.clone(),
-            enclosing,
-            diagnostics: self.diagnostics,
-        }
+    /// Bind `f` (a lambda body) with `relations` as an enclosing level and the
+    /// lambda `params` as a `Lambda` level on top.
+    fn in_lambda<R>(
+        &mut self,
+        relations: Vec<Relation>,
+        params: impl IntoIterator<Item = Ident>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let child = self.context.with_outer(relations).with_lambda(params);
+        self.in_scope(child, f)
     }
 
     /// Build a table reference from a parsed name, recording a
     /// `TooManyTableQualifiers` diagnostic and returning `None` when it has
     /// more identifiers than `catalog.schema.name` (the only conversion
     /// failure) — so the dropped relation stays observable.
-    pub(super) fn table_ref(&self, name: &ObjectName) -> Option<TableReference> {
+    pub(super) fn table_ref(&mut self, name: &ObjectName) -> Option<TableReference> {
         match TableReference::try_from_name(name) {
             Ok(table) => Some(table),
             Err(_) => {
@@ -199,10 +164,10 @@ impl<'a> Binder<'a> {
     /// Record a `WildcardSuppressed` diagnostic for a projection wildcard
     /// (`*` / `t.*` / `(expr).*`) left unexpanded, carrying the wildcard
     /// token's location (a zero-line span is treated as unknown).
-    pub(super) fn record_wildcard_suppressed(&self, description: &str, span: Span) {
+    pub(super) fn record_wildcard_suppressed(&mut self, description: &str, span: Span) {
         let span = (span.start.line != 0).then_some(span);
         let suffix = span_suffix(span);
-        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+        self.diagnostics.push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::WildcardSuppressed,
             message: format!(
                 "{description}{suffix} left unexpanded — column lineage will be incomplete for this projection"
@@ -217,7 +182,7 @@ impl<'a> Binder<'a> {
     /// non-identifier part (a function-computed name like Snowflake's
     /// `IDENTIFIER('t')`). The kind covers both "unrepresentable table ref"
     /// cases; the message states which. Carries the name's location.
-    pub(super) fn record_unrepresentable_table(&self, name: &ObjectName) {
+    pub(super) fn record_unrepresentable_table(&mut self, name: &ObjectName) {
         let span = name
             .0
             .first()
@@ -230,7 +195,7 @@ impl<'a> Binder<'a> {
         } else {
             "has too many qualifiers (max catalog.schema.name)"
         };
-        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+        self.diagnostics.push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::TooManyTableQualifiers,
             message: format!("table reference `{name}`{suffix} {reason} — dropped"),
             span,
@@ -245,7 +210,7 @@ impl<'a> Binder<'a> {
     /// unknown), so blaming a missing catalog there would mislead — that's
     /// reserved for a determinate source with no catalog to fill the target.
     pub(super) fn record_insert_columns_unresolved(
-        &self,
+        &mut self,
         target: &TableReference,
         source_wildcard: bool,
     ) {
@@ -258,7 +223,7 @@ impl<'a> Binder<'a> {
                 "column-list-less INSERT into `{target}` can't pair source columns to target columns without a catalog — column writes / lineage dropped"
             )
         };
-        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+        self.diagnostics.push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::InsertColumnsUnresolved,
             message,
             span: None,
@@ -270,8 +235,8 @@ impl<'a> Binder<'a> {
     /// statement then binds to nothing, so an `UnsupportedStatement` (it
     /// projects to the table level) signals the empty surfaces are a coverage
     /// gap, not "nothing there". `message` shows the offending target.
-    pub(super) fn record_unsupported_merge_target(&self, factor: &TableFactor) {
-        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+    pub(super) fn record_unsupported_merge_target(&mut self, factor: &TableFactor) {
+        self.diagnostics.push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::UnsupportedStatement,
             message: format!(
                 "MERGE target `{factor}` is not a plain table (a derived table / subquery / table function) — the statement can't be analyzed and is dropped"
@@ -286,8 +251,8 @@ impl<'a> Binder<'a> {
     /// wouldn't help — the source columns aren't expanded), so its column-level
     /// `writes` / `lineage` are dropped. The target still surfaces in
     /// `table_writes` and feeds `table_lineage`.
-    pub(super) fn record_merge_insert_row_unresolved(&self, target: &TableReference) {
-        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+    pub(super) fn record_merge_insert_row_unresolved(&mut self, target: &TableReference) {
+        self.diagnostics.push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::InsertColumnsUnresolved,
             message: format!(
                 "MERGE INSERT ROW into `{target}` inserts the full source row — its column writes / lineage can't be recovered from SQL text and are dropped"
@@ -301,12 +266,12 @@ impl<'a> Binder<'a> {
     /// projected count: the positional pairing zips to the shorter side, so
     /// surplus columns get no lineage edge.
     pub(super) fn record_insert_columns_arity_mismatch(
-        &self,
+        &mut self,
         target: &TableReference,
         target_columns: usize,
         source_columns: usize,
     ) {
-        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+        self.diagnostics.push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::InsertColumnsArityMismatch,
             message: format!(
                 "INSERT into `{target}` lists {target_columns} target column(s) but the source projects {source_columns} — lineage pairs only the first {min} and drops the rest",
@@ -323,7 +288,7 @@ impl<'a> Binder<'a> {
     /// output is nameable. The set-op result schema follows the left branch, so
     /// only the first operand is inspected (mirroring `created_relation_*`).
     pub(super) fn flag_anonymous_relation_columns(
-        &self,
+        &mut self,
         target: &TableReference,
         explicit: &[Ident],
         input: &LogicalPlan,
@@ -339,7 +304,7 @@ impl<'a> Binder<'a> {
         if anonymous == 0 {
             return;
         }
-        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+        self.diagnostics.push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::AnonymousColumnsSuppressed,
             message: format!(
                 "`{target}` has {anonymous} unaliased expression column(s) with no name recoverable from the SQL text — dropped from column writes / lineage; alias them to surface"
@@ -357,7 +322,7 @@ impl<'a> Binder<'a> {
     /// indeterminate; the wildcard is flagged separately and the lineage walker
     /// drops the unreliable pairing).
     pub(super) fn diagnose_created_columns(
-        &self,
+        &mut self,
         target: &TableReference,
         explicit: &[Ident],
         input: &LogicalPlan,
@@ -383,12 +348,12 @@ impl<'a> Binder<'a> {
     /// the surplus columns get no lineage edge (their `writes` still surface).
     /// Shares the kind with the INSERT form; the message names the relation.
     pub(super) fn record_created_columns_arity_mismatch(
-        &self,
+        &mut self,
         target: &TableReference,
         target_columns: usize,
         source_columns: usize,
     ) {
-        self.diagnostics.borrow_mut().push(ColumnLevelDiagnostic {
+        self.diagnostics.push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::InsertColumnsArityMismatch,
             message: format!(
                 "created relation `{target}` lists {target_columns} column(s) but the source projects {source_columns} — lineage pairs only the first {min} and drops the rest",
