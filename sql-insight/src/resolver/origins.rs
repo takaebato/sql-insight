@@ -20,13 +20,13 @@ use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReferen
 /// casing for name comparisons (alias matching vs column matching use
 /// different rules — e.g. ClickHouse folds neither, the generic dialect
 /// folds both).
-pub(super) struct Ctx<'a> {
+pub(super) struct TraceContext<'a> {
     pub(super) ctes: Vec<&'a Cte>,
     pub(super) active: Vec<String>,
     pub(super) casing: IdentifierCasing,
 }
 
-impl<'a> Ctx<'a> {
+impl<'a> TraceContext<'a> {
     pub(super) fn new(op: &'a LogicalPlan, casing: IdentifierCasing) -> Self {
         // Collect leading `With` declarations so a `CteRef` on a traced path
         // resolves to its body.
@@ -36,7 +36,7 @@ impl<'a> Ctx<'a> {
             ctes.extend(w.ctes.iter());
             node = &w.body;
         }
-        Ctx {
+        TraceContext {
             ctes,
             active: Vec::new(),
             casing,
@@ -61,7 +61,7 @@ impl<'a> Ctx<'a> {
     pub(super) fn with_decls<R>(
         &mut self,
         ctes: &'a [Cte],
-        f: impl FnOnce(&mut Ctx<'a>) -> R,
+        f: impl FnOnce(&mut TraceContext<'a>) -> R,
     ) -> R {
         let added = ctes.len();
         ctes.iter().for_each(|c| self.ctes.push(c));
@@ -78,7 +78,7 @@ impl<'a> Ctx<'a> {
     pub(super) fn enter_cte<R>(
         &mut self,
         name: &Ident,
-        f: impl FnOnce(&mut Ctx<'a>, &'a LogicalPlan) -> R,
+        f: impl FnOnce(&mut TraceContext<'a>, &'a LogicalPlan) -> R,
     ) -> Option<R> {
         if self.active.iter().any(|n| n == &name.value) {
             return None; // recursive self-reference — terminate
@@ -103,28 +103,30 @@ impl<'a> Ctx<'a> {
 pub(super) fn origins_of_expr<'a>(
     expr: &'a Expr,
     input: &'a LogicalPlan,
-    ctx: &mut Ctx<'a>,
+    context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match expr {
-        Expr::Column(c) => origins_of_ref(c, input, ctx),
-        Expr::Call { args } => transform(args.iter().flat_map(|e| origins_of_expr(e, input, ctx))),
+        Expr::Column(c) => origins_of_ref(c, input, context),
+        Expr::Call { args } => {
+            transform(args.iter().flat_map(|e| origins_of_expr(e, input, context)))
+        }
         Expr::Case {
             then, else_result, ..
         } => {
             // `when` conditions are filter — only the results are value.
             let mut sources: Vec<_> = then
                 .iter()
-                .flat_map(|e| origins_of_expr(e, input, ctx))
+                .flat_map(|e| origins_of_expr(e, input, context))
                 .collect();
             if let Some(e) = else_result {
-                sources.extend(origins_of_expr(e, input, ctx));
+                sources.extend(origins_of_expr(e, input, context));
             }
             transform(sources)
         }
         // The function argument is value; partition / order keys are filter.
-        Expr::Window { arg, .. } => transform(origins_of_expr(arg, input, ctx)),
+        Expr::Window { arg, .. } => transform(origins_of_expr(arg, input, context)),
         // A scalar subquery's first output column flows as a transformation.
-        Expr::Subquery(plan) => transform(scalar_subquery_origins(plan, ctx)),
+        Expr::Subquery(plan) => transform(scalar_subquery_origins(plan, context)),
         // A merge-column fan-in: each owning side is its own origin, traced
         // like a column ref — a real-table side is a `Passthrough` base read,
         // a derived / CTE side traces into its producing subquery (so a
@@ -132,7 +134,7 @@ pub(super) fn origins_of_expr<'a>(
         // `t.id`, not just one).
         Expr::Fanin(refs) => refs
             .iter()
-            .flat_map(|c| origins_of_ref(c, input, ctx))
+            .flat_map(|c| origins_of_ref(c, input, context))
             .collect(),
         // Tests / suppressed operands contribute no value origin (reads only).
         Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Filter(_) => Vec::new(),
@@ -146,13 +148,13 @@ pub(super) fn origins_of_expr<'a>(
 fn origins_of_ref<'a>(
     c: &'a BoundColumn,
     input: &'a LogicalPlan,
-    ctx: &mut Ctx<'a>,
+    context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match &c.binding {
         Binding::Base { .. } | Binding::Unresolved | Binding::Ambiguous => column_read(c)
             .map(|r| vec![(r, ColumnLineageKind::Passthrough)])
             .unwrap_or_default(),
-        Binding::Derived => origins_into(input, c.qualifier.as_ref(), &c.name, ctx),
+        Binding::Derived => origins_into(input, c.qualifier.as_ref(), &c.name, context),
         // A lambda parameter is a local with no base column — no origin.
         Binding::Local => Vec::new(),
     }
@@ -199,26 +201,26 @@ fn origins_into<'a>(
     op: &'a LogicalPlan,
     qualifier: Option<&Ident>,
     name: &Ident,
-    ctx: &mut Ctx<'a>,
+    context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match op {
-        LogicalPlan::Projection(p) => match find_named(&p.exprs, name, ctx.casing.column) {
-            Some(ne) => origins_of_expr(&ne.expr, &p.input, ctx),
+        LogicalPlan::Projection(p) => match find_named(&p.exprs, name, context.casing.column) {
+            Some(ne) => origins_of_expr(&ne.expr, &p.input, context),
             None => Vec::new(),
         },
         // The projection resolves against the FROM scope, so a column is a
         // base ref that returns directly, not a named `Aggregate` output —
         // a `Derived` ref tracing down just passes through to the input.
-        LogicalPlan::Aggregate(a) => origins_into(&a.input, qualifier, name, ctx),
-        LogicalPlan::Filter(f) => origins_into(&f.input, qualifier, name, ctx),
-        LogicalPlan::Sort(s) => origins_into(&s.input, qualifier, name, ctx),
+        LogicalPlan::Aggregate(a) => origins_into(&a.input, qualifier, name, context),
+        LogicalPlan::Filter(f) => origins_into(&f.input, qualifier, name, context),
+        LogicalPlan::Sort(s) => origins_into(&s.input, qualifier, name, context),
         LogicalPlan::Join(j) => {
-            let mut o = origins_into(&j.left, qualifier, name, ctx);
-            o.extend(origins_into(&j.right, qualifier, name, ctx));
+            let mut o = origins_into(&j.left, qualifier, name, context);
+            o.extend(origins_into(&j.right, qualifier, name, context));
             o
         }
         LogicalPlan::SubqueryAlias(sa) => {
-            if !qualifier.is_none_or(|q| ctx.eq_alias(q, &sa.alias)) {
+            if !qualifier.is_none_or(|q| context.eq_alias(q, &sa.alias)) {
                 Vec::new()
             } else if values_backed(&sa.input) {
                 // A `(VALUES …) AS t(x)` relation synthesises rows with no base
@@ -228,14 +230,14 @@ fn origins_into<'a>(
                     ColumnLineageKind::Passthrough,
                 )]
             } else {
-                origins_into(&sa.input, None, name, ctx)
+                origins_into(&sa.input, None, name, context)
             }
         }
         // An opaque table function: its produced columns are dynamic, so a ref
         // through its alias is a synthetic lineage source (the alias as table)
         // — not collapsible to a base column.
         LogicalPlan::TableFunction(tf) => match &tf.alias {
-            Some(alias) if qualifier.is_none_or(|q| ctx.eq_alias(q, alias)) => {
+            Some(alias) if qualifier.is_none_or(|q| context.eq_alias(q, alias)) => {
                 vec![(
                     synthetic_source(alias, name),
                     ColumnLineageKind::Passthrough,
@@ -257,19 +259,19 @@ fn origins_into<'a>(
             let operands = output_operands(op);
             let Some(i) = operands.first().and_then(|&(outs, _)| {
                 outs.iter()
-                    .position(|ne| ne.name.as_ref().is_some_and(|n| ctx.eq_column(n, name)))
+                    .position(|ne| ne.name.as_ref().is_some_and(|n| context.eq_column(n, name)))
             }) else {
                 return Vec::new();
             };
             operands
                 .iter()
                 .filter_map(|&(outs, input)| outs.get(i).map(|ne| (ne, input)))
-                .flat_map(|(ne, input)| origins_of_expr(&ne.expr, input, ctx))
+                .flat_map(|(ne, input)| origins_of_expr(&ne.expr, input, context))
                 .collect()
         }
-        LogicalPlan::With(w) => {
-            ctx.with_decls(&w.ctes, |ctx| origins_into(&w.body, qualifier, name, ctx))
-        }
+        LogicalPlan::With(w) => context.with_decls(&w.ctes, |context| {
+            origins_into(&w.body, qualifier, name, context)
+        }),
         // Like `SubqueryAlias`, a `CteRef` is a relation boundary: a qualified
         // trace only descends through the reference whose *exposed* name (its
         // alias, else the CTE name) the qualifier matches. Without this guard a
@@ -277,7 +279,7 @@ fn origins_into<'a>(
         // references and duplicates the edge.
         LogicalPlan::CteRef(r) => {
             let exposed = r.alias.as_ref().unwrap_or(&r.name);
-            if !qualifier.is_none_or(|q| ctx.eq_alias(q, exposed)) {
+            if !qualifier.is_none_or(|q| context.eq_alias(q, exposed)) {
                 return Vec::new();
             }
             // Expand the body once per reference. (No memo: a cache keyed on
@@ -286,19 +288,20 @@ fn origins_into<'a>(
             // distinct slots, so only a *repeated identical* `cte.col` would
             // ever reuse one.) Active-set `None` (recursive self-reference)
             // becomes an empty `Vec` via `unwrap_or_default`.
-            ctx.enter_cte(&r.name, |ctx, body| {
-                // A VALUES-backed CTE has no traceable base columns — the
-                // exposed column is a synthetic source (cte.col).
-                if values_backed(body) {
-                    vec![(
-                        synthetic_source(&r.name, name),
-                        ColumnLineageKind::Passthrough,
-                    )]
-                } else {
-                    origins_into(body, None, name, ctx)
-                }
-            })
-            .unwrap_or_default()
+            context
+                .enter_cte(&r.name, |context, body| {
+                    // A VALUES-backed CTE has no traceable base columns — the
+                    // exposed column is a synthetic source (cte.col).
+                    if values_backed(body) {
+                        vec![(
+                            synthetic_source(&r.name, name),
+                            ColumnLineageKind::Passthrough,
+                        )]
+                    } else {
+                        origins_into(body, None, name, context)
+                    }
+                })
+                .unwrap_or_default()
         }
         // A `Derived` reference resolves at a producer's named output (a
         // `Projection` / `Aggregate` expr), never at a raw `Scan` — a reference to
@@ -324,20 +327,20 @@ fn origins_into<'a>(
 /// positionally.
 fn scalar_subquery_origins<'a>(
     op: &'a LogicalPlan,
-    ctx: &mut Ctx<'a>,
+    context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     // A leading `WITH` on the subquery must register its CTE declarations so a
     // `CteRef` in the body resolves during the trace: `output_operands` peels
-    // the `With` for shape but doesn't push its CTEs (and `Ctx::new` only
+    // the `With` for shape but doesn't push its CTEs (and `TraceContext::new` only
     // registers the statement's *top-level* leading WITH, not a nested
     // subquery's own). `with_decls` balances the push/pop.
     if let LogicalPlan::With(w) = op {
-        return ctx.with_decls(&w.ctes, |ctx| scalar_subquery_origins(&w.body, ctx));
+        return context.with_decls(&w.ctes, |context| scalar_subquery_origins(&w.body, context));
     }
     output_operands(op)
         .iter()
         .filter_map(|&(outputs, input)| outputs.first().map(|ne| (ne, input)))
-        .flat_map(|(ne, input)| origins_of_expr(&ne.expr, input, ctx))
+        .flat_map(|(ne, input)| origins_of_expr(&ne.expr, input, context))
         .collect()
 }
 
@@ -350,7 +353,7 @@ pub(super) fn conflict_value_origins<'a>(
     value: &'a Expr,
     columns: &[Ident],
     source: &'a LogicalPlan,
-    ctx: &mut Ctx<'a>,
+    context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match value {
         // A `Derived` ref here is `EXCLUDED.col` (the only synthetic relation in
@@ -358,7 +361,7 @@ pub(super) fn conflict_value_origins<'a>(
         // fanning out to every set-operation branch. A source with no
         // inspectable projection (VALUES) keeps the `EXCLUDED.col` pseudo-source.
         Expr::Column(c) if matches!(c.binding, Binding::Derived) => {
-            let Some(i) = columns.iter().position(|t| ctx.eq_column(t, &c.name)) else {
+            let Some(i) = columns.iter().position(|t| context.eq_column(t, &c.name)) else {
                 return Vec::new();
             };
             let operands = output_operands(source);
@@ -368,32 +371,34 @@ pub(super) fn conflict_value_origins<'a>(
             let mut out = Vec::new();
             for (outputs, input) in operands {
                 if let Some(ne) = outputs.get(i) {
-                    out.extend(origins_of_expr(&ne.expr, input, ctx));
+                    out.extend(origins_of_expr(&ne.expr, input, context));
                 }
             }
             out
         }
         // A non-EXCLUDED ref (a target column, MySQL `VALUES(col)` inner, …)
         // and the structural variants trace like any value.
-        Expr::Column(_) => origins_of_expr(value, source, ctx),
+        Expr::Column(_) => origins_of_expr(value, source, context),
         Expr::Call { args } => transform(
             args.iter()
-                .flat_map(|e| conflict_value_origins(e, columns, source, ctx)),
+                .flat_map(|e| conflict_value_origins(e, columns, source, context)),
         ),
         Expr::Case {
             then, else_result, ..
         } => {
             let mut sources: Vec<_> = then
                 .iter()
-                .flat_map(|e| conflict_value_origins(e, columns, source, ctx))
+                .flat_map(|e| conflict_value_origins(e, columns, source, context))
                 .collect();
             if let Some(e) = else_result {
-                sources.extend(conflict_value_origins(e, columns, source, ctx));
+                sources.extend(conflict_value_origins(e, columns, source, context));
             }
             transform(sources)
         }
-        Expr::Window { arg, .. } => transform(conflict_value_origins(arg, columns, source, ctx)),
-        Expr::Subquery(plan) => transform(scalar_subquery_origins(plan, ctx)),
+        Expr::Window { arg, .. } => {
+            transform(conflict_value_origins(arg, columns, source, context))
+        }
+        Expr::Subquery(plan) => transform(scalar_subquery_origins(plan, context)),
         Expr::Fanin(refs) => refs
             .iter()
             .filter_map(|c| column_read(c).map(|r| (r, ColumnLineageKind::Passthrough)))
@@ -474,14 +479,17 @@ pub(super) fn output_operands(op: &LogicalPlan) -> Vec<(&[NamedExpr], &LogicalPl
 }
 
 /// Peel leading `With` nodes off `op`, pushing their CTE declarations into
-/// `ctx` so a `CteRef` below resolves during the trace, and return the peeled
-/// root. (`Ctx::new` already does this for a query's leading `WITH`; a DML
+/// `context` so a `CteRef` below resolves during the trace, and return the peeled
+/// root. (`TraceContext::new` already does this for a query's leading `WITH`; a DML
 /// source carries its own `WITH`, reached only here.) The push is not popped —
-/// the ctx is per-statement scratch, discarded after the walk.
-pub(super) fn enter_withs<'a>(op: &'a LogicalPlan, ctx: &mut Ctx<'a>) -> &'a LogicalPlan {
+/// the context is per-statement scratch, discarded after the walk.
+pub(super) fn enter_withs<'a>(
+    op: &'a LogicalPlan,
+    context: &mut TraceContext<'a>,
+) -> &'a LogicalPlan {
     let mut node = op;
     while let LogicalPlan::With(w) = node {
-        w.ctes.iter().for_each(|c| ctx.ctes.push(c));
+        w.ctes.iter().for_each(|c| context.ctes.push(c));
         node = &w.body;
     }
     node
