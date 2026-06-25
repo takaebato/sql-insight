@@ -184,7 +184,7 @@ impl TableOperationExtractor {
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
     ) -> Result<TableOperation, Error> {
-        Self::extract_inner(statement, catalog, style).map(|(op, _)| op)
+        Self::extract_inner(statement, catalog, style).map(|(op, ..)| op)
     }
 
     /// Bind the statement and walk the plan for `reads` / `writes` / (for
@@ -199,13 +199,20 @@ impl TableOperationExtractor {
         statement: &Statement,
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
-    ) -> Result<(TableOperation, Option<MergeActions>), Error> {
+    ) -> Result<(TableOperation, Option<MergeActions>, bool), Error> {
         let statement_kind = classify_statement(statement);
         if statement_kind == StatementKind::Unsupported {
-            return Ok((unsupported_table_operation(statement_kind, statement), None));
+            return Ok((
+                unsupported_table_operation(statement_kind, statement),
+                None,
+                false,
+            ));
         }
         let (plan, column_diagnostics) = crate::resolver::build(statement, catalog, style);
         let merge_actions = crate::resolver::merge_actions(&plan);
+        // An upsert (`INSERT … ON CONFLICT DO UPDATE`) both inserts and updates
+        // its target, so the CRUD extractor places it in both buckets.
+        let insert_updates = crate::resolver::insert_updates_on_conflict(&plan);
         // Lineage is only for statements that move data into a target. A
         // column-less INSERT and a DELETE both bind to a `Write`, so the
         // structural walk can't tell them apart — gate on the kind. A MERGE
@@ -233,7 +240,7 @@ impl TableOperationExtractor {
                 .filter_map(|d| d.to_table_level())
                 .collect(),
         };
-        Ok((op, merge_actions))
+        Ok((op, merge_actions, insert_updates))
     }
 }
 

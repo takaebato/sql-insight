@@ -314,6 +314,51 @@ mod insert_statement {
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
     }
+
+    #[test]
+    fn test_upsert_do_update_buckets_target_as_create_and_update() {
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        // `ON CONFLICT DO UPDATE` is an upsert: it both inserts and updates the
+        // target, so `t1` lands in both the create and update buckets.
+        let sql = "INSERT INTO t1 (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 2";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![table("t1")],
+            read_tables: vec![],
+            update_tables: vec![table("t1")],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
+    }
+
+    #[test]
+    fn test_upsert_do_nothing_is_create_only() {
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        // `ON CONFLICT DO NOTHING` performs no update — create-only.
+        let sql = "INSERT INTO t1 (a) VALUES (1) ON CONFLICT (a) DO NOTHING";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![table("t1")],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
+    }
+
+    #[test]
+    fn test_mysql_on_duplicate_key_update_is_upsert() {
+        // MySQL `ON DUPLICATE KEY UPDATE` is the same upsert shape: create + update.
+        let sql = "INSERT INTO t1 (a) VALUES (1) ON DUPLICATE KEY UPDATE b = 2";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![table("t1")],
+            read_tables: vec![],
+            update_tables: vec![table("t1")],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(MySqlDialect {})]);
+    }
 }
 
 mod update_statement {

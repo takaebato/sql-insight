@@ -9,8 +9,10 @@
 //!
 //! Write targets bucket by verb, so DDL lands where its effect is, not in
 //! `Read`: `INSERT`, `CREATE TABLE` / `CREATE VIEW`, and `SELECT … INTO` →
-//! Create, `UPDATE` and `ALTER` → Update, `DELETE` / `DROP` / `TRUNCATE` →
-//! Delete, and `MERGE` to each bucket its WHEN actions imply. A statement's
+//! Create (an upsert `INSERT … ON CONFLICT DO UPDATE` / `ON DUPLICATE KEY
+//! UPDATE` also → Update), `UPDATE` and `ALTER` → Update, `DELETE` / `DROP` /
+//! `TRUNCATE` → Delete, and `MERGE` to each bucket its WHEN actions imply. A
+//! statement's
 //! read-role tables (a `SELECT`, a CTAS / view source, an `UPDATE … FROM`)
 //! always go to Read. A `WITH … <DML>` parses as a `Query`-wrapped DML, so
 //! the verb is recovered through that wrapper.
@@ -122,7 +124,7 @@ impl CrudTableExtractor {
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
     ) -> Result<CrudTables, Error> {
-        let (ops, merge_actions) =
+        let (ops, merge_actions, insert_updates) =
             TableOperationExtractor::extract_inner(statement, catalog, style)?;
         // CRUD buckets are identity-only — drop the per-read
         // `ResolutionKind` and keep the bare `TableReference`s.
@@ -136,6 +138,13 @@ impl CrudTableExtractor {
         };
         match ops.statement_kind {
             StatementKind::Insert => {
+                // An upsert (`INSERT … ON CONFLICT DO UPDATE` / MySQL
+                // `ON DUPLICATE KEY UPDATE`) both inserts and updates the
+                // target, so it lands in both buckets; a plain INSERT (or
+                // `DO NOTHING`) is create-only.
+                if insert_updates {
+                    crud.update_tables = writes.clone();
+                }
                 crud.create_tables = writes;
                 crud.read_tables = reads;
             }

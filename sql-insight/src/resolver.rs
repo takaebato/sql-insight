@@ -159,3 +159,13 @@ pub(crate) fn merge_actions(plan: &LogicalPlan) -> Option<MergeActions> {
     }
     Some(actions)
 }
+
+/// Whether an `INSERT` root performs an on-conflict *update* — an upsert
+/// (`ON CONFLICT DO UPDATE` / MySQL `ON DUPLICATE KEY UPDATE`), which both
+/// inserts and updates the target. A plain INSERT and `ON CONFLICT DO NOTHING`
+/// (no conflict assignments) are `false`. Derived from the bound plan (peeling
+/// a leading `WITH`) so callers don't re-walk the raw AST.
+pub(crate) fn insert_updates_on_conflict(plan: &LogicalPlan) -> bool {
+    use logical_plan::peel_with;
+    matches!(peel_with(plan), LogicalPlan::Insert(i) if !i.on_conflict.is_empty())
+}
