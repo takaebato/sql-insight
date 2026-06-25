@@ -629,6 +629,31 @@ mod cte_derived_rename {
             },
         );
     }
+
+    #[test]
+    fn subquery_inner_cte_shadows_without_leaking_to_a_sibling() {
+        // Two scalar subqueries reference a CTE named `c`: the first uses the
+        // outer `c` (→ outer_t); the second has its own `WITH c` shadowing it
+        // within its body (→ inner_t). The inner CTE is scoped to that
+        // subquery's child binder, so it doesn't leak — the first subquery
+        // still resolves the outer `c` (no cross-contamination).
+        assert_column_ops(
+            "WITH c AS (SELECT a FROM outer_t) \
+             SELECT (SELECT a FROM c) AS r1, \
+                    (SELECT a FROM (WITH c AS (SELECT a FROM inner_t) SELECT a FROM c) s) AS r2 \
+             FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("outer_t", "a"), read("inner_t", "a")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("outer_t", "a"), out("r1", 0)),
+                    transformation(col("inner_t", "a"), out("r2", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
 }
 
 mod lambda {
