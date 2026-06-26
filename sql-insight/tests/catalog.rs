@@ -312,3 +312,78 @@ fn columnless_insert_from_wildcard_source_drops_writes_and_flags() {
         plain.diagnostics
     );
 }
+
+#[test]
+fn from_ddl_folds_unquoted_identifiers_to_their_stored_form() {
+    // `from_ddl` registers each identifier in its dialect-stored form: an
+    // unquoted DDL name folds (Postgres lowercases), a quoted one stays exact.
+    // So the registered identity matches what a query reference folds to —
+    // previously an unquoted mixed-case `CREATE TABLE Users` registered `Users`
+    // and missed a folded query `users` under a case-sensitive dialect.
+    use sql_insight::sqlparser::dialect::PostgreSqlDialect;
+    let resolution = |ddl: &str, query: &str| -> ResolutionKind {
+        let catalog = Catalog::from_ddl(&PostgreSqlDialect {}, ddl).unwrap();
+        extract_column_operations_with_options(
+            &PostgreSqlDialect {},
+            query,
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap()
+        .reads
+        .first()
+        .unwrap()
+        .resolution
+    };
+
+    // Unquoted DDL folds to lowercase → a folded (unquoted) query matches,
+    // however it was cased in the query text.
+    assert_eq!(
+        resolution("CREATE TABLE Users (Id INT)", "SELECT id FROM users"),
+        ResolutionKind::Cataloged
+    );
+    assert_eq!(
+        resolution("CREATE TABLE Users (Id INT)", "SELECT Id FROM Users"),
+        ResolutionKind::Cataloged
+    );
+    // A quoted query is a distinct, case-exact identifier the folded DDL never
+    // created.
+    assert_eq!(
+        resolution("CREATE TABLE Users (Id INT)", r#"SELECT "Id" FROM "Users""#),
+        ResolutionKind::Inferred
+    );
+
+    // Quoted DDL stays exact → matches a quoted query, not an unquoted (folded)
+    // one.
+    assert_eq!(
+        resolution(
+            r#"CREATE TABLE "Users" ("Id" INT)"#,
+            r#"SELECT "Id" FROM "Users""#
+        ),
+        ResolutionKind::Cataloged
+    );
+    assert_eq!(
+        resolution(r#"CREATE TABLE "Users" ("Id" INT)"#, "SELECT id FROM users"),
+        ResolutionKind::Inferred
+    );
+}
+
+#[test]
+fn from_ddl_unquoted_registration_canonicalizes_the_surfaced_identity() {
+    // The Cataloged read surfaces the catalog's stored (folded) identity, not
+    // the query's written casing.
+    use sql_insight::sqlparser::dialect::PostgreSqlDialect;
+    let catalog = Catalog::from_ddl(&PostgreSqlDialect {}, "CREATE TABLE Users (Id INT)").unwrap();
+    let reads = extract_column_operations_with_options(
+        &PostgreSqlDialect {},
+        "SELECT Id FROM Users",
+        ExtractorOptions::new().with_catalog(&catalog),
+    )
+    .unwrap()
+    .remove(0)
+    .unwrap()
+    .reads;
+    let read = reads.first().unwrap();
+    assert_eq!(read.reference.table.as_ref().unwrap().name.value, "users");
+}
