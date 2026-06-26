@@ -85,6 +85,28 @@ mod with_in_dml {
     }
 }
 
+mod parenthesized_dml {
+    //! A parenthesised DML `(INSERT/UPDATE/DELETE …)` parses as a Query
+    //! wrapping the DML; it must keep its verb, not misclassify as a read-only
+    //! `Select` (which would surface phantom writes / lineage under a `Select`
+    //! kind — a contract violation).
+    use super::*;
+
+    #[test]
+    fn parenthesized_insert_surfaces_as_insert_not_select() {
+        assert_column_ops(
+            "(INSERT INTO t (a) SELECT b FROM src)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("src", "b")],
+                writes: vec![write("t", "a")],
+                lineage: vec![passthrough(col("src", "b"), relation("t", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+}
+
 mod merge {
     use super::*;
 

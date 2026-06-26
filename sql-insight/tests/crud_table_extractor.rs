@@ -284,6 +284,23 @@ mod delete_statement {
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
     }
+
+    #[test]
+    fn test_parenthesized_delete_keeps_the_delete_verb() {
+        // A parenthesised DML `(DELETE …)` parses as a Query wrapping the DML;
+        // it must keep its verb so the target buckets as Delete, not misclassify
+        // as a read-only Select (which dropped the verb and the table-lineage).
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        let sql = "(DELETE FROM t WHERE id = 1)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![table("t")],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
+    }
 }
 
 mod insert_statement {
@@ -313,6 +330,22 @@ mod insert_statement {
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_parenthesized_insert_keeps_the_insert_verb() {
+        // `(INSERT … SELECT …)` keeps its verb → target buckets as Create,
+        // source as Read (the misclassification dropped both into a Select).
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        let sql = "(INSERT INTO t (a) SELECT b FROM src)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![table("t")],
+            read_tables: vec![table("src")],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
     }
 
     #[test]
@@ -395,6 +428,21 @@ mod update_statement {
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_parenthesized_update_keeps_the_update_verb() {
+        // `(UPDATE …)` keeps its verb → the target buckets as Update.
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        let sql = "(UPDATE t SET a = 1)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![],
+            update_tables: vec![table("t")],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
     }
 }
 
