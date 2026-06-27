@@ -454,6 +454,24 @@ mod integration {
         }
 
         #[test]
+        fn test_write_target_shows_catalog_resolution() {
+            // A DML write target carries the catalog match too: the registered
+            // `users` insert target prints `(cataloged)`, like a read would.
+            let mut schema = NamedTempFile::new().unwrap();
+            schema.write_all(b"CREATE TABLE users (id INT);").unwrap();
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("table-ops")
+                .arg("--ddl-file")
+                .arg(schema.path())
+                .arg("INSERT INTO users (id) VALUES (1)")
+                .assert()
+                .success()
+                .stdout("[1] Insert\n  writes:  \"users\" (cataloged)\n")
+                .stderr("");
+        }
+
+        #[test]
         fn test_extract_with_unparseable_ddl_file_is_labelled() {
             // A parse error in the --ddl-file is prefixed with the DDL-file
             // context, so it isn't mistaken for an error in the analysed query

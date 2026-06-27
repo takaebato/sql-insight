@@ -8,7 +8,7 @@ use sql_insight::extractor::{
 };
 use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::sqlparser::dialect::{self, Dialect};
-use sql_insight::{CaseRule, ColumnRead, IdentifierCasing, ResolutionKind, TableRead};
+use sql_insight::{CaseRule, ColumnRead, IdentifierCasing, ResolutionKind, TableRead, TableWrite};
 
 pub trait CliExecutable {
     fn execute(&self) -> Result<Vec<String>, Error>;
@@ -326,6 +326,10 @@ fn table_read(read: &TableRead) -> String {
     format!("{}{}", read.reference, resolution_marker(read.resolution))
 }
 
+fn table_write(write: &TableWrite) -> String {
+    format!("{}{}", write.reference, resolution_marker(write.resolution))
+}
+
 fn column_read(read: &ColumnRead) -> String {
     format!("{}{}", read.reference, resolution_marker(read.resolution))
 }
@@ -365,11 +369,7 @@ fn format_table_operation(n: usize, op: &TableOperation) -> String {
         lines.push(labeled("reads:", reads.join(", ")));
     }
     if !op.writes.is_empty() {
-        let writes = op
-            .writes
-            .iter()
-            .map(|w| w.reference.to_string())
-            .collect::<Vec<_>>();
+        let writes = op.writes.iter().map(table_write).collect::<Vec<_>>();
         lines.push(labeled("writes:", writes.join(", ")));
     }
     if !op.lineage.is_empty() {
