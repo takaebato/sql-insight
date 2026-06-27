@@ -1009,6 +1009,61 @@ mod output_alias_visibility {
     }
 
     #[test]
+    fn group_by_ordinal_reads_like_the_named_column() {
+        // `GROUP BY 1` is the 1st output (`a`, an identity output), so it reads
+        // `t.a` a second time — occurrence-consistent with `GROUP BY a`.
+        assert_column_ops(
+            "SELECT a FROM t GROUP BY 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn group_by_ordinal_of_introduced_alias_is_suppressed() {
+        // `GROUP BY 1` here is `a + b AS x` (an introduced alias) — like
+        // `GROUP BY x`, it binds Derived and adds no read; the dependency on
+        // `a`, `b` is already counted at the projection.
+        assert_column_ops(
+            "SELECT a + b AS x FROM t GROUP BY 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "a"), out("x", 0)),
+                    transformation(col("t", "b"), out("x", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn order_by_ordinal_reads_the_referenced_output() {
+        // `ORDER BY 2` is the 2nd output (`b`), so it reads `t.b` again — like
+        // `ORDER BY b`. (`a` is read once, at the projection.)
+        assert_column_ops(
+            "SELECT a, b FROM t ORDER BY 2",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("t", "b"), out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn having_computed_alias_is_suppressed() {
         // `s` = `SUM(a)` is a computed alias; HAVING s references the
         // aggregate output, not a stored column.

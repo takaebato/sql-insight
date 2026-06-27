@@ -687,10 +687,23 @@ impl<'a> Binder<'a> {
                 _ => None,
             }));
             for expr in members {
-                keys.push(self.bind_expr(expr, scope));
+                keys.push(self.bind_clause_key(expr, scope));
             }
         }
         keys
+    }
+
+    /// Bind a GROUP BY / ORDER BY key. A positional ordinal (`GROUP BY 1`) binds
+    /// as if the 1-based n-th output column were named explicitly — so it reads
+    /// (an identity output) or suppresses (an introduced alias) exactly like the
+    /// by-name form, keeping `reads` occurrence-consistent (`GROUP BY a` and
+    /// `GROUP BY 1` agree). Any other key — or an out-of-range / unnamed
+    /// position — binds as written.
+    fn bind_clause_key(&mut self, expr: &SqlExpr, scope: &Scope) -> Expr {
+        match ordinal_output_name(expr, scope) {
+            Some(name) => self.bind_expr(&SqlExpr::Identifier(name), scope),
+            None => self.bind_expr(expr, scope),
+        }
     }
 
     /// The ORDER BY key expressions (a trailing `query.order_by`).
@@ -706,7 +719,7 @@ impl<'a> Binder<'a> {
     pub(super) fn order_by_expr_keys(&mut self, exprs: &[OrderByExpr], scope: &Scope) -> Vec<Expr> {
         exprs
             .iter()
-            .map(|e| self.bind_expr(&e.expr, scope))
+            .map(|e| self.bind_clause_key(&e.expr, scope))
             .collect()
     }
 

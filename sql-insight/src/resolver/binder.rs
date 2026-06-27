@@ -45,7 +45,7 @@ use sqlparser::ast::{
     ObjectName, ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind,
     OutputClause, PipeOperator, PivotValueSource, Query, Select, SelectItem, SetExpr, Statement,
     TableAlias, TableFactor, TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind,
-    Values as SqlValues,
+    Value, Values as SqlValues,
 };
 
 use sqlparser::ast::{
@@ -694,6 +694,21 @@ fn inferred_name(expr: &SqlExpr) -> Option<Ident> {
         SqlExpr::CompoundIdentifier(parts) => parts.last().cloned(),
         _ => None,
     }
+}
+
+/// The name of the query output a positional ordinal key (`GROUP BY 1` /
+/// `ORDER BY 1`) refers to — the 1-based n-th [`Scope::query_outputs`] entry,
+/// if it has one. `None` for a non-integer / zero / out-of-range position, or
+/// an anonymous output: the caller then binds the literal as written.
+fn ordinal_output_name(expr: &SqlExpr, scope: &Scope) -> Option<Ident> {
+    let SqlExpr::Value(v) = expr else {
+        return None;
+    };
+    let Value::Number(digits, _) = &v.value else {
+        return None;
+    };
+    let n: usize = digits.parse().ok()?;
+    scope.query_outputs.get(n.checked_sub(1)?)?.name.clone()
 }
 
 /// The `ON` predicate of a join operator, if any.
