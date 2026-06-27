@@ -767,6 +767,12 @@ fn join_using(op: &JoinOperator) -> Vec<Ident> {
     }
 }
 
+/// Whether a join is `NATURAL` — its merge columns are the schema-common ones
+/// (computed from both sides' known columns), not an explicit `USING` list.
+fn join_is_natural(op: &JoinOperator) -> bool {
+    matches!(join_constraint(op), Some(JoinConstraint::Natural))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -367,6 +367,32 @@ mod catalog_strict {
     }
 
     #[test]
+    fn catalog_natural_join_fans_in_schema_common_columns() {
+        // A NATURAL join's merge set is the schema intersection of both sides —
+        // knowable only with a catalog. `id` is common to t1 and t2, so an
+        // unqualified `id` fans in to both (like USING (id)); the unique columns
+        // (`a`, `b`) are not merge columns. (Catalog-free, `id` stays ambiguous
+        // — see `joins_sets`.)
+        let catalog = TestCatalog::default()
+            .with("t1", vec!["id", "a"])
+            .with("t2", vec!["id", "b"]);
+        assert_column_ops_with_catalog(
+            "SELECT id FROM t1 NATURAL JOIN t2",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read_confirmed("t1", "id"), read_confirmed("t2", "id")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col_confirmed("t1", "id"), out("id", 0)),
+                    passthrough(col_confirmed("t2", "id"), out("id", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn catalog_disambiguates_join_unqualified_ref() {
         // Both tables are Known via catalog; only t2 has `a`, so
         // unqualified `a` in `t1 JOIN t2` resolves to t2 (no

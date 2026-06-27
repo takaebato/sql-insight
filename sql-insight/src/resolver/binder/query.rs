@@ -535,10 +535,17 @@ impl<'a> Binder<'a> {
             // inputs accumulated so far.
             let visible: Vec<Relation> = left.iter().chain(&scope.relations).cloned().collect();
             let (right, right_scope) = self.bind_table_factor(&j.relation, &visible);
+            // Merge columns — an unqualified reference to one fans in to both
+            // sides. An explicit `USING (col)` names them; a NATURAL join takes
+            // the two sides' schema-common columns (so it needs a catalog —
+            // computed before the right scope is absorbed into the left).
+            let merge = if join_is_natural(&j.join_operator) {
+                self.natural_merge_columns(&scope, &right_scope)
+            } else {
+                join_using(&j.join_operator)
+            };
             scope.absorb(right_scope);
-            // A `USING (col)` join records its merge columns: an unqualified
-            // reference to one fans in to both sides.
-            scope.add_merge_columns(join_using(&j.join_operator));
+            scope.add_merge_columns(merge);
             // The ON predicate resolves against both sides' columns.
             let on = join_on(&j.join_operator)
                 .map(|e| self.bind_expr(e, &scope))
@@ -547,6 +554,32 @@ impl<'a> Binder<'a> {
             node = join(node, right, on);
         }
         (node, scope)
+    }
+
+    /// A NATURAL join's merge columns: the column names exposed by *both* sides
+    /// (the schema intersection, case-folded). Catalog-only — a side with no
+    /// known column list (a catalog-free table, an opaque table function)
+    /// contributes nothing, so a catalog-free NATURAL join yields no merge
+    /// columns (an unqualified reference stays ambiguous rather than fanning in).
+    fn natural_merge_columns(&self, left: &Scope, right: &Scope) -> Vec<Ident> {
+        let right_columns: Vec<&Ident> = right
+            .relations
+            .iter()
+            .flat_map(|r| r.known_columns())
+            .collect();
+        let mut common: Vec<Ident> = Vec::new();
+        for column in left.relations.iter().flat_map(|r| r.known_columns()) {
+            let in_right = right_columns
+                .iter()
+                .any(|r| self.eq(self.style.casing.column, column, r));
+            let already = common
+                .iter()
+                .any(|c| self.eq(self.style.casing.column, c, column));
+            if in_right && !already {
+                common.push(column.clone());
+            }
+        }
+        common
     }
 
     /// Bind a bare named table into a read `Scan` plus a single-relation scope
