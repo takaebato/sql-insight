@@ -95,11 +95,12 @@ pub enum ColumnLevelDiagnosticKind {
     /// `table_writes`). Supply a [`Catalog`](crate::catalog::Catalog) to
     /// resolve it. `message` names the target.
     InsertColumnsUnresolved,
-    /// An `INSERT INTO t (a, b, c) <source>` whose explicit target column
-    /// count differs from the source query's projected column count. The
-    /// positional pairing zips to the shorter side, so the surplus target
-    /// columns get no `lineage` edge (their `writes` still surface) — a
-    /// silent truncation this flags. `message` states both counts.
+    /// An explicit target column list whose count differs from the source
+    /// query's projected column count — an `INSERT INTO t (a, b, c) <source>`,
+    /// or a `CREATE TABLE t (a, b, c) AS` / `CREATE VIEW` / `ALTER VIEW` with a
+    /// column list. The positional pairing zips to the shorter side, so the
+    /// surplus target columns get no `lineage` edge (their `writes` still
+    /// surface) — a silent truncation this flags. `message` states both counts.
     InsertColumnsArityMismatch,
     /// A `CREATE TABLE … AS` / `CREATE VIEW …` (without an explicit column
     /// list) whose source projects one or more outputs with no derivable name —

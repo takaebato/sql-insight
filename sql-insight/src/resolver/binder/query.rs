@@ -11,11 +11,11 @@ impl<'a> Binder<'a> {
     /// CTE binds in declaration order into an environment the later CTEs and the
     /// body resolve against; the bodies are owned by a `With` node, references
     /// are `CteRef`s.
-    pub(super) fn bind_query(&self, query: &Query) -> (LogicalPlan, Scope) {
+    pub(super) fn bind_query(&mut self, query: &Query) -> (LogicalPlan, Scope) {
         let Some(with) = &query.with else {
             return self.bind_query_body(query);
         };
-        let mut env = self.ctes.clone();
+        let mut env = self.context.ctes.clone();
         let mut declared = Vec::new();
         for cte in &with.cte_tables {
             let (entry, body) = self.bind_cte(cte, &env, with.recursive);
@@ -25,7 +25,7 @@ impl<'a> Binder<'a> {
             });
             env.push(entry);
         }
-        let (body, scope) = self.with_ctes(env).bind_query_body(query);
+        let (body, scope) = self.in_ctes(env, |b| b.bind_query_body(query));
         (
             LogicalPlan::With(With {
                 ctes: declared,
@@ -42,7 +42,7 @@ impl<'a> Binder<'a> {
     /// from the anchor (the left branch); any other body registers with no
     /// known columns (so a self-reference is still a `CteRef`, not a phantom).
     pub(super) fn bind_cte(
-        &self,
+        &mut self,
         cte: &SqlCte,
         env: &[CteDecl],
         recursive: bool,
@@ -51,8 +51,7 @@ impl<'a> Binder<'a> {
         let inner_env = if recursive {
             let provisional = match cte.query.body.as_ref() {
                 SetExpr::SetOperation { left, .. } => self
-                    .with_ctes(env.to_vec())
-                    .bind_set_expr(left)
+                    .in_ctes(env.to_vec(), |b| b.bind_set_expr(left))
                     .1
                     .exposed_columns(Some(&cte.alias)),
                 _ => Vec::new(),
@@ -66,7 +65,7 @@ impl<'a> Binder<'a> {
         } else {
             env.to_vec()
         };
-        let (mut plan, scope) = self.with_ctes(inner_env).bind_query(&cte.query);
+        let (mut plan, scope) = self.in_ctes(inner_env, |b| b.bind_query(&cte.query));
         let columns = scope.exposed_columns(Some(&cte.alias));
         // An explicit `c (x, y)` column list renames the body's output columns
         // so a reference through the CTE traces to them.
@@ -75,8 +74,8 @@ impl<'a> Binder<'a> {
     }
 
     /// Bind a query's body, its pipe-operator chain, and trailing ORDER BY (the
-    /// `WITH` is already in scope via `self.ctes`).
-    pub(super) fn bind_query_body(&self, query: &Query) -> (LogicalPlan, Scope) {
+    /// `WITH` is already in scope via `self.context.ctes`).
+    pub(super) fn bind_query_body(&mut self, query: &Query) -> (LogicalPlan, Scope) {
         let (mut op, mut scope) = self.bind_set_expr(&query.body);
         // A trailing ORDER BY / LIMIT over a set operation resolves in the
         // outer scope (both branch scopes are popped), so a reference to a
@@ -143,7 +142,7 @@ impl<'a> Binder<'a> {
     /// rest (sampling / rename / drop / unpivot) pass through. The match is
     /// exhaustive so a new pipe operator is reviewed here.
     pub(super) fn bind_pipe(
-        &self,
+        &mut self,
         op: &PipeOperator,
         input: LogicalPlan,
         scope: &mut Scope,
@@ -186,22 +185,24 @@ impl<'a> Binder<'a> {
                 node
             }
             PipeOperator::Where { expr } => {
-                self.pipe_filter(input, vec![self.bind_expr(expr, scope)])
+                let reads = vec![self.bind_expr(expr, scope)];
+                self.pipe_filter(input, reads)
             }
             PipeOperator::Limit { expr, offset } => {
                 let mut reads = vec![self.bind_expr(expr, scope)];
                 reads.extend(offset.iter().map(|o| self.bind_expr(o, scope)));
                 self.pipe_filter(input, reads)
             }
-            PipeOperator::OrderBy { exprs } => self.pipe_filter(
-                input,
-                exprs
+            PipeOperator::OrderBy { exprs } => {
+                let reads = exprs
                     .iter()
                     .map(|o| self.bind_expr(&o.expr, scope))
-                    .collect(),
-            ),
+                    .collect();
+                self.pipe_filter(input, reads)
+            }
             PipeOperator::Call { function, .. } => {
-                self.pipe_filter(input, self.bind_function_args(function, scope))
+                let reads = self.bind_function_args(function, scope);
+                self.pipe_filter(input, reads)
             }
             PipeOperator::Pivot {
                 aggregate_functions,
@@ -249,7 +250,11 @@ impl<'a> Binder<'a> {
     }
 
     /// Bind a list of output items (SELECT / EXTEND projection items).
-    pub(super) fn bind_output_items(&self, items: &[SelectItem], scope: &Scope) -> Vec<NamedExpr> {
+    pub(super) fn bind_output_items(
+        &mut self,
+        items: &[SelectItem],
+        scope: &Scope,
+    ) -> Vec<NamedExpr> {
         items
             .iter()
             .filter_map(|i| self.bind_select_item(i, scope))
@@ -261,7 +266,7 @@ impl<'a> Binder<'a> {
     /// re-reads its real column, a computed output is `Derived` and traced)
     /// plus the `new` value columns.
     pub(super) fn pipe_project(
-        &self,
+        &mut self,
         input: LogicalPlan,
         base: &[OutputCol],
         new: Vec<NamedExpr>,
@@ -306,7 +311,7 @@ impl<'a> Binder<'a> {
     /// `|> SET col = expr`: each assignment replaces a same-named base output in
     /// place (else appends), so a SET after a SELECT rewrites that column.
     pub(super) fn pipe_set(
-        &self,
+        &mut self,
         input: LogicalPlan,
         base: Vec<OutputCol>,
         assignments: &[sqlparser::ast::Assignment],
@@ -352,7 +357,7 @@ impl<'a> Binder<'a> {
         }
     }
 
-    pub(super) fn bind_set_expr(&self, body: &SetExpr) -> (LogicalPlan, Scope) {
+    pub(super) fn bind_set_expr(&mut self, body: &SetExpr) -> (LogicalPlan, Scope) {
         match body {
             SetExpr::Select(select) => self.bind_select(select),
             SetExpr::Query(query) => self.bind_query(query),
@@ -393,7 +398,7 @@ impl<'a> Binder<'a> {
     /// expressions are reads, resolved against the empty current scope and
     /// falling through to the correlation stack (a `(VALUES (t.a)) AS v` reads
     /// the enclosing / sibling `t.a` like a derived subquery's body).
-    pub(super) fn bind_values(&self, values: &SqlValues) -> (LogicalPlan, Scope) {
+    pub(super) fn bind_values(&mut self, values: &SqlValues) -> (LogicalPlan, Scope) {
         let width = values.rows.iter().map(Vec::len).max().unwrap_or(0);
         let rows: Vec<Vec<Expr>> = values
             .rows
@@ -429,7 +434,7 @@ impl<'a> Binder<'a> {
     /// ORDER BY clauses resolve against the FROM relations *plus* the projection
     /// outputs (clause-alias visibility) — a resolution-scope rule, independent
     /// of tree position.
-    pub(super) fn bind_select(&self, select: &Select) -> (LogicalPlan, Scope) {
+    pub(super) fn bind_select(&mut self, select: &Select) -> (LogicalPlan, Scope) {
         let (from, scope) = self.bind_from(&select.from);
         // WHERE + the WHERE-family auxiliary clauses (DISTINCT ON / TOP /
         // LATERAL VIEW / PREWHERE / QUALIFY / CONNECT BY / CLUSTER BY / named
@@ -490,7 +495,7 @@ impl<'a> Binder<'a> {
         (node, clause_scope)
     }
 
-    pub(super) fn bind_from(&self, items: &[TableWithJoins]) -> (LogicalPlan, Scope) {
+    pub(super) fn bind_from(&mut self, items: &[TableWithJoins]) -> (LogicalPlan, Scope) {
         let mut iter = items.iter();
         let Some(first) = iter.next() else {
             return (LogicalPlan::Empty, Scope::default());
@@ -509,7 +514,7 @@ impl<'a> Binder<'a> {
     /// `left` are the FROM siblings to this item's left, visible to a LATERAL
     /// factor (and to a joined factor, after the preceding join inputs).
     pub(super) fn bind_table_with_joins(
-        &self,
+        &mut self,
         twj: &TableWithJoins,
         left: &[Relation],
     ) -> (LogicalPlan, Scope) {
@@ -538,7 +543,7 @@ impl<'a> Binder<'a> {
     /// else open + `Inferred` / `Ambiguous`). Shared by the table factor and a
     /// `TABLE foo` query body.
     pub(super) fn bind_named_table(
-        &self,
+        &mut self,
         written: &TableReference,
         alias: Option<Ident>,
     ) -> (LogicalPlan, Scope) {
@@ -561,7 +566,7 @@ impl<'a> Binder<'a> {
     }
 
     pub(super) fn bind_table_factor(
-        &self,
+        &mut self,
         factor: &TableFactor,
         left: &[Relation],
     ) -> (LogicalPlan, Scope) {
@@ -578,7 +583,7 @@ impl<'a> Binder<'a> {
                 // output columns as a synthetic relation.
                 if written.schema.is_none() && written.catalog.is_none() {
                     if let Some(cte) =
-                        self.ctes.iter().rev().find(|c| {
+                        self.context.ctes.iter().rev().find(|c| {
                             self.eq(self.style.casing.table_alias, &c.name, &written.name)
                         })
                     {
@@ -620,7 +625,7 @@ impl<'a> Binder<'a> {
                 ..
             } => {
                 let (mut op, sub_scope) = if *lateral {
-                    self.with_outer(left.to_vec()).bind_query(subquery)
+                    self.in_outer(left.to_vec(), |b| b.bind_query(subquery))
                 } else {
                     self.bind_query(subquery)
                 };
@@ -733,18 +738,20 @@ impl<'a> Binder<'a> {
             }
             TableFactor::Unpivot {
                 table,
-                value,
                 columns,
                 alias,
                 ..
             } => {
                 let (inner, inner_scope) = self.bind_table_factor(table, left);
-                let mut args = vec![self.bind_expr(value, &inner_scope)];
-                args.extend(
-                    columns
-                        .iter()
-                        .map(|c| self.bind_expr(&c.expr, &inner_scope)),
-                );
+                // `value` (the new value column) and `name` (the new name
+                // column) are *generated* output column names, not source
+                // columns — only the IN-list `columns` are read. (PIVOT differs:
+                // its `value_column` is an existing source column, so that arm
+                // binds it.)
+                let args = columns
+                    .iter()
+                    .map(|c| self.bind_expr(&c.expr, &inner_scope))
+                    .collect();
                 self.opaque(inner, args, alias.as_ref())
             }
             TableFactor::MatchRecognize {
@@ -804,7 +811,7 @@ impl<'a> Binder<'a> {
     /// The value expressions of a PIVOT value source (`IN (list)` / `ANY ORDER
     /// BY …` / a subquery). The subquery's reads come from binding it.
     pub(super) fn pivot_value_source_exprs(
-        &self,
+        &mut self,
         source: &PivotValueSource,
         scope: &Scope,
     ) -> Vec<Expr> {

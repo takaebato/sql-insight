@@ -173,6 +173,26 @@ mod reported {
     }
 
     #[test]
+    fn insert_with_wildcard_source_drops_lineage_and_skips_arity_diagnostic() {
+        // A wildcard in the source projection (`SELECT *, y`) makes the column
+        // count / positions indeterminate (wildcards aren't expanded), so the
+        // positional pairing can't be trusted: relation lineage is dropped and
+        // the arity check is skipped (no false `InsertColumnsArityMismatch`).
+        // The target columns still surface as `writes`, with `WildcardSuppressed`
+        // flagging the gap — matching a pure `SELECT *` source.
+        assert_column_ops(
+            "INSERT INTO t (a, b) SELECT *, y FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "y")],
+                writes: vec![write("t", "a"), write("t", "b")],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
     fn unaliased_ctas_expression_column_is_flagged() {
         // `a + 1` has no alias, so the created table's column can't be named
         // from the SQL text (engines auto-name it, e.g. `?column?`). It's
@@ -202,6 +222,129 @@ mod reported {
                 writes: vec![write("t", "x")],
                 lineage: vec![transformation(col("s", "a"), relation("t", "x"))],
                 diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn unaliased_select_into_expression_column_is_flagged() {
+        // `SELECT … INTO` lowers to a CTAS, so an unaliased expression column is
+        // unnameable and dropped — and now flagged, like `CREATE TABLE … AS`
+        // (the two are equivalent; the SELECT INTO path previously dropped it
+        // silently).
+        assert_column_ops(
+            "SELECT a + 1 INTO t2 FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("t1", "a")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::AnonymousColumnsSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_columns_unresolved_message_reflects_the_cause() {
+        // A `SELECT *` source can't be paired even with a catalog (its arity is
+        // unknown), so the message blames the wildcard, not a missing catalog.
+        let wildcard = extract("INSERT INTO dst SELECT * FROM src");
+        let msg = wildcard
+            .diagnostics
+            .iter()
+            .find(|d| d.kind == ColumnLevelDiagnosticKind::InsertColumnsUnresolved)
+            .expect("expected InsertColumnsUnresolved")
+            .message
+            .clone();
+        assert!(
+            msg.contains("SELECT *"),
+            "wildcard cause should mention `SELECT *`: {msg}"
+        );
+        assert!(
+            !msg.contains("without a catalog"),
+            "wildcard cause must not blame the catalog: {msg}"
+        );
+
+        // A determinate source with no catalog genuinely can't fill the target
+        // columns — there the message does cite the missing catalog.
+        let no_catalog = extract("INSERT INTO dst SELECT a FROM src");
+        let msg2 = no_catalog
+            .diagnostics
+            .iter()
+            .find(|d| d.kind == ColumnLevelDiagnosticKind::InsertColumnsUnresolved)
+            .expect("expected InsertColumnsUnresolved")
+            .message
+            .clone();
+        assert!(
+            msg2.contains("without a catalog"),
+            "no-catalog cause should say so: {msg2}"
+        );
+    }
+
+    #[test]
+    fn ctas_explicit_column_count_mismatch_is_flagged() {
+        // 3 explicit columns but the source projects 1: like the INSERT form,
+        // `writes` lists all three (from syntax) but lineage pairs only the
+        // first, so the surplus is flagged with an arity mismatch.
+        assert_column_ops(
+            "CREATE TABLE t (a INT, b INT, c INT) AS SELECT x FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("s", "x")],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "c")],
+                lineage: vec![passthrough(col("s", "x"), relation("t", "a"))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsArityMismatch)],
+            },
+        );
+    }
+
+    #[test]
+    fn create_view_explicit_column_count_mismatch_is_flagged() {
+        // CREATE VIEW with an explicit column list shares the arity check.
+        assert_column_ops(
+            "CREATE VIEW v (a, b, c) AS SELECT x FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateView,
+                reads: vec![read("s", "x")],
+                writes: vec![write("v", "a"), write("v", "b"), write("v", "c")],
+                lineage: vec![passthrough(col("s", "x"), relation("v", "a"))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsArityMismatch)],
+            },
+        );
+    }
+
+    #[test]
+    fn ctas_explicit_columns_with_wildcard_source_drops_lineage_no_arity() {
+        // An explicit column list pairs positionally; a wildcard source makes
+        // positions indeterminate, so lineage is dropped and the arity check
+        // skipped (no false mismatch) — matching the INSERT form. Writes still
+        // surface; `WildcardSuppressed` flags the gap.
+        assert_column_ops(
+            "CREATE TABLE t (a INT, b INT) AS SELECT *, y FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("s", "y")],
+                writes: vec![write("t", "a"), write("t", "b")],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn ctas_implicit_columns_with_wildcard_source_keeps_name_followed_lineage() {
+        // The implicit form takes each source output's own name, so a wildcard
+        // there merely omits the unexpanded columns — the named `y` still maps
+        // to its same-named target column (no misattribution), unlike the
+        // explicit case above.
+        assert_column_ops(
+            "CREATE TABLE t AS SELECT *, y FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("s", "y")],
+                writes: vec![write("t", "y")],
+                lineage: vec![passthrough(col("s", "y"), relation("t", "y"))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
             },
         );
     }

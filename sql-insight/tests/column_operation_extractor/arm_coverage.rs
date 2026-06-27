@@ -138,8 +138,21 @@ mod expr_arm_coverage {
 
     #[test]
     fn lambda() {
+        // A real column in the body is read; the lambda parameter is a local,
+        // not a column.
         assert_unordered_eq!(
             reads("SELECT transform(t.arr, x -> t.a) FROM t"),
+            vec![c("arr"), c("a")]
+        );
+        // A bare reference to the parameter `x` adds no read (a previous
+        // version wrongly read `t.x`).
+        assert_unordered_eq!(
+            reads("SELECT transform(t.arr, x -> x + 1) FROM t"),
+            vec![c("arr")]
+        );
+        // Mixed: the parameter is suppressed, the real column `t.a` stays.
+        assert_unordered_eq!(
+            reads("SELECT transform(t.arr, x -> x + t.a) FROM t"),
             vec![c("arr"), c("a")]
         );
     }
@@ -199,6 +212,29 @@ mod expr_arm_coverage {
     }
 
     #[test]
+    fn match_against() {
+        // MySQL full-text `MATCH (cols) AGAINST ('lit')`: the search columns
+        // are reads (the search string is a literal). In value position they
+        // also originate the (anonymous) relevance score.
+        assert_unordered_eq!(
+            reads("SELECT MATCH(t.title, t.body) AGAINST ('x') FROM t"),
+            vec![c("title"), c("body")]
+        );
+        assert_unordered_eq!(
+            lineage("SELECT MATCH(t.title, t.body) AGAINST ('x') FROM t"),
+            vec![
+                transformation(c("title"), out_anon(0)),
+                transformation(c("body"), out_anon(0)),
+            ]
+        );
+        // Filter position (`WHERE`): the columns are reads, originate nothing.
+        assert_unordered_eq!(
+            reads("SELECT t.id FROM t WHERE MATCH(t.title, t.body) AGAINST ('x')"),
+            vec![c("id"), c("title"), c("body")]
+        );
+    }
+
+    #[test]
     fn subscript_index() {
         assert_unordered_eq!(reads("SELECT arr[1] FROM t"), vec![c("arr")]);
     }
@@ -210,12 +246,25 @@ mod expr_arm_coverage {
 
     #[test]
     fn dot_access() {
-        assert_unordered_eq!(reads("SELECT (t.a).b FROM t"), vec![c("a"), c("b")]);
+        // `(t.a).b` accesses field `b` of the value `t.a` — `b` is a struct /
+        // JSON field, not a column of `t`, so only `t.a` is read (a previous
+        // version wrongly read `t.b` too). Chained dots add no further reads.
+        assert_unordered_eq!(reads("SELECT (t.a).b FROM t"), vec![c("a")]);
+        assert_unordered_eq!(reads("SELECT (t.a).b.c FROM t"), vec![c("a")]);
     }
 
     #[test]
     fn json_access() {
+        // The accessed value is read; a string / `.field` path key is a literal
+        // field name, not a column.
         assert_unordered_eq!(reads("SELECT t.a -> 'b' FROM t"), vec![c("a")]);
+        // A `[expr]` bracket key in the path is a value expression and is read
+        // (the column `idx`); the `:field` dot key is not (a previous version
+        // dropped the whole path, losing `idx`).
+        assert_unordered_eq!(
+            reads("SELECT a:b[t.idx] AS r FROM t"),
+            vec![c("a"), c("idx")]
+        );
     }
 
     #[test]
@@ -828,8 +877,12 @@ mod relation_arm_coverage {
 
     #[test]
     fn unpivot() {
+        // `UNPIVOT (v FOR n IN (t.a, t.b))`: `v` (value) and `n` (name) are
+        // generated output column names, not source columns — only the IN-list
+        // columns `t.a` / `t.b` are read (a previous version wrongly read the
+        // value name `t.v`).
         let result = op("SELECT * FROM t UNPIVOT(v FOR n IN (t.a, t.b))");
-        assert_unordered_eq!(result.reads, vec![c("t", "v"), c("t", "a"), c("t", "b")]);
+        assert_unordered_eq!(result.reads, vec![c("t", "a"), c("t", "b")]);
     }
 
     #[test]

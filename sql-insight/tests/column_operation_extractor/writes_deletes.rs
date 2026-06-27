@@ -91,6 +91,24 @@ mod writes {
             },
         );
     }
+
+    #[test]
+    fn update_parenthesized_join_target_resolves_all_relations() {
+        // `UPDATE (t1 JOIN t2 …) SET t1.b = t2.b`: the parenthesized join target
+        // is flattened, so t2 is a joined read — the ON columns and the SET RHS
+        // `t2.b` resolve (the join's second relation was previously dropped,
+        // leaving `t2.b` unresolved).
+        assert_column_ops(
+            "UPDATE (t1 JOIN t2 ON t1.a = t2.a) SET t1.b = t2.b",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1", "a"), read("t2", "a"), read("t2", "b")],
+                writes: vec![write("t1", "b")],
+                lineage: vec![passthrough(col("t2", "b"), relation("t1", "b"))],
+                diagnostics: vec![],
+            },
+        );
+    }
 }
 
 mod delete {

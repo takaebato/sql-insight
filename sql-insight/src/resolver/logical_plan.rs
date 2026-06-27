@@ -205,6 +205,14 @@ pub(crate) struct Values {
 /// reference the `EXCLUDED` pseudo-table (the proposed row) — resolved to a
 /// `Derived` ref qualified `excluded`, traced to the source's like-positioned
 /// output column.
+///
+/// `source_wildcard` flags that the source projection contains an (unexpanded)
+/// wildcard (`SELECT *, y`): its column count and positions are then
+/// indeterminate, so positional pairing with `columns` would mis-attribute and
+/// the arity check would mis-fire. The relation-lineage walker and the arity
+/// check skip when it is set — the target columns still surface as `writes`,
+/// the `WildcardSuppressed` diagnostic signals the gap, matching a pure
+/// `SELECT *` source (which yields no operands to pair at all).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Insert {
     pub(crate) target: TableReference,
@@ -213,6 +221,7 @@ pub(crate) struct Insert {
     pub(crate) returning: Vec<NamedExpr>,
     pub(crate) on_conflict: Vec<Assignment>,
     pub(crate) conflict_predicate: Vec<Expr>,
+    pub(crate) source_wildcard: bool,
 }
 
 /// `UPDATE target SET assignments [FROM ...] WHERE ...`: `input` carries the
@@ -273,21 +282,31 @@ pub(crate) enum MergeClause {
 /// structural reference — the new table's *columns* aren't known here (no
 /// wildcard expansion) and no row data moves — so it surfaces only in the flat
 /// table list, never as a column read / write / lineage edge.
+///
+/// `source_wildcard` mirrors [`Insert::source_wildcard`]: the source projection
+/// holds an unexpanded wildcard, so an *explicit* column list can't be paired
+/// positionally (the lineage walker skips it then). The implicit form follows
+/// the source outputs' own names, so a wildcard there merely omits the
+/// unexpanded columns without misattributing — `source_wildcard` only gates the
+/// explicit case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreateTableAs {
     pub(crate) target: TableReference,
     pub(crate) columns: Vec<Ident>,
     pub(crate) input: Box<LogicalPlan>,
     pub(crate) schema_source: Option<TableReference>,
+    pub(crate) source_wildcard: bool,
 }
 
 /// `CREATE VIEW target (columns) AS <input>`. `columns` is the explicit column
 /// list only (empty for the implicit form), resolved like [`CreateTableAs`].
+/// `source_wildcard` plays the same role as on [`CreateTableAs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreateView {
     pub(crate) target: TableReference,
     pub(crate) columns: Vec<Ident>,
     pub(crate) input: Box<LogicalPlan>,
+    pub(crate) source_wildcard: bool,
 }
 
 /// `ALTER TABLE target ...`: the column-naming operations' `columns` are
@@ -471,9 +490,10 @@ pub(crate) struct BoundColumn {
 }
 
 /// What a column reference resolved to, decided at bind. `reads` keeps
-/// `Base` / `Unresolved` / `Ambiguous` and drops `Derived` (the physical read
-/// was counted at the inner producer); the origin traversal follows all four
-/// (`Derived` recurses into the producing relation, collapsing lazily).
+/// `Base` / `Unresolved` / `Ambiguous`, drops `Derived` (the physical read was
+/// counted at the inner producer) and `Local` (not a column at all); the origin
+/// traversal traces `Derived` into its producer and treats the rest as
+/// terminal (`Local` contributing nothing).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Binding {
     /// A real base-table column (the table is canonicalised; `resolution` is
@@ -489,6 +509,11 @@ pub(crate) enum Binding {
     Unresolved,
     /// Several candidate owners.
     Ambiguous,
+    /// A lambda parameter (`x` in `x -> x + 1`) — a *local* binding, not a
+    /// table column, so it is neither a read nor a lineage origin. Bare
+    /// references to an in-scope lambda parameter resolve here, shadowing any
+    /// real column of the same name within the lambda body.
+    Local,
 }
 
 // ===== tree navigation ====================================================

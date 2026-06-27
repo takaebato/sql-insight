@@ -109,6 +109,14 @@ impl Catalog {
     /// ```
     pub fn from_ddl(dialect: &dyn Dialect, ddl: &str) -> Result<Self, Error> {
         let statements = Parser::parse_sql(dialect, ddl)?;
+        // Normalize each DDL identifier to its stored form the way the dialect
+        // would: an unquoted name folds (e.g. Postgres `Users` → `users`), a
+        // quoted name stays exact. So the registered identity matches what a
+        // query reference folds to — otherwise an unquoted mixed-case
+        // `CREATE TABLE Users` would register `Users` and miss a folded query
+        // `users` under a case-sensitive dialect. (Catalog names compare like
+        // quoted identifiers, so they must already be in canonical form.)
+        let casing = crate::casing::IdentifierCasing::for_dialect(dialect);
         let mut catalog = Catalog::new();
         for statement in &statements {
             let Statement::CreateTable(create) = statement else {
@@ -119,17 +127,20 @@ impl Catalog {
                 continue;
             }
             let parts: Vec<&Ident> = create.name.0.iter().filter_map(|p| p.as_ident()).collect();
+            let name = |id: &Ident| casing.table.normalize(id);
             let table = match parts.as_slice() {
-                [name] => CatalogTable::unqualified(name.value.clone()),
-                [schema, name] => CatalogTable::new(schema.value.clone(), name.value.clone()),
-                [catalog_seg, schema, name] => {
-                    CatalogTable::new(schema.value.clone(), name.value.clone())
-                        .catalog(catalog_seg.value.clone())
+                [n] => CatalogTable::unqualified(name(n)),
+                [schema, n] => CatalogTable::new(name(schema), name(n)),
+                [catalog_seg, schema, n] => {
+                    CatalogTable::new(name(schema), name(n)).catalog(name(catalog_seg))
                 }
                 // 0 or 4+ segments — unrepresentable identity.
                 _ => continue,
             };
-            let columns = create.columns.iter().map(|c| c.name.value.clone());
+            let columns = create
+                .columns
+                .iter()
+                .map(|c| casing.column.normalize(&c.name));
             catalog = catalog.table(table.columns(columns));
         }
         Ok(catalog)

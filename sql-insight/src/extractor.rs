@@ -195,30 +195,14 @@ where
 /// column / flat / CRUD extractors to pick the verb before assembling
 /// their surfaces.
 pub(crate) fn classify_statement(statement: &Statement) -> StatementKind {
-    use sqlparser::ast::{ObjectType, SetExpr};
+    use sqlparser::ast::ObjectType;
     match statement {
-        // `WITH cte AS (...) INSERT/UPDATE/DELETE/MERGE ...` is parsed
-        // by sqlparser as a top-level Query whose body is a
-        // `SetExpr::Insert/Update/Delete/Merge` wrapping the actual
-        // DML statement. Reclassify against the inner statement so
-        // the public StatementKind matches the verb the user wrote,
-        // not the parser-level wrapper.
-        Statement::Query(query) => match query.body.as_ref() {
-            SetExpr::Insert(stmt)
-            | SetExpr::Update(stmt)
-            | SetExpr::Delete(stmt)
-            | SetExpr::Merge(stmt) => classify_statement(stmt),
-            // Read-only / row-producing bodies all classify as `Select`
-            // (`StatementKind::Select` documents that it covers `VALUES`,
-            // `WITH … SELECT`, `TABLE foo`, and set operations). Enumerated, not
-            // `_`-matched, so a future write-bearing `SetExpr` variant is a
-            // compile error here rather than silently bucketing as `Select`.
-            SetExpr::Select(_)
-            | SetExpr::Query(_)
-            | SetExpr::SetOperation { .. }
-            | SetExpr::Values(_)
-            | SetExpr::Table(_) => StatementKind::Select,
-        },
+        // `WITH cte AS (...) INSERT/UPDATE/DELETE/MERGE ...` and a
+        // parenthesised DML `(DELETE FROM t)` are both parsed by sqlparser as a
+        // top-level Query whose body wraps the actual DML. Reclassify against
+        // the inner statement so the public StatementKind matches the verb the
+        // user wrote, not the parser-level wrapper.
+        Statement::Query(query) => classify_query_body(query.body.as_ref()),
         Statement::Insert(_) => StatementKind::Insert,
         Statement::Update(_) => StatementKind::Update,
         Statement::Delete(_) => StatementKind::Delete,
@@ -239,5 +223,54 @@ pub(crate) fn classify_statement(statement: &Statement) -> StatementKind {
         // fall through to Unsupported so the caller still gets a clear
         // diagnostic.
         _ => StatementKind::Unsupported,
+    }
+}
+
+/// Classify a top-level `Query`'s body to the verb the user wrote. A DML body
+/// (`WITH … <DML>`) reclassifies against the inner statement; a parenthesised
+/// body (`(DELETE …)`, even nested) recurses through the wrapper to find the
+/// DML / `SELECT … INTO` verb — mirroring [`has_leading_select_into`], which
+/// already recurses `SetExpr::Query`, so the two stay in step. Anything else is
+/// read-only / row-producing → `Select`. The match is exhaustive so a new
+/// write-bearing `SetExpr` variant is a compile error rather than a silent
+/// `Select`.
+fn classify_query_body(body: &sqlparser::ast::SetExpr) -> StatementKind {
+    use sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Insert(stmt)
+        | SetExpr::Update(stmt)
+        | SetExpr::Delete(stmt)
+        | SetExpr::Merge(stmt) => classify_statement(stmt),
+        // A parenthesised query: peel the wrapper (nested parens included) and
+        // classify the inner body, so `(DELETE …)` keeps its verb.
+        SetExpr::Query(inner) => classify_query_body(inner.body.as_ref()),
+        // A leading `SELECT … INTO t` lowers to `CreateTableAs` in the binder;
+        // keep the verb (and the table-lineage gate that keys on it) in step.
+        body if has_leading_select_into(body) => StatementKind::CreateTable,
+        SetExpr::Select(_)
+        | SetExpr::SetOperation { .. }
+        | SetExpr::Values(_)
+        | SetExpr::Table(_) => StatementKind::Select,
+    }
+}
+
+/// Whether a query body carries a leading `SELECT … INTO t` — the table-creating
+/// `SELECT INTO` (T-SQL / Postgres), which the binder lowers to `CreateTableAs`.
+/// `INTO` rides the left spine (through a parenthesised query and the left
+/// branch of a set operation, where it targets the combined result), so this
+/// mirrors the binder's `leading_select_into`; the two must stay in step. The
+/// match is exhaustive so a new `SetExpr` variant forces a decision here too.
+fn has_leading_select_into(body: &sqlparser::ast::SetExpr) -> bool {
+    use sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(select) => select.into.is_some(),
+        SetExpr::Query(query) => has_leading_select_into(&query.body),
+        SetExpr::SetOperation { left, .. } => has_leading_select_into(left),
+        SetExpr::Values(_)
+        | SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_)
+        | SetExpr::Table(_) => false,
     }
 }

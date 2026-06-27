@@ -85,6 +85,28 @@ mod with_in_dml {
     }
 }
 
+mod parenthesized_dml {
+    //! A parenthesised DML `(INSERT/UPDATE/DELETE …)` parses as a Query
+    //! wrapping the DML; it must keep its verb, not misclassify as a read-only
+    //! `Select` (which would surface phantom writes / lineage under a `Select`
+    //! kind — a contract violation).
+    use super::*;
+
+    #[test]
+    fn parenthesized_insert_surfaces_as_insert_not_select() {
+        assert_column_ops(
+            "(INSERT INTO t (a) SELECT b FROM src)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("src", "b")],
+                writes: vec![write("t", "a")],
+                lineage: vec![passthrough(col("src", "b"), relation("t", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+}
+
 mod merge {
     use super::*;
 
@@ -146,6 +168,43 @@ mod merge {
                 writes: vec![],
                 lineage: vec![],
                 diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsUnresolved)],
+            },
+        );
+    }
+
+    #[test]
+    fn merge_insert_row_drops_columns_but_flags() {
+        // BigQuery `WHEN NOT MATCHED THEN INSERT ROW` inserts the full source
+        // row; its column pairing isn't recoverable from SQL text, so column
+        // writes / lineage are dropped and flagged with `InsertColumnsUnresolved`
+        // (the table still surfaces in `table_writes` / `table_lineage`). The
+        // only reads are the ON predicate's.
+        assert_column_ops(
+            "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT ROW",
+            ColumnOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![read("t", "id"), read("s", "id")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsUnresolved)],
+            },
+        );
+    }
+
+    #[test]
+    fn merge_into_subquery_target_is_flagged() {
+        // A non-table MERGE target (a derived table / subquery) can't be a
+        // write target — the statement binds to nothing, flagged as
+        // `UnsupportedStatement` rather than dropped silently.
+        assert_column_ops(
+            "MERGE INTO (SELECT a FROM t) AS d USING s ON d.id = s.id \
+             WHEN MATCHED THEN UPDATE SET d.a = s.a",
+            ColumnOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
             },
         );
     }
@@ -224,6 +283,24 @@ mod ctas_view {
                     passthrough(col("s", "x"), relation("t", "a")),
                     passthrough(col("s", "y"), relation("t", "y")),
                 ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn select_into_classifies_as_create_and_pairs_target_columns() {
+        // `SELECT … INTO t2` (T-SQL / Postgres) creates a table: the binder
+        // lowers it to a CTAS, so it classifies as `CreateTable` and pairs the
+        // source projection with the created relation's columns — identical to
+        // `CREATE TABLE t2 AS SELECT a FROM t1`.
+        assert_column_ops(
+            "SELECT a INTO t2 FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("t1", "a")],
+                writes: vec![write("t2", "a")],
+                lineage: vec![passthrough(col("t1", "a"), relation("t2", "a"))],
                 diagnostics: vec![],
             },
         );

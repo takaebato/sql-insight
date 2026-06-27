@@ -26,6 +26,48 @@ mod set_operations {
     }
 
     #[test]
+    fn parenthesized_branch_cte_feeds_the_result_column() {
+        // A CTE declared inside a parenthesised set-op branch must be registered
+        // during the lineage trace (the "peel With, keep its CTEs" the
+        // scalar-subquery path also needs), so the branch's output flows to the
+        // result column — previously `s.id` was read but dropped from lineage.
+        assert_column_ops(
+            "SELECT a FROM t1 UNION (WITH c AS (SELECT id FROM s) SELECT id FROM c)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a"), read("s", "id")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t1", "a"), out("a", 0)),
+                    passthrough(col("s", "id"), out("a", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_from_set_op_branch_cte_agrees_across_surfaces() {
+        // The same branch-CTE through an INSERT: the column lineage must keep
+        // `s.id → dst.a` (it used to drop it), agreeing with the table lineage
+        // (`s → dst`) and reads — the three surfaces no longer disagree.
+        assert_column_ops(
+            "INSERT INTO dst (a) SELECT a FROM t1 \
+             UNION (WITH c AS (SELECT id FROM s) SELECT id FROM c)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("t1", "a"), read("s", "id")],
+                writes: vec![write("dst", "a")],
+                lineage: vec![
+                    passthrough(col("t1", "a"), relation("dst", "a")),
+                    passthrough(col("s", "id"), relation("dst", "a")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn union_all_behaves_same_as_union() {
         // UNION ALL only differs from UNION at runtime (dedup vs
         // not); structurally the resolver should treat them identically.
@@ -196,6 +238,98 @@ mod set_operations {
                 lineage: vec![
                     passthrough(col("t1", "a"), out("x", 0)),
                     passthrough(col("t2", "b"), out("x", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn union_in_subquery_differing_right_name_collapses_both_branches() {
+        // Regression: the result column name comes from the LEFT branch (`x`),
+        // and the branches merge POSITIONALLY — the right branch's own output
+        // name (`b`, no `AS x`) names no result column. Tracing `x` must still
+        // reach the right branch's like-positioned column. (A per-branch name
+        // match dropped `t2.b`, since only the left branch carries `x`. The
+        // sibling `union_in_subquery_collapses_both_branches_to_outer` hides
+        // this by aliasing BOTH branches to `x`.)
+        assert_column_ops(
+            "SELECT x FROM (SELECT a AS x FROM t1 UNION SELECT b FROM t2) sub",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a"), read("t2", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t1", "a"), out("x", 0)),
+                    passthrough(col("t2", "b"), out("x", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn union_in_cte_differing_right_name_collapses_both_branches() {
+        // The same regression across a CTE boundary: the right branch
+        // (`SELECT b`, no `AS x`) still feeds the result column `x`.
+        assert_column_ops(
+            "WITH cte AS (SELECT a AS x FROM t1 UNION SELECT b FROM t2) \
+             SELECT x FROM cte",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a"), read("t2", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t1", "a"), out("x", 0)),
+                    passthrough(col("t2", "b"), out("x", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn union_in_subquery_traces_by_position_not_reused_name() {
+        // Both branches expose two columns; the right branch REUSES the name
+        // `x` at a DIFFERENT position (0) than the left (1). The trace must
+        // follow POSITION: left `x` is position 1, so the right's position 1
+        // (`e AS y` = t2.e) feeds it — NOT the right's own `x` (position 0 =
+        // t2.c), which a name match would misattribute.
+        assert_column_ops(
+            "SELECT x FROM \
+             (SELECT a AS p, b AS x FROM t1 UNION SELECT c AS x, e AS y FROM t2) sub",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("t1", "a"),
+                    read("t1", "b"),
+                    read("t2", "c"),
+                    read("t2", "e"),
+                ],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t1", "b"), out("x", 0)),
+                    passthrough(col("t2", "e"), out("x", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn scalar_subquery_over_union_feeds_all_branches() {
+        // A scalar subquery whose body is a set operation feeds EVERY branch's
+        // position-0 output to the output column (`s`), not just the leftmost.
+        // Both flow as Transformation (a scalar-subquery value).
+        assert_column_ops(
+            "SELECT (SELECT a FROM x UNION SELECT b FROM y) AS s FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("x", "a"), read("y", "b")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("x", "a"), out("s", 0)),
+                    transformation(col("y", "b"), out("s", 0)),
                 ],
                 diagnostics: vec![],
             },
@@ -374,6 +508,66 @@ mod join_using_and_natural {
                 reads: vec![read("t1", "id")],
                 writes: vec![],
                 lineage: vec![passthrough(col("t1", "id"), out("id", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_using_fans_in_to_a_derived_side_and_a_real_table() {
+        // A derived table that exposes the merge column is a fan-in owner too:
+        // `id` fans in to both `d` (traced into its subquery → `s.id`) and the
+        // real table `t`. Previously only the derived side surfaced and `t.id`
+        // was dropped at the column level.
+        assert_column_ops(
+            "SELECT id FROM (SELECT id FROM s) d JOIN t USING (id)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "id"), read("t", "id")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("s", "id"), out("id", 0)),
+                    passthrough(col("t", "id"), out("id", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_using_fans_in_to_a_cte_side_and_a_real_table() {
+        // Same fan-in across a CTE side: the CTE body's `s.id` and the real
+        // table `t.id` both feed the merged output column.
+        assert_column_ops(
+            "WITH c AS (SELECT id FROM s) SELECT id FROM c JOIN t USING (id)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "id"), read("t", "id")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("s", "id"), out("id", 0)),
+                    passthrough(col("t", "id"), out("id", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_using_derived_side_traces_through_its_alias_rename() {
+        // The derived side renames its source (`a AS id`), so the fan-in member
+        // traces through the alias to `s.a` — still a Passthrough (a rename
+        // doesn't transform the value), as is the real table side `t.id`.
+        assert_column_ops(
+            "SELECT id FROM (SELECT a AS id FROM s) d JOIN t USING (id)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "a"), read("t", "id")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("s", "a"), out("id", 0)),
+                    passthrough(col("t", "id"), out("id", 0)),
+                ],
                 diagnostics: vec![],
             },
         );

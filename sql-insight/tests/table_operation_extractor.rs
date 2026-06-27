@@ -283,6 +283,24 @@ mod set_operations {
             },
         );
     }
+
+    #[test]
+    fn insert_from_set_op_branch_cte_keeps_branch_lineage() {
+        // A CTE inside a parenthesised UNION branch: its base table (`s`) still
+        // feeds the target, agreeing with the column-level surface (the trace
+        // registers the branch's CTE rather than dropping it).
+        assert_ops(
+            "INSERT INTO dst (a) SELECT a FROM t1 \
+             UNION (WITH c AS (SELECT id FROM s) SELECT id FROM c)",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("t1"), read("s")],
+                writes: vec![table("dst")],
+                lineage: vec![edge("t1", "dst"), edge("s", "dst")],
+                diagnostics: vec![],
+            },
+        );
+    }
 }
 
 mod diagnostics {
@@ -918,6 +936,79 @@ mod lineage {
     }
 
     #[test]
+    fn update_parenthesized_join_target_keeps_all_relations() {
+        // `UPDATE (t1 JOIN t2 …) SET …`: the parenthesized join target is
+        // flattened — t1 is the write target, t2 a joined read — so it behaves
+        // like the non-paren `UPDATE t1 JOIN t2 …` form (t2 used to be dropped).
+        assert_ops(
+            "UPDATE (t1 JOIN t2 ON t1.a = t2.a) SET t1.b = t2.b",
+            TableOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t2")],
+                writes: vec![table("t1")],
+                lineage: vec![edge("t2", "t1")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_on_conflict_value_subquery_feeds_lineage() {
+        // ON CONFLICT DO UPDATE SET col = (SELECT … FROM other): the value
+        // subquery feeds the target like an UPDATE SET RHS — so `other` is a
+        // lineage source alongside the INSERT source `src`.
+        assert_ops_with(
+            "INSERT INTO dst (id) SELECT id FROM src \
+             ON CONFLICT (id) DO UPDATE SET id = (SELECT y FROM other)",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("src"), read("other")],
+                writes: vec![table("dst")],
+                lineage: vec![edge("src", "dst"), edge("other", "dst")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_on_conflict_excluded_value_adds_no_lineage() {
+        // An `EXCLUDED.x` conflict value names the INSERT source row (already
+        // fed via the source), so it introduces no new feeding table — only
+        // `src → dst`, no double-count.
+        assert_ops_with(
+            "INSERT INTO dst (id) SELECT id FROM src \
+             ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("src")],
+                writes: vec![table("dst")],
+                lineage: vec![edge("src", "dst")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn select_into_classifies_as_create_and_emits_lineage() {
+        // `SELECT … INTO t2` binds as a CTAS, so it classifies as `CreateTable`
+        // (not `Select`) and emits table lineage from the source — the verb,
+        // the lineage gate, and `writes` now agree (previously the `Select`
+        // verb gated lineage off while `writes` still showed the target).
+        assert_ops(
+            "SELECT a INTO t2 FROM t1",
+            TableOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("t1")],
+                writes: vec![table("t2")],
+                lineage: vec![edge("t1", "t2")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn create_table_as_select_emits_lineage() {
         assert_ops(
             "CREATE TABLE t1 AS SELECT * FROM t2",
@@ -978,6 +1069,24 @@ mod lineage {
     }
 
     #[test]
+    fn merge_insert_row_emits_lineage() {
+        // BigQuery `WHEN NOT MATCHED THEN INSERT ROW` inserts the full source
+        // row: the column pairing isn't recoverable, but the source still
+        // feeds the target at the table level (the column-level coverage gap
+        // is flagged on the column surface, not here).
+        assert_ops(
+            "MERGE INTO t1 USING t2 ON t1.id = t2.id WHEN NOT MATCHED THEN INSERT ROW",
+            TableOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![read("t2")],
+                writes: vec![table("t1")],
+                lineage: vec![edge("t2", "t1")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn merge_with_only_delete_action_emits_no_lineage() {
         // WHEN MATCHED THEN DELETE doesn't move data — the source
         // is only used to pick which target rows to delete. A
@@ -992,6 +1101,43 @@ mod lineage {
                 writes: vec![table("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn merge_into_subquery_target_is_flagged_not_silently_dropped() {
+        // A MERGE whose target is a derived table / subquery can't be a write
+        // target, so the statement binds to nothing — flagged as
+        // UnsupportedStatement (it projects to the table level) rather than
+        // dropped silently.
+        assert_ops(
+            "MERGE INTO (SELECT a FROM t) AS d USING s ON d.id = s.id \
+             WHEN MATCHED THEN UPDATE SET d.a = s.a",
+            TableOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(TableLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
+    fn merge_into_parenthesized_join_target_is_flagged() {
+        // You merge into one table, not a join — a `(t1 JOIN t2)` MERGE target
+        // is flagged as UnsupportedStatement rather than silently picking the
+        // first relation. (A parenthesized single table `(t1)` is fine.)
+        assert_ops(
+            "MERGE INTO (t1 JOIN t2 ON t1.id = t2.id) USING s ON s.id = t1.id \
+             WHEN MATCHED THEN UPDATE SET t1.a = s.a",
+            TableOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(TableLevelDiagnosticKind::UnsupportedStatement)],
             },
         );
     }
@@ -1140,7 +1286,7 @@ mod lineage {
 
     #[test]
     fn distinct_ctes_each_feed_target_independently() {
-        // The fold is per *CTE name*, not per `CteRef` node — two different
+        // The fold is per *declaration*, not per `CteRef` node — two different
         // CTEs (each referenced once) each contribute their own edge.
         assert_ops(
             "WITH c AS (SELECT id FROM base), d AS (SELECT id FROM other) \
@@ -1150,6 +1296,27 @@ mod lineage {
                 reads: vec![read("base"), read("other")],
                 writes: vec![table("t")],
                 lineage: vec![edge("base", "t"), edge("other", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn same_name_shadowing_ctes_each_feed_target() {
+        // Two distinct CTEs sharing the name `q` (an inner one shadowing an
+        // outer across scopes) are separate declarations, so each feeds the
+        // target. The fold keys on the resolved body's identity, not the name —
+        // a name key collapsed the two and dropped one declaration's source.
+        assert_ops(
+            "INSERT INTO dst (c) \
+             WITH q AS (SELECT k FROM base1) \
+             SELECT k FROM (WITH q AS (SELECT k FROM base2) SELECT k FROM q) sub \
+             UNION ALL SELECT k FROM q",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("base1"), read("base2")],
+                writes: vec![table("dst")],
+                lineage: vec![edge("base1", "dst"), edge("base2", "dst")],
                 diagnostics: vec![],
             },
         );

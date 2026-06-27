@@ -609,4 +609,138 @@ mod cte_derived_rename {
             },
         );
     }
+
+    #[test]
+    fn scalar_subquery_with_leading_with_keeps_column_lineage() {
+        // A scalar subquery with its *own* leading WITH: the CTE `c` is
+        // registered during the origins trace, so the body's `CteRef` resolves
+        // and `s.k` flows to the output `r`. (The trace peels the WITH for shape
+        // via `output_operands`; it must also push the CTE declarations, which a
+        // nested subquery's WITH otherwise misses — only the statement's
+        // top-level WITH is pre-registered.)
+        assert_column_ops(
+            "SELECT (WITH c AS (SELECT k AS x FROM s) SELECT x FROM c) AS r FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "k")],
+                writes: vec![],
+                lineage: vec![transformation(col("s", "k"), out("r", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn subquery_inner_cte_shadows_without_leaking_to_a_sibling() {
+        // Two scalar subqueries reference a CTE named `c`: the first uses the
+        // outer `c` (→ outer_t); the second has its own `WITH c` shadowing it
+        // within its body (→ inner_t). The inner CTE is scoped to that
+        // subquery's child binder, so it doesn't leak — the first subquery
+        // still resolves the outer `c` (no cross-contamination).
+        assert_column_ops(
+            "WITH c AS (SELECT a FROM outer_t) \
+             SELECT (SELECT a FROM c) AS r1, \
+                    (SELECT a FROM (WITH c AS (SELECT a FROM inner_t) SELECT a FROM c) s) AS r2 \
+             FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("outer_t", "a"), read("inner_t", "a")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("outer_t", "a"), out("r1", 0)),
+                    transformation(col("inner_t", "a"), out("r2", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+}
+
+mod lambda {
+    use super::*;
+
+    #[test]
+    fn lambda_param_is_not_traced_into_a_same_named_derived_column() {
+        // The lambda parameter `x` shadows the derived table's column `x`
+        // within the body: it's a local, so it neither reads nor originates
+        // `s.x`. Only the array argument (`arr` → `s.arr`) flows to the output.
+        // (A `Derived` binding instead of a dedicated `Local` would mis-trace
+        // `x` into the derived subquery and emit a spurious `s.x → r`.)
+        assert_column_ops(
+            "SELECT transform(arr, x -> x) AS r FROM (SELECT arr, x FROM s) d",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "arr"), read("s", "x")],
+                writes: vec![],
+                lineage: vec![transformation(col("s", "arr"), out("r", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn lambda_param_does_not_shadow_a_subquery_own_column() {
+        // A subquery in the body has its own innermost scope: a bare `x` in
+        // `(SELECT x FROM t2)` resolves to the subquery's own `t2.x`, not the
+        // (enclosing) lambda parameter — the parameter sits at its lexical depth
+        // in the resolution stack and doesn't over-shadow an inner scope. Both
+        // the array arg (`t1.arr`) and the body value (`t2.x`) flow to the
+        // anonymous output as a transformation.
+        assert_column_ops(
+            "SELECT transform(arr, x -> (SELECT x FROM t2)) FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "arr"), read("t2", "x")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t1", "arr"), out_anon(0)),
+                    transformation(col("t2", "x"), out_anon(0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn lambda_param_resolves_at_the_right_depth_when_deeply_nested() {
+        // Two levels of nested subquery: the innermost (`t3`) is the innermost
+        // scope, so a bare `x` resolves to `t3.x`. A flat "parameter checked
+        // first" rule would have wrongly shadowed both `t2` and `t3`; the frame
+        // stack places the parameter at its correct depth.
+        assert_column_ops(
+            "SELECT transform(arr, x -> (SELECT (SELECT x FROM t3) FROM t2)) FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "arr"), read("t3", "x")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t1", "arr"), out_anon(0)),
+                    transformation(col("t3", "x"), out_anon(0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn lambda_param_shadowed_by_a_cte_column_in_the_body() {
+        // Inside the body, the CTE `c` exposes a column `x` (renamed from `k`),
+        // so the subquery `SELECT x FROM c` resolves `x` to the CTE column
+        // (→ s.k), shadowing the lambda parameter — the parameter is not a false
+        // read. Both the array arg (`t1.arr`) and the body value (`s.k`, through
+        // the CTE) flow to the anonymous output.
+        assert_column_ops(
+            "SELECT transform(arr, x -> (WITH c AS (SELECT k AS x FROM s) SELECT x FROM c)) FROM t1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "arr"), read("s", "k")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t1", "arr"), out_anon(0)),
+                    transformation(col("s", "k"), out_anon(0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
 }

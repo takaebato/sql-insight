@@ -41,6 +41,16 @@ fn test_unary_operators_preceding_constants() {
 }
 
 #[test]
+fn test_nested_unary_operators_collapse_to_single_placeholder() {
+    // A chain of unary ops over a literal collapses to one `?` (not `-?`), so
+    // `- -9` matches `-9` and `9`. A parenthesised operand (`Expr::Nested`)
+    // stops the chain — only its inner value is placeholdered.
+    let sql = "SELECT * FROM t WHERE a = - -9 AND b = + -9 AND c = -(9)";
+    let expected = vec!["SELECT * FROM t WHERE a = ? AND b = ? AND c = -(?)".into()];
+    assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
+}
+
+#[test]
 fn test_unary_operators_preceding_booleans() {
     let sql = "SELECT * FROM t1 WHERE a=TRUE AND b=NOT TRUE AND c=NOT(TRUE)";
     let expected = vec!["SELECT * FROM t1 WHERE a = ? AND b = ? AND c = NOT (?)".into()];
@@ -168,5 +178,39 @@ fn test_do_not_alphabetize_insert_columns_when_values_not_unified() {
         NormalizerOptions::new()
             .with_unify_values(true)
             .with_alphabetize_insert_columns(true),
+    );
+}
+
+#[test]
+fn test_typed_string_literal_value_is_normalized() {
+    // A `DATE` / `TIMESTAMP '…'` literal is a `TypedString`, whose value is a
+    // bare `Value` field (not an `Expr::Value`) — it must still normalize so
+    // queries differing only in the date / timestamp collapse together.
+    let sql =
+        "SELECT * FROM t WHERE d = DATE '2020-01-01' AND ts > TIMESTAMP '2020-01-01 00:00:00'";
+    let expected = vec!["SELECT * FROM t WHERE d = DATE ? AND ts > TIMESTAMP ?".into()];
+    assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
+}
+
+#[test]
+fn test_like_escape_char_is_normalized() {
+    // The `ESCAPE '!'` char is a bare `Value` on the `Like` node, alongside
+    // the (already-normalized) pattern expression.
+    let sql = "SELECT a FROM t WHERE c LIKE '%x%' ESCAPE '!'";
+    let expected = vec!["SELECT a FROM t WHERE c LIKE ? ESCAPE ?".into()];
+    assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
+}
+
+#[test]
+fn test_match_against_search_value_is_normalized() {
+    // MySQL `MATCH(col) AGAINST ('…')`: the search string is a bare `Value`
+    // on the `MatchAgainst` node.
+    let sql = "SELECT MATCH(title, body) AGAINST ('foo') FROM t";
+    let expected = vec!["SELECT MATCH (title, body) AGAINST (?) FROM t".into()];
+    assert_normalize(
+        sql,
+        expected,
+        vec![Box::new(sql_insight::sqlparser::dialect::MySqlDialect {})],
+        NormalizerOptions::new(),
     );
 }

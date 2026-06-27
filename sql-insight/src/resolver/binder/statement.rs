@@ -6,7 +6,7 @@
 use super::*;
 
 impl<'a> Binder<'a> {
-    pub(super) fn bind_statement(&self, statement: &Statement) -> LogicalPlan {
+    pub(super) fn bind_statement(&mut self, statement: &Statement) -> LogicalPlan {
         match statement {
             Statement::Query(query) => self.bind_query_into(query),
             Statement::Insert(insert) => self.bind_insert(insert),
@@ -36,17 +36,20 @@ impl<'a> Binder<'a> {
                     columns: Vec::new(),
                     input: Box::new(LogicalPlan::Empty),
                     schema_source: None,
+                    source_wildcard: false,
                 }),
                 None => LogicalPlan::Empty,
             },
-            Statement::Truncate(truncate) => LogicalPlan::Drop(Drop {
-                targets: truncate
+            Statement::Truncate(truncate) => {
+                let written: Vec<_> = truncate
                     .table_names
                     .iter()
                     .filter_map(|t| self.table_ref(&t.name))
-                    .map(|written| self.table_match(&written).table)
-                    .collect(),
-            }),
+                    .collect();
+                LogicalPlan::Drop(Drop {
+                    targets: written.iter().map(|w| self.table_match(w).table).collect(),
+                })
+            }
             _ => LogicalPlan::Empty,
         }
     }
@@ -57,7 +60,7 @@ impl<'a> Binder<'a> {
     /// table — `INTO` nested in a subquery / CTE body isn't valid SQL there, so
     /// it's ignored rather than leaking a mid-tree `CreateTableAs` that the
     /// write walkers (which peel only a leading `WITH`) would miss.
-    fn bind_query_into(&self, query: &Query) -> LogicalPlan {
+    fn bind_query_into(&mut self, query: &Query) -> LogicalPlan {
         let plan = self.bind_query(query).0;
         let Some(name) = leading_select_into(&query.body) else {
             return plan;
@@ -65,11 +68,19 @@ impl<'a> Binder<'a> {
         let Some(written) = self.table_ref(name) else {
             return plan;
         };
+        let target = self.table_match(&written).table;
+        // `SELECT … INTO` lowers to a CTAS with no explicit column list, so an
+        // unaliased source expression (`SELECT a + 1 INTO t`) is an unnameable
+        // column dropped from `writes` / `lineage` — flag it, like the
+        // `CREATE TABLE … AS` path. (No explicit list, so no arity check.)
+        let source_wildcard = source_has_wildcard(query);
+        self.diagnose_created_columns(&target, &[], &plan, source_wildcard);
         LogicalPlan::CreateTableAs(CreateTableAs {
-            target: self.table_match(&written).table,
+            target,
             columns: Vec::new(),
             input: Box::new(plan),
             schema_source: None,
+            source_wildcard,
         })
     }
 
@@ -82,7 +93,17 @@ impl<'a> Binder<'a> {
     /// [`LogicalPlan::Values`] (the rows are reads, but synthesise no traceable
     /// output, so there is no column lineage). RETURNING / ON CONFLICT / the
     /// MySQL `SET` form are later bricks.
-    pub(super) fn bind_insert(&self, insert: &SqlInsert) -> LogicalPlan {
+    ///
+    /// The Hive `PARTITION (…)` spec (`insert.partitioned`) is intentionally
+    /// not extracted: a partition clause is write-side metadata whose value is
+    /// normally a constant (`PARTITION (dt = '2020-01-01')`) or a dynamic
+    /// column name (`PARTITION (dt)`), contributing no read / lineage
+    /// dependency — and a partition value has no FROM scope to resolve a column
+    /// reference against, so binding it would surface a bogus target-column
+    /// read and an unresolved ref rather than a real edge. A non-trivial value
+    /// expression is dropped (not flagged: it isn't an analyzable-info loss the
+    /// common, constant case would false-alarm on).
+    pub(super) fn bind_insert(&mut self, insert: &SqlInsert) -> LogicalPlan {
         let name = match &insert.table {
             TableObject::TableName(name) => name,
             TableObject::TableFunction(function) => &function.name,
@@ -102,32 +123,51 @@ impl<'a> Binder<'a> {
             Some(source) => self.bind_query(source),
             None => (LogicalPlan::Empty, Scope::default()),
         };
-        // A column-less INSERT fills from the target's catalog columns — reuse
-        // the list from the `table_match` above rather than re-matching via
-        // `catalog_columns`. They are quote-wrapped for folded resolution; the
-        // written column list takes the plain identifier.
-        let columns = if insert.columns.is_empty() {
+        // A wildcard in the source projection (`SELECT *, y`) leaves the column
+        // count / positions indeterminate (wildcards aren't expanded), so
+        // neither the arity check nor positional relation-lineage can trust the
+        // visible outputs. Carried on `source_wildcard`; the arity check and the
+        // lineage walker both skip when set, it words the diagnostic below, and
+        // a column-list-less INSERT can't fill from the catalog under it (next).
+        let source_wildcard = insert
+            .source
+            .as_ref()
+            .is_some_and(|q| source_has_wildcard(q));
+        // The written column list: an explicit `(a, b)` wins; otherwise a
+        // column-less INSERT fills from the target's catalog columns (reusing
+        // the `table_match` list above, plain identifiers), truncated to the
+        // source's projected arity. But a wildcard source has indeterminate
+        // arity — the `*` isn't in `query_outputs`, so the visible count is too
+        // low — and the catalog columns can't be positionally paired: leave the
+        // list empty so the drop + flag guard below fires rather than
+        // mis-truncating to the undercounted outputs.
+        let columns = if !insert.columns.is_empty() {
+            insert.columns.clone()
+        } else if source_wildcard {
+            Vec::new()
+        } else {
             m.columns
                 .iter()
                 .take(scope.query_outputs.len())
                 .map(|c| Ident::new(&c.value))
                 .collect()
-        } else {
-            insert.columns.clone()
         };
-        // A column-list-less INSERT whose target columns can't be filled (no
-        // catalog) drops its column writes / lineage — flag it so the empty
-        // surfaces read as "couldn't analyze", not "nothing written".
+        // A column-list-less INSERT whose target columns can't be determined
+        // drops its column writes / lineage — flag it so the empty surfaces
+        // read as "couldn't analyze", not "nothing written". The cause is the
+        // wildcard when present (a catalog wouldn't help), else a missing
+        // catalog.
         if columns.is_empty() && insert.source.is_some() {
-            self.record_insert_columns_unresolved(&target);
+            self.record_insert_columns_unresolved(&target, source_wildcard);
         }
         // An *explicit* target column list whose count differs from the source
         // query's projected columns: relation lineage zips to the shorter side,
         // silently dropping the surplus. Flag it. (Only when the source exposes
         // a determinate projection — a `VALUES` / pure-wildcard source yields no
-        // operands here and is covered elsewhere.)
-        if !insert.columns.is_empty() {
-            if let Some((outputs, _)) = output_operands(&input).first() {
+        // operands here, and a wildcard-bearing source is indeterminate.)
+        if !insert.columns.is_empty() && !source_wildcard {
+            if let Some(operand) = output_operands(&input).first() {
+                let outputs = operand.outputs;
                 if !outputs.is_empty() && outputs.len() != columns.len() {
                     self.record_insert_columns_arity_mismatch(
                         &target,
@@ -154,6 +194,7 @@ impl<'a> Binder<'a> {
             returning,
             on_conflict,
             conflict_predicate,
+            source_wildcard,
         })
     }
 
@@ -162,7 +203,7 @@ impl<'a> Binder<'a> {
     /// (resolved against the target's own columns), placed in a `Projection` so the
     /// `value → target.col` lineage reuses the relation-lineage machinery.
     pub(super) fn bind_insert_set(
-        &self,
+        &mut self,
         insert: &SqlInsert,
         target: TableReference,
     ) -> LogicalPlan {
@@ -193,6 +234,8 @@ impl<'a> Binder<'a> {
             returning,
             on_conflict,
             conflict_predicate,
+            // The MySQL SET form has no source query, so no wildcard.
+            source_wildcard: false,
         })
     }
 
@@ -204,7 +247,7 @@ impl<'a> Binder<'a> {
     /// self-references the target). Returns the conflict assignments (extra
     /// writes + lineage) and the optional `DO UPDATE … WHERE` (filter reads).
     pub(super) fn bind_conflict(
-        &self,
+        &mut self,
         on: &OnInsert,
         target: &TableReference,
         columns: &[Ident],
@@ -257,14 +300,19 @@ impl<'a> Binder<'a> {
     /// WHERE predicate as a `Filter`. The SET assignments are the value path
     /// (each `RHS → target.col` for lineage / writes). RETURNING / the MySQL
     /// multi-table form's exotic shapes are later bricks.
-    pub(super) fn bind_update(&self, update: &SqlUpdate) -> LogicalPlan {
-        let Some((target_relation, target)) = self.target_relation(&update.table.relation) else {
+    pub(super) fn bind_update(&mut self, update: &SqlUpdate) -> LogicalPlan {
+        // Flatten a parenthesized join target `UPDATE (t1 JOIN t2 …) SET …`:
+        // the innermost table is the write target, the joins are read relations
+        // — so the parenthesized form behaves like the non-paren MySQL
+        // `UPDATE t1 JOIN t2 …` form (whose joins live on `update.table.joins`).
+        let (target_factor, joins) = flatten_dml_target(&update.table);
+        let Some((target_relation, target)) = self.target_relation(target_factor) else {
             return LogicalPlan::Empty;
         };
         let mut scope = Scope::single(target_relation);
         let mut input = LogicalPlan::Empty;
         // Joins on the UPDATE target clause are read relations.
-        for j in &update.table.joins {
+        for j in joins {
             let (node, jscope) = self.bind_table_factor(&j.relation, &scope.relations);
             scope.relations.extend(jscope.relations);
             let on = join_on(&j.join_operator)
@@ -324,7 +372,7 @@ impl<'a> Binder<'a> {
     ///   `DELETE t1, t2 FROM src`       → FROM are reads, the list are targets
     /// A target is in scope for the predicate but never scanned (so it isn't a
     /// read). There are no column writes / lineage — rows go wholesale.
-    pub(super) fn bind_delete(&self, delete: &SqlDelete) -> LogicalPlan {
+    pub(super) fn bind_delete(&mut self, delete: &SqlDelete) -> LogicalPlan {
         let from_tables = match &delete.from {
             FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
         };
@@ -392,8 +440,20 @@ impl<'a> Binder<'a> {
     /// a `MergeClause`: an UPDATE SET's `RHS → target.col` and an INSERT's
     /// `value → target.col` drive writes / lineage. A column-less INSERT fills
     /// from the catalog (empty without one — the values are then reads only).
-    pub(super) fn bind_merge(&self, merge: &SqlMerge) -> LogicalPlan {
+    pub(super) fn bind_merge(&mut self, merge: &SqlMerge) -> LogicalPlan {
+        // A parenthesized *join* target `MERGE INTO (t1 JOIN t2) …` can't be a
+        // write target (you merge into one table) — flag it rather than
+        // silently picking the first relation. A parenthesized *single* table
+        // `(t1)` is fine and resolves below.
+        if is_join_factor(&merge.table) {
+            self.record_unsupported_merge_target(&merge.table);
+            return LogicalPlan::Empty;
+        }
         let Some((target_relation, target)) = self.target_relation(&merge.table) else {
+            // A non-table MERGE target (derived table / subquery / table
+            // function) can't be a write target — flag it rather than dropping
+            // the whole statement silently (best-effort drop + flag).
+            self.record_unsupported_merge_target(&merge.table);
             return LogicalPlan::Empty;
         };
         let mut scope = Scope::single(target_relation);
@@ -411,33 +471,50 @@ impl<'a> Binder<'a> {
                     if let Some(predicate) = &insert.insert_predicate {
                         on.push(self.bind_expr(predicate, &scope));
                     }
-                    if let MergeInsertKind::Values(values) = &insert.kind {
-                        let explicit: Vec<Ident> = insert
-                            .columns
-                            .iter()
-                            .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
-                            .collect();
-                        let columns = if explicit.is_empty() {
-                            self.catalog_columns(&target)
-                        } else {
-                            explicit
-                        };
-                        // A MERGE INSERT is a single VALUES row.
-                        let row: Vec<Expr> = values
-                            .rows
-                            .iter()
-                            .flatten()
-                            .map(|e| self.bind_expr(e, &scope))
-                            .collect();
-                        // Column-list-less and no catalog to fill the target
-                        // columns: the values can't be paired (see `bind_insert`).
-                        if columns.is_empty() && !row.is_empty() {
-                            self.record_insert_columns_unresolved(&target);
+                    match &insert.kind {
+                        MergeInsertKind::Values(values) => {
+                            let explicit: Vec<Ident> = insert
+                                .columns
+                                .iter()
+                                .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
+                                .collect();
+                            let columns = if explicit.is_empty() {
+                                self.catalog_columns(&target)
+                            } else {
+                                explicit
+                            };
+                            // A MERGE INSERT is a single VALUES row.
+                            let row: Vec<Expr> = values
+                                .rows
+                                .iter()
+                                .flatten()
+                                .map(|e| self.bind_expr(e, &scope))
+                                .collect();
+                            // Column-list-less and no catalog to fill the target
+                            // columns: the values can't be paired (see `bind_insert`).
+                            // A MERGE INSERT VALUES has no wildcard, so the cause
+                            // is always the missing catalog.
+                            if columns.is_empty() && !row.is_empty() {
+                                self.record_insert_columns_unresolved(&target, false);
+                            }
+                            clauses.push(MergeClause::Insert {
+                                columns,
+                                values: row,
+                            });
                         }
-                        clauses.push(MergeClause::Insert {
-                            columns,
-                            values: row,
-                        });
+                        // BigQuery `INSERT ROW`: insert the full source row, with
+                        // no explicit column / value lists. The column pairing
+                        // isn't recoverable from SQL text, so push a column-less
+                        // Insert — the target still surfaces (CRUD create +
+                        // `table_lineage` source → target) while the column-level
+                        // writes / lineage are a flagged coverage gap.
+                        MergeInsertKind::Row => {
+                            self.record_merge_insert_row_unresolved(&target);
+                            clauses.push(MergeClause::Insert {
+                                columns: Vec::new(),
+                                values: Vec::new(),
+                            });
+                        }
                     }
                 }
                 MergeAction::Update(update) => {
@@ -479,7 +556,7 @@ impl<'a> Binder<'a> {
     /// resolving SET / WHERE against the target's columns) and its canonical
     /// write-target identity. Returns `None` for a non-table factor.
     pub(super) fn target_relation(
-        &self,
+        &mut self,
         factor: &TableFactor,
     ) -> Option<(Relation, TableReference)> {
         // Reuse the table-factor binder for catalog matching / column
@@ -511,7 +588,7 @@ impl<'a> Binder<'a> {
     /// in-scope relation), so consult the scope first; otherwise canonicalise
     /// it as written.
     pub(super) fn resolve_delete_target(
-        &self,
+        &mut self,
         name: &ObjectName,
         scope: &Scope,
     ) -> Option<TableReference> {
@@ -586,7 +663,7 @@ impl<'a> Binder<'a> {
     /// contributes target reads and a `QueryOutput` lineage edge. A wildcard is
     /// suppressed (its diagnostic is a later brick).
     pub(super) fn bind_returning(
-        &self,
+        &mut self,
         returning: &Option<Vec<SelectItem>>,
         scope: &Scope,
     ) -> Vec<NamedExpr> {
@@ -606,7 +683,7 @@ impl<'a> Binder<'a> {
     /// outputs. A plain `CREATE TABLE t (cols)` (no query) is a target-only
     /// create — its column definitions aren't writes — so it binds with no
     /// columns / input.
-    pub(super) fn bind_create_table(&self, create: &CreateTable) -> LogicalPlan {
+    pub(super) fn bind_create_table(&mut self, create: &CreateTable) -> LogicalPlan {
         let Some(written) = self.table_ref(&create.name) else {
             return LogicalPlan::Empty;
         };
@@ -632,34 +709,39 @@ impl<'a> Binder<'a> {
                 columns: Vec::new(),
                 input: Box::new(LogicalPlan::Empty),
                 schema_source,
+                source_wildcard: false,
             });
         };
         let (input, _) = self.bind_query(query);
         let columns: Vec<Ident> = create.columns.iter().map(|c| c.name.clone()).collect();
-        self.flag_anonymous_relation_columns(&target, &columns, &input);
+        let source_wildcard = source_has_wildcard(query);
+        self.diagnose_created_columns(&target, &columns, &input, source_wildcard);
         LogicalPlan::CreateTableAs(CreateTableAs {
             target,
             columns,
             input: Box::new(input),
             schema_source: None,
+            source_wildcard,
         })
     }
 
     /// `CREATE VIEW v AS <query>`: like CTAS — `columns` is the explicit column
     /// list only (empty when none); the implicit source-output names are
     /// resolved at the write / lineage surface.
-    pub(super) fn bind_create_view(&self, create: &SqlCreateView) -> LogicalPlan {
+    pub(super) fn bind_create_view(&mut self, create: &SqlCreateView) -> LogicalPlan {
         let Some(written) = self.table_ref(&create.name) else {
             return LogicalPlan::Empty;
         };
         let target = self.table_match(&written).table;
         let (input, _) = self.bind_query(&create.query);
         let columns: Vec<Ident> = create.columns.iter().map(|c| c.name.clone()).collect();
-        self.flag_anonymous_relation_columns(&target, &columns, &input);
+        let source_wildcard = source_has_wildcard(&create.query);
+        self.diagnose_created_columns(&target, &columns, &input, source_wildcard);
         LogicalPlan::CreateView(CreateView {
             target,
             columns,
             input: Box::new(input),
+            source_wildcard,
         })
     }
 
@@ -667,7 +749,7 @@ impl<'a> Binder<'a> {
     /// [`bind_create_view`](Self::bind_create_view) (`columns` = the explicit
     /// list only).
     pub(super) fn bind_alter_view(
-        &self,
+        &mut self,
         name: &ObjectName,
         columns: &[Ident],
         query: &Query,
@@ -677,11 +759,13 @@ impl<'a> Binder<'a> {
         };
         let target = self.table_match(&written).table;
         let (input, _) = self.bind_query(query);
-        self.flag_anonymous_relation_columns(&target, columns, &input);
+        let source_wildcard = source_has_wildcard(query);
+        self.diagnose_created_columns(&target, columns, &input, source_wildcard);
         LogicalPlan::CreateView(CreateView {
             target,
             columns: columns.to_vec(),
             input: Box::new(input),
+            source_wildcard,
         })
     }
 
@@ -689,7 +773,7 @@ impl<'a> Binder<'a> {
     /// column-naming operation contributes its column(s) as writes (RENAME /
     /// CHANGE surface both names). Schema-level ops name no columns. No reads
     /// or lineage — ALTER restructures, it doesn't move row data.
-    pub(super) fn bind_alter_table(&self, alter: &SqlAlterTable) -> LogicalPlan {
+    pub(super) fn bind_alter_table(&mut self, alter: &SqlAlterTable) -> LogicalPlan {
         let Some(written) = self.table_ref(&alter.name) else {
             return LogicalPlan::Empty;
         };
@@ -706,7 +790,7 @@ impl<'a> Binder<'a> {
     /// write targets. Other object types (index / schema / …) name no
     /// relations — unbound (`LogicalPlan::Empty`).
     pub(super) fn bind_drop(
-        &self,
+        &mut self,
         object_type: &ObjectType,
         names: &[ObjectName],
         table: Option<&ObjectName>,
@@ -717,14 +801,73 @@ impl<'a> Binder<'a> {
         ) {
             return LogicalPlan::Empty;
         }
-        let targets = names
+        let written: Vec<_> = names
             .iter()
             .chain(table)
             .filter_map(|name| self.table_ref(name))
-            .map(|written| self.table_match(&written).table)
             .collect();
+        let targets = written.iter().map(|w| self.table_match(w).table).collect();
         LogicalPlan::Drop(Drop { targets })
     }
+}
+
+/// Flatten a DML target's `TableWithJoins` through any parenthesised
+/// (`NestedJoin`) wrapper: the innermost table factor is the write target, and
+/// every join (inner-parens joins first, then the outer joins) is a read
+/// relation — so a parenthesised `(t1 JOIN t2 …)` target behaves like the
+/// non-paren `t1 JOIN t2 …` form.
+fn flatten_dml_target(twj: &TableWithJoins) -> (&TableFactor, Vec<&sqlparser::ast::Join>) {
+    let mut relation = &twj.relation;
+    let mut joins: Vec<&sqlparser::ast::Join> = twj.joins.iter().collect();
+    while let TableFactor::NestedJoin {
+        table_with_joins, ..
+    } = relation
+    {
+        joins = table_with_joins.joins.iter().chain(joins).collect();
+        relation = &table_with_joins.relation;
+    }
+    (relation, joins)
+}
+
+/// Whether a table factor is a parenthesised *join* (two or more relations) —
+/// a `(t1 JOIN t2)`, not a parenthesised single table `(t1)`. Used to reject a
+/// join as a MERGE target.
+fn is_join_factor(factor: &TableFactor) -> bool {
+    match factor {
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => !table_with_joins.joins.is_empty() || is_join_factor(&table_with_joins.relation),
+        _ => false,
+    }
+}
+
+/// Whether a query's output projection contains an (unexpanded) wildcard
+/// (`*` / `t.*`), anywhere a set operation's branches or a parenthesised
+/// subquery reach. An INSERT source with one has an indeterminate column count
+/// / positions, so positional pairing with the target columns can't be trusted
+/// (see [`Insert::source_wildcard`](super::super::logical_plan::Insert)). The
+/// `SetExpr` / `SelectItem` matches are exhaustive so a new variant forces a
+/// decision here.
+fn source_has_wildcard(query: &Query) -> bool {
+    fn body_has_wildcard(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Select(select) => select.projection.iter().any(|item| match item {
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => true,
+                SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => false,
+            }),
+            SetExpr::Query(q) => body_has_wildcard(&q.body),
+            SetExpr::SetOperation { left, right, .. } => {
+                body_has_wildcard(left) || body_has_wildcard(right)
+            }
+            SetExpr::Values(_)
+            | SetExpr::Insert(_)
+            | SetExpr::Update(_)
+            | SetExpr::Delete(_)
+            | SetExpr::Merge(_)
+            | SetExpr::Table(_) => false,
+        }
+    }
+    body_has_wildcard(&query.body)
 }
 
 /// The target table of a query's leading `SELECT … INTO t`, if any. `INTO`

@@ -12,9 +12,10 @@
 //!   side.
 //!
 //! Enclosing scopes (correlation) and the CTE registry are *not* here — they
-//! live on the [`Binder`](super::Binder) (`outer` / `ctes`) and are extended by
-//! spawning child binders, because an inner subquery reaches enclosing
-//! *relations* (and CTE declarations), not their outputs or merge columns.
+//! live on the [`Binder`](super::Binder)'s downward `Context` (`outer` /
+//! `ctes`), swapped per scope by `in_scope`, because an inner subquery reaches
+//! enclosing *relations* (and CTE declarations), not their outputs or merge
+//! columns.
 
 use sqlparser::ast::{Ident, TableAlias};
 

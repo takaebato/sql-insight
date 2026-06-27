@@ -97,7 +97,9 @@ pub(super) fn column_read(c: &BoundColumn) -> Option<ColumnRead> {
         Binding::Base { table, resolution } => (Some(table.clone()), *resolution),
         Binding::Unresolved => (None, ResolutionKind::Unresolved),
         Binding::Ambiguous => (None, ResolutionKind::Ambiguous),
-        Binding::Derived => return None,
+        // A `Derived` ref's read was counted at the inner producer; a `Local`
+        // (lambda parameter) is not a column at all — neither is a read.
+        Binding::Derived | Binding::Local => return None,
     };
     Some(ColumnRead {
         reference: ColumnReference {

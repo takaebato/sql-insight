@@ -163,7 +163,8 @@ fn created_relation_writes(
         return qualify(explicit, target);
     }
     match output_operands(input).first() {
-        Some((outputs, _)) => outputs
+        Some(operand) => operand
+            .outputs
             .iter()
             .filter_map(|ne| ne.name.clone())
             .map(|name| ColumnReference {
@@ -191,11 +192,66 @@ pub(super) fn collect_flat_tables(plan: &LogicalPlan) -> Vec<TableReference> {
 /// bodies, so a DML's target is pushed once at the root and the input's scans
 /// follow naturally. `DELETE` is the one shape this can't model — its target
 /// often coincides with a FROM scan already collected, so handled separately.
+/// The relations directly in a DELETE input's FROM / USING clause — the
+/// structural scans, *not* those nested in a WHERE-predicate subquery. Used to
+/// dedup a DELETE target that coincides with a FROM relation (`DELETE t1 FROM
+/// t1 …`) without folding away a same-named table that only appears in a
+/// predicate subquery (a distinct occurrence). Stops at expression operands, so
+/// a predicate / projection subquery is not descended; a `CteRef` names a CTE
+/// (not a base relation) and is skipped.
+fn direct_from_scans(op: &LogicalPlan, out: &mut Vec<TableReference>) {
+    match op {
+        LogicalPlan::Scan(s) => out.push(s.table.clone()),
+        LogicalPlan::Filter(f) => direct_from_scans(&f.input, out),
+        LogicalPlan::Aggregate(a) => direct_from_scans(&a.input, out),
+        LogicalPlan::Sort(s) => direct_from_scans(&s.input, out),
+        LogicalPlan::SubqueryAlias(sa) => direct_from_scans(&sa.input, out),
+        LogicalPlan::TableFunction(tf) => direct_from_scans(&tf.input, out),
+        LogicalPlan::With(w) => direct_from_scans(&w.body, out),
+        LogicalPlan::Join(j) => {
+            direct_from_scans(&j.left, out);
+            direct_from_scans(&j.right, out);
+        }
+        LogicalPlan::SetOp(so) => {
+            direct_from_scans(&so.left, out);
+            direct_from_scans(&so.right, out);
+        }
+        // Not a structural FROM relation: a `CteRef` (a CTE name), `Values`,
+        // `Empty`, a `Projection` (its value subqueries are not direct FROM),
+        // and DML / DDL roots. Listed explicitly so a new relational operator
+        // forces a decision here.
+        LogicalPlan::Projection(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::Insert(_)
+        | LogicalPlan::Update(_)
+        | LogicalPlan::Delete(_)
+        | LogicalPlan::Merge(_)
+        | LogicalPlan::CreateTableAs(_)
+        | LogicalPlan::CreateView(_)
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => {}
+    }
+}
+
 fn collect_flat_into(plan: &LogicalPlan, out: &mut Vec<TableReference>) {
-    if let LogicalPlan::Delete(d) = plan {
-        let before = out.len();
+    // A CTE-prefixed DELETE binds as `With { body: Delete }`, so peel the
+    // leading WITH(s) to reach it (mirroring the sibling write walkers'
+    // `peel_with`) — walking their CTE bodies into the flat list first. The
+    // target is deduped against the DELETE's *direct* FROM / USING relations
+    // only (where it may recur as a scan, `DELETE t1 FROM t1 …`); a same-named
+    // table that only appears in a WHERE-predicate subquery or a CTE body is a
+    // distinct binding and stays listed separately.
+    if let LogicalPlan::Delete(d) = peel_with(plan) {
+        let mut node = plan;
+        while let LogicalPlan::With(w) = node {
+            w.ctes.iter().for_each(|c| collect_flat_into(&c.body, out));
+            node = &w.body;
+        }
         collect_flat_into(&d.input, out);
-        let from: Vec<TableReference> = out[before..].to_vec();
+        let mut from = Vec::new();
+        direct_from_scans(&d.input, &mut from);
         for target in &d.targets {
             if !from.contains(target) {
                 out.push(target.clone());
@@ -220,7 +276,8 @@ fn collect_flat_into(plan: &LogicalPlan, out: &mut Vec<TableReference>) {
         LogicalPlan::AlterTable(a) => out.push(a.target.clone()),
         // Operators that name no table of their own: pure relational shape,
         // CTE plumbing, synthetic leaves, and `Delete` (its targets are
-        // collected by the early-return above, before this walk). Listed
+        // collected by the peel-aware early-return above, before this walk).
+        // Listed
         // explicitly — like the sibling write walkers — so a new
         // table-naming `LogicalPlan` variant is a compile error here, not a
         // silent omission from the flat list.

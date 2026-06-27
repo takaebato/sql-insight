@@ -284,6 +284,23 @@ mod delete_statement {
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
     }
+
+    #[test]
+    fn test_parenthesized_delete_keeps_the_delete_verb() {
+        // A parenthesised DML `(DELETE …)` parses as a Query wrapping the DML;
+        // it must keep its verb so the target buckets as Delete, not misclassify
+        // as a read-only Select (which dropped the verb and the table-lineage).
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        let sql = "(DELETE FROM t WHERE id = 1)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![table("t")],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
+    }
 }
 
 mod insert_statement {
@@ -313,6 +330,67 @@ mod insert_statement {
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_parenthesized_insert_keeps_the_insert_verb() {
+        // `(INSERT … SELECT …)` keeps its verb → target buckets as Create,
+        // source as Read (the misclassification dropped both into a Select).
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        let sql = "(INSERT INTO t (a) SELECT b FROM src)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![table("t")],
+            read_tables: vec![table("src")],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
+    }
+
+    #[test]
+    fn test_upsert_do_update_buckets_target_as_create_and_update() {
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        // `ON CONFLICT DO UPDATE` is an upsert: it both inserts and updates the
+        // target, so `t1` lands in both the create and update buckets.
+        let sql = "INSERT INTO t1 (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 2";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![table("t1")],
+            read_tables: vec![],
+            update_tables: vec![table("t1")],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
+    }
+
+    #[test]
+    fn test_upsert_do_nothing_is_create_only() {
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        // `ON CONFLICT DO NOTHING` performs no update — create-only.
+        let sql = "INSERT INTO t1 (a) VALUES (1) ON CONFLICT (a) DO NOTHING";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![table("t1")],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
+    }
+
+    #[test]
+    fn test_mysql_on_duplicate_key_update_is_upsert() {
+        // MySQL `ON DUPLICATE KEY UPDATE` is the same upsert shape: create + update.
+        let sql = "INSERT INTO t1 (a) VALUES (1) ON DUPLICATE KEY UPDATE b = 2";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![table("t1")],
+            read_tables: vec![],
+            update_tables: vec![table("t1")],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(MySqlDialect {})]);
     }
 }
 
@@ -351,6 +429,21 @@ mod update_statement {
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
     }
+
+    #[test]
+    fn test_parenthesized_update_keeps_the_update_verb() {
+        // `(UPDATE …)` keeps its verb → the target buckets as Update.
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        let sql = "(UPDATE t SET a = 1)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![],
+            update_tables: vec![table("t")],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
+    }
 }
 
 mod merge {
@@ -372,6 +465,27 @@ mod merge {
                 create_tables: vec![],
                 read_tables: vec![table("src")],
                 update_tables: vec![table("tgt")],
+                delete_tables: vec![],
+                diagnostics: vec![],
+            })]
+        );
+    }
+
+    #[test]
+    fn test_merge_insert_row_buckets_target_as_create() {
+        // BigQuery `WHEN NOT MATCHED THEN INSERT ROW`: the target is an insert
+        // target (Create), the source a Read. Regression — the unhandled ROW
+        // kind left `has_insert` false, so the target fell out of every bucket.
+        // The column-level coverage gap is flagged on the column surface only,
+        // so no table-level diagnostic surfaces here.
+        let sql = "MERGE INTO tgt USING src ON tgt.id = src.id WHEN NOT MATCHED THEN INSERT ROW";
+        let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
+        assert_eq!(
+            result,
+            vec![Ok(CrudTables {
+                create_tables: vec![table("tgt")],
+                read_tables: vec![table("src")],
+                update_tables: vec![],
                 delete_tables: vec![],
                 diagnostics: vec![],
             })]
@@ -516,9 +630,10 @@ mod ddl {
 
     #[test]
     fn test_select_into_buckets_target_as_create_source_as_read() {
-        // `SELECT … INTO new_t` has `StatementKind::Select` but binds as a
-        // CTAS, so the created table is a Create (not a Read) and the source
-        // a Read — a plain `SELECT` writes nothing, keeping Create empty.
+        // `SELECT … INTO new_t` classifies as `StatementKind::CreateTable`
+        // (the binder lowers it to a CTAS), so the created table is a Create
+        // (not a Read) and the source a Read — a plain `SELECT` writes nothing,
+        // keeping Create empty.
         let sql = "SELECT a INTO new_t FROM src";
         let result = CrudTableExtractor::extract(&GenericDialect {}, sql).unwrap();
         assert_eq!(
