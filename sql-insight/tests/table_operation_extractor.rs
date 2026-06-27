@@ -283,6 +283,24 @@ mod set_operations {
             },
         );
     }
+
+    #[test]
+    fn insert_from_set_op_branch_cte_keeps_branch_lineage() {
+        // A CTE inside a parenthesised UNION branch: its base table (`s`) still
+        // feeds the target, agreeing with the column-level surface (the trace
+        // registers the branch's CTE rather than dropping it).
+        assert_ops(
+            "INSERT INTO dst (a) SELECT a FROM t1 \
+             UNION (WITH c AS (SELECT id FROM s) SELECT id FROM c)",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("t1"), read("s")],
+                writes: vec![table("dst")],
+                lineage: vec![edge("t1", "dst"), edge("s", "dst")],
+                diagnostics: vec![],
+            },
+        );
+    }
 }
 
 mod diagnostics {

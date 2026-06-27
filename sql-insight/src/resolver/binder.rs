@@ -297,10 +297,14 @@ impl<'a> Binder<'a> {
             return;
         }
         let operands = output_operands(input);
-        let Some((outputs, _)) = operands.first() else {
+        let Some(operand) = operands.first() else {
             return;
         };
-        let anonymous = outputs.iter().filter(|ne| ne.name.is_none()).count();
+        let anonymous = operand
+            .outputs
+            .iter()
+            .filter(|ne| ne.name.is_none())
+            .count();
         if anonymous == 0 {
             return;
         }
@@ -335,7 +339,8 @@ impl<'a> Binder<'a> {
         if source_wildcard {
             return;
         }
-        if let Some((outputs, _)) = output_operands(input).first() {
+        if let Some(operand) = output_operands(input).first() {
+            let outputs = operand.outputs;
             if !outputs.is_empty() && outputs.len() != explicit.len() {
                 self.record_created_columns_arity_mismatch(target, explicit.len(), outputs.len());
             }

@@ -26,6 +26,48 @@ mod set_operations {
     }
 
     #[test]
+    fn parenthesized_branch_cte_feeds_the_result_column() {
+        // A CTE declared inside a parenthesised set-op branch must be registered
+        // during the lineage trace (the "peel With, keep its CTEs" the
+        // scalar-subquery path also needs), so the branch's output flows to the
+        // result column — previously `s.id` was read but dropped from lineage.
+        assert_column_ops(
+            "SELECT a FROM t1 UNION (WITH c AS (SELECT id FROM s) SELECT id FROM c)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a"), read("s", "id")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t1", "a"), out("a", 0)),
+                    passthrough(col("s", "id"), out("a", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_from_set_op_branch_cte_agrees_across_surfaces() {
+        // The same branch-CTE through an INSERT: the column lineage must keep
+        // `s.id → dst.a` (it used to drop it), agreeing with the table lineage
+        // (`s → dst`) and reads — the three surfaces no longer disagree.
+        assert_column_ops(
+            "INSERT INTO dst (a) SELECT a FROM t1 \
+             UNION (WITH c AS (SELECT id FROM s) SELECT id FROM c)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("t1", "a"), read("s", "id")],
+                writes: vec![write("dst", "a")],
+                lineage: vec![
+                    passthrough(col("t1", "a"), relation("dst", "a")),
+                    passthrough(col("s", "id"), relation("dst", "a")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn union_all_behaves_same_as_union() {
         // UNION ALL only differs from UNION at runtime (dedup vs
         // not); structurally the resolver should treat them identically.

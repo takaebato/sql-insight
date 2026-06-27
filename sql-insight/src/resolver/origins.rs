@@ -70,6 +70,21 @@ impl<'a> TraceContext<'a> {
         r
     }
 
+    /// Like [`with_decls`](Self::with_decls) but for already-borrowed CTE
+    /// declarations — an [`Operand`]'s accumulated in-scope CTEs (the `With`s
+    /// peeled above it). Pushed for the duration of `f`, popped after.
+    pub(super) fn with_cte_refs<R>(
+        &mut self,
+        ctes: &[&'a Cte],
+        f: impl FnOnce(&mut TraceContext<'a>) -> R,
+    ) -> R {
+        let added = ctes.len();
+        self.ctes.extend_from_slice(ctes);
+        let r = f(self);
+        self.ctes.truncate(self.ctes.len() - added);
+        r
+    }
+
     /// Resolve a `CteRef` by name and run `f` on its body with the name marked
     /// active (popped after), so a recursive self-reference terminates. Returns
     /// `None` — and never calls `f` — for an unknown name or an already-active
@@ -257,17 +272,14 @@ fn origins_into<'a>(
         // set-ops so an N-way `A UNION B UNION C` traces all branches at once.
         LogicalPlan::SetOp(_) => {
             let operands = output_operands(op);
-            let Some(i) = operands.first().and_then(|&(outs, _)| {
-                outs.iter()
+            let Some(i) = operands.first().and_then(|o| {
+                o.outputs
+                    .iter()
                     .position(|ne| ne.name.as_ref().is_some_and(|n| context.eq_column(n, name)))
             }) else {
                 return Vec::new();
             };
-            operands
-                .iter()
-                .filter_map(|&(outs, input)| outs.get(i).map(|ne| (ne, input)))
-                .flat_map(|(ne, input)| origins_of_expr(&ne.expr, input, context))
-                .collect()
+            trace_nth_output(&operands, i, context)
         }
         LogicalPlan::With(w) => context.with_decls(&w.ctes, |context| {
             origins_into(&w.body, qualifier, name, context)
@@ -329,19 +341,30 @@ fn scalar_subquery_origins<'a>(
     op: &'a LogicalPlan,
     context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
-    // A leading `WITH` on the subquery must register its CTE declarations so a
-    // `CteRef` in the body resolves during the trace: `output_operands` peels
-    // the `With` for shape but doesn't push its CTEs (and `TraceContext::new` only
-    // registers the statement's *top-level* leading WITH, not a nested
-    // subquery's own). `with_decls` balances the push/pop.
-    if let LogicalPlan::With(w) = op {
-        return context.with_decls(&w.ctes, |context| scalar_subquery_origins(&w.body, context));
+    // Position 0 of every branch. `output_operands` accumulates each peeled
+    // `With`'s CTE declarations onto the operand and `trace_nth_output`
+    // registers them — so a `CteRef` in the body (including the subquery's *own*
+    // leading `WITH`, which `TraceContext::new` doesn't see) resolves.
+    trace_nth_output(&output_operands(op), 0, context)
+}
+
+/// Trace the `i`-th output column of every operand — the positional fan-out
+/// shared by a set operation (its result column `i`), a scalar subquery
+/// (column 0), and an `EXCLUDED.col` conflict reference. Each operand's
+/// in-scope CTEs are registered for its trace ([`Operand::trace`]); a branch
+/// shorter than `i` contributes nothing.
+fn trace_nth_output<'a>(
+    operands: &[Operand<'a>],
+    i: usize,
+    context: &mut TraceContext<'a>,
+) -> Vec<(ColumnRead, ColumnLineageKind)> {
+    let mut out = Vec::new();
+    for operand in operands {
+        if let Some(ne) = operand.outputs.get(i) {
+            out.extend(operand.trace(context, |input, cx| origins_of_expr(&ne.expr, input, cx)));
+        }
     }
-    output_operands(op)
-        .iter()
-        .filter_map(|&(outputs, input)| outputs.first().map(|ne| (ne, input)))
-        .flat_map(|(ne, input)| origins_of_expr(&ne.expr, input, context))
-        .collect()
+    out
 }
 
 /// The origins of an ON CONFLICT DO UPDATE value. Like [`origins_of_expr`],
@@ -368,13 +391,7 @@ pub(super) fn conflict_value_origins<'a>(
             if operands.is_empty() {
                 return vec![(excluded_source(c), ColumnLineageKind::Passthrough)];
             }
-            let mut out = Vec::new();
-            for (outputs, input) in operands {
-                if let Some(ne) = outputs.get(i) {
-                    out.extend(origins_of_expr(&ne.expr, input, context));
-                }
-            }
-            out
+            trace_nth_output(&operands, i, context)
         }
         // A non-EXCLUDED ref (a target column, MySQL `VALUES(col)` inner, …)
         // and the structural variants trace like any value.
@@ -440,20 +457,62 @@ fn synthetic_source(table: &Ident, name: &Ident) -> ColumnRead {
     }
 }
 
-/// A query's output operands: one `(output columns, producing input)` per
-/// set-operation branch (a plain query has a single operand). Peels the clause
+/// One output operand of a query: the projected columns and the input that
+/// produces them, one per set-operation branch (a plain query has a single
+/// operand). The `input` and the CTEs in scope at this operand (the `With`s
+/// peeled above it) are private: a consumer that *traces* `input` reaches it
+/// only through [`trace`](Operand::trace), which registers those CTEs first — so
+/// a `CteRef` in the input resolves and no traversal can forget the
+/// registration (the recurring "peel `With` for shape, drop its CTEs" bug). A
+/// consumer that only needs the shape uses the public `outputs`.
+pub(super) struct Operand<'a> {
+    pub(super) outputs: &'a [NamedExpr],
+    input: &'a LogicalPlan,
+    ctes: Vec<&'a Cte>,
+}
+
+impl<'a> Operand<'a> {
+    /// Trace this operand's input with its in-scope CTEs registered in
+    /// `context` for the duration of `f`, unregistering after. The only path to
+    /// the input, so the CTE registration can't be skipped.
+    pub(super) fn trace<R>(
+        &self,
+        context: &mut TraceContext<'a>,
+        f: impl FnOnce(&'a LogicalPlan, &mut TraceContext<'a>) -> R,
+    ) -> R {
+        context.with_cte_refs(&self.ctes, |context| f(self.input, context))
+    }
+}
+
+/// A query's output operands (one per set-operation branch). Peels the clause
 /// layers above the projection (GROUP BY / HAVING `Filter`, ORDER BY `Sort`)
-/// and `With`.
-pub(super) fn output_operands(op: &LogicalPlan) -> Vec<(&[NamedExpr], &LogicalPlan)> {
+/// and `With` — accumulating each peeled `With`'s CTEs into the operand so a
+/// later [`Operand::trace`] can register them.
+pub(super) fn output_operands(op: &LogicalPlan) -> Vec<Operand<'_>> {
+    let mut out = Vec::new();
+    collect_operands(op, &[], &mut out);
+    out
+}
+
+/// Recursive worker for [`output_operands`]: collect each branch's operand,
+/// carrying `ctes` — the CTEs from the `With`s peeled on the way down — into it.
+fn collect_operands<'a>(op: &'a LogicalPlan, ctes: &[&'a Cte], out: &mut Vec<Operand<'a>>) {
     match op {
-        LogicalPlan::Projection(p) => vec![(&p.exprs, &p.input)],
-        LogicalPlan::Sort(s) => output_operands(&s.input),
-        LogicalPlan::Filter(f) => output_operands(&f.input),
-        LogicalPlan::With(w) => output_operands(&w.body),
+        LogicalPlan::Projection(p) => out.push(Operand {
+            outputs: &p.exprs,
+            input: &p.input,
+            ctes: ctes.to_vec(),
+        }),
+        LogicalPlan::Sort(s) => collect_operands(&s.input, ctes, out),
+        LogicalPlan::Filter(f) => collect_operands(&f.input, ctes, out),
+        LogicalPlan::With(w) => {
+            let mut inner: Vec<&Cte> = ctes.to_vec();
+            inner.extend(w.ctes.iter());
+            collect_operands(&w.body, &inner, out);
+        }
         LogicalPlan::SetOp(so) => {
-            let mut operands = output_operands(&so.left);
-            operands.extend(output_operands(&so.right));
-            operands
+            collect_operands(&so.left, ctes, out);
+            collect_operands(&so.right, ctes, out);
         }
         // No projection at this level — a relation that doesn't carry a
         // SELECT list (a `Scan`, a join below a projection, a DML / DDL root,
@@ -474,7 +533,7 @@ pub(super) fn output_operands(op: &LogicalPlan) -> Vec<(&[NamedExpr], &LogicalPl
         | LogicalPlan::CreateTableAs(_)
         | LogicalPlan::CreateView(_)
         | LogicalPlan::AlterTable(_)
-        | LogicalPlan::Drop(_) => Vec::new(),
+        | LogicalPlan::Drop(_) => {}
     }
 }
 

@@ -166,7 +166,8 @@ impl<'a> Binder<'a> {
         // a determinate projection — a `VALUES` / pure-wildcard source yields no
         // operands here, and a wildcard-bearing source is indeterminate.)
         if !insert.columns.is_empty() && !source_wildcard {
-            if let Some((outputs, _)) = output_operands(&input).first() {
+            if let Some(operand) = output_operands(&input).first() {
+                let outputs = operand.outputs;
                 if !outputs.is_empty() && outputs.len() != columns.len() {
                     self.record_insert_columns_arity_mismatch(
                         &target,

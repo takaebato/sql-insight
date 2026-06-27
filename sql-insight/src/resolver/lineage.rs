@@ -179,17 +179,20 @@ fn query_output_lineage<'a>(
     // column). Position already restarts per branch, aligning them; a plain
     // query has a single operand, so this is a no-op there.
     let result_names: Vec<Option<Ident>> = match operands.first() {
-        Some((outputs, _)) => outputs.iter().map(|ne| ne.name.clone()).collect(),
+        Some(o) => o.outputs.iter().map(|ne| ne.name.clone()).collect(),
         None => Vec::new(),
     };
-    for (outputs, input) in operands {
-        for (position, ne) in outputs.iter().enumerate() {
-            let target = ColumnTarget::QueryOutput {
-                name: result_names.get(position).cloned().flatten(),
-                position,
-            };
-            emit_edges(origins_of_expr(&ne.expr, input, context), target, out);
-        }
+    for operand in &operands {
+        let outputs = operand.outputs;
+        operand.trace(context, |input, cx| {
+            for (position, ne) in outputs.iter().enumerate() {
+                let target = ColumnTarget::QueryOutput {
+                    name: result_names.get(position).cloned().flatten(),
+                    position,
+                };
+                emit_edges(origins_of_expr(&ne.expr, input, cx), target, out);
+            }
+        });
     }
 }
 
@@ -222,14 +225,17 @@ fn relation_lineage<'a>(
     context: &mut TraceContext<'a>,
     out: &mut Vec<ColumnLineageEdge>,
 ) {
-    for (outputs, src_input) in output_operands(input) {
-        for (target_column, ne) in columns.iter().zip(outputs) {
-            let tgt = ColumnTarget::Relation(ColumnReference {
-                table: Some(target.clone()),
-                name: target_column.clone(),
-            });
-            emit_edges(origins_of_expr(&ne.expr, src_input, context), tgt, out);
-        }
+    for operand in output_operands(input) {
+        let outputs = operand.outputs;
+        operand.trace(context, |src_input, cx| {
+            for (target_column, ne) in columns.iter().zip(outputs) {
+                let tgt = ColumnTarget::Relation(ColumnReference {
+                    table: Some(target.clone()),
+                    name: target_column.clone(),
+                });
+                emit_edges(origins_of_expr(&ne.expr, src_input, cx), tgt, out);
+            }
+        });
     }
 }
 
@@ -262,23 +268,26 @@ fn created_relation_lineage<'a>(
     let operands = output_operands(input);
     let result_names: Vec<Option<Ident>> = if explicit.is_empty() {
         match operands.first() {
-            Some((outputs, _)) => outputs.iter().map(|ne| ne.name.clone()).collect(),
+            Some(o) => o.outputs.iter().map(|ne| ne.name.clone()).collect(),
             None => Vec::new(),
         }
     } else {
         explicit.iter().cloned().map(Some).collect()
     };
-    for (outputs, src_input) in operands {
-        for (position, ne) in outputs.iter().enumerate() {
-            let Some(name) = result_names.get(position).cloned().flatten() else {
-                continue;
-            };
-            let tgt = ColumnTarget::Relation(ColumnReference {
-                table: Some(target.clone()),
-                name,
-            });
-            emit_edges(origins_of_expr(&ne.expr, src_input, context), tgt, out);
-        }
+    for operand in &operands {
+        let outputs = operand.outputs;
+        operand.trace(context, |src_input, cx| {
+            for (position, ne) in outputs.iter().enumerate() {
+                let Some(name) = result_names.get(position).cloned().flatten() else {
+                    continue;
+                };
+                let tgt = ColumnTarget::Relation(ColumnReference {
+                    table: Some(target.clone()),
+                    name,
+                });
+                emit_edges(origins_of_expr(&ne.expr, src_input, cx), tgt, out);
+            }
+        });
     }
 }
 

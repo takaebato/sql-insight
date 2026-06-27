@@ -163,7 +163,8 @@ fn created_relation_writes(
         return qualify(explicit, target);
     }
     match output_operands(input).first() {
-        Some((outputs, _)) => outputs
+        Some(operand) => operand
+            .outputs
             .iter()
             .filter_map(|ne| ne.name.clone())
             .map(|name| ColumnReference {
