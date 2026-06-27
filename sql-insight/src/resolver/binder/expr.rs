@@ -561,9 +561,11 @@ impl<'a> Binder<'a> {
     }
 
     /// Filter-position reads from a SELECT's auxiliary clauses (`DISTINCT ON`
-    /// keys, `TOP n`, Hive `LATERAL VIEW`, `PREWHERE`, `QUALIFY`, `CONNECT BY`
-    /// / `START WITH`, `CLUSTER BY` / `DISTRIBUTE BY`, named `WINDOW` specs),
-    /// resolved against the FROM scope. None feed values.
+    /// keys, `TOP n`, Hive `LATERAL VIEW`, `PREWHERE`, `CONNECT BY` / `START
+    /// WITH`, `CLUSTER BY` / `DISTRIBUTE BY`, named `WINDOW` specs), resolved
+    /// against the FROM scope. None feed values. `QUALIFY` is *not* here — it
+    /// filters on window / projection outputs (post-projection), so it binds
+    /// against the output-aware scope in [`bind_select`](Self::bind_select).
     pub(super) fn select_clause_reads(&mut self, select: &Select, scope: &Scope) -> Vec<Expr> {
         let mut reads = Vec::new();
         if let Some(Distinct::On(exprs)) = &select.distinct {
@@ -578,7 +580,6 @@ impl<'a> Binder<'a> {
             reads.push(self.bind_expr(&lateral_view.lateral_view, scope));
         }
         reads.extend(select.prewhere.iter().map(|e| self.bind_expr(e, scope)));
-        reads.extend(select.qualify.iter().map(|e| self.bind_expr(e, scope)));
         for connect_by in &select.connect_by {
             match connect_by {
                 ConnectByKind::ConnectBy { relationships, .. } => {

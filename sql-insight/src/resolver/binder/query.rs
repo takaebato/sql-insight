@@ -437,9 +437,9 @@ impl<'a> Binder<'a> {
     pub(super) fn bind_select(&mut self, select: &Select) -> (LogicalPlan, Scope) {
         let (from, scope) = self.bind_from(&select.from);
         // WHERE + the WHERE-family auxiliary clauses (DISTINCT ON / TOP /
-        // LATERAL VIEW / PREWHERE / QUALIFY / CONNECT BY / CLUSTER BY / named
-        // WINDOW) filter rows before grouping — a filter over the FROM (no
-        // output aliases visible).
+        // LATERAL VIEW / PREWHERE / CONNECT BY / CLUSTER BY / named WINDOW)
+        // filter rows before grouping — a filter over the FROM (no output
+        // aliases visible). QUALIFY is post-projection (handled below).
         let mut where_reads: Vec<Expr> = select
             .selection
             .iter()
@@ -481,6 +481,17 @@ impl<'a> Binder<'a> {
             input: Box::new(node),
             exprs,
         });
+        // QUALIFY filters on window / projection outputs (it runs after the
+        // window functions the projection computes), so it sees output aliases
+        // — bind it against `clause_scope` like HAVING, so an alias reference
+        // (`QUALIFY rn = 1`) binds `Derived` and drops from reads rather than
+        // surfacing a phantom base column. Filter-position: reads, no lineage.
+        if let Some(qualify) = &select.qualify {
+            node = LogicalPlan::Filter(Filter {
+                input: Box::new(node),
+                predicate: vec![self.bind_expr(qualify, &clause_scope)],
+            });
+        }
         // SORT BY (Hive) sees the outputs, like a trailing ORDER BY.
         let sort_keys = self.order_by_expr_keys(&select.sort_by, &clause_scope);
         if !sort_keys.is_empty() {

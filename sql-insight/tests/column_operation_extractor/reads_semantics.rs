@@ -1025,6 +1025,59 @@ mod output_alias_visibility {
     }
 
     #[test]
+    fn qualify_window_alias_is_suppressed() {
+        // `rn` aliases a window output; QUALIFY references it post-projection,
+        // not a stored column — so no phantom `t.rn` read. The real dependency
+        // (the window's `PARTITION BY a`) is counted at the projection.
+        assert_column_ops(
+            "SELECT a, ROW_NUMBER() OVER (PARTITION BY a) AS rn FROM t QUALIFY rn = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn qualify_window_key_is_a_read() {
+        // A window key referenced only in QUALIFY's inline window (`b` is not
+        // projected) is a genuine new read — QUALIFY adds reads even as it
+        // suppresses alias references. Still no lineage (filter position).
+        assert_column_ops(
+            "SELECT a FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY b) = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn qualify_base_column_is_a_read() {
+        // A QUALIFY referencing a real column (not an output alias) is a
+        // (filter-position) read, like any predicate.
+        assert_column_ops(
+            "SELECT a, b FROM t QUALIFY b > 0",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("t", "b"), out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn qualified_ref_in_order_by_is_not_an_alias() {
         // `t.total` is qualified — aliases are unqualified-only, so it's
         // taken as a (best-effort) column of `t`, not the computed
