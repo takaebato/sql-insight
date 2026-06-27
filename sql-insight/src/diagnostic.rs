@@ -2,7 +2,7 @@
 //!
 //! Diagnostics are split by extraction granularity:
 //! [`TableLevelDiagnostic`] for the table-level surfaces
-//! (`extract_tables` / `extract_table_operations` / `extract_crud_tables`)
+//! (`extract_table_operations` / `extract_crud_tables`)
 //! and [`ColumnLevelDiagnostic`] for `extract_column_operations`. The split
 //! is by *type* so a table-level result cannot even represent a column-only
 //! condition — e.g. a suppressed wildcard, which leaves column lineage

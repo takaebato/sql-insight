@@ -272,89 +272,6 @@ mod integration {
         }
     }
 
-    mod extract_tables {
-        use super::*;
-
-        #[test]
-        fn test_extract_tables() {
-            sql_insight_cmd()
-                .arg("extract").arg("tables")
-                .arg("select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
-                .assert()
-                .success()
-                .stdout("t1, t2\nt1, t2\n")
-                .stderr("");
-        }
-
-        #[test]
-        fn test_extract_tables_surfaces_diagnostics_in_text() {
-            // An unsupported statement has no tables; the text output must
-            // still surface the diagnostic rather than silently print nothing.
-            sql_insight_cmd()
-                .arg("extract")
-                .arg("tables")
-                .arg("CREATE INDEX i ON t(a)")
-                .assert()
-                .success()
-                .stdout("  ! Unsupported statement: CREATE INDEX i ON t(a)\n")
-                .stderr("");
-        }
-
-        #[test]
-        fn test_extract_tables_with_full_identifiers_and_alis() {
-            sql_insight_cmd()
-                .arg("extract").arg("tables")
-                .arg("select * from catalog.schema.t1 as t1 inner join catalog.schema.t2 as t2 using(id); \
-                      insert into catalog.schema.t1 (a) select b from catalog.schema.t2;")
-                .assert()
-                .success()
-                .stdout("catalog.schema.t1, catalog.schema.t2\ncatalog.schema.t1, catalog.schema.t2\n")
-                .stderr("");
-        }
-
-        #[test]
-        fn test_extract_tables_with_cte() {
-            sql_insight_cmd()
-                .arg("extract")
-                .arg("tables")
-                .arg("with t2 as (select id from t1) select * from t2;")
-                .assert()
-                .success()
-                .stdout("t1\n")
-                .stderr("");
-        }
-
-        #[test]
-        fn test_extract_tables_with_dialect() {
-            sql_insight_cmd()
-                .arg("extract").arg("tables")
-                .arg("--dialect")
-                .arg("mysql")
-                .arg("select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
-                .assert()
-                .success()
-                .stdout("t1, t2\nt1, t2\n")
-                .stderr("");
-        }
-
-        #[test]
-        fn test_extract_tables_from_file() {
-            let mut temp_file = NamedTempFile::new().unwrap();
-            temp_file
-                .write_all(b"select * from t1 inner join t2 using(id); insert into t1 (a) select b from t2;")
-                .unwrap();
-            sql_insight_cmd()
-                .arg("extract")
-                .arg("tables")
-                .arg("--file")
-                .arg(temp_file.path())
-                .assert()
-                .success()
-                .stdout("t1, t2\nt1, t2\n")
-                .stderr("");
-        }
-    }
-
     mod extract_table_ops {
         use super::*;
 
@@ -480,7 +397,7 @@ mod integration {
             schema.write_all(b"CREATE TABL bad (id INT);").unwrap();
             sql_insight_cmd()
                 .arg("extract")
-                .arg("tables")
+                .arg("crud")
                 .arg("--ddl-file")
                 .arg(schema.path())
                 .arg("SELECT 1")
@@ -534,13 +451,13 @@ mod integration {
             // uppercase CTE `T2`, so it surfaces as a distinct table.
             sql_insight_cmd()
                 .arg("extract")
-                .arg("tables")
+                .arg("crud")
                 .arg("--casing")
                 .arg("sensitive")
                 .arg("WITH T2 AS (SELECT id FROM t1) SELECT * FROM t2")
                 .assert()
                 .success()
-                .stdout("t1, t2\n")
+                .stdout("Create: [], Read: [t1, t2], Update: [], Delete: []\n")
                 .stderr("");
         }
     }
@@ -551,22 +468,6 @@ mod integration {
         // JSON output is a single pretty array of per-statement results.
         // Keys are sorted (serde_json `Value`) and identifiers serialize as
         // `{value, quote}` (no source span), so the text is stable.
-
-        #[test]
-        fn test_tables_json() {
-            sql_insight_cmd()
-                .arg("extract")
-                .arg("tables")
-                .arg("--format")
-                .arg("json")
-                .arg("SELECT a FROM t1")
-                .assert()
-                .success()
-                .stdout(
-                    "[\n  {\n    \"diagnostics\": [],\n    \"tables\": [\n      {\n        \"catalog\": null,\n        \"name\": {\n          \"quote\": null,\n          \"value\": \"t1\"\n        },\n        \"schema\": null\n      }\n    ]\n  }\n]\n",
-                )
-                .stderr("");
-        }
 
         #[test]
         fn test_column_ops_json_has_lineage_kind() {
@@ -594,7 +495,7 @@ mod integration {
             // diagnostic (not a dropped entry), alongside the resolved `t1`.
             sql_insight_cmd()
                 .arg("extract")
-                .arg("tables")
+                .arg("crud")
                 .arg("--format")
                 .arg("json")
                 .arg("SELECT a FROM t1; SET x = 1")
@@ -787,7 +688,7 @@ mod integration {
             // drop as a diagnostic rather than printing a silent empty line.
             sql_insight_cmd()
                 .arg("extract")
-                .arg("tables")
+                .arg("crud")
                 .arg("select * from catalog.schema.table.extra")
                 .assert()
                 .success()
@@ -821,7 +722,7 @@ mod integration {
         fn test_file_not_found() {
             sql_insight_cmd()
                 .arg("extract")
-                .arg("tables")
+                .arg("crud")
                 .arg("--file")
                 .arg("non_existent_file.sql")
                 .assert()

@@ -13,8 +13,8 @@
 //!
 //! This module is the **facade** the [`crate::extractor`] layer drives:
 //! [`build`] binds a statement into a `LogicalPlan` (plus diagnostics), and the
-//! seven free functions below — `reads` / `table_reads` / `writes` /
-//! `table_writes` / `column_lineage` / `table_lineage` / `flat_tables` — are the
+//! six free functions below — `reads` / `table_reads` / `writes` /
+//! `table_writes` / `column_lineage` / `table_lineage` — are the
 //! extraction surfaces over that plan. They are thin entry points: each
 //! delegates to a `collect_*` walker in the matching concern submodule, so the
 //! `LogicalPlan` type stays plain data (extraction is a pass *over* it, not a
@@ -31,7 +31,7 @@
 //!   to its base columns (the value-vs-filter split falls out for free).
 //! - [`lineage`] — the `column_lineage` / `table_lineage` walkers, built on the
 //!   [`origins`] trace.
-//! - [`tables`] — the `writes` / `table_writes` / `flat_tables` walkers.
+//! - [`tables`] — the `writes` / `table_writes` walkers.
 
 mod binder;
 mod lineage;
@@ -43,7 +43,7 @@ mod tables;
 use logical_plan::LogicalPlan;
 
 use crate::extractor::{ColumnLineageEdge, TableLineageEdge};
-use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference, TableWrite};
+use crate::reference::{ColumnRead, ColumnReference, TableRead, TableWrite};
 
 // `build_with_diagnostics` already folds an unmodelled statement to
 // `LogicalPlan::Empty`, so it doubles as `build`.
@@ -111,15 +111,6 @@ pub(crate) fn table_lineage(
     let mut edges = lineage::collect_table_lineage(plan, casing);
     edges.sort_by_key(|e| source_order(&e.source.reference.name));
     edges
-}
-
-/// The flat list of every table the statement references — one per relation
-/// binding (the un-bucketed table surface). Returned in source order (by each
-/// table's written token span).
-pub(crate) fn flat_tables(plan: &LogicalPlan) -> Vec<TableReference> {
-    let mut tables = tables::collect_flat_tables(plan);
-    tables.sort_by_key(|t| source_order(&t.name));
-    tables
 }
 
 /// Which `WHEN` actions a `MERGE` carries — `Some` for a (possibly `WITH`-

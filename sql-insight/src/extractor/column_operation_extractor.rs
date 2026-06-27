@@ -25,7 +25,7 @@
 //!   / `lineage` here: there are no columns to enumerate (wildcards stay
 //!   unexpanded). The target relation is a *table*-level fact; read it from
 //!   [`extract_table_operations`](crate::extractor::extract_table_operations)
-//!   (its `writes`) or [`extract_tables`](crate::extractor::extract_tables).
+//!   (its `writes`).
 
 use crate::casing::IdentifierStyle;
 use crate::catalog::Catalog;

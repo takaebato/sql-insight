@@ -1,10 +1,8 @@
-//! Extraction APIs at four granularities of "what does this SQL touch?"
+//! Extraction APIs at three granularities of "what does this SQL touch?"
 //!
 //! Each sub-extractor is a thin wrapper around the bound-plan analysis
 //! engine, projecting the resolved plan into a different surface:
 //!
-//! - [`extract_tables`] — flat list of `TableReference`s per
-//!   statement, no read/write distinction.
 //! - [`extract_crud_tables`] — tables bucketed by CRUD verb
 //!   (Create / Read / Update / Delete).
 //! - [`extract_table_operations`] — per-statement
@@ -22,12 +20,10 @@
 
 mod column_operation_extractor;
 mod crud_table_extractor;
-mod table_extractor;
 mod table_operation_extractor;
 
 pub use column_operation_extractor::*;
 pub use crud_table_extractor::*;
-pub use table_extractor::*;
 pub use table_operation_extractor::*;
 
 use crate::casing::{IdentifierCasing, IdentifierStyle};

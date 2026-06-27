@@ -19,7 +19,6 @@ cargo install sql-insight-cli
   preserved — the parser does not retain them in the AST).
 - `normalize` — abstract literals to placeholders (`--unify-in-list` /
   `--unify-values` collapse repetitive shapes).
-- `extract tables` — flat list of tables a statement references.
 - `extract crud` — tables bucketed by Create / Read / Update / Delete.
 - `extract table-ops` — table-level reads / writes / lineage per statement.
 - `extract column-ops` — the same at column granularity, with lineage kinds.
@@ -46,9 +45,6 @@ SELECT * FROM users WHERE id = 1
 
 $ sql-insight normalize "SELECT * FROM users WHERE id = 1"
 SELECT * FROM users WHERE id = ?
-
-$ sql-insight extract tables "SELECT * FROM catalog.schema.users AS u"
-catalog.schema.users
 
 $ sql-insight extract crud "INSERT INTO users (name) SELECT name FROM employees"
 Create: [users], Read: [employees], Update: [], Delete: []

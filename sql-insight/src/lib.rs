@@ -14,9 +14,6 @@
 //! - **SQL Normalization** — abstract literals into placeholders so
 //!   structurally identical queries hash to the same shape. See
 //!   [`normalizer`].
-//! - **Table Extraction** — flat list of
-//!   [`TableReference`]s touched by a statement. See
-//!   [`extractor::extract_tables`].
 //! - **CRUD Table Extraction** — CRUD-bucketed table sets per
 //!   statement. See [`extractor::extract_crud_tables`].
 //! - **Table-level Operation Extraction** — `reads` / `writes` /
@@ -75,7 +72,7 @@
 //! Public types live in domain-named modules ([`catalog`],
 //! [`diagnostic`], [`error`], [`extractor`], [`formatter`],
 //! [`normalizer`]); access them via their module path
-//! (`sql_insight::extractor::extract_tables`,
+//! (`sql_insight::extractor::extract_table_operations`,
 //! `sql_insight::formatter::format`, etc.). The two identity types
 //! [`TableReference`] / [`ColumnReference`] are re-exported at the
 //! crate root because they show up across modules; their containing

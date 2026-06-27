@@ -1,9 +1,9 @@
 //! Extracts the application-level operations a SQL statement performs.
 //!
-//! Where [`extract_tables`](crate::extractor::extract_tables()) answers "what tables
-//! does this SQL touch?" and [`extract_crud_tables`](crate::extractor::extract_crud_tables())
-//! answers it in CRUD buckets, this module answers "what operations does
-//! this SQL perform, on which tables, and how do those tables relate?".
+//! Where [`extract_crud_tables`](crate::extractor::extract_crud_tables())
+//! answers "what tables does this SQL touch?" in CRUD buckets, this module
+//! answers "what operations does this SQL perform, on which tables, and how do
+//! those tables relate?".
 //!
 //! The output is per-statement: one [`TableOperation`] per parsed
 //! statement, since a single application call (e.g. an ORM `execute()`)

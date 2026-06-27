@@ -3,8 +3,8 @@ use sql_insight::diagnostic::TableLevelDiagnostic;
 use sql_insight::error::Error;
 use sql_insight::extractor::{
     extract_column_operations_with_options, extract_crud_tables_with_options,
-    extract_table_operations_with_options, extract_tables_with_options, ColumnLineageKind,
-    ColumnOperation, ColumnTarget, ExtractorOptions, TableOperation,
+    extract_table_operations_with_options, ColumnLineageKind, ColumnOperation, ColumnTarget,
+    ExtractorOptions, TableOperation,
 };
 use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::sqlparser::dialect::{self, Dialect};
@@ -74,7 +74,6 @@ impl CliExecutable for NormalizeExecutor {
 /// Which extraction surface an [`ExtractExecutor`] produces.
 #[derive(Clone, Copy)]
 pub enum ExtractKind {
-    Tables,
     Crud,
     TableOps,
     ColumnOps,
@@ -166,10 +165,6 @@ impl CliExecutable for ExtractExecutor {
 
         let sql = self.sql.as_ref();
         match (self.kind, self.format) {
-            (ExtractKind::Tables, OutputFormat::Text) => Ok(render_display(
-                &extract_tables_with_options(dialect, sql, options)?,
-                |e| &e.diagnostics,
-            )),
             (ExtractKind::Crud, OutputFormat::Text) => Ok(render_display(
                 &extract_crud_tables_with_options(dialect, sql, options)?,
                 |c| &c.diagnostics,
@@ -182,9 +177,6 @@ impl CliExecutable for ExtractExecutor {
                 &extract_column_operations_with_options(dialect, sql, options)?,
                 format_column_operation,
             )),
-            (ExtractKind::Tables, OutputFormat::Json) => {
-                render_json(&extract_tables_with_options(dialect, sql, options)?)
-            }
             (ExtractKind::Crud, OutputFormat::Json) => {
                 render_json(&extract_crud_tables_with_options(dialect, sql, options)?)
             }
@@ -279,7 +271,7 @@ fn render_json<T: serde::Serialize>(results: &[Result<T, Error>]) -> Result<Vec<
     Ok(vec![json])
 }
 
-/// Render the `Display`-backed extractors (`tables` / `crud`), one
+/// Render the `Display`-backed extractor (`crud`), one
 /// statement per line, appending any diagnostics as `! <message>` lines
 /// (the same marker the operation extractors use) so the text output never
 /// silently drops an unsupported / over-qualified statement.
