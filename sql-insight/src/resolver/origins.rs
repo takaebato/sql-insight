@@ -151,8 +151,12 @@ pub(super) fn origins_of_expr<'a>(
             .iter()
             .flat_map(|c| origins_of_ref(c, input, context))
             .collect(),
+        // `a IN (subquery)`: the LHS is a value operand — `a IN (…)` is a
+        // boolean transformation of it, like `a IN (list)`. The subquery's
+        // columns are a membership test (filter), contributing no origin.
+        Expr::InSubquery { expr, .. } => transform(origins_of_expr(expr, input, context)),
         // Tests / suppressed operands contribute no value origin (reads only).
-        Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Filter(_) => Vec::new(),
+        Expr::Exists(_) | Expr::Filter(_) => Vec::new(),
     }
 }
 
@@ -423,7 +427,12 @@ pub(super) fn conflict_value_origins<'a>(
             .iter()
             .filter_map(|c| column_read(c).map(|r| (r, ColumnLineageKind::Passthrough)))
             .collect(),
-        Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Filter(_) => Vec::new(),
+        // `a IN (subquery)`: the LHS flows as a value operand (see
+        // `origins_of_expr`); the subquery side is a filter.
+        Expr::InSubquery { expr, .. } => {
+            transform(conflict_value_origins(expr, columns, source, context))
+        }
+        Expr::Exists(_) | Expr::Filter(_) => Vec::new(),
     }
 }
 

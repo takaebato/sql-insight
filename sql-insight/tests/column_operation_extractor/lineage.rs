@@ -49,6 +49,23 @@ mod projections {
     }
 
     #[test]
+    fn in_subquery_in_value_position_flows_lhs_not_the_subquery() {
+        // `a IN (subquery)` projected as a value: the LHS `a` flows to the
+        // output (a boolean transformation of it, symmetric with `a IN (list)`);
+        // the subquery's `s.x` is a membership test — a read, never a source.
+        assert_column_ops(
+            "SELECT (a IN (SELECT x FROM s)) AS f FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("s", "x")],
+                writes: vec![],
+                lineage: vec![transformation(col("t", "a"), out("f", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn select_mixed_projection_separates_targets_by_position() {
         assert_column_ops(
             "SELECT a, a + b FROM t1",
