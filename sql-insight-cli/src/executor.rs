@@ -3,12 +3,14 @@ use sql_insight::diagnostic::TableLevelDiagnostic;
 use sql_insight::error::Error;
 use sql_insight::extractor::{
     extract_column_operations_with_options, extract_crud_tables_with_options,
-    extract_table_operations_with_options, extract_tables_with_options, ColumnLineageKind,
-    ColumnOperation, ColumnTarget, ExtractorOptions, TableOperation,
+    extract_table_operations_with_options, ColumnLineageKind, ColumnOperation, ColumnTarget,
+    ExtractorOptions, TableOperation,
 };
 use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::sqlparser::dialect::{self, Dialect};
-use sql_insight::{CaseRule, ColumnRead, IdentifierCasing, ResolutionKind, TableRead};
+use sql_insight::{
+    CaseRule, ColumnRead, ColumnWrite, IdentifierCasing, ResolutionKind, TableRead, TableWrite,
+};
 
 pub trait CliExecutable {
     fn execute(&self) -> Result<Vec<String>, Error>;
@@ -74,7 +76,6 @@ impl CliExecutable for NormalizeExecutor {
 /// Which extraction surface an [`ExtractExecutor`] produces.
 #[derive(Clone, Copy)]
 pub enum ExtractKind {
-    Tables,
     Crud,
     TableOps,
     ColumnOps,
@@ -166,10 +167,6 @@ impl CliExecutable for ExtractExecutor {
 
         let sql = self.sql.as_ref();
         match (self.kind, self.format) {
-            (ExtractKind::Tables, OutputFormat::Text) => Ok(render_display(
-                &extract_tables_with_options(dialect, sql, options)?,
-                |e| &e.diagnostics,
-            )),
             (ExtractKind::Crud, OutputFormat::Text) => Ok(render_display(
                 &extract_crud_tables_with_options(dialect, sql, options)?,
                 |c| &c.diagnostics,
@@ -182,9 +179,6 @@ impl CliExecutable for ExtractExecutor {
                 &extract_column_operations_with_options(dialect, sql, options)?,
                 format_column_operation,
             )),
-            (ExtractKind::Tables, OutputFormat::Json) => {
-                render_json(&extract_tables_with_options(dialect, sql, options)?)
-            }
             (ExtractKind::Crud, OutputFormat::Json) => {
                 render_json(&extract_crud_tables_with_options(dialect, sql, options)?)
             }
@@ -279,7 +273,7 @@ fn render_json<T: serde::Serialize>(results: &[Result<T, Error>]) -> Result<Vec<
     Ok(vec![json])
 }
 
-/// Render the `Display`-backed extractors (`tables` / `crud`), one
+/// Render the `Display`-backed extractor (`crud`), one
 /// statement per line, appending any diagnostics as `! <message>` lines
 /// (the same marker the operation extractors use) so the text output never
 /// silently drops an unsupported / over-qualified statement.
@@ -326,13 +320,21 @@ fn table_read(read: &TableRead) -> String {
     format!("{}{}", read.reference, resolution_marker(read.resolution))
 }
 
+fn table_write(write: &TableWrite) -> String {
+    format!("{}{}", write.reference, resolution_marker(write.resolution))
+}
+
 fn column_read(read: &ColumnRead) -> String {
     format!("{}{}", read.reference, resolution_marker(read.resolution))
 }
 
+fn column_write(write: &ColumnWrite) -> String {
+    format!("{}{}", write.reference, resolution_marker(write.resolution))
+}
+
 fn column_target(target: &ColumnTarget) -> String {
     match target {
-        ColumnTarget::Relation(reference) => reference.to_string(),
+        ColumnTarget::Relation(write) => column_write(write),
         ColumnTarget::QueryOutput { name, position } => match name {
             Some(name) => name.value.clone(),
             None => format!("#{position}"),
@@ -365,14 +367,14 @@ fn format_table_operation(n: usize, op: &TableOperation) -> String {
         lines.push(labeled("reads:", reads.join(", ")));
     }
     if !op.writes.is_empty() {
-        let writes = op.writes.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let writes = op.writes.iter().map(table_write).collect::<Vec<_>>();
         lines.push(labeled("writes:", writes.join(", ")));
     }
     if !op.lineage.is_empty() {
         let edges = op
             .lineage
             .iter()
-            .map(|e| format!("{} -> {}", table_read(&e.source), e.target))
+            .map(|e| format!("{} -> {}", table_read(&e.source), table_write(&e.target)))
             .collect();
         lines.push(lineage_block(edges));
     }
@@ -389,7 +391,7 @@ fn format_column_operation(n: usize, op: &ColumnOperation) -> String {
         lines.push(labeled("reads:", reads.join(", ")));
     }
     if !op.writes.is_empty() {
-        let writes = op.writes.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let writes = op.writes.iter().map(column_write).collect::<Vec<_>>();
         lines.push(labeled("writes:", writes.join(", ")));
     }
     if !op.lineage.is_empty() {

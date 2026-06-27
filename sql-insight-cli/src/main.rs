@@ -105,8 +105,6 @@ enum Commands {
 /// Extraction granularities — thin wrappers over the library's extractors.
 #[derive(Subcommand, Debug)]
 enum ExtractTarget {
-    /// Flat list of tables the statement references
-    Tables(ExtractArgs),
     /// Tables bucketed by CRUD verb (Create / Read / Update / Delete)
     Crud(ExtractArgs),
     /// Table-level reads / writes / lineage per statement
@@ -192,10 +190,7 @@ impl From<FormatArg> for OutputFormat {
 impl ExtractTarget {
     fn args(&self) -> &ExtractArgs {
         match self {
-            ExtractTarget::Tables(a)
-            | ExtractTarget::Crud(a)
-            | ExtractTarget::TableOps(a)
-            | ExtractTarget::ColumnOps(a) => a,
+            ExtractTarget::Crud(a) | ExtractTarget::TableOps(a) | ExtractTarget::ColumnOps(a) => a,
         }
     }
 
@@ -206,7 +201,6 @@ impl ExtractTarget {
     fn executor(&self, sql: String) -> Box<dyn CliExecutable> {
         let args = self.args();
         let kind = match self {
-            ExtractTarget::Tables(_) => ExtractKind::Tables,
             ExtractTarget::Crud(_) => ExtractKind::Crud,
             ExtractTarget::TableOps(_) => ExtractKind::TableOps,
             ExtractTarget::ColumnOps(_) => ExtractKind::ColumnOps,

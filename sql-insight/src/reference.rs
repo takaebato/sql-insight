@@ -53,10 +53,8 @@ pub struct TableReference {
 /// The table-granularity mirror of [`ColumnRead`]. Read-side surfaces
 /// ([`TableOperation::reads`] and [`TableLineageEdge::source`]) use this
 /// wrapper so each occurrence can carry resolution metadata while
-/// [`TableReference`] stays identity-only. Write-side surfaces
-/// ([`TableOperation::writes`], [`TableLineageEdge::target`]) stay bare
-/// [`TableReference`] — write targets come straight from SQL syntax and
-/// are trivially resolved by construction.
+/// [`TableReference`] stays identity-only. The write-side counterpart is
+/// [`TableWrite`] ([`TableOperation::writes`], [`TableLineageEdge::target`]).
 ///
 /// Unlike [`ColumnRead`], `reference` is **always present**: a table's
 /// name is written out in the SQL, so even an
@@ -77,6 +75,29 @@ pub struct TableReference {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TableRead {
+    pub reference: TableReference,
+    pub resolution: ResolutionKind,
+}
+
+/// One write-side occurrence of a [`TableReference`] — a DML / DDL write
+/// target — pairing the identity with how the catalog matched it
+/// ([`ResolutionKind`]).
+///
+/// The write-role counterpart of [`TableRead`], kept a distinct type so a
+/// read can't be passed where a write is meant (and so the write side can
+/// diverge later). The `resolution` carries the same catalog-match outcome a
+/// scanned source would: [`Cataloged`](ResolutionKind::Cataloged) for a unique
+/// registered hit, [`Ambiguous`](ResolutionKind::Ambiguous) for several, and
+/// [`Inferred`](ResolutionKind::Inferred) for a catalog miss or catalog-less
+/// mode — so the [`Cataloged`](ResolutionKind::Cataloged)-detects-catalog-aware
+/// invariant holds on writes too. `reference` is always present (a target's
+/// name is written out), so [`Unresolved`](ResolutionKind::Unresolved) never
+/// arises here, exactly as for [`TableRead`].
+///
+/// [`TableOperation::writes`]: crate::extractor::TableOperation::writes
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct TableWrite {
     pub reference: TableReference,
     pub resolution: ResolutionKind,
 }
@@ -109,20 +130,38 @@ pub struct ColumnReference {
 /// Read-side surfaces ([`ColumnOperation::reads`] and
 /// [`ColumnLineageEdge::source`]) use this wrapper so the same column
 /// referenced twice can carry per-occurrence resolution metadata
-/// without breaking [`ColumnReference`]'s identity-only contract.
-/// Write-side surfaces ([`ColumnOperation::writes`],
-/// [`ColumnTarget::Relation`]) stay as bare [`ColumnReference`] —
-/// targets come straight from SQL syntax and are always
-/// [`ResolutionKind::Cataloged`]-or-trivially-resolved by construction,
-/// so the field would be dead weight there.
+/// without breaking [`ColumnReference`]'s identity-only contract. The
+/// write-side counterpart is [`ColumnWrite`].
 ///
 /// [`ColumnOperation::reads`]: crate::extractor::ColumnOperation::reads
-/// [`ColumnOperation::writes`]: crate::extractor::ColumnOperation::writes
 /// [`ColumnLineageEdge::source`]: crate::extractor::ColumnLineageEdge::source
-/// [`ColumnTarget::Relation`]: crate::extractor::ColumnTarget::Relation
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ColumnRead {
+    pub reference: ColumnReference,
+    pub resolution: ResolutionKind,
+}
+
+/// One write-side occurrence of a [`ColumnReference`] — a written column —
+/// pairing the identity with how the resolver resolved it against the target
+/// ([`ResolutionKind`]). The write-role counterpart of [`ColumnRead`], kept a
+/// distinct type so a read can't be passed where a write is meant.
+///
+/// `resolution` is the column's catalog match against its (always pinned) write
+/// target: [`Cataloged`](ResolutionKind::Cataloged) when the column is in the
+/// target's catalog column list, else [`Inferred`](ResolutionKind::Inferred)
+/// (catalog-free, the target's columns aren't known, the column isn't listed,
+/// or a freshly created / altered relation). A written column's owning table is
+/// always pinned and the column is named, so
+/// [`Unresolved`](ResolutionKind::Unresolved) /
+/// [`Ambiguous`](ResolutionKind::Ambiguous) never arise — mirroring how a base
+/// column read resolves against its relation's column list.
+///
+/// [`ColumnOperation::writes`]: crate::extractor::ColumnOperation::writes
+/// [`ColumnTarget::Relation`]: crate::extractor::ColumnTarget::Relation
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct ColumnWrite {
     pub reference: ColumnReference,
     pub resolution: ResolutionKind,
 }

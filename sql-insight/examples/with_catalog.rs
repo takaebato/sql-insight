@@ -52,7 +52,7 @@ fn main() {
             if let ColumnTarget::Relation(target) = &edge.target {
                 println!(
                     "  {} -> orders.{} ({:?})",
-                    edge.source.reference.name.value, target.name.value, edge.kind
+                    edge.source.reference.name.value, target.reference.name.value, edge.kind
                 );
             }
         }

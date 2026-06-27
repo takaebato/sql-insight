@@ -11,13 +11,15 @@
 
 use sqlparser::ast::Ident;
 
-use super::logical_plan::{peel_with, Expr, LogicalPlan, MergeClause, NamedExpr};
+use super::logical_plan::{peel_with, Expr, LogicalPlan, MergeClause, NamedExpr, Update};
 use super::origins::{
     conflict_value_origins, enter_withs, origins_of_expr, output_operands, TraceContext,
 };
 use crate::casing::IdentifierCasing;
 use crate::extractor::{ColumnLineageEdge, ColumnLineageKind, ColumnTarget, TableLineageEdge};
-use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference};
+use crate::reference::{
+    ColumnRead, ColumnReference, ColumnWrite, ResolutionKind, TableRead, TableReference, TableWrite,
+};
 
 // ===== column lineage ====================================================
 
@@ -47,18 +49,14 @@ pub(super) fn collect_column_lineage(
             // columns still surface as `writes`, flagged by `WildcardSuppressed`
             // — matching a pure `SELECT *` source (no operands to pair).
             if !i.source_wildcard {
-                relation_lineage(&i.columns, &i.target, src, &mut context, &mut edges);
+                relation_lineage(&i.columns, src, &mut context, &mut edges);
             }
             // ON CONFLICT DO UPDATE SET col = value: each `value → target.col`,
             // an `EXCLUDED.x` ref mapped to the source's like-positioned output.
             for a in &i.on_conflict {
-                let target = ColumnTarget::Relation(ColumnReference {
-                    table: Some(i.target.clone()),
-                    name: a.target.clone(),
-                });
                 emit_edges(
                     conflict_value_origins(&a.value, &i.columns, src, &mut context),
-                    target,
+                    ColumnTarget::Relation(a.target.clone()),
                     &mut edges,
                 );
             }
@@ -69,13 +67,9 @@ pub(super) fn collect_column_lineage(
         // FROM derived table) traces through `input`.
         LogicalPlan::Update(u) => {
             for a in &u.assignments {
-                let target = ColumnTarget::Relation(ColumnReference {
-                    table: Some(u.target.clone()),
-                    name: a.target.clone(),
-                });
                 emit_edges(
                     origins_of_expr(&a.value, &u.input, &mut context),
-                    target,
+                    ColumnTarget::Relation(a.target.clone()),
                     &mut edges,
                 );
             }
@@ -93,13 +87,25 @@ pub(super) fn collect_column_lineage(
         LogicalPlan::CreateTableAs(c) => {
             let src = enter_withs(&c.input, &mut context);
             if pairs_positionally(c.source_wildcard, &c.columns) {
-                created_relation_lineage(&c.columns, &c.target, src, &mut context, &mut edges);
+                created_relation_lineage(
+                    &c.columns,
+                    &c.target.reference,
+                    src,
+                    &mut context,
+                    &mut edges,
+                );
             }
         }
         LogicalPlan::CreateView(c) => {
             let src = enter_withs(&c.input, &mut context);
             if pairs_positionally(c.source_wildcard, &c.columns) {
-                created_relation_lineage(&c.columns, &c.target, src, &mut context, &mut edges);
+                created_relation_lineage(
+                    &c.columns,
+                    &c.target.reference,
+                    src,
+                    &mut context,
+                    &mut edges,
+                );
             }
         }
         // MERGE: each WHEN action's value traces to its target column (an
@@ -114,7 +120,6 @@ pub(super) fn collect_column_lineage(
                             merge_value_edges(
                                 &a.target,
                                 &a.value,
-                                &m.target,
                                 &m.source,
                                 &mut context,
                                 &mut edges,
@@ -123,14 +128,7 @@ pub(super) fn collect_column_lineage(
                     }
                     MergeClause::Insert { columns, values } => {
                         for (column, value) in columns.iter().zip(values) {
-                            merge_value_edges(
-                                column,
-                                value,
-                                &m.target,
-                                &m.source,
-                                &mut context,
-                                &mut edges,
-                            );
+                            merge_value_edges(column, value, &m.source, &mut context, &mut edges);
                         }
                     }
                     MergeClause::Delete => {}
@@ -219,8 +217,7 @@ fn emit_edges(
 /// with the target `columns` (so a UNION-sourced INSERT pairs every branch) and
 /// emit one `Relation` edge per traced origin.
 fn relation_lineage<'a>(
-    columns: &[Ident],
-    target: &TableReference,
+    columns: &[ColumnWrite],
     input: &'a LogicalPlan,
     context: &mut TraceContext<'a>,
     out: &mut Vec<ColumnLineageEdge>,
@@ -229,10 +226,7 @@ fn relation_lineage<'a>(
         let outputs = operand.outputs;
         operand.trace(context, |src_input, cx| {
             for (target_column, ne) in columns.iter().zip(outputs) {
-                let tgt = ColumnTarget::Relation(ColumnReference {
-                    table: Some(target.clone()),
-                    name: target_column.clone(),
-                });
+                let tgt = ColumnTarget::Relation(target_column.clone());
                 emit_edges(origins_of_expr(&ne.expr, src_input, cx), tgt, out);
             }
         });
@@ -281,9 +275,13 @@ fn created_relation_lineage<'a>(
                 let Some(name) = result_names.get(position).cloned().flatten() else {
                     continue;
                 };
-                let tgt = ColumnTarget::Relation(ColumnReference {
-                    table: Some(target.clone()),
-                    name,
+                // A freshly created relation's columns aren't in any catalog yet.
+                let tgt = ColumnTarget::Relation(ColumnWrite {
+                    reference: ColumnReference {
+                        table: Some(target.clone()),
+                        name,
+                    },
+                    resolution: ResolutionKind::Inferred,
                 });
                 emit_edges(origins_of_expr(&ne.expr, src_input, cx), tgt, out);
             }
@@ -312,17 +310,13 @@ fn returning_lineage<'a>(
 /// Emit the `value → target.column` lineage edges of one MERGE WHEN value, its
 /// origins traced through the `source` relation.
 fn merge_value_edges<'a>(
-    column: &Ident,
+    target: &ColumnWrite,
     value: &'a Expr,
-    target: &TableReference,
     source: &'a LogicalPlan,
     context: &mut TraceContext<'a>,
     out: &mut Vec<ColumnLineageEdge>,
 ) {
-    let tgt = ColumnTarget::Relation(ColumnReference {
-        table: Some(target.clone()),
-        name: column.clone(),
-    });
+    let tgt = ColumnTarget::Relation(target.clone());
     emit_edges(origins_of_expr(value, source, context), tgt, out);
 }
 
@@ -368,19 +362,22 @@ pub(super) fn collect_table_lineage(
             }
             &i.target
         }
-        // UPDATE feeds from the FROM relations (the read `input`) AND any value
-        // subquery in a SET RHS; the WHERE predicate / a self-reference to the
-        // target do not feed.
-        LogicalPlan::Update(u) => {
-            feeding_scans(&u.input, &mut context, &mut fed_ctes, &mut sources);
-            for a in &u.assignments {
-                expr_feeding(&a.value, &mut context, &mut fed_ctes, &mut sources);
-            }
-            &u.target
-        }
-        // CTAS / CREATE VIEW move data like INSERT; ALTER / DROP do not.
+        // UPDATE is per-assignment: each SET RHS's feeding sources flow into
+        // *that assignment's* resolved target table — a multi-table
+        // `UPDATE t1 JOIN t2 SET t2.b = t1.c` writes t1.c into t2, not the root.
+        // (Handled out of line since it has several targets, unlike the
+        // single-target DML below.)
+        LogicalPlan::Update(u) => return update_table_lineage(u, &mut context),
+        // CTAS / CREATE VIEW move data like INSERT; ALTER / DROP do not. A
+        // `CLONE src` copies the data, so its shape source feeds `src → target`
+        // (a `LIKE src` copies only the schema → no edge).
         LogicalPlan::CreateTableAs(c) => {
             feeding_scans(&c.input, &mut context, &mut fed_ctes, &mut sources);
+            if let Some(schema_source) = &c.schema_source {
+                if schema_source.copies_data {
+                    sources.push(schema_source.source.clone());
+                }
+            }
             &c.target
         }
         LogicalPlan::CreateView(c) => {
@@ -437,6 +434,52 @@ pub(super) fn collect_table_lineage(
             target: target.clone(),
         })
         .collect()
+}
+
+/// Table lineage for an UPDATE: each SET assignment's RHS value feeds *its own*
+/// resolved target table — so a multi-table `UPDATE t1 JOIN t2 SET t2.b = t1.c`
+/// emits `t1 → t2`, not the root. The sources are the RHS value's traced base
+/// columns projected to their tables (mirroring the column lineage, so the two
+/// surfaces agree), as distinct `source → target` table pairs. A self-flow
+/// (`SET a = a + 1` → `t → t`) is kept, matching both the column lineage (which
+/// carries `t.a → t.a`) and the self-insert table edge (`INSERT INTO t SELECT *
+/// FROM t` → `t → t`). The WHERE predicate and joined relations don't feed on
+/// their own; only a value through a SET RHS does.
+fn update_table_lineage<'a>(
+    u: &'a Update,
+    context: &mut TraceContext<'a>,
+) -> Vec<TableLineageEdge> {
+    let mut edges: Vec<TableLineageEdge> = Vec::new();
+    for a in &u.assignments {
+        let Some(table) = &a.target.reference.table else {
+            continue;
+        };
+        // The lineage target carries the write-target *table*'s resolution
+        // (matching `table_writes`), not the column-level one on `a.target`.
+        let target = TableWrite {
+            reference: table.clone(),
+            resolution: a.target_resolution,
+        };
+        for (read, _kind) in origins_of_expr(&a.value, &u.input, context) {
+            let Some(source) = read.reference.table else {
+                continue;
+            };
+            if edges
+                .iter()
+                .any(|e| e.source.reference == source && e.target == target)
+            {
+                continue; // distinct (source, target) pairs
+            }
+            edges.push(TableLineageEdge {
+                source: TableRead {
+                    reference: source,
+                    resolution: read.resolution,
+                },
+                target: target.clone(),
+            });
+        }
+    }
+    edges
 }
 
 /// Collect the read-role scans that feed data up through `op` (a value / data
@@ -583,7 +626,7 @@ mod tests {
                     ColumnTarget::QueryOutput { name, .. } => {
                         name.as_ref().map_or("?".to_string(), |n| n.value.clone())
                     }
-                    ColumnTarget::Relation(r) => r.name.value.clone(),
+                    ColumnTarget::Relation(r) => r.reference.name.value.clone(),
                 };
                 let k = match e.kind {
                     ColumnLineageKind::Passthrough => "=",

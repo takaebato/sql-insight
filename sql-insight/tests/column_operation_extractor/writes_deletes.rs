@@ -93,6 +93,60 @@ mod writes {
     }
 
     #[test]
+    fn multi_table_update_writes_each_set_target_to_its_own_table() {
+        use sql_insight::sqlparser::dialect::MySqlDialect;
+        // A multi-table `UPDATE t1 JOIN t2 SET t1.a = …, t2.b = …`: each SET
+        // target writes the table its qualifier names, not the root. `t2.b`
+        // used to be mis-attributed to `t1.b` (and its lineage to `t1.b`).
+        assert_column_ops_with_dialect(
+            &MySqlDialect {},
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET t1.a = 1, t2.b = t2.c",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1", "id"), read("t2", "id"), read("t2", "c")],
+                writes: vec![write("t1", "a"), write("t2", "b")],
+                lineage: vec![passthrough(col("t2", "c"), relation("t2", "b"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn self_referencing_update_reads_and_self_lineages_the_target() {
+        // `SET a = a + 1` reads `t.a` and writes `t.a`, with an intra-table
+        // `t.a → t.a` edge (a transformation). The table surfaces mirror this
+        // (table reads `t`, table lineage `t → t`).
+        assert_column_ops(
+            "UPDATE t SET a = a + 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t", "a")],
+                writes: vec![write("t", "a")],
+                lineage: vec![transformation(col("t", "a"), relation("t", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn multi_table_update_set_joined_table_from_root_column() {
+        use sql_insight::sqlparser::dialect::MySqlDialect;
+        // `SET t2.b = t1.c`: writes t2.b, lineage from t1.c (the root is the
+        // source here, the joined table the write target).
+        assert_column_ops_with_dialect(
+            &MySqlDialect {},
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET t2.b = t1.c",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1", "id"), read("t2", "id"), read("t1", "c")],
+                writes: vec![write("t2", "b")],
+                lineage: vec![passthrough(col("t1", "c"), relation("t2", "b"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn update_parenthesized_join_target_resolves_all_relations() {
         // `UPDATE (t1 JOIN t2 …) SET t1.b = t2.b`: the parenthesized join target
         // is flattened, so t2 is a joined read — the ON columns and the SET RHS

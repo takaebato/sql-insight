@@ -21,9 +21,6 @@ across every SQL dialect sqlparser-rs supports.
 - **Optional Catalog**: pass column schemas to tighten column
   resolution and pair INSERT values with target columns by position.
   Best-effort without one.
-- **Table Extraction**: flat list of tables a statement touches —
-  the lightest extraction when you don't need a read/write split or
-  lineage.
 - **CRUD Table Extraction**: tables bucketed by Create / Read /
   Update / Delete role, for CRUD-style access analysis.
 - **SQL Formatting**: emit a query in a consistent layout (single-line
@@ -83,21 +80,6 @@ let result = extract_column_operations(
 let ops = result[0].as_ref().unwrap();
 // a → a (Passthrough), b → b (Transformation, via LOWER).
 assert_eq!(ops.lineage.len(), 2);
-```
-
-### Table Extraction (lightweight)
-
-Flat list of table references touched by a statement:
-
-```rust
-use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::extractor::extract_tables;
-
-let dialect = GenericDialect {};
-let extractions = extract_tables(&dialect, "SELECT * FROM catalog.schema.t1").unwrap();
-let extraction = extractions[0].as_ref().unwrap();
-assert_eq!(extraction.tables.len(), 1);
-assert_eq!(extraction.tables[0].to_string(), "catalog.schema.t1");
 ```
 
 ### CRUD Table Extraction

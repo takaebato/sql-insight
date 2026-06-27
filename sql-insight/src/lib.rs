@@ -14,9 +14,6 @@
 //! - **SQL Normalization** — abstract literals into placeholders so
 //!   structurally identical queries hash to the same shape. See
 //!   [`normalizer`].
-//! - **Table Extraction** — flat list of
-//!   [`TableReference`]s touched by a statement. See
-//!   [`extractor::extract_tables`].
 //! - **CRUD Table Extraction** — CRUD-bucketed table sets per
 //!   statement. See [`extractor::extract_crud_tables`].
 //! - **Table-level Operation Extraction** — `reads` / `writes` /
@@ -75,7 +72,7 @@
 //! Public types live in domain-named modules ([`catalog`],
 //! [`diagnostic`], [`error`], [`extractor`], [`formatter`],
 //! [`normalizer`]); access them via their module path
-//! (`sql_insight::extractor::extract_tables`,
+//! (`sql_insight::extractor::extract_table_operations`,
 //! `sql_insight::formatter::format`, etc.). The two identity types
 //! [`TableReference`] / [`ColumnReference`] are re-exported at the
 //! crate root because they show up across modules; their containing
@@ -95,6 +92,14 @@
 //! - `lineage` — directed `source → target` edges, emitted only for
 //!   statements that physically move data (`INSERT` / `UPDATE` /
 //!   `MERGE` / `CREATE TABLE AS` / `CREATE VIEW`).
+//!
+//! `reads` / `writes` follow a relation's **syntactic role in the
+//! written SQL**, not what is physically touched at runtime: an
+//! unreferenced CTE body's tables, a `SELECT COUNT(*) FROM t`, and a
+//! `CREATE TABLE t LIKE src` source all read, even though no row data is
+//! consumed. The actual data-flow precision lives in `lineage` — e.g.
+//! `LIKE` (schema only) emits none, while `CLONE` (data copied) feeds
+//! `src → t`.
 //!
 //! For column-level lineage, [`extractor::ColumnLineageKind`] makes one
 //! clean distinction: `Passthrough` (the value is forwarded unchanged; a
@@ -231,8 +236,8 @@ pub use casing::{CaseRule, IdentifierCasing};
 // every other module's public surface.
 mod reference;
 pub use reference::{
-    ColumnIdentityKey, ColumnRead, ColumnReference, ResolutionKind, TableIdentityKey, TableRead,
-    TableReference,
+    ColumnIdentityKey, ColumnRead, ColumnReference, ColumnWrite, ResolutionKind, TableIdentityKey,
+    TableRead, TableReference, TableWrite,
 };
 
 // `sqlparser` is re-exported so consumers can name `Dialect` /

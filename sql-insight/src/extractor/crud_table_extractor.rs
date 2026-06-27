@@ -24,7 +24,7 @@ use crate::catalog::Catalog;
 use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::extractor::{ExtractorOptions, StatementKind, TableOperationExtractor};
-use crate::reference::TableReference;
+use crate::reference::{TableRead, TableReference, TableWrite};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 
@@ -66,10 +66,15 @@ pub fn extract_crud_tables_with_options(
 #[derive(Default, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CrudTables {
-    pub create_tables: Vec<TableReference>,
-    pub read_tables: Vec<TableReference>,
-    pub update_tables: Vec<TableReference>,
-    pub delete_tables: Vec<TableReference>,
+    /// Tables created (`INSERT` / `CREATE` / a MERGE INSERT action), each paired
+    /// with its catalog-match [`ResolutionKind`](crate::ResolutionKind).
+    pub create_tables: Vec<TableWrite>,
+    /// Tables read, each paired with its [`ResolutionKind`](crate::ResolutionKind).
+    pub read_tables: Vec<TableRead>,
+    /// Tables updated (`UPDATE` / `ALTER` / a MERGE UPDATE action / an upsert).
+    pub update_tables: Vec<TableWrite>,
+    /// Tables deleted (`DELETE` / `DROP` / `TRUNCATE` / a MERGE DELETE action).
+    pub delete_tables: Vec<TableWrite>,
     /// Non-fatal diagnostics, forwarded from the underlying table-level
     /// extraction (only [`UnsupportedStatement`](crate::diagnostic::TableLevelDiagnosticKind::UnsupportedStatement)
     /// arises at this granularity).
@@ -78,13 +83,19 @@ pub struct CrudTables {
 
 impl fmt::Display for CrudTables {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let write_refs = |ws: &[TableWrite]| -> Vec<TableReference> {
+            ws.iter().map(|w| w.reference.clone()).collect()
+        };
+        let read_refs = |rs: &[TableRead]| -> Vec<TableReference> {
+            rs.iter().map(|r| r.reference.clone()).collect()
+        };
         write!(
             f,
             "Create: [{}], Read: [{}], Update: [{}], Delete: [{}]",
-            TableReference::format_list(&self.create_tables),
-            TableReference::format_list(&self.read_tables),
-            TableReference::format_list(&self.update_tables),
-            TableReference::format_list(&self.delete_tables),
+            TableReference::format_list(&write_refs(&self.create_tables)),
+            TableReference::format_list(&read_refs(&self.read_tables)),
+            TableReference::format_list(&write_refs(&self.update_tables)),
+            TableReference::format_list(&write_refs(&self.delete_tables)),
         )
     }
 }
@@ -126,9 +137,10 @@ impl CrudTableExtractor {
     ) -> Result<CrudTables, Error> {
         let (ops, merge_actions, insert_updates) =
             TableOperationExtractor::extract_inner(statement, catalog, style)?;
-        // CRUD buckets are identity-only — drop the per-read
-        // `ResolutionKind` and keep the bare `TableReference`s.
-        let reads: Vec<TableReference> = ops.reads.into_iter().map(|r| r.reference).collect();
+        // CRUD buckets carry the same `ResolutionKind` as the table operation:
+        // reads as `TableRead`, the create / update / delete buckets as
+        // `TableWrite`.
+        let reads = ops.reads;
         let writes = ops.writes;
         let diagnostics = ops.diagnostics;
 
@@ -208,7 +220,14 @@ impl CrudTableExtractor {
             // compile error here and forces a bucket decision.
             StatementKind::Unsupported => {
                 crud.read_tables = reads;
-                crud.read_tables.extend(writes);
+                // Best-effort: fold any write targets in as reads (an
+                // unsupported statement builds no plan, so this is normally
+                // empty). Same fields, write → read role.
+                crud.read_tables
+                    .extend(writes.into_iter().map(|w| TableRead {
+                        reference: w.reference,
+                        resolution: w.resolution,
+                    }));
             }
         }
 

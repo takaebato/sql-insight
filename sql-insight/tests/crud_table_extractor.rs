@@ -32,6 +32,23 @@ fn catalog_schema_table(catalog: &str, schema: &str, name: &str) -> TableReferen
     }
 }
 
+/// Wrap a reference as a catalog-free read (every CRUD test here runs
+/// without a catalog, so the resolution is [`ResolutionKind::Inferred`]).
+fn cread(reference: TableReference) -> TableRead {
+    TableRead {
+        reference,
+        resolution: ResolutionKind::Inferred,
+    }
+}
+
+/// Wrap a reference as a catalog-free write occurrence.
+fn cwrite(reference: TableReference) -> TableWrite {
+    TableWrite {
+        reference,
+        resolution: ResolutionKind::Inferred,
+    }
+}
+
 mod basic {
     use super::*;
 
@@ -40,7 +57,7 @@ mod basic {
         let sql = "SELECT a FROM t1";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![table("t1")],
+            read_tables: vec![cread(table("t1"))],
             update_tables: vec![],
             delete_tables: vec![],
             diagnostics: vec![],
@@ -54,14 +71,14 @@ mod basic {
         let expected = vec![
             Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![table("t1")],
+                read_tables: vec![cread(table("t1"))],
                 update_tables: vec![],
                 delete_tables: vec![],
                 diagnostics: vec![],
             }),
             Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![table("t2")],
+                read_tables: vec![cread(table("t2"))],
                 update_tables: vec![],
                 delete_tables: vec![],
                 diagnostics: vec![],
@@ -75,7 +92,7 @@ mod basic {
         let sql = "SELECT a FROM t1 AS t1_alias";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![table("t1")],
+            read_tables: vec![cread(table("t1"))],
             update_tables: vec![],
             delete_tables: vec![],
             diagnostics: vec![],
@@ -88,7 +105,7 @@ mod basic {
         let sql = "SELECT a FROM catalog.schema.table";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![catalog_schema_table("catalog", "schema", "table")],
+            read_tables: vec![cread(catalog_schema_table("catalog", "schema", "table"))],
             update_tables: vec![],
             delete_tables: vec![],
             diagnostics: vec![],
@@ -101,7 +118,7 @@ mod basic {
         let sql = "SELECT a FROM catalog.schema.table AS table_alias";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![catalog_schema_table("catalog", "schema", "table")],
+            read_tables: vec![cread(catalog_schema_table("catalog", "schema", "table"))],
             update_tables: vec![],
             delete_tables: vec![],
             diagnostics: vec![],
@@ -114,7 +131,7 @@ mod basic {
         let sql = "WITH t2 AS (SELECT id FROM t1) SELECT * FROM t2";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![table("t1")],
+            read_tables: vec![cread(table("t1"))],
             update_tables: vec![],
             delete_tables: vec![],
             diagnostics: vec![],
@@ -182,7 +199,7 @@ mod delete_statement {
             create_tables: vec![],
             read_tables: vec![],
             update_tables: vec![],
-            delete_tables: vec![table("t1")],
+            delete_tables: vec![cwrite(table("t1"))],
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
@@ -195,7 +212,7 @@ mod delete_statement {
             create_tables: vec![],
             read_tables: vec![],
             update_tables: vec![],
-            delete_tables: vec![catalog_schema_table("catalog", "schema", "t1")],
+            delete_tables: vec![cwrite(catalog_schema_table("catalog", "schema", "t1"))],
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
@@ -208,7 +225,7 @@ mod delete_statement {
             create_tables: vec![],
             read_tables: vec![],
             update_tables: vec![],
-            delete_tables: vec![table("t1")],
+            delete_tables: vec![cwrite(table("t1"))],
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
@@ -219,9 +236,9 @@ mod delete_statement {
         let sql = "DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![table("t1"), table("t2"), table("t3")],
+            read_tables: vec![cread(table("t1")), cread(table("t2")), cread(table("t3"))],
             update_tables: vec![],
-            delete_tables: vec![table("t1"), table("t2")],
+            delete_tables: vec![cwrite(table("t1")), cwrite(table("t2"))],
             diagnostics: vec![],
         })];
         // BigQuery and Generic do not support DELETE ... FROM
@@ -242,9 +259,9 @@ mod delete_statement {
             "DELETE t1_alias, t2_alias FROM t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![table("t1"), table("t2"), table("t3")],
+            read_tables: vec![cread(table("t1")), cread(table("t2")), cread(table("t3"))],
             update_tables: vec![],
-            delete_tables: vec![table("t1"), table("t2")],
+            delete_tables: vec![cwrite(table("t1")), cwrite(table("t2"))],
             diagnostics: vec![],
         })];
         // BigQuery and Generic do not support DELETE ... FROM
@@ -264,9 +281,9 @@ mod delete_statement {
         let sql = "DELETE FROM t1, t2 USING t1 INNER JOIN t2 INNER JOIN t3";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![table("t1"), table("t2"), table("t3")],
+            read_tables: vec![cread(table("t1")), cread(table("t2")), cread(table("t3"))],
             update_tables: vec![],
-            delete_tables: vec![table("t1"), table("t2")],
+            delete_tables: vec![cwrite(table("t1")), cwrite(table("t2"))],
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
@@ -277,9 +294,9 @@ mod delete_statement {
         let sql = "DELETE FROM t1_alias, t2_alias USING t1 AS t1_alias INNER JOIN t2 AS t2_alias INNER JOIN t3";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![table("t1"), table("t2"), table("t3")],
+            read_tables: vec![cread(table("t1")), cread(table("t2")), cread(table("t3"))],
             update_tables: vec![],
-            delete_tables: vec![table("t1"), table("t2")],
+            delete_tables: vec![cwrite(table("t1")), cwrite(table("t2"))],
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
@@ -294,9 +311,11 @@ mod delete_statement {
         let sql = "(DELETE FROM t WHERE id = 1)";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![],
+            // `t.id` is read by the WHERE — the target's own data is consumed,
+            // so it reads as well as deletes.
+            read_tables: vec![cread(table("t"))],
             update_tables: vec![],
-            delete_tables: vec![table("t")],
+            delete_tables: vec![cwrite(table("t"))],
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
@@ -310,7 +329,7 @@ mod insert_statement {
     fn test_insert_statement() {
         let sql = "INSERT INTO t1 (a) VALUES (1)";
         let expected = vec![Ok(CrudTables {
-            create_tables: vec![table("t1")],
+            create_tables: vec![cwrite(table("t1"))],
             read_tables: vec![],
             update_tables: vec![],
             delete_tables: vec![],
@@ -323,8 +342,8 @@ mod insert_statement {
     fn test_insert_select_statement() {
         let sql = "INSERT INTO t1 (a) SELECT a FROM t2 AS t2_alias INNER JOIN t3 USING (id)";
         let expected = vec![Ok(CrudTables {
-            create_tables: vec![table("t1")],
-            read_tables: vec![table("t2"), table("t3")],
+            create_tables: vec![cwrite(table("t1"))],
+            read_tables: vec![cread(table("t2")), cread(table("t3"))],
             update_tables: vec![],
             delete_tables: vec![],
             diagnostics: vec![],
@@ -339,8 +358,8 @@ mod insert_statement {
         use sql_insight::sqlparser::dialect::GenericDialect;
         let sql = "(INSERT INTO t (a) SELECT b FROM src)";
         let expected = vec![Ok(CrudTables {
-            create_tables: vec![table("t")],
-            read_tables: vec![table("src")],
+            create_tables: vec![cwrite(table("t"))],
+            read_tables: vec![cread(table("src"))],
             update_tables: vec![],
             delete_tables: vec![],
             diagnostics: vec![],
@@ -355,9 +374,9 @@ mod insert_statement {
         // target, so `t1` lands in both the create and update buckets.
         let sql = "INSERT INTO t1 (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 2";
         let expected = vec![Ok(CrudTables {
-            create_tables: vec![table("t1")],
+            create_tables: vec![cwrite(table("t1"))],
             read_tables: vec![],
-            update_tables: vec![table("t1")],
+            update_tables: vec![cwrite(table("t1"))],
             delete_tables: vec![],
             diagnostics: vec![],
         })];
@@ -370,7 +389,7 @@ mod insert_statement {
         // `ON CONFLICT DO NOTHING` performs no update — create-only.
         let sql = "INSERT INTO t1 (a) VALUES (1) ON CONFLICT (a) DO NOTHING";
         let expected = vec![Ok(CrudTables {
-            create_tables: vec![table("t1")],
+            create_tables: vec![cwrite(table("t1"))],
             read_tables: vec![],
             update_tables: vec![],
             delete_tables: vec![],
@@ -384,9 +403,9 @@ mod insert_statement {
         // MySQL `ON DUPLICATE KEY UPDATE` is the same upsert shape: create + update.
         let sql = "INSERT INTO t1 (a) VALUES (1) ON DUPLICATE KEY UPDATE b = 2";
         let expected = vec![Ok(CrudTables {
-            create_tables: vec![table("t1")],
+            create_tables: vec![cwrite(table("t1"))],
             read_tables: vec![],
-            update_tables: vec![table("t1")],
+            update_tables: vec![cwrite(table("t1"))],
             delete_tables: vec![],
             diagnostics: vec![],
         })];
@@ -406,7 +425,7 @@ mod update_statement {
             vec![Ok(CrudTables {
                 create_tables: vec![],
                 read_tables: vec![],
-                update_tables: vec![table("t1")],
+                update_tables: vec![cwrite(table("t1"))],
                 delete_tables: vec![],
                 diagnostics: vec![],
             }),]
@@ -415,19 +434,35 @@ mod update_statement {
 
     #[test]
     fn test_update_statement_with_alias() {
-        // Behavior change vs the legacy implementation: joined tables
-        // (`t2` here) are now classified as `read_tables` rather than
-        // bundled into `update_tables`. This matches the SQL semantics
-        // — only `t1` is being updated; `t2` is a join partner.
+        // `t1` is updated AND a join source — `t1_alias.a` is read by the ON, so
+        // its own data is consumed. So `t1` is both a read and an update; `t2`
+        // and `t3` are read-only sources.
         let sql = "UPDATE t1 AS t1_alias INNER JOIN t2 ON t1_alias.a = t2.a SET t1_alias.b = t2.b WHERE t2.c = (SELECT c FROM t3)";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![table("t2"), table("t3")],
-            update_tables: vec![table("t1")],
+            read_tables: vec![cread(table("t1")), cread(table("t2")), cread(table("t3"))],
+            update_tables: vec![cwrite(table("t1"))],
             delete_tables: vec![],
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_multi_table_update_buckets_set_target_and_reads_sources() {
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        // `UPDATE t1 JOIN t2 SET t2.b = t1.c`: only `t2` is updated (the SET
+        // target's resolved table); both `t1` and `t2` are read (their `id`
+        // columns are consumed by the ON).
+        let sql = "UPDATE t1 JOIN t2 ON t1.id = t2.id SET t2.b = t1.c";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![cread(table("t1")), cread(table("t2"))],
+            update_tables: vec![cwrite(table("t2"))],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
     }
 
     #[test]
@@ -438,7 +473,7 @@ mod update_statement {
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
             read_tables: vec![],
-            update_tables: vec![table("t")],
+            update_tables: vec![cwrite(table("t"))],
             delete_tables: vec![],
             diagnostics: vec![],
         })];
@@ -462,9 +497,11 @@ mod merge {
         assert_eq!(
             result,
             vec![Ok(CrudTables {
+                // `tgt.id` is read by the ON (to match), so the target reads as
+                // well as updates; `src` is the read source.
                 create_tables: vec![],
-                read_tables: vec![table("src")],
-                update_tables: vec![table("tgt")],
+                read_tables: vec![cread(table("src")), cread(table("tgt"))],
+                update_tables: vec![cwrite(table("tgt"))],
                 delete_tables: vec![],
                 diagnostics: vec![],
             })]
@@ -483,8 +520,10 @@ mod merge {
         assert_eq!(
             result,
             vec![Ok(CrudTables {
-                create_tables: vec![table("tgt")],
-                read_tables: vec![table("src")],
+                // `tgt.id` is read by the ON, so the target reads as well as
+                // (insert-)creates; `src` is the read source.
+                create_tables: vec![cwrite(table("tgt"))],
+                read_tables: vec![cread(table("tgt")), cread(table("src"))],
                 update_tables: vec![],
                 delete_tables: vec![],
                 diagnostics: vec![],
@@ -499,10 +538,12 @@ mod merge {
                      WHEN MATCHED AND t2_alias.b = 2 THEN UPDATE SET t1_alias.b = t2_alias.b \
                      WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2_alias.a, t2_alias.b)";
         let expected = vec![Ok(CrudTables {
-            create_tables: vec![table("t1")],
-            read_tables: vec![table("t2")],
-            update_tables: vec![table("t1")],
-            delete_tables: vec![table("t1")],
+            // `t1_alias.a` is read by the ON, so the target `t1` reads as well
+            // as create/update/delete; `t2` is the read source.
+            create_tables: vec![cwrite(table("t1"))],
+            read_tables: vec![cread(table("t1")), cread(table("t2"))],
+            update_tables: vec![cwrite(table("t1"))],
+            delete_tables: vec![cwrite(table("t1"))],
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
@@ -522,7 +563,7 @@ mod ddl {
     fn test_create_table_buckets_as_create() {
         let sql = "CREATE TABLE t1 (a INT)";
         let expected = vec![Ok(CrudTables {
-            create_tables: vec![table("t1")],
+            create_tables: vec![cwrite(table("t1"))],
             read_tables: vec![],
             update_tables: vec![],
             delete_tables: vec![],
@@ -539,8 +580,8 @@ mod ddl {
         assert_eq!(
             result,
             vec![Ok(CrudTables {
-                create_tables: vec![table("new")],
-                read_tables: vec![table("src")],
+                create_tables: vec![cwrite(table("new"))],
+                read_tables: vec![cread(table("src"))],
                 update_tables: vec![],
                 delete_tables: vec![],
                 diagnostics: vec![],
@@ -555,8 +596,8 @@ mod ddl {
         assert_eq!(
             result,
             vec![Ok(CrudTables {
-                create_tables: vec![table("v")],
-                read_tables: vec![table("src")],
+                create_tables: vec![cwrite(table("v"))],
+                read_tables: vec![cread(table("src"))],
                 update_tables: vec![],
                 delete_tables: vec![],
                 diagnostics: vec![],
@@ -570,7 +611,7 @@ mod ddl {
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
             read_tables: vec![],
-            update_tables: vec![table("t1")],
+            update_tables: vec![cwrite(table("t1"))],
             delete_tables: vec![],
             diagnostics: vec![],
         })];
@@ -587,8 +628,8 @@ mod ddl {
             result,
             vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![table("src")],
-                update_tables: vec![table("v")],
+                read_tables: vec![cread(table("src"))],
+                update_tables: vec![cwrite(table("v"))],
                 delete_tables: vec![],
                 diagnostics: vec![],
             })]
@@ -606,7 +647,7 @@ mod ddl {
                 create_tables: vec![],
                 read_tables: vec![],
                 update_tables: vec![],
-                delete_tables: vec![table("doomed")],
+                delete_tables: vec![cwrite(table("doomed"))],
                 diagnostics: vec![],
             })]
         );
@@ -622,7 +663,7 @@ mod ddl {
                 create_tables: vec![],
                 read_tables: vec![],
                 update_tables: vec![],
-                delete_tables: vec![table("logs")],
+                delete_tables: vec![cwrite(table("logs"))],
                 diagnostics: vec![],
             })]
         );
@@ -639,8 +680,8 @@ mod ddl {
         assert_eq!(
             result,
             vec![Ok(CrudTables {
-                create_tables: vec![table("new_t")],
-                read_tables: vec![table("src")],
+                create_tables: vec![cwrite(table("new_t"))],
+                read_tables: vec![cread(table("src"))],
                 update_tables: vec![],
                 delete_tables: vec![],
                 diagnostics: vec![],
@@ -659,8 +700,8 @@ mod ddl {
         assert_eq!(
             result,
             vec![Ok(CrudTables {
-                create_tables: vec![table("new_t")],
-                read_tables: vec![table("src"), table("other")],
+                create_tables: vec![cwrite(table("new_t"))],
+                read_tables: vec![cread(table("src")), cread(table("other"))],
                 update_tables: vec![],
                 delete_tables: vec![],
                 diagnostics: vec![],
@@ -679,7 +720,7 @@ mod ddl {
             result,
             vec![Ok(CrudTables {
                 create_tables: vec![],
-                read_tables: vec![table("s")],
+                read_tables: vec![cread(table("s"))],
                 update_tables: vec![],
                 delete_tables: vec![],
                 diagnostics: vec![],

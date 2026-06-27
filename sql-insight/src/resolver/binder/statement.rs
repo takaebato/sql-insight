@@ -32,7 +32,7 @@ impl<'a> Binder<'a> {
             // inspectable source — a target-only create.
             Statement::CreateVirtualTable { name, .. } => match self.table_ref(name) {
                 Some(written) => LogicalPlan::CreateTableAs(CreateTableAs {
-                    target: self.table_match(&written).table,
+                    target: self.table_write(&written),
                     columns: Vec::new(),
                     input: Box::new(LogicalPlan::Empty),
                     schema_source: None,
@@ -47,7 +47,7 @@ impl<'a> Binder<'a> {
                     .filter_map(|t| self.table_ref(&t.name))
                     .collect();
                 LogicalPlan::Drop(Drop {
-                    targets: written.iter().map(|w| self.table_match(w).table).collect(),
+                    targets: written.iter().map(|w| self.table_write(w)).collect(),
                 })
             }
             _ => LogicalPlan::Empty,
@@ -68,13 +68,13 @@ impl<'a> Binder<'a> {
         let Some(written) = self.table_ref(name) else {
             return plan;
         };
-        let target = self.table_match(&written).table;
+        let target = self.table_write(&written);
         // `SELECT … INTO` lowers to a CTAS with no explicit column list, so an
         // unaliased source expression (`SELECT a + 1 INTO t`) is an unnameable
         // column dropped from `writes` / `lineage` — flag it, like the
         // `CREATE TABLE … AS` path. (No explicit list, so no arity check.)
         let source_wildcard = source_has_wildcard(query);
-        self.diagnose_created_columns(&target, &[], &plan, source_wildcard);
+        self.diagnose_created_columns(&target.reference, &[], &plan, source_wildcard);
         LogicalPlan::CreateTableAs(CreateTableAs {
             target,
             columns: Vec::new(),
@@ -117,7 +117,7 @@ impl<'a> Binder<'a> {
         // VALUES / SELECT source) — each assignment is a value column named by
         // its target, like a single-row UPDATE.
         if insert.source.is_none() && !insert.assignments.is_empty() {
-            return self.bind_insert_set(insert, target);
+            return self.bind_insert_set(insert, target, m.resolution, m.columns);
         }
         let (input, scope) = match &insert.source {
             Some(source) => self.bind_query(source),
@@ -187,8 +187,15 @@ impl<'a> Binder<'a> {
         // RETURNING resolves against the target alone (the source query's
         // scope is already popped).
         let returning = self.bind_returning(&insert.returning, &self.target_scope(&target));
+        // Each written column carries its catalog match against the target
+        // (`Cataloged` if listed, else `Inferred` — a catalog-filled column is
+        // by definition listed).
+        let columns = self.column_writes(&target, &m.columns, columns);
         LogicalPlan::Insert(Insert {
-            target,
+            target: TableWrite {
+                reference: target,
+                resolution: m.resolution,
+            },
             columns,
             input: Box::new(input),
             returning,
@@ -196,6 +203,32 @@ impl<'a> Binder<'a> {
             conflict_predicate,
             source_wildcard,
         })
+    }
+
+    /// Wrap written column names as [`ColumnWrite`]s, each resolved against the
+    /// target's catalog column list: `Cataloged` when listed, else `Inferred`
+    /// (catalog-free, target columns unknown, or an unlisted column). Shared by
+    /// the INSERT / MERGE-insert write paths.
+    fn column_writes(
+        &self,
+        target: &TableReference,
+        catalog_columns: &[Ident],
+        columns: Vec<Ident>,
+    ) -> Vec<ColumnWrite> {
+        columns
+            .into_iter()
+            .map(|name| ColumnWrite {
+                resolution: if self.list_has(catalog_columns, &name) {
+                    ResolutionKind::Cataloged
+                } else {
+                    ResolutionKind::Inferred
+                },
+                reference: crate::reference::ColumnReference {
+                    table: Some(target.clone()),
+                    name,
+                },
+            })
+            .collect()
     }
 
     /// MySQL `INSERT INTO t SET col = expr, …`: bind the assignment form like a
@@ -206,6 +239,8 @@ impl<'a> Binder<'a> {
         &mut self,
         insert: &SqlInsert,
         target: TableReference,
+        resolution: ResolutionKind,
+        catalog_columns: Vec<Ident>,
     ) -> LogicalPlan {
         let scope = self.target_scope(&target);
         let mut columns = Vec::new();
@@ -224,8 +259,12 @@ impl<'a> Binder<'a> {
             None => (Vec::new(), Vec::new()),
         };
         let returning = self.bind_returning(&insert.returning, &scope);
+        let columns = self.column_writes(&target, &catalog_columns, columns);
         LogicalPlan::Insert(Insert {
-            target,
+            target: TableWrite {
+                reference: target,
+                resolution,
+            },
             columns,
             input: Box::new(LogicalPlan::Projection(Projection {
                 input: Box::new(LogicalPlan::Empty),
@@ -274,16 +313,18 @@ impl<'a> Binder<'a> {
             // `OnInsert` is non-exhaustive; an unmodelled action is a no-op.
             _ => return (Vec::new(), Vec::new()),
         };
+        // A conflict-action SET always targets the insert target's own columns.
         let bound = assignments
             .iter()
-            .flat_map(|a| {
-                assignment_target_columns(&a.target)
-                    .into_iter()
-                    .map(move |column| (column, &a.value))
-            })
-            .map(|(column, value)| Assignment {
-                target: column,
-                value: self.bind_expr(value, &scope),
+            .filter_map(|a| {
+                let value = self.bind_expr(&a.value, &scope);
+                let (target, target_resolution) =
+                    self.assignment_target(&a.target, &scope, target)?;
+                Some(Assignment {
+                    target,
+                    target_resolution,
+                    value,
+                })
             })
             .collect();
         let predicate = selection
@@ -306,7 +347,9 @@ impl<'a> Binder<'a> {
         // — so the parenthesized form behaves like the non-paren MySQL
         // `UPDATE t1 JOIN t2 …` form (whose joins live on `update.table.joins`).
         let (target_factor, joins) = flatten_dml_target(&update.table);
-        let Some((target_relation, target)) = self.target_relation(target_factor) else {
+        // The root's own resolution isn't needed here — each SET assignment
+        // carries its write-target table's resolution (`assignment_target`).
+        let Some((target_relation, target, _)) = self.target_relation(target_factor) else {
             return LogicalPlan::Empty;
         };
         let mut scope = Scope::single(target_relation);
@@ -340,18 +383,21 @@ impl<'a> Binder<'a> {
                 predicate: vec![self.bind_expr(predicate, &scope)],
             });
         }
-        // SET assignments resolve against the target + FROM scope.
+        // SET assignments resolve against the target + FROM scope; each writes
+        // its resolved target table (the root, or the relation a qualifier names
+        // in a multi-table `UPDATE t1 JOIN t2 SET t2.col = …`).
         let assignments = update
             .assignments
             .iter()
-            .flat_map(|a| {
-                assignment_target_columns(&a.target)
-                    .into_iter()
-                    .map(move |column| (column, &a.value))
-            })
-            .map(|(column, value)| Assignment {
-                target: column,
-                value: self.bind_expr(value, &scope),
+            .filter_map(|a| {
+                let value = self.bind_expr(&a.value, &scope);
+                let (target, target_resolution) =
+                    self.assignment_target(&a.target, &scope, &target)?;
+                Some(Assignment {
+                    target,
+                    target_resolution,
+                    value,
+                })
             })
             .collect();
         // RETURNING resolves against the statement scope (target + FROM).
@@ -449,7 +495,8 @@ impl<'a> Binder<'a> {
             self.record_unsupported_merge_target(&merge.table);
             return LogicalPlan::Empty;
         }
-        let Some((target_relation, target)) = self.target_relation(&merge.table) else {
+        let Some((target_relation, target, target_resolution)) = self.target_relation(&merge.table)
+        else {
             // A non-table MERGE target (derived table / subquery / table
             // function) can't be a write target — flag it rather than dropping
             // the whole statement silently (best-effort drop + flag).
@@ -478,8 +525,9 @@ impl<'a> Binder<'a> {
                                 .iter()
                                 .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
                                 .collect();
+                            let catalog_cols = self.catalog_columns(&target);
                             let columns = if explicit.is_empty() {
-                                self.catalog_columns(&target)
+                                catalog_cols.clone()
                             } else {
                                 explicit
                             };
@@ -498,7 +546,7 @@ impl<'a> Binder<'a> {
                                 self.record_insert_columns_unresolved(&target, false);
                             }
                             clauses.push(MergeClause::Insert {
-                                columns,
+                                columns: self.column_writes(&target, &catalog_cols, columns),
                                 values: row,
                             });
                         }
@@ -524,17 +572,20 @@ impl<'a> Binder<'a> {
                     {
                         on.push(self.bind_expr(predicate, &scope));
                     }
+                    // A MERGE WHEN UPDATE always targets the merge target's
+                    // own columns.
                     let assignments = update
                         .assignments
                         .iter()
-                        .flat_map(|a| {
-                            assignment_target_columns(&a.target)
-                                .into_iter()
-                                .map(move |column| (column, &a.value))
-                        })
-                        .map(|(column, value)| Assignment {
-                            target: column,
-                            value: self.bind_expr(value, &scope),
+                        .filter_map(|a| {
+                            let value = self.bind_expr(&a.value, &scope);
+                            let (target, target_resolution) =
+                                self.assignment_target(&a.target, &scope, &target)?;
+                            Some(Assignment {
+                                target,
+                                target_resolution,
+                                value,
+                            })
                         })
                         .collect();
                     clauses.push(MergeClause::Update { assignments });
@@ -545,7 +596,10 @@ impl<'a> Binder<'a> {
             }
         }
         LogicalPlan::Merge(Merge {
-            target,
+            target: TableWrite {
+                reference: target,
+                resolution: target_resolution,
+            },
             source: Box::new(source),
             on,
             clauses,
@@ -558,16 +612,20 @@ impl<'a> Binder<'a> {
     pub(super) fn target_relation(
         &mut self,
         factor: &TableFactor,
-    ) -> Option<(Relation, TableReference)> {
+    ) -> Option<(Relation, TableReference, ResolutionKind)> {
         // Reuse the table-factor binder for catalog matching / column
-        // knowledge, then discard the scan — the target is named on the DML
-        // root, not read.
-        let (_scan, scope) = self.bind_table_factor(factor, &[]);
+        // knowledge; the target isn't read (it's named on the DML root), but
+        // the scan's `resolution` is the catalog match we keep for the write.
+        let (scan, scope) = self.bind_table_factor(factor, &[]);
         let relation = scope.relations.into_iter().next()?;
         match &relation {
             Relation::Table { table, .. } => {
+                let resolution = match &scan {
+                    LogicalPlan::Scan(s) => s.resolution,
+                    _ => ResolutionKind::Inferred,
+                };
                 let target = table.clone();
-                Some((relation, target))
+                Some((relation, target, resolution))
             }
             Relation::Derived { .. } | Relation::TableFunction { .. } => None,
         }
@@ -575,11 +633,11 @@ impl<'a> Binder<'a> {
 
     /// The plain-table deletion targets of a FROM `TableWithJoins` (its
     /// relation plus any joined relations), catalog-canonicalised.
-    pub(super) fn twj_table_targets(&self, twj: &TableWithJoins) -> Vec<TableReference> {
+    pub(super) fn twj_table_targets(&self, twj: &TableWithJoins) -> Vec<TableWrite> {
         std::iter::once(&twj.relation)
             .chain(twj.joins.iter().map(|join| &join.relation))
             .filter_map(|factor| TableReference::try_from(factor).ok())
-            .map(|written| self.table_match(&written).table)
+            .map(|written| self.table_write(&written))
             .collect()
     }
 
@@ -591,11 +649,11 @@ impl<'a> Binder<'a> {
         &mut self,
         name: &ObjectName,
         scope: &Scope,
-    ) -> Option<TableReference> {
+    ) -> Option<TableWrite> {
         let written = self.table_ref(name)?;
         Some(
             self.scope_target(&written, scope)
-                .unwrap_or_else(|| self.table_match(&written).table),
+                .unwrap_or_else(|| self.table_write(&written)),
         )
     }
 
@@ -608,7 +666,7 @@ impl<'a> Binder<'a> {
         &self,
         written: &TableReference,
         scope: &Scope,
-    ) -> Option<TableReference> {
+    ) -> Option<TableWrite> {
         let canonical = self.table_match(written).table;
         scope.relations.iter().find_map(|relation| match relation {
             Relation::Table { table, alias, .. } => {
@@ -620,7 +678,9 @@ impl<'a> Binder<'a> {
                     }
                     None => self.table_identity_eq(&canonical, table),
                 };
-                matches.then(|| table.clone())
+                // Re-match the resolved real table for its catalog resolution
+                // (the scope `Relation` carries identity, not resolution).
+                matches.then(|| self.table_write(table))
             }
             Relation::Derived { .. } | Relation::TableFunction { .. } => None,
         })
@@ -658,6 +718,85 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// Resolve a SET assignment's target to the column it writes, qualified by
+    /// its **resolved table**: an unqualified column writes the DML `root`; a
+    /// qualified `t2.col` (a multi-table `UPDATE t1 JOIN t2 SET t2.col = …`)
+    /// writes whichever in-scope real table the qualifier names. Returns `None`
+    /// — dropped (+ flagged by the caller) — for a tuple target (`SET (a,b)=…`,
+    /// not modelled) or a qualifier that names no writable table (a derived
+    /// table / CTE / unknown alias can't be a write target).
+    fn assignment_target(
+        &self,
+        target: &AssignmentTarget,
+        scope: &Scope,
+        root: &TableReference,
+    ) -> Option<(ColumnWrite, ResolutionKind)> {
+        let AssignmentTarget::ColumnName(name) = target else {
+            return None; // tuple `SET (a, b) = …` — not modelled
+        };
+        let parts: Vec<Ident> = name
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident().cloned())
+            .collect();
+        let column = parts.last()?.clone();
+        let table = if parts.len() == 1 {
+            root.clone() // unqualified → the DML root target
+        } else {
+            let qualifier = &parts[..parts.len() - 1];
+            scope
+                .relations
+                .iter()
+                .find_map(|rel| self.writable_qualifier_table(rel, qualifier))?
+        };
+        // Re-match the resolved write-target table (`table` is canonical, so
+        // this reproduces the root scan's / joined relation's catalog match):
+        // its `resolution` is the table-level write resolution; whether the
+        // written `column` is in its catalog column list is the column-level
+        // one (`Cataloged` if listed, else `Inferred` — mirroring a base read).
+        let m = self.table_match(&table);
+        let column_resolution = if self.list_has(&m.columns, &column) {
+            ResolutionKind::Cataloged
+        } else {
+            ResolutionKind::Inferred
+        };
+        Some((
+            ColumnWrite {
+                reference: crate::reference::ColumnReference {
+                    table: Some(table),
+                    name: column,
+                },
+                resolution: column_resolution,
+            },
+            m.resolution,
+        ))
+    }
+
+    /// The table a SET qualifier names, iff it's a *writable* relation — a real
+    /// table matched the way a column qualifier is (an aliased table by its
+    /// alias, a non-aliased one right-anchored). A derived table / CTE / table
+    /// function isn't writable, so it yields `None`.
+    fn writable_qualifier_table(
+        &self,
+        rel: &Relation,
+        qualifier: &[Ident],
+    ) -> Option<TableReference> {
+        match rel {
+            Relation::Table {
+                alias: Some(alias),
+                table,
+                ..
+            } => matches!(qualifier, [q] if self.eq(self.style.casing.table_alias, q, alias))
+                .then(|| table.clone()),
+            Relation::Table {
+                alias: None, table, ..
+            } => TableReference::try_from_parts(qualifier)
+                .filter(|q| self.qualifier_matches_table(q, table))
+                .map(|_| table.clone()),
+            Relation::Derived { .. } | Relation::TableFunction { .. } => None,
+        }
+    }
+
     /// Bind a `RETURNING` clause's projected columns against `scope` — a value
     /// projection over the written relation, like a SELECT list, so each item
     /// contributes target reads and a `QueryOutput` lineage edge. A wildcard is
@@ -683,29 +822,47 @@ impl<'a> Binder<'a> {
     /// outputs. A plain `CREATE TABLE t (cols)` (no query) is a target-only
     /// create — its column definitions aren't writes — so it binds with no
     /// columns / input.
+    /// The `LIKE` / `CLONE` shape source of a target-only `CREATE TABLE`,
+    /// catalog-matched as a [`TableRead`] (it's read either way). `copies_data`
+    /// is `true` for `CLONE` (data copied → feeds lineage), `false` for `LIKE`
+    /// (schema only). `None` if the source name isn't representable.
+    fn schema_source(&mut self, name: &ObjectName, copies_data: bool) -> Option<SchemaSource> {
+        let written = self.table_ref(name)?;
+        let m = self.table_match(&written);
+        Some(SchemaSource {
+            source: TableRead {
+                reference: m.table,
+                resolution: m.resolution,
+            },
+            copies_data,
+        })
+    }
+
     pub(super) fn bind_create_table(&mut self, create: &CreateTable) -> LogicalPlan {
         let Some(written) = self.table_ref(&create.name) else {
             return LogicalPlan::Empty;
         };
-        let target = self.table_match(&written).table;
+        let m = self.table_match(&written);
+        let target = m.table;
+        let resolution = m.resolution;
         let Some(query) = create.query.as_ref() else {
-            // No `AS <query>`: a target-only create. `LIKE src` / `CLONE src`
-            // copies another table's shape — capture that source so it still
-            // surfaces in the flat table list (it is a structural reference,
-            // not a row-data read; see `CreateTableAs::schema_source`).
-            let schema_source = create
-                .like
-                .as_ref()
-                .map(|k| match k {
-                    CreateTableLikeKind::Plain(l) | CreateTableLikeKind::Parenthesized(l) => {
-                        &l.name
-                    }
-                })
-                .or(create.clone.as_ref())
-                .and_then(|name| self.table_ref(name))
-                .map(|src| self.table_match(&src).table);
+            // No `AS <query>`: a target-only create. `LIKE src` copies only the
+            // column definitions (schema, no rows); `CLONE src` copies the data
+            // too. Both read `src`; only CLONE feeds `src → target` lineage
+            // (see `SchemaSource`).
+            let like_name = create.like.as_ref().map(|k| match k {
+                CreateTableLikeKind::Plain(l) | CreateTableLikeKind::Parenthesized(l) => &l.name,
+            });
+            let schema_source = match (like_name, create.clone.as_ref()) {
+                (Some(name), _) => self.schema_source(name, false),
+                (None, Some(name)) => self.schema_source(name, true),
+                (None, None) => None,
+            };
             return LogicalPlan::CreateTableAs(CreateTableAs {
-                target,
+                target: TableWrite {
+                    reference: target,
+                    resolution,
+                },
                 columns: Vec::new(),
                 input: Box::new(LogicalPlan::Empty),
                 schema_source,
@@ -717,7 +874,10 @@ impl<'a> Binder<'a> {
         let source_wildcard = source_has_wildcard(query);
         self.diagnose_created_columns(&target, &columns, &input, source_wildcard);
         LogicalPlan::CreateTableAs(CreateTableAs {
-            target,
+            target: TableWrite {
+                reference: target,
+                resolution,
+            },
             columns,
             input: Box::new(input),
             schema_source: None,
@@ -732,13 +892,17 @@ impl<'a> Binder<'a> {
         let Some(written) = self.table_ref(&create.name) else {
             return LogicalPlan::Empty;
         };
-        let target = self.table_match(&written).table;
+        let m = self.table_match(&written);
+        let target = m.table;
         let (input, _) = self.bind_query(&create.query);
         let columns: Vec<Ident> = create.columns.iter().map(|c| c.name.clone()).collect();
         let source_wildcard = source_has_wildcard(&create.query);
         self.diagnose_created_columns(&target, &columns, &input, source_wildcard);
         LogicalPlan::CreateView(CreateView {
-            target,
+            target: TableWrite {
+                reference: target,
+                resolution: m.resolution,
+            },
             columns,
             input: Box::new(input),
             source_wildcard,
@@ -757,12 +921,16 @@ impl<'a> Binder<'a> {
         let Some(written) = self.table_ref(name) else {
             return LogicalPlan::Empty;
         };
-        let target = self.table_match(&written).table;
+        let m = self.table_match(&written);
+        let target = m.table;
         let (input, _) = self.bind_query(query);
         let source_wildcard = source_has_wildcard(query);
         self.diagnose_created_columns(&target, columns, &input, source_wildcard);
         LogicalPlan::CreateView(CreateView {
-            target,
+            target: TableWrite {
+                reference: target,
+                resolution: m.resolution,
+            },
             columns: columns.to_vec(),
             input: Box::new(input),
             source_wildcard,
@@ -777,13 +945,19 @@ impl<'a> Binder<'a> {
         let Some(written) = self.table_ref(&alter.name) else {
             return LogicalPlan::Empty;
         };
-        let target = self.table_match(&written).table;
+        let m = self.table_match(&written);
         let columns = alter
             .operations
             .iter()
             .flat_map(alter_table_op_target_columns)
             .collect();
-        LogicalPlan::AlterTable(AlterTable { target, columns })
+        LogicalPlan::AlterTable(AlterTable {
+            target: TableWrite {
+                reference: m.table,
+                resolution: m.resolution,
+            },
+            columns,
+        })
     }
 
     /// `DROP TABLE/VIEW/MATERIALIZED VIEW a, b`: the dropped relations are
@@ -806,7 +980,7 @@ impl<'a> Binder<'a> {
             .chain(table)
             .filter_map(|name| self.table_ref(name))
             .collect();
-        let targets = written.iter().map(|w| self.table_match(w).table).collect();
+        let targets = written.iter().map(|w| self.table_write(w)).collect();
         LogicalPlan::Drop(Drop { targets })
     }
 }

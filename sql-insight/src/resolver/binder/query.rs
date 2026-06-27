@@ -491,7 +491,7 @@ impl<'a> Binder<'a> {
         // from the combined result), and it's only a real create at the
         // statement root. The wrap happens once in `bind_statement` so a nested
         // SELECT can't leak a `CreateTableAs` mid-tree (which the write walkers,
-        // peeling only a leading `WITH`, would miss while `flat_tables` saw it).
+        // peeling only a leading `WITH`, would miss).
         (node, clause_scope)
     }
 
