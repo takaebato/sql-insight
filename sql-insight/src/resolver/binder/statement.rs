@@ -595,6 +595,14 @@ impl<'a> Binder<'a> {
                 }
             }
         }
+        // RETURNING (Snowflake) / OUTPUT (MSSQL) projects the affected rows
+        // over the target + source scope, like the other DML roots. (MSSQL
+        // `OUTPUT … INTO <table>`'s secondary write is not modelled yet.)
+        let output_items = merge.output.as_ref().map(|o| match o {
+            OutputClause::Output { select_items, .. }
+            | OutputClause::Returning { select_items, .. } => select_items.clone(),
+        });
+        let returning = self.bind_returning(&output_items, &scope);
         LogicalPlan::Merge(Merge {
             target: TableWrite {
                 reference: target,
@@ -603,6 +611,7 @@ impl<'a> Binder<'a> {
             source: Box::new(source),
             on,
             clauses,
+            returning,
         })
     }
 

@@ -42,9 +42,9 @@ use sqlparser::ast::{
     Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
     GroupByExpr, GroupByWithModifier, Ident, Insert as SqlInsert, JoinConstraint, JoinOperator,
     JsonPathElem, Merge as SqlMerge, MergeAction, MergeInsertKind, ObjectName, ObjectType,
-    OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource,
-    Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject,
-    TableWithJoins, Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
+    OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, OutputClause, PipeOperator,
+    PivotValueSource, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
+    TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
 };
 
 use sqlparser::ast::{

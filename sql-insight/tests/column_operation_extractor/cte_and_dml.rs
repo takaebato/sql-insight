@@ -125,6 +125,34 @@ mod merge {
     }
 
     #[test]
+    fn merge_returning_projects_affected_rows() {
+        // RETURNING (Snowflake) / OUTPUT (MSSQL) projects the affected rows over
+        // the target + source — its columns surface as reads with `QueryOutput`
+        // lineage, alongside the WHEN action's write / lineage.
+        assert_column_ops(
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.a = s.a RETURNING s.b, t.c",
+            ColumnOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![
+                    read("t", "id"),
+                    read("s", "id"),
+                    read("s", "a"),
+                    read("s", "b"),
+                    read("t", "c"),
+                ],
+                writes: vec![write("t", "a")],
+                lineage: vec![
+                    passthrough(col("s", "a"), relation("t", "a")),
+                    passthrough(col("s", "b"), out("b", 0)),
+                    passthrough(col("t", "c"), out("c", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn merge_when_not_matched_insert_emits_lineage_and_write() {
         assert_column_ops(
             "MERGE INTO t USING s ON t.id = s.id \

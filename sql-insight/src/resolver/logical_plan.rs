@@ -251,13 +251,16 @@ pub(crate) struct Delete {
 }
 
 /// `MERGE INTO target USING source ON on WHEN ...`: the `clauses` drive
-/// writes / lineage (UPDATE SET / INSERT VALUES).
+/// writes / lineage (UPDATE SET / INSERT VALUES). `returning` projects the
+/// affected rows — the `RETURNING` (Snowflake) / `OUTPUT` (MSSQL) clause's
+/// select items, over the target + source scope, like the other DML roots.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Merge {
     pub(crate) target: TableWrite,
     pub(crate) source: Box<LogicalPlan>,
     pub(crate) on: Vec<Expr>,
     pub(crate) clauses: Vec<MergeClause>,
+    pub(crate) returning: Vec<NamedExpr>,
 }
 
 /// One `WHEN [NOT] MATCHED ...` action of a [`Merge`].
@@ -593,6 +596,7 @@ pub(super) fn own_exprs(op: &LogicalPlan) -> Vec<&Expr> {
                     MergeClause::Delete => {}
                 }
             }
+            exprs.extend(m.returning.iter().map(|ne| &ne.expr));
             exprs
         }
         LogicalPlan::Scan(_)
