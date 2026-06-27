@@ -28,6 +28,7 @@
 //! as actually stored (e.g. what `information_schema` reports); the
 //! resolver's dialect-casing policy governs the comparison.
 
+use crate::casing::IdentifierCasing;
 use crate::error::Error;
 use sqlparser::ast::{Ident, Statement};
 use sqlparser::dialect::Dialect;
@@ -108,6 +109,21 @@ impl Catalog {
     /// // `users` registered schema-less; `app.orders` keeps its schema.
     /// ```
     pub fn from_ddl(dialect: &dyn Dialect, ddl: &str) -> Result<Self, Error> {
+        Self::from_ddl_with_casing(dialect, ddl, IdentifierCasing::for_dialect(dialect))
+    }
+
+    /// Like [`from_ddl`](Self::from_ddl) but normalizes the stored identifiers
+    /// with an explicit `casing` instead of the dialect default. Pass the same
+    /// [`IdentifierCasing`] you give the extractor via
+    /// [`ExtractorOptions::with_casing`](crate::extractor::ExtractorOptions::with_casing),
+    /// so the catalog's canonical form matches what a query reference folds to:
+    /// `from_ddl` (dialect default) only matches when the extraction also uses
+    /// the default, so a case-sensitive override needs this to resolve.
+    pub fn from_ddl_with_casing(
+        dialect: &dyn Dialect,
+        ddl: &str,
+        casing: IdentifierCasing,
+    ) -> Result<Self, Error> {
         let statements = Parser::parse_sql(dialect, ddl)?;
         // Normalize each DDL identifier to its stored form the way the dialect
         // would: an unquoted name folds (e.g. Postgres `Users` → `users`), a
@@ -116,7 +132,6 @@ impl Catalog {
         // `CREATE TABLE Users` would register `Users` and miss a folded query
         // `users` under a case-sensitive dialect. (Catalog names compare like
         // quoted identifiers, so they must already be in canonical form.)
-        let casing = crate::casing::IdentifierCasing::for_dialect(dialect);
         let mut catalog = Catalog::new();
         for statement in &statements {
             let Statement::CreateTable(create) = statement else {
