@@ -43,7 +43,7 @@ mod tables;
 use logical_plan::LogicalPlan;
 
 use crate::extractor::{ColumnLineageEdge, TableLineageEdge};
-use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference};
+use crate::reference::{ColumnRead, ColumnReference, TableRead, TableReference, TableWrite};
 
 // `build_with_diagnostics` already folds an unmodelled statement to
 // `LogicalPlan::Empty`, so it doubles as `build`.
@@ -82,8 +82,9 @@ pub(crate) fn writes(plan: &LogicalPlan) -> Vec<ColumnReference> {
     tables::collect_writes(plan)
 }
 
-/// Every table the statement writes to — one per DML target.
-pub(crate) fn table_writes(plan: &LogicalPlan) -> Vec<TableReference> {
+/// Every table the statement writes to — one per DML target, each paired with
+/// its catalog [`ResolutionKind`](crate::ResolutionKind).
+pub(crate) fn table_writes(plan: &LogicalPlan) -> Vec<TableWrite> {
     tables::collect_table_writes(plan)
 }
 

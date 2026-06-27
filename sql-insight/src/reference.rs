@@ -81,6 +81,29 @@ pub struct TableRead {
     pub resolution: ResolutionKind,
 }
 
+/// One write-side occurrence of a [`TableReference`] — a DML / DDL write
+/// target — pairing the identity with how the catalog matched it
+/// ([`ResolutionKind`]).
+///
+/// The write-role counterpart of [`TableRead`], kept a distinct type so a
+/// read can't be passed where a write is meant (and so the write side can
+/// diverge later). The `resolution` carries the same catalog-match outcome a
+/// scanned source would: [`Cataloged`](ResolutionKind::Cataloged) for a unique
+/// registered hit, [`Ambiguous`](ResolutionKind::Ambiguous) for several, and
+/// [`Inferred`](ResolutionKind::Inferred) for a catalog miss or catalog-less
+/// mode — so the [`Cataloged`](ResolutionKind::Cataloged)-detects-catalog-aware
+/// invariant holds on writes too. `reference` is always present (a target's
+/// name is written out), so [`Unresolved`](ResolutionKind::Unresolved) never
+/// arises here, exactly as for [`TableRead`].
+///
+/// [`TableOperation::writes`]: crate::extractor::TableOperation::writes
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct TableWrite {
+    pub reference: TableReference,
+    pub resolution: ResolutionKind,
+}
+
 /// A column-level identity reference: an optional owning table plus the
 /// column name.
 ///

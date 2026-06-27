@@ -127,7 +127,7 @@ fn column_op_read_tables_appear_in_table_op_reads_or_writes() {
                     Some(r.reference.clone())
                 });
             let table_op_writes: HashSet<_> =
-                table_set(pair.tab.writes.clone(), |w| Some(w.clone()));
+                table_set(pair.tab.writes.clone(), |w| Some(w.reference.clone()));
             let known: HashSet<_> = table_op_reads.union(&table_op_writes).cloned().collect();
             let column_op_read_tables = table_set(pair.col.reads.clone(), column_read_table);
             for t in &column_op_read_tables {
@@ -147,7 +147,7 @@ fn column_op_read_tables_appear_in_table_op_reads_or_writes() {
 fn column_op_write_tables_appear_in_table_op_writes() {
     for sql in corpus() {
         for (idx, pair) in extract_paired(sql).into_iter().enumerate() {
-            let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.clone()));
+            let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.reference.clone()));
             let column_op_write_tables = table_set(pair.col.writes.clone(), column_write_table);
             for t in &column_op_write_tables {
                 assert!(
@@ -165,7 +165,7 @@ fn column_op_write_tables_appear_in_table_op_writes() {
 fn relation_lineage_targets_resolve_to_known_write_tables() {
     for sql in corpus() {
         for (idx, pair) in extract_paired(sql).into_iter().enumerate() {
-            let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.clone()));
+            let table_op_writes = table_set(pair.tab.writes.clone(), |w| Some(w.reference.clone()));
             for f in &pair.col.lineage {
                 if let Some(target_table) = edge_relation_table(f) {
                     assert!(

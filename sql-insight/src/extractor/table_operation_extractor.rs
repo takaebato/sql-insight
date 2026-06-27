@@ -24,7 +24,7 @@ use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
 use crate::extractor::{classify_statement, ExtractorOptions, StatementKind};
-use crate::reference::{TableRead, TableReference};
+use crate::reference::{TableRead, TableReference, TableWrite};
 use crate::resolver::MergeActions;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
@@ -85,9 +85,12 @@ pub struct TableOperation {
     /// to fold case-equivalent spellings).
     pub reads: Vec<TableRead>,
     /// Tables written by the statement, in source order. Occurrence-based
-    /// like `reads`. Bare [`TableReference`] — write targets are trivially
-    /// resolved by construction.
-    pub writes: Vec<TableReference>,
+    /// like `reads`. Each [`TableWrite`] pairs the target identity with its
+    /// catalog-match [`ResolutionKind`](crate::ResolutionKind) — so a write
+    /// target carries the same `Cataloged` / `Inferred` / `Ambiguous` signal
+    /// a scanned source does (and the `Cataloged`-detects-catalog-aware
+    /// invariant holds on writes too).
+    pub writes: Vec<TableWrite>,
     /// Lineage edges, only for statements that physically move data
     /// (`INSERT`, `UPDATE`, `MERGE` with an Insert / Update WHEN
     /// clause, CTAS, `CREATE VIEW`, `ALTER VIEW`). **In source order** of the

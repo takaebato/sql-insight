@@ -52,6 +52,15 @@ fn read(name: &str) -> TableRead {
     }
 }
 
+/// A write occurrence. These tests run catalog-free, so every write
+/// resolves to [`ResolutionKind::Inferred`].
+fn twrite(name: &str) -> TableWrite {
+    TableWrite {
+        reference: table(name),
+        resolution: ResolutionKind::Inferred,
+    }
+}
+
 fn edge(source: &str, target: &str) -> TableLineageEdge {
     TableLineageEdge {
         source: read(source),
@@ -263,7 +272,7 @@ mod set_operations {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("dst")],
+                writes: vec![twrite("dst")],
                 lineage: vec![edge("t1", "dst"), edge("t2", "dst")],
                 diagnostics: vec![],
             },
@@ -277,7 +286,7 @@ mod set_operations {
             TableOperation {
                 statement_kind: StatementKind::CreateTable,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("dst")],
+                writes: vec![twrite("dst")],
                 lineage: vec![edge("t1", "dst"), edge("t2", "dst")],
                 diagnostics: vec![],
             },
@@ -295,7 +304,7 @@ mod set_operations {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("t1"), read("s")],
-                writes: vec![table("dst")],
+                writes: vec![twrite("dst")],
                 lineage: vec![edge("t1", "dst"), edge("s", "dst")],
                 diagnostics: vec![],
             },
@@ -358,7 +367,7 @@ mod insert {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -372,7 +381,7 @@ mod insert {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
             },
@@ -390,7 +399,7 @@ mod update {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -404,7 +413,7 @@ mod update {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -425,7 +434,7 @@ mod update {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![read("t1"), read("t2"), read("t3"), read("t4")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t3", "t1")],
                 diagnostics: vec![],
             },
@@ -443,7 +452,7 @@ mod delete {
             TableOperation {
                 statement_kind: StatementKind::Delete,
                 reads: vec![],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -457,7 +466,7 @@ mod delete {
             TableOperation {
                 statement_kind: StatementKind::Delete,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -474,7 +483,7 @@ mod delete {
             TableOperation {
                 statement_kind: StatementKind::Delete,
                 reads: vec![read("t1"), read("t2"), read("t3")],
-                writes: vec![table("t1"), table("t2")],
+                writes: vec![twrite("t1"), twrite("t2")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -488,7 +497,7 @@ mod delete {
             TableOperation {
                 statement_kind: StatementKind::Delete,
                 reads: vec![read("t1"), read("t2"), read("t3")],
-                writes: vec![table("t1"), table("t2")],
+                writes: vec![twrite("t1"), twrite("t2")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -503,7 +512,7 @@ mod delete {
             TableOperation {
                 statement_kind: StatementKind::Delete,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -522,7 +531,7 @@ mod merge {
             TableOperation {
                 statement_kind: StatementKind::Merge,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
             },
@@ -540,7 +549,7 @@ mod ddl {
             TableOperation {
                 statement_kind: StatementKind::CreateTable,
                 reads: vec![],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -554,7 +563,7 @@ mod ddl {
             TableOperation {
                 statement_kind: StatementKind::CreateTable,
                 reads: vec![read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
             },
@@ -568,7 +577,7 @@ mod ddl {
             TableOperation {
                 statement_kind: StatementKind::CreateView,
                 reads: vec![read("t1")],
-                writes: vec![table("v1")],
+                writes: vec![twrite("v1")],
                 lineage: vec![edge("t1", "v1")],
                 diagnostics: vec![],
             },
@@ -582,7 +591,7 @@ mod ddl {
             TableOperation {
                 statement_kind: StatementKind::AlterTable,
                 reads: vec![],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -599,7 +608,7 @@ mod ddl {
             TableOperation {
                 statement_kind: StatementKind::AlterView,
                 reads: vec![read("t1")],
-                writes: vec![table("v1")],
+                writes: vec![twrite("v1")],
                 lineage: vec![edge("t1", "v1")],
                 diagnostics: vec![],
             },
@@ -613,7 +622,7 @@ mod ddl {
             TableOperation {
                 statement_kind: StatementKind::Drop,
                 reads: vec![],
-                writes: vec![table("v1"), table("v2")],
+                writes: vec![twrite("v1"), twrite("v2")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -627,7 +636,7 @@ mod ddl {
             TableOperation {
                 statement_kind: StatementKind::Drop,
                 reads: vec![],
-                writes: vec![table("mv1")],
+                writes: vec![twrite("mv1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -641,7 +650,7 @@ mod ddl {
             TableOperation {
                 statement_kind: StatementKind::Drop,
                 reads: vec![],
-                writes: vec![table("t1"), table("t2")],
+                writes: vec![twrite("t1"), twrite("t2")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -655,7 +664,7 @@ mod ddl {
             TableOperation {
                 statement_kind: StatementKind::Truncate,
                 reads: vec![],
-                writes: vec![table("t1"), table("t2")],
+                writes: vec![twrite("t1"), twrite("t2")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -689,7 +698,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
             },
@@ -703,7 +712,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("t2"), read("t3")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1"), edge("t3", "t1")],
                 diagnostics: vec![],
             },
@@ -720,7 +729,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("t2"), read("t3")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
             },
@@ -736,7 +745,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s")],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![edge("s", "t")],
                 diagnostics: vec![],
             },
@@ -752,7 +761,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("u"), read("s")],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![edge("u", "t"), edge("s", "t")],
                 diagnostics: vec![],
             },
@@ -770,7 +779,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("u"), read("v"), read("s")],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![edge("u", "t"), edge("v", "t"), edge("s", "t")],
                 diagnostics: vec![],
             },
@@ -788,7 +797,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("t2"), read("t3"), read("t4")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1"), edge("t3", "t1")],
                 diagnostics: vec![],
             },
@@ -809,7 +818,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s"), read("x")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("s", "t1")],
                 diagnostics: vec![],
             },
@@ -829,7 +838,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s"), read("x")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("s", "t1")],
                 diagnostics: vec![],
             },
@@ -846,7 +855,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![read("x")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -863,7 +872,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s"), read("x")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("s", "t1"), edge("x", "t1")],
                 diagnostics: vec![],
             },
@@ -884,7 +893,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s"), read("x")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("s", "t1")],
                 diagnostics: vec![],
             },
@@ -902,7 +911,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s"), read("x")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("s", "t1")],
                 diagnostics: vec![],
             },
@@ -916,7 +925,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
             },
@@ -930,7 +939,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -947,7 +956,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
             },
@@ -966,7 +975,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("src"), read("other")],
-                writes: vec![table("dst")],
+                writes: vec![twrite("dst")],
                 lineage: vec![edge("src", "dst"), edge("other", "dst")],
                 diagnostics: vec![],
             },
@@ -985,7 +994,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("src")],
-                writes: vec![table("dst")],
+                writes: vec![twrite("dst")],
                 lineage: vec![edge("src", "dst")],
                 diagnostics: vec![],
             },
@@ -1003,7 +1012,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::CreateTable,
                 reads: vec![read("t1")],
-                writes: vec![table("t2")],
+                writes: vec![twrite("t2")],
                 lineage: vec![edge("t1", "t2")],
                 diagnostics: vec![],
             },
@@ -1017,7 +1026,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::CreateTable,
                 reads: vec![read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
             },
@@ -1031,7 +1040,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::CreateView,
                 reads: vec![read("t1")],
-                writes: vec![table("v1")],
+                writes: vec![twrite("v1")],
                 lineage: vec![edge("t1", "v1")],
                 diagnostics: vec![],
             },
@@ -1046,7 +1055,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Merge,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
             },
@@ -1063,7 +1072,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Merge,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
             },
@@ -1081,7 +1090,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Merge,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
             },
@@ -1100,7 +1109,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Merge,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -1151,7 +1160,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("s", "t1")],
                 diagnostics: vec![],
             },
@@ -1169,7 +1178,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s"), read("x")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![edge("s", "t1")],
                 diagnostics: vec![],
             },
@@ -1198,7 +1207,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -1220,7 +1229,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("x")],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![edge("x", "t")],
                 diagnostics: vec![],
             },
@@ -1241,7 +1250,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -1262,7 +1271,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("base")],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![edge("base", "t")],
                 diagnostics: vec![],
             },
@@ -1279,7 +1288,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("base")],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![edge("base", "t")],
                 diagnostics: vec![],
             },
@@ -1296,7 +1305,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("base"), read("other")],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![edge("base", "t"), edge("other", "t")],
                 diagnostics: vec![],
             },
@@ -1317,7 +1326,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("base1"), read("base2")],
-                writes: vec![table("dst")],
+                writes: vec![twrite("dst")],
                 lineage: vec![edge("base1", "dst"), edge("base2", "dst")],
                 diagnostics: vec![],
             },
@@ -1345,7 +1354,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -1361,7 +1370,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Delete,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -1375,7 +1384,7 @@ mod lineage {
             TableOperation {
                 statement_kind: StatementKind::Truncate,
                 reads: vec![],
-                writes: vec![table("t1")],
+                writes: vec![twrite("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -1410,6 +1419,16 @@ mod catalog_resolution {
     /// the surfaced identity to `public.<name>`.
     fn cataloged(name: &str) -> TableRead {
         TableRead {
+            reference: pub_table(name),
+            resolution: ResolutionKind::Cataloged,
+        }
+    }
+
+    /// A write target the catalog uniquely identified — canonicalized to
+    /// `public.<name>` and carrying `Cataloged`, like [`cataloged`] on the
+    /// read side.
+    fn cataloged_write(name: &str) -> TableWrite {
+        TableWrite {
             reference: pub_table(name),
             resolution: ResolutionKind::Cataloged,
         }
@@ -1451,12 +1470,12 @@ mod catalog_resolution {
     #[test]
     fn lineage_source_carries_catalog_resolution() {
         // The cataloged INSERT source `t2` surfaces Cataloged in both
-        // `reads` and the lineage source; the write target stays a
-        // bare `TableReference`.
+        // `reads` and the lineage source. The write target `t1` isn't
+        // registered, so its `TableWrite` carries `Inferred`.
         let catalog = Catalog::new().table(CatalogTable::new("public", "t2"));
         let ops = ops_with_catalog("INSERT INTO t1 SELECT * FROM t2", &catalog);
         assert_eq!(ops.reads, vec![cataloged("t2")]);
-        assert_eq!(ops.writes, vec![table("t1")]);
+        assert_eq!(ops.writes, vec![twrite("t1")]);
         assert_eq!(
             ops.lineage,
             vec![TableLineageEdge {
@@ -1495,7 +1514,7 @@ mod catalog_resolution {
         .collect();
         let ops = ops_with_catalog("INSERT INTO orders SELECT id FROM staging", &catalog);
         assert_eq!(ops.reads, vec![cataloged("staging")]);
-        assert_eq!(ops.writes, vec![pub_table("orders")]);
+        assert_eq!(ops.writes, vec![cataloged_write("orders")]);
         assert_eq!(
             ops.lineage,
             vec![TableLineageEdge {
@@ -1503,6 +1522,53 @@ mod catalog_resolution {
                 target: pub_table("orders"),
             }]
         );
+    }
+
+    #[test]
+    fn update_and_delete_write_targets_carry_resolution() {
+        // A registered DML target carries `Cataloged` (canonicalized to
+        // `public.<name>`) on the write side, just like a read.
+        let catalog = Catalog::new().table(CatalogTable::new("public", "t"));
+        let upd = ops_with_catalog("UPDATE t SET a = 1", &catalog);
+        assert_eq!(upd.writes, vec![cataloged_write("t")]);
+        let del = ops_with_catalog("DELETE FROM t WHERE id = 1", &catalog);
+        assert_eq!(del.writes, vec![cataloged_write("t")]);
+    }
+
+    #[test]
+    fn unregistered_write_target_is_inferred() {
+        // The target isn't in the (non-empty) catalog → `Inferred`, never a
+        // false `Cataloged`.
+        let catalog = Catalog::new().table(CatalogTable::new("public", "other"));
+        let ops = ops_with_catalog("INSERT INTO t (a) VALUES (1)", &catalog);
+        assert_eq!(ops.writes, vec![twrite("t")]);
+    }
+
+    #[test]
+    fn multi_table_update_resolves_each_write_target_independently() {
+        // Only `t2` is registered; `UPDATE t1 JOIN t2 SET t1.a = …, t2.b = …`
+        // writes both, each carrying its own resolution — `t1` Inferred, `t2`
+        // Cataloged. (MySQL canonicalizes the hit with its backtick quote.)
+        use sql_insight::sqlparser::ast::Ident;
+        let catalog = Catalog::new().table(CatalogTable::new("public", "t2"));
+        let options = ExtractorOptions::new().with_catalog(&catalog);
+        let ops = extract_table_operations_with_options(
+            &MySqlDialect {},
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET t1.a = t2.c, t2.b = t1.c",
+            options,
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        let t2_cataloged = TableWrite {
+            reference: TableReference {
+                catalog: None,
+                schema: Some(Ident::with_quote('`', "public")),
+                name: Ident::with_quote('`', "t2"),
+            },
+            resolution: ResolutionKind::Cataloged,
+        };
+        assert_eq!(ops.writes, vec![twrite("t1"), t2_cataloged]);
     }
 }
 
@@ -1522,7 +1588,7 @@ mod read_write_model {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t1"), table("t2")],
+                writes: vec![twrite("t1"), twrite("t2")],
                 lineage: vec![edge("t2", "t2")],
                 diagnostics: vec![],
             },
@@ -1539,7 +1605,7 @@ mod read_write_model {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![read("t1"), read("t2")],
-                writes: vec![table("t2")],
+                writes: vec![twrite("t2")],
                 lineage: vec![edge("t1", "t2")],
                 diagnostics: vec![],
             },
@@ -1554,7 +1620,7 @@ mod read_write_model {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -1569,7 +1635,7 @@ mod read_write_model {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -1585,7 +1651,7 @@ mod read_write_model {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![read("t")],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![edge("t", "t")],
                 diagnostics: vec![],
             },
@@ -1603,7 +1669,7 @@ mod read_write_model {
             TableOperation {
                 statement_kind: StatementKind::Update,
                 reads: vec![read("t2")],
-                writes: vec![table("t1"), table("t2")],
+                writes: vec![twrite("t1"), twrite("t2")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -1619,7 +1685,7 @@ mod read_write_model {
             TableOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("t")],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![edge("t", "t")],
                 diagnostics: vec![],
             },
@@ -1633,7 +1699,7 @@ mod read_write_model {
             TableOperation {
                 statement_kind: StatementKind::Delete,
                 reads: vec![],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![],
                 diagnostics: vec![],
             },
@@ -1647,7 +1713,7 @@ mod read_write_model {
             TableOperation {
                 statement_kind: StatementKind::Delete,
                 reads: vec![read("t")],
-                writes: vec![table("t")],
+                writes: vec![twrite("t")],
                 lineage: vec![],
                 diagnostics: vec![],
             },

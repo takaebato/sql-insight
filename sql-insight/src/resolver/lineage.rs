@@ -47,7 +47,13 @@ pub(super) fn collect_column_lineage(
             // columns still surface as `writes`, flagged by `WildcardSuppressed`
             // — matching a pure `SELECT *` source (no operands to pair).
             if !i.source_wildcard {
-                relation_lineage(&i.columns, &i.target, src, &mut context, &mut edges);
+                relation_lineage(
+                    &i.columns,
+                    &i.target.reference,
+                    src,
+                    &mut context,
+                    &mut edges,
+                );
             }
             // ON CONFLICT DO UPDATE SET col = value: each `value → target.col`,
             // an `EXCLUDED.x` ref mapped to the source's like-positioned output.
@@ -85,13 +91,25 @@ pub(super) fn collect_column_lineage(
         LogicalPlan::CreateTableAs(c) => {
             let src = enter_withs(&c.input, &mut context);
             if pairs_positionally(c.source_wildcard, &c.columns) {
-                created_relation_lineage(&c.columns, &c.target, src, &mut context, &mut edges);
+                created_relation_lineage(
+                    &c.columns,
+                    &c.target.reference,
+                    src,
+                    &mut context,
+                    &mut edges,
+                );
             }
         }
         LogicalPlan::CreateView(c) => {
             let src = enter_withs(&c.input, &mut context);
             if pairs_positionally(c.source_wildcard, &c.columns) {
-                created_relation_lineage(&c.columns, &c.target, src, &mut context, &mut edges);
+                created_relation_lineage(
+                    &c.columns,
+                    &c.target.reference,
+                    src,
+                    &mut context,
+                    &mut edges,
+                );
             }
         }
         // MERGE: each WHEN action's value traces to its target column (an
@@ -106,7 +124,7 @@ pub(super) fn collect_column_lineage(
                             merge_value_edges(
                                 &a.target.name,
                                 &a.value,
-                                &m.target,
+                                &m.target.reference,
                                 &m.source,
                                 &mut context,
                                 &mut edges,
@@ -118,7 +136,7 @@ pub(super) fn collect_column_lineage(
                             merge_value_edges(
                                 column,
                                 value,
-                                &m.target,
+                                &m.target.reference,
                                 &m.source,
                                 &mut context,
                                 &mut edges,
@@ -358,7 +376,7 @@ pub(super) fn collect_table_lineage(
             for a in &i.on_conflict {
                 expr_feeding(&a.value, &mut context, &mut fed_ctes, &mut sources);
             }
-            &i.target
+            &i.target.reference
         }
         // UPDATE is per-assignment: each SET RHS's feeding sources flow into
         // *that assignment's* resolved target table — a multi-table
@@ -369,11 +387,11 @@ pub(super) fn collect_table_lineage(
         // CTAS / CREATE VIEW move data like INSERT; ALTER / DROP do not.
         LogicalPlan::CreateTableAs(c) => {
             feeding_scans(&c.input, &mut context, &mut fed_ctes, &mut sources);
-            &c.target
+            &c.target.reference
         }
         LogicalPlan::CreateView(c) => {
             feeding_scans(&c.input, &mut context, &mut fed_ctes, &mut sources);
-            &c.target
+            &c.target.reference
         }
         // MERGE feeds from the source relation plus each *written* WHEN value
         // (an UPDATE SET RHS; an INSERT value paired with a column). The ON /
@@ -395,7 +413,7 @@ pub(super) fn collect_table_lineage(
                     MergeClause::Delete => {}
                 }
             }
-            &m.target
+            &m.target.reference
         }
         // No table lineage: a bare query (no target), DDL that moves no value
         // (`Drop` / `Truncate` modelled as `Drop` / `AlterTable`), and the

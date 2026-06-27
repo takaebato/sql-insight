@@ -29,7 +29,11 @@ fn main() {
             .iter()
             .map(|r| format!("{} [{:?}]", r.reference.name.value, r.resolution))
             .collect();
-        let writes: Vec<&str> = ops.writes.iter().map(|w| w.name.value.as_str()).collect();
+        let writes: Vec<&str> = ops
+            .writes
+            .iter()
+            .map(|w| w.reference.name.value.as_str())
+            .collect();
         println!("reads:  {:?}", reads);
         println!("writes: {:?}", writes);
         println!("lineage:  {} edge(s)", ops.lineage.len());

@@ -8,7 +8,7 @@
 
 use sqlparser::ast::Ident;
 
-use crate::reference::{ColumnReference, ResolutionKind, TableReference};
+use crate::reference::{ColumnReference, ResolutionKind, TableReference, TableWrite};
 
 // ===== the logical plan ==================================================
 
@@ -215,7 +215,7 @@ pub(crate) struct Values {
 /// `SELECT *` source (which yields no operands to pair at all).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Insert {
-    pub(crate) target: TableReference,
+    pub(crate) target: TableWrite,
     pub(crate) columns: Vec<Ident>,
     pub(crate) input: Box<LogicalPlan>,
     pub(crate) returning: Vec<NamedExpr>,
@@ -229,6 +229,9 @@ pub(crate) struct Insert {
 /// assignment pairs an RHS with its target column for lineage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Update {
+    /// The DML root — used for the unqualified-SET default, the sink read, and
+    /// RETURNING scope. The *write* targets are per-assignment (`Assignment`),
+    /// since a multi-table UPDATE writes the relation each SET qualifier names.
     pub(crate) target: TableReference,
     pub(crate) assignments: Vec<Assignment>,
     pub(crate) input: Box<LogicalPlan>,
@@ -240,7 +243,7 @@ pub(crate) struct Update {
 /// `returning` projects the deleted rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Delete {
-    pub(crate) targets: Vec<TableReference>,
+    pub(crate) targets: Vec<TableWrite>,
     pub(crate) input: Box<LogicalPlan>,
     pub(crate) returning: Vec<NamedExpr>,
 }
@@ -249,7 +252,7 @@ pub(crate) struct Delete {
 /// writes / lineage (UPDATE SET / INSERT VALUES).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Merge {
-    pub(crate) target: TableReference,
+    pub(crate) target: TableWrite,
     pub(crate) source: Box<LogicalPlan>,
     pub(crate) on: Vec<Expr>,
     pub(crate) clauses: Vec<MergeClause>,
@@ -291,7 +294,7 @@ pub(crate) enum MergeClause {
 /// explicit case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreateTableAs {
-    pub(crate) target: TableReference,
+    pub(crate) target: TableWrite,
     pub(crate) columns: Vec<Ident>,
     pub(crate) input: Box<LogicalPlan>,
     pub(crate) schema_source: Option<TableReference>,
@@ -303,7 +306,7 @@ pub(crate) struct CreateTableAs {
 /// `source_wildcard` plays the same role as on [`CreateTableAs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreateView {
-    pub(crate) target: TableReference,
+    pub(crate) target: TableWrite,
     pub(crate) columns: Vec<Ident>,
     pub(crate) input: Box<LogicalPlan>,
     pub(crate) source_wildcard: bool,
@@ -313,7 +316,7 @@ pub(crate) struct CreateView {
 /// writes; no reads or lineage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AlterTable {
-    pub(crate) target: TableReference,
+    pub(crate) target: TableWrite,
     pub(crate) columns: Vec<Ident>,
 }
 
@@ -321,7 +324,7 @@ pub(crate) struct AlterTable {
 /// reads, lineage, or column-level writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Drop {
-    pub(crate) targets: Vec<TableReference>,
+    pub(crate) targets: Vec<TableWrite>,
 }
 
 // ===== expressions =======================================================
@@ -476,10 +479,13 @@ pub(crate) struct NamedExpr {
 /// writes — the DML root for a single-table statement, or the relation a
 /// qualifier names in a multi-table `UPDATE t1 JOIN t2 SET t2.col = …` — so a
 /// write / lineage edge attributes to the right table rather than assuming the
-/// root.
+/// root. `target_resolution` is how the catalog matched that table (captured
+/// where the qualifier is resolved), so an UPDATE's per-target table write
+/// surfaces its [`ResolutionKind`] without the walker re-deriving it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Assignment {
     pub(crate) target: ColumnReference,
+    pub(crate) target_resolution: ResolutionKind,
     pub(crate) value: Expr,
 }
 

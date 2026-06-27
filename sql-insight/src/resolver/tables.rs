@@ -16,7 +16,7 @@ use sqlparser::ast::Ident;
 
 use super::logical_plan::{peel_with, walk_plan, LogicalPlan, MergeClause};
 use super::origins::output_operands;
-use crate::reference::{ColumnReference, TableReference};
+use crate::reference::{ColumnReference, TableReference, TableWrite};
 
 // ===== writes ============================================================
 
@@ -28,7 +28,7 @@ pub(super) fn collect_writes(plan: &LogicalPlan) -> Vec<ColumnReference> {
         // INSERT columns, then any ON CONFLICT DO UPDATE SET targets (extra
         // writes on the same relation).
         LogicalPlan::Insert(i) => {
-            let mut w = qualify(&i.columns, &i.target);
+            let mut w = qualify(&i.columns, &i.target.reference);
             w.extend(i.on_conflict.iter().map(|a| a.target.clone()));
             w
         }
@@ -36,15 +36,19 @@ pub(super) fn collect_writes(plan: &LogicalPlan) -> Vec<ColumnReference> {
         LogicalPlan::Update(u) => u.assignments.iter().map(|a| a.target.clone()).collect(),
         // CTAS / CREATE VIEW write the new relation's columns; ALTER TABLE
         // writes its column-naming operations' columns.
-        LogicalPlan::CreateTableAs(c) => created_relation_writes(&c.columns, &c.input, &c.target),
-        LogicalPlan::CreateView(c) => created_relation_writes(&c.columns, &c.input, &c.target),
-        LogicalPlan::AlterTable(a) => qualify(&a.columns, &a.target),
+        LogicalPlan::CreateTableAs(c) => {
+            created_relation_writes(&c.columns, &c.input, &c.target.reference)
+        }
+        LogicalPlan::CreateView(c) => {
+            created_relation_writes(&c.columns, &c.input, &c.target.reference)
+        }
+        LogicalPlan::AlterTable(a) => qualify(&a.columns, &a.target.reference),
         // MERGE writes each WHEN action's target columns (UPDATE SET targets;
         // INSERT columns paired with values).
         LogicalPlan::Merge(m) => m
             .clauses
             .iter()
-            .flat_map(|clause| merge_clause_writes(clause, &m.target))
+            .flat_map(|clause| merge_clause_writes(clause, &m.target.reference))
             .collect(),
         // No column writes: read-only / structural query operators, the bare
         // FROM-less / synthetic relations, and DML / DDL whose target rows go
@@ -92,23 +96,28 @@ fn merge_clause_writes(clause: &MergeClause, target: &TableReference) -> Vec<Col
 
 /// Every table the statement writes to — one per DML target. A leading `WITH`
 /// is peeled. Backs [`crate::resolver::table_writes`].
-pub(super) fn collect_table_writes(plan: &LogicalPlan) -> Vec<TableReference> {
+pub(super) fn collect_table_writes(plan: &LogicalPlan) -> Vec<TableWrite> {
     match peel_with(plan) {
         LogicalPlan::Insert(i) => vec![i.target.clone()],
         // The distinct tables the SET assignments write — the root for a
         // single-table UPDATE, but each qualified relation for a multi-table
         // `UPDATE t1 JOIN t2 SET t1.a = …, t2.b = …` (a table set in several
-        // columns counts once; assignment order preserved).
+        // columns counts once; assignment order preserved). Each assignment
+        // carries its target table's resolution (`Assignment::target_resolution`).
         LogicalPlan::Update(u) => {
-            let mut tables: Vec<TableReference> = Vec::new();
+            let mut out: Vec<TableWrite> = Vec::new();
             for a in &u.assignments {
                 if let Some(table) = &a.target.table {
-                    if !tables.contains(table) {
-                        tables.push(table.clone());
+                    if out.iter().any(|w| &w.reference == table) {
+                        continue;
                     }
+                    out.push(TableWrite {
+                        reference: table.clone(),
+                        resolution: a.target_resolution,
+                    });
                 }
             }
-            tables
+            out
         }
         // A DELETE removes rows from each of its targets.
         LogicalPlan::Delete(d) => d.targets.clone(),
@@ -253,8 +262,8 @@ fn collect_flat_into(plan: &LogicalPlan, out: &mut Vec<TableReference>) {
         let mut from = Vec::new();
         direct_from_scans(&d.input, &mut from);
         for target in &d.targets {
-            if !from.contains(target) {
-                out.push(target.clone());
+            if !from.contains(&target.reference) {
+                out.push(target.reference.clone());
             }
         }
         return;
@@ -262,18 +271,18 @@ fn collect_flat_into(plan: &LogicalPlan, out: &mut Vec<TableReference>) {
     walk_plan(plan, &mut |op| match op {
         LogicalPlan::Scan(s) => out.push(s.table.clone()),
         // DROP / TRUNCATE — multiple targets in one statement, no input.
-        LogicalPlan::Drop(d) => out.extend(d.targets.iter().cloned()),
-        LogicalPlan::Insert(i) => out.push(i.target.clone()),
+        LogicalPlan::Drop(d) => out.extend(d.targets.iter().map(|w| w.reference.clone())),
+        LogicalPlan::Insert(i) => out.push(i.target.reference.clone()),
         LogicalPlan::Update(u) => out.push(u.target.clone()),
-        LogicalPlan::Merge(m) => out.push(m.target.clone()),
+        LogicalPlan::Merge(m) => out.push(m.target.reference.clone()),
         LogicalPlan::CreateTableAs(c) => {
-            out.push(c.target.clone());
+            out.push(c.target.reference.clone());
             // `LIKE` / `CLONE` schema template — a referenced table with no
             // row-data role, surfaced only in this flat list.
             out.extend(c.schema_source.clone());
         }
-        LogicalPlan::CreateView(c) => out.push(c.target.clone()),
-        LogicalPlan::AlterTable(a) => out.push(a.target.clone()),
+        LogicalPlan::CreateView(c) => out.push(c.target.reference.clone()),
+        LogicalPlan::AlterTable(a) => out.push(a.target.reference.clone()),
         // Operators that name no table of their own: pure relational shape,
         // CTE plumbing, synthetic leaves, and `Delete` (its targets are
         // collected by the peel-aware early-return above, before this walk).

@@ -365,7 +365,11 @@ fn format_table_operation(n: usize, op: &TableOperation) -> String {
         lines.push(labeled("reads:", reads.join(", ")));
     }
     if !op.writes.is_empty() {
-        let writes = op.writes.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let writes = op
+            .writes
+            .iter()
+            .map(|w| w.reference.to_string())
+            .collect::<Vec<_>>();
         lines.push(labeled("writes:", writes.join(", ")));
     }
     if !op.lineage.is_empty() {

@@ -96,6 +96,12 @@
 //!   statements that physically move data (`INSERT` / `UPDATE` /
 //!   `MERGE` / `CREATE TABLE AS` / `CREATE VIEW`).
 //!
+//! `reads` / `writes` follow a relation's **syntactic role in the
+//! written SQL**, not what is physically touched at runtime: an
+//! unreferenced CTE body's tables and a `SELECT COUNT(*) FROM t` both
+//! read, even though no row data is consumed. The actual data-flow
+//! precision lives in `lineage`.
+//!
 //! For column-level lineage, [`extractor::ColumnLineageKind`] makes one
 //! clean distinction: `Passthrough` (the value is forwarded unchanged; a
 //! rename still counts) vs `Transformation` (any expression that
@@ -232,7 +238,7 @@ pub use casing::{CaseRule, IdentifierCasing};
 mod reference;
 pub use reference::{
     ColumnIdentityKey, ColumnRead, ColumnReference, ResolutionKind, TableIdentityKey, TableRead,
-    TableReference,
+    TableReference, TableWrite,
 };
 
 // `sqlparser` is re-exported so consumers can name `Dialect` /

@@ -238,6 +238,19 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Match a write target against the catalog as a [`TableWrite`] — the
+    /// canonical identity paired with its [`ResolutionKind`]. The write-side
+    /// counterpart of [`table_match`](Self::table_match), dropping the column
+    /// list (the target's columns are pulled separately where a column-less
+    /// INSERT / RETURNING needs them).
+    pub(super) fn table_write(&self, written: &TableReference) -> TableWrite {
+        let m = self.table_match(written);
+        TableWrite {
+            reference: m.table,
+            resolution: m.resolution,
+        }
+    }
+
     /// Right-anchored match of a decoded qualifier against a real table's
     /// `catalog.schema.name`, under the dialect's table casing (an omitted
     /// qualifier segment is a wildcard).
