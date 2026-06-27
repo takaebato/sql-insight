@@ -237,11 +237,11 @@ impl<'a> Binder<'a> {
     /// statement then binds to nothing, so an `UnsupportedStatement` (it
     /// projects to the table level) signals the empty surfaces are a coverage
     /// gap, not "nothing there". `message` shows the offending target.
-    pub(super) fn record_unsupported_merge_target(&mut self, factor: &TableFactor) {
+    pub(super) fn record_unsupported_dml_target(&mut self, statement: &str, factor: &TableFactor) {
         self.diagnostics.push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::UnsupportedStatement,
             message: format!(
-                "MERGE target `{factor}` is not a plain table (a derived table / subquery / table function) — the statement can't be analyzed and is dropped"
+                "{statement} target `{factor}` is not a plain table (a derived table / subquery / table function) — the statement can't be analyzed and is dropped"
             ),
             span: None,
         });
@@ -765,6 +765,12 @@ fn join_using(op: &JoinOperator) -> Vec<Ident> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Whether a join is `NATURAL` — its merge columns are the schema-common ones
+/// (computed from both sides' known columns), not an explicit `USING` list.
+fn join_is_natural(op: &JoinOperator) -> bool {
+    matches!(join_constraint(op), Some(JoinConstraint::Natural))
 }
 
 #[cfg(test)]

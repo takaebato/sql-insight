@@ -1,5 +1,5 @@
 use sql_insight::normalizer::*;
-use sql_insight::sqlparser::dialect::Dialect;
+use sql_insight::sqlparser::dialect::{Dialect, MsSqlDialect};
 use sql_insight::test_utils::{all_dialects, all_dialects_except, DialectName};
 
 fn assert_normalize(
@@ -31,6 +31,27 @@ fn test_multiple_sql() {
         "DELETE FROM t3 WHERE c = ?".into(),
     ];
     assert_normalize(sql, expected, all_dialects(), NormalizerOptions::new());
+}
+
+#[test]
+fn test_top_constant_is_normalized() {
+    // `TOP 5`'s quantity is a bare `u64` (not a `Value`), so it needs explicit
+    // handling — without it, `TOP 5` / `TOP 10` would fingerprint differently
+    // (unlike `LIMIT`). It collapses to the same form as `TOP (expr)`.
+    let mssql = || -> Vec<Box<dyn Dialect>> { vec![Box::new(MsSqlDialect {})] };
+    assert_normalize(
+        "SELECT TOP 5 a FROM t",
+        vec!["SELECT TOP (?) a FROM t".into()],
+        mssql(),
+        NormalizerOptions::new(),
+    );
+    // `TOP 5` and the parenthesized `TOP (10)` normalize identically.
+    assert_normalize(
+        "SELECT TOP (10) a FROM t",
+        vec!["SELECT TOP (?) a FROM t".into()],
+        mssql(),
+        NormalizerOptions::new(),
+    );
 }
 
 #[test]

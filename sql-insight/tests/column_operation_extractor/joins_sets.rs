@@ -425,8 +425,10 @@ mod join_using_and_natural {
     //! a USING column resolves to *every* joined relation that could own
     //! it (the COALESCE-style merged column has no single owner), so it
     //! surfaces one read / lineage source per side rather than an
-    //! ambiguous `table: None`. NATURAL JOIN stays unexpanded (its merge
-    //! set needs both schemas, like wildcard expansion).
+    //! ambiguous `table: None`. A NATURAL JOIN fans in the same way, but its
+    //! merge set is the schema intersection of both sides — knowable only with
+    //! a catalog (covered in `resolution`); catalog-free, it can't expand and an
+    //! unqualified ref stays ambiguous.
     use super::*;
 
     #[test]

@@ -349,6 +349,14 @@ impl<'a> Binder<'a> {
         // The root's own resolution isn't needed here — each SET assignment
         // carries its write-target table's resolution (`assignment_target`).
         let Some((target_relation, target, _)) = self.target_relation(target_factor) else {
+            // A non-table target (derived table / subquery / table function)
+            // can't be a write target — flag it (like `bind_merge`) rather than
+            // dropping silently. A plain table that failed to resolve is already
+            // flagged by `table_ref` (e.g. too many qualifiers), so don't
+            // double-report it.
+            if !matches!(target_factor, TableFactor::Table { .. }) {
+                self.record_unsupported_dml_target("UPDATE", target_factor);
+            }
             return LogicalPlan::Empty;
         };
         let mut scope = Scope::single(target_relation);
@@ -502,7 +510,7 @@ impl<'a> Binder<'a> {
         // silently picking the first relation. A parenthesized *single* table
         // `(t1)` is fine and resolves below.
         if is_join_factor(&merge.table) {
-            self.record_unsupported_merge_target(&merge.table);
+            self.record_unsupported_dml_target("MERGE", &merge.table);
             return LogicalPlan::Empty;
         }
         let Some((target_relation, target, target_resolution)) = self.target_relation(&merge.table)
@@ -510,7 +518,7 @@ impl<'a> Binder<'a> {
             // A non-table MERGE target (derived table / subquery / table
             // function) can't be a write target — flag it rather than dropping
             // the whole statement silently (best-effort drop + flag).
-            self.record_unsupported_merge_target(&merge.table);
+            self.record_unsupported_dml_target("MERGE", &merge.table);
             return LogicalPlan::Empty;
         };
         let mut scope = Scope::single(target_relation);

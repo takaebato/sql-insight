@@ -374,6 +374,48 @@ fn from_ddl_folds_unquoted_identifiers_to_their_stored_form() {
 }
 
 #[test]
+fn from_ddl_with_casing_aligns_the_catalog_with_a_casing_override() {
+    // Under a `with_casing(Sensitive)` extraction override, a default `from_ddl`
+    // (folding with the dialect default) no longer matches — its canonical form
+    // differs from what the Sensitive query folds to. `from_ddl_with_casing`
+    // builds the catalog with the same casing, so it matches.
+    use sql_insight::sqlparser::dialect::PostgreSqlDialect;
+    use sql_insight::{CaseRule, IdentifierCasing};
+    let sensitive = IdentifierCasing::uniform(CaseRule::Sensitive);
+    let resolution = |catalog: &Catalog| -> ResolutionKind {
+        extract_column_operations_with_options(
+            &PostgreSqlDialect {},
+            "SELECT a FROM MyTable",
+            ExtractorOptions::new()
+                .with_catalog(catalog)
+                .with_casing(sensitive),
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap()
+        .reads
+        .first()
+        .unwrap()
+        .resolution
+    };
+
+    // Default `from_ddl` folds `MyTable` → `mytable`; the Sensitive query keeps
+    // `MyTable`, so it misses.
+    let default = Catalog::from_ddl(&PostgreSqlDialect {}, "CREATE TABLE MyTable (a INT)").unwrap();
+    assert_eq!(resolution(&default), ResolutionKind::Inferred);
+
+    // Built with the same Sensitive casing, the catalog stores `MyTable` exact,
+    // so the Sensitive query matches.
+    let aligned = Catalog::from_ddl_with_casing(
+        &PostgreSqlDialect {},
+        "CREATE TABLE MyTable (a INT)",
+        sensitive,
+    )
+    .unwrap();
+    assert_eq!(resolution(&aligned), ResolutionKind::Cataloged);
+}
+
+#[test]
 fn from_ddl_unquoted_registration_canonicalizes_the_surfaced_identity() {
     // The Cataloged read surfaces the catalog's stored (folded) identity, not
     // the query's written casing.

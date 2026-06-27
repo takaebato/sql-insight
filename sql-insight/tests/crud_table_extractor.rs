@@ -411,6 +411,38 @@ mod insert_statement {
         })];
         assert_crud_table_extraction(sql, expected, vec![Box::new(MySqlDialect {})]);
     }
+
+    #[test]
+    fn test_replace_into_buckets_target_as_create_and_delete() {
+        // `REPLACE INTO` deletes the conflicting row before inserting (unlike an
+        // upsert, which updates in place), so `t1` lands in both create and
+        // delete.
+        let sql = "REPLACE INTO t1 (a) VALUES (1)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![cwrite(table("t1"))],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![cwrite(table("t1"))],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(MySqlDialect {})]);
+    }
+
+    #[test]
+    fn test_insert_overwrite_buckets_target_as_create_and_delete() {
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        // `INSERT OVERWRITE` replaces the target's existing data, so `t1` lands
+        // in both create and delete; the `SELECT` source `s` is a read.
+        let sql = "INSERT OVERWRITE t1 SELECT a FROM s";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![cwrite(table("t1"))],
+            read_tables: vec![cread(table("s"))],
+            update_tables: vec![],
+            delete_tables: vec![cwrite(table("t1"))],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
+    }
 }
 
 mod update_statement {

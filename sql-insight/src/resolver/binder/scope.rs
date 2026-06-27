@@ -165,4 +165,23 @@ impl Relation {
             Relation::Derived { alias, .. } | Relation::TableFunction { alias } => alias.as_ref(),
         }
     }
+
+    /// The column names this relation is *known* to expose — a `Cataloged`
+    /// table's columns, or a derived relation's exposed columns. An `Unknown`
+    /// (catalog-free) table or an opaque table function has no known list, so it
+    /// contributes nothing to a NATURAL join's schema-common columns.
+    pub(super) fn known_columns(&self) -> &[Ident] {
+        match self {
+            Relation::Table {
+                columns: Columns::Cataloged(cols),
+                ..
+            } => cols,
+            Relation::Derived { columns, .. } => columns,
+            Relation::Table {
+                columns: Columns::Unknown,
+                ..
+            }
+            | Relation::TableFunction { .. } => &[],
+        }
+    }
 }

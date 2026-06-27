@@ -34,7 +34,7 @@ use std::ops::{ControlFlow, Deref};
 
 use crate::error::Error;
 use sqlparser::ast::{Expr, Insert, Statement, VisitMut, VisitorMut};
-use sqlparser::ast::{Query, SetExpr, Value};
+use sqlparser::ast::{Query, SetExpr, TopQuantity, Value};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 use std::ops::DerefMut;
@@ -129,6 +129,10 @@ impl VisitorMut for Normalizer {
     type Break = ();
 
     fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        // `SELECT TOP 10`'s quantity is a bare `u64` (`TopQuantity::Constant`),
+        // not a `Value`, so the visitor's literal pass doesn't reach it — unlike
+        // `TOP (expr)` / `LIMIT`. Normalize it here so `TOP 10` becomes `TOP ?`.
+        normalize_top(query.body.deref_mut());
         if let SetExpr::Values(values) = query.body.deref_mut() {
             if self.options.unify_values {
                 let rows = &mut values.rows;
@@ -265,5 +269,28 @@ impl Normalizer {
             Expr::Tuple(v) => v.iter().all(Self::contains_only_tuples_of_values),
             _ => false,
         }
+    }
+}
+
+/// Replace a `SELECT TOP 10`-style constant quantity with a `?` placeholder
+/// (rendered `TOP ?`), recursing into set-operation branches. A bare
+/// `TopQuantity::Constant(u64)` isn't a `Value`, so the visitor's literal pass
+/// misses it; `TopQuantity::Expr` is already normalized by that pass.
+fn normalize_top(body: &mut SetExpr) {
+    match body {
+        SetExpr::Select(select) => {
+            if let Some(top) = &mut select.top {
+                if matches!(top.quantity, Some(TopQuantity::Constant(_))) {
+                    top.quantity = Some(TopQuantity::Expr(Expr::Value(
+                        Value::Placeholder("?".into()).with_empty_span(),
+                    )));
+                }
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            normalize_top(left);
+            normalize_top(right);
+        }
+        _ => {}
     }
 }

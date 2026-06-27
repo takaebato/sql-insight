@@ -10,8 +10,10 @@
 //! Write targets bucket by verb, so DDL lands where its effect is, not in
 //! `Read`: `INSERT`, `CREATE TABLE` / `CREATE VIEW`, and `SELECT … INTO` →
 //! Create (an upsert `INSERT … ON CONFLICT DO UPDATE` / `ON DUPLICATE KEY
-//! UPDATE` also → Update), `UPDATE` and `ALTER` → Update, `DELETE` / `DROP` /
-//! `TRUNCATE` → Delete, and `MERGE` to each bucket its WHEN actions imply. A
+//! UPDATE` also → Update; `REPLACE INTO` / `INSERT OVERWRITE`, which delete the
+//! conflicting / existing rows first, also → Delete), `UPDATE` and `ALTER` →
+//! Update, `DELETE` / `DROP` / `TRUNCATE` → Delete, and `MERGE` to each bucket
+//! its WHEN actions imply. A
 //! statement's
 //! read-role tables (a `SELECT`, a CTAS / view source, an `UPDATE … FROM`)
 //! always go to Read. A `WITH … <DML>` parses as a `Query`-wrapped DML, so
@@ -156,6 +158,12 @@ impl CrudTableExtractor {
                 // `DO NOTHING`) is create-only.
                 if insert_updates {
                     crud.update_tables = writes.clone();
+                }
+                // `REPLACE INTO` / `INSERT OVERWRITE` delete the conflicting /
+                // existing rows of the target before inserting, so the target is
+                // also a delete (unlike an upsert, which updates in place).
+                if matches!(statement, Statement::Insert(i) if i.replace_into || i.overwrite) {
+                    crud.delete_tables = writes.clone();
                 }
                 crud.create_tables = writes;
                 crud.read_tables = reads;
