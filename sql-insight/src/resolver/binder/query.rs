@@ -257,7 +257,7 @@ impl<'a> Binder<'a> {
     ) -> Vec<NamedExpr> {
         items
             .iter()
-            .filter_map(|i| self.bind_select_item(i, scope))
+            .flat_map(|i| self.bind_select_item(i, scope))
             .collect()
     }
 
@@ -437,9 +437,9 @@ impl<'a> Binder<'a> {
     pub(super) fn bind_select(&mut self, select: &Select) -> (LogicalPlan, Scope) {
         let (from, scope) = self.bind_from(&select.from);
         // WHERE + the WHERE-family auxiliary clauses (DISTINCT ON / TOP /
-        // LATERAL VIEW / PREWHERE / QUALIFY / CONNECT BY / CLUSTER BY / named
-        // WINDOW) filter rows before grouping — a filter over the FROM (no
-        // output aliases visible).
+        // LATERAL VIEW / PREWHERE / CONNECT BY / CLUSTER BY / named WINDOW)
+        // filter rows before grouping — a filter over the FROM (no output
+        // aliases visible). QUALIFY is post-projection (handled below).
         let mut where_reads: Vec<Expr> = select
             .selection
             .iter()
@@ -458,7 +458,7 @@ impl<'a> Binder<'a> {
         let exprs: Vec<NamedExpr> = select
             .projection
             .iter()
-            .filter_map(|item| self.bind_select_item(item, &scope))
+            .flat_map(|item| self.bind_select_item(item, &scope))
             .collect();
         let clause_scope = scope.with_query_outputs(self.output_cols(&exprs));
         // GROUP BY → an `Aggregate` over the filtered rows; its keys are reads.
@@ -481,6 +481,17 @@ impl<'a> Binder<'a> {
             input: Box::new(node),
             exprs,
         });
+        // QUALIFY filters on window / projection outputs (it runs after the
+        // window functions the projection computes), so it sees output aliases
+        // — bind it against `clause_scope` like HAVING, so an alias reference
+        // (`QUALIFY rn = 1`) binds `Derived` and drops from reads rather than
+        // surfacing a phantom base column. Filter-position: reads, no lineage.
+        if let Some(qualify) = &select.qualify {
+            node = LogicalPlan::Filter(Filter {
+                input: Box::new(node),
+                predicate: vec![self.bind_expr(qualify, &clause_scope)],
+            });
+        }
         // SORT BY (Hive) sees the outputs, like a trailing ORDER BY.
         let sort_keys = self.order_by_expr_keys(&select.sort_by, &clause_scope);
         if !sort_keys.is_empty() {
@@ -574,6 +585,17 @@ impl<'a> Binder<'a> {
             TableFactor::Table {
                 name, alias, args, ..
             } => {
+                // `foo(args)` in FROM is a table-valued function, not a base
+                // table — bind it as an opaque table-producing factor (like
+                // UNNEST / `TableFactor::Function`): its produced columns are
+                // dynamic, so a reference through its alias is a synthetic source
+                // and the function name is *not* a real table read. The argument
+                // expressions read against the sibling scope.
+                if let Some(args) = args {
+                    let bound =
+                        self.bind_function_arg_list(&args.args, &Scope::from_relations(left));
+                    return self.opaque(LogicalPlan::Empty, bound, alias.as_ref());
+                }
                 let Some(written) = self.table_ref(name) else {
                     return (LogicalPlan::Empty, Scope::default());
                 };
@@ -600,19 +622,7 @@ impl<'a> Binder<'a> {
                         );
                     }
                 }
-                let (scan, scope) = self.bind_named_table(&written, alias_name);
-                // A parameterised table reference `foo(args)`: the argument
-                // expressions read against the surrounding (sibling) scope —
-                // attach them as a non-feeding filter over the scan.
-                let node = match args {
-                    Some(args) => LogicalPlan::Filter(Filter {
-                        input: Box::new(scan),
-                        predicate: self
-                            .bind_function_arg_list(&args.args, &Scope::from_relations(left)),
-                    }),
-                    None => scan,
-                };
-                (node, scope)
+                self.bind_named_table(&written, alias_name)
             }
             // A derived table `(<subquery>) AS d`: bind the subquery, expose
             // its output columns as a synthetic relation under the alias. A
@@ -825,7 +835,10 @@ impl<'a> Binder<'a> {
                 .map(|o| self.bind_expr(&o.expr, scope))
                 .collect(),
             PivotValueSource::Subquery(query) => {
-                vec![Expr::Subquery(Box::new(self.bind_subquery(query, scope)))]
+                vec![Expr::Subquery {
+                    plan: Box::new(self.bind_subquery(query, scope)),
+                    output: 0,
+                }]
             }
         }
     }

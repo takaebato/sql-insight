@@ -5,26 +5,26 @@
 use super::*;
 
 impl<'a> Binder<'a> {
-    pub(super) fn bind_select_item(
-        &mut self,
-        item: &SelectItem,
-        scope: &Scope,
-    ) -> Option<NamedExpr> {
+    pub(super) fn bind_select_item(&mut self, item: &SelectItem, scope: &Scope) -> Vec<NamedExpr> {
         match item {
-            SelectItem::UnnamedExpr(expr) => Some(NamedExpr {
+            SelectItem::UnnamedExpr(expr) => vec![NamedExpr {
                 name: inferred_name(expr),
                 expr: self.bind_expr(expr, scope),
-            }),
-            SelectItem::ExprWithAlias { expr, alias } => Some(NamedExpr {
+            }],
+            SelectItem::ExprWithAlias { expr, alias } => vec![NamedExpr {
                 name: Some(alias.clone()),
                 expr: self.bind_expr(expr, scope),
-            }),
+            }],
             // A wildcard isn't expanded (the rigor cost is too high for a
             // SQL-text-only library); record it so consumers know this
-            // projection's column lineage is incomplete, and skip it.
+            // projection's column lineage is incomplete. A `REPLACE (expr AS
+            // col)` clause is a real value-producing output, though — bind each
+            // replacement as a named output (its reads / lineage are exactly a
+            // standalone `expr AS col`; only the output position is best-effort,
+            // since the wildcard's own columns aren't enumerated).
             SelectItem::Wildcard(options) => {
                 self.record_wildcard_suppressed("wildcard `*`", options.wildcard_token.0.span);
-                None
+                self.replace_outputs(options, scope)
             }
             SelectItem::QualifiedWildcard(kind, options) => {
                 let description = match kind {
@@ -38,18 +38,41 @@ impl<'a> Binder<'a> {
                 self.record_wildcard_suppressed(&description, options.wildcard_token.0.span);
                 // `(expr).*` still projects its base expression as one
                 // Transformation output (a structural field access); `alias.*`
-                // has no inspectable base.
-                match kind {
-                    SelectItemQualifiedWildcardKind::Expr(expr) => Some(NamedExpr {
+                // has no inspectable base. Either way a `REPLACE` clause's
+                // explicit outputs follow.
+                let mut out = match kind {
+                    SelectItemQualifiedWildcardKind::Expr(expr) => vec![NamedExpr {
                         name: None,
                         expr: Expr::Call {
                             args: vec![self.bind_expr(expr, scope)],
                         },
-                    }),
-                    SelectItemQualifiedWildcardKind::ObjectName(_) => None,
-                }
+                    }],
+                    SelectItemQualifiedWildcardKind::ObjectName(_) => Vec::new(),
+                };
+                out.extend(self.replace_outputs(options, scope));
+                out
             }
         }
+    }
+
+    /// A wildcard's `REPLACE (expr AS col, …)` outputs: each replacement is a
+    /// value-producing column named by `col`, bound like a standalone
+    /// `expr AS col` (its reads / lineage are identical). The wildcard's other
+    /// columns stay unexpanded.
+    fn replace_outputs(
+        &mut self,
+        options: &WildcardAdditionalOptions,
+        scope: &Scope,
+    ) -> Vec<NamedExpr> {
+        options
+            .opt_replace
+            .iter()
+            .flat_map(|replace| &replace.items)
+            .map(|element| NamedExpr {
+                name: Some(element.column_name.clone()),
+                expr: self.bind_expr(&element.expr, scope),
+            })
+            .collect()
     }
 
     /// Resolve a `sqlparser` expression into a bound [`Expr`], mirroring the
@@ -261,7 +284,10 @@ impl<'a> Binder<'a> {
                 self.call([member_of.value.as_ref(), member_of.array.as_ref()], scope)
             }
             // A scalar subquery (value position): its output flows in.
-            SqlExpr::Subquery(query) => Expr::Subquery(Box::new(self.bind_subquery(query, scope))),
+            SqlExpr::Subquery(query) => Expr::Subquery {
+                plan: Box::new(self.bind_subquery(query, scope)),
+                output: 0,
+            },
             // Tests (filter position): columns read, never an origin.
             SqlExpr::Exists { subquery, .. } => {
                 Expr::Exists(Box::new(self.bind_subquery(subquery, scope)))
@@ -454,7 +480,10 @@ impl<'a> Binder<'a> {
                 }
             }
         } else if let FunctionArguments::Subquery(query) = &function.args {
-            args.push(Expr::Subquery(Box::new(self.bind_subquery(query, scope))));
+            args.push(Expr::Subquery {
+                plan: Box::new(self.bind_subquery(query, scope)),
+                output: 0,
+            });
         }
         if let Some(filter) = &function.filter {
             suppressed.push(self.bind_expr(filter, scope));
@@ -561,9 +590,11 @@ impl<'a> Binder<'a> {
     }
 
     /// Filter-position reads from a SELECT's auxiliary clauses (`DISTINCT ON`
-    /// keys, `TOP n`, Hive `LATERAL VIEW`, `PREWHERE`, `QUALIFY`, `CONNECT BY`
-    /// / `START WITH`, `CLUSTER BY` / `DISTRIBUTE BY`, named `WINDOW` specs),
-    /// resolved against the FROM scope. None feed values.
+    /// keys, `TOP n`, Hive `LATERAL VIEW`, `PREWHERE`, `CONNECT BY` / `START
+    /// WITH`, `CLUSTER BY` / `DISTRIBUTE BY`, named `WINDOW` specs), resolved
+    /// against the FROM scope. None feed values. `QUALIFY` is *not* here — it
+    /// filters on window / projection outputs (post-projection), so it binds
+    /// against the output-aware scope in [`bind_select`](Self::bind_select).
     pub(super) fn select_clause_reads(&mut self, select: &Select, scope: &Scope) -> Vec<Expr> {
         let mut reads = Vec::new();
         if let Some(Distinct::On(exprs)) = &select.distinct {
@@ -578,7 +609,6 @@ impl<'a> Binder<'a> {
             reads.push(self.bind_expr(&lateral_view.lateral_view, scope));
         }
         reads.extend(select.prewhere.iter().map(|e| self.bind_expr(e, scope)));
-        reads.extend(select.qualify.iter().map(|e| self.bind_expr(e, scope)));
         for connect_by in &select.connect_by {
             match connect_by {
                 ConnectByKind::ConnectBy { relationships, .. } => {
@@ -657,10 +687,23 @@ impl<'a> Binder<'a> {
                 _ => None,
             }));
             for expr in members {
-                keys.push(self.bind_expr(expr, scope));
+                keys.push(self.bind_clause_key(expr, scope));
             }
         }
         keys
+    }
+
+    /// Bind a GROUP BY / ORDER BY key. A positional ordinal (`GROUP BY 1`) binds
+    /// as if the 1-based n-th output column were named explicitly — so it reads
+    /// (an identity output) or suppresses (an introduced alias) exactly like the
+    /// by-name form, keeping `reads` occurrence-consistent (`GROUP BY a` and
+    /// `GROUP BY 1` agree). Any other key — or an out-of-range / unnamed
+    /// position — binds as written.
+    fn bind_clause_key(&mut self, expr: &SqlExpr, scope: &Scope) -> Expr {
+        match ordinal_output_name(expr, scope) {
+            Some(name) => self.bind_expr(&SqlExpr::Identifier(name), scope),
+            None => self.bind_expr(expr, scope),
+        }
     }
 
     /// The ORDER BY key expressions (a trailing `query.order_by`).
@@ -676,7 +719,7 @@ impl<'a> Binder<'a> {
     pub(super) fn order_by_expr_keys(&mut self, exprs: &[OrderByExpr], scope: &Scope) -> Vec<Expr> {
         exprs
             .iter()
-            .map(|e| self.bind_expr(&e.expr, scope))
+            .map(|e| self.bind_clause_key(&e.expr, scope))
             .collect()
     }
 

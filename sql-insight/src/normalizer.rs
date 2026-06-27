@@ -4,8 +4,19 @@
 //!
 //! The base pass replaces every literal `Value` with a `?`
 //! placeholder, so queries that differ only in their parameter
-//! values collapse to the same string. Three opt-in toggles
-//! ([`NormalizerOptions`]) further collapse repetitive shapes:
+//! values collapse to the same string.
+//!
+//! "Every literal" is meant literally: it includes `Value`s in
+//! structurally significant positions, not just bound-parameter slots.
+//! A JSON path (`JSON_TABLE(data, '$.a')`, `JSON_EXTRACT(data, '$.a')`),
+//! a `CAST(x AS DATE FORMAT 'YYYY-MM-DD')` format string, the
+//! `TABLESAMPLE (BUCKET 3 OUT OF 10)` / `(10 PERCENT)` counts, and
+//! `LIMIT` / `OFFSET` are all rewritten to `?`. So two queries differing
+//! only in such a literal — e.g. selecting a different JSON field or
+//! sampling a different bucket — collapse to the same normalized string.
+//!
+//! Three opt-in toggles ([`NormalizerOptions`]) further collapse
+//! repetitive shapes:
 //!
 //! - [`unify_in_list`](NormalizerOptions::unify_in_list):
 //!   `IN (1, 2, 3)` → `IN (...)`.

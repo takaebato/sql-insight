@@ -117,13 +117,17 @@
 //! Intentional non-support and known gaps — set expectations before
 //! relying on a given output:
 //!
-//! - **Wildcards not expanded**: `SELECT *` / `t.*` contribute
-//!   nothing to `reads` / `lineage`. Expanding them safely would
-//!   require modelling USING / NATURAL JOIN merge, EXCLUDE / REPLACE
-//!   clauses, and multi-level aliases — too much rigor for a
-//!   SQL-text-only library. Surfaced as
+//! - **Wildcards not expanded**: the `*` / `t.*` itself contributes
+//!   nothing to `reads` / `lineage` (expanding it safely would require
+//!   modelling USING / NATURAL JOIN merge, EXCLUDE / EXCEPT / RENAME, and
+//!   multi-level aliases — too much rigor for a SQL-text-only library).
+//!   Surfaced as
 //!   [`WildcardSuppressed`](diagnostic::ColumnLevelDiagnosticKind::WildcardSuppressed)
-//!   so consumers can detect incomplete projections.
+//!   so consumers can detect incomplete projections. A `REPLACE (expr AS
+//!   col)` clause *is* extracted — each replacement's `expr` contributes
+//!   reads and a `col` lineage edge, exactly like a standalone `expr AS col`
+//!   — but its **output position** is best-effort, since the wildcard's own
+//!   columns aren't enumerated to place it among them.
 //! - **Table functions are opaque**: `UNNEST` / `generate_series` /
 //!   `JSON_TABLE` / `PIVOT` etc. produce dynamic columns that aren't
 //!   enumerated. Their argument expressions surface as reads, but a

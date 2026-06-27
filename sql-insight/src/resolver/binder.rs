@@ -37,20 +37,21 @@
 //! named on the root, never a read scan.
 
 use sqlparser::ast::{
-    AlterTable as SqlAlterTable, AlterTableOperation, AssignmentTarget, CreateTable,
-    CreateTableLikeKind, CreateView as SqlCreateView, Cte as SqlCte, Delete as SqlDelete,
-    Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, GroupByWithModifier, Ident, Insert as SqlInsert, JoinConstraint, JoinOperator,
-    JsonPathElem, Merge as SqlMerge, MergeAction, MergeInsertKind, ObjectName, ObjectType,
-    OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource,
-    Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject,
-    TableWithJoins, Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
+    AlterTable as SqlAlterTable, AlterTableOperation, Assignment as SqlAssignment,
+    AssignmentTarget, CreateTable, CreateTableLikeKind, CreateView as SqlCreateView, Cte as SqlCte,
+    Delete as SqlDelete, Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, GroupByWithModifier, Ident, Insert as SqlInsert,
+    JoinConstraint, JoinOperator, JsonPathElem, Merge as SqlMerge, MergeAction, MergeInsertKind,
+    ObjectName, ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind,
+    OutputClause, PipeOperator, PivotValueSource, Query, Select, SelectItem, SetExpr, Statement,
+    TableAlias, TableFactor, TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind,
+    Value, Values as SqlValues,
 };
 
 use sqlparser::ast::{
     AccessExpr, ConnectByKind, Distinct, FunctionArgumentClause, LimitClause, ListAggOnOverflow,
-    NamedWindowExpr, SelectItemQualifiedWildcardKind, Subscript, TopQuantity, WindowFrameBound,
-    WindowSpec, WindowType,
+    NamedWindowExpr, SelectItemQualifiedWildcardKind, Subscript, TopQuantity,
+    WildcardAdditionalOptions, WindowFrameBound, WindowSpec, WindowType,
 };
 use sqlparser::tokenizer::Span;
 
@@ -280,6 +281,30 @@ impl<'a> Binder<'a> {
             ),
             span: None,
         });
+    }
+
+    /// Record an INSERT / MERGE-INSERT arity mismatch between the target columns
+    /// and the source values *if* they disagree (a no-op otherwise) — the caller
+    /// passes the two determinate counts (no wildcard). An **explicit** column
+    /// list must match exactly: either direction silently zips to the shorter
+    /// side. A **column-less** target filled from the catalog is flagged only
+    /// when the source is *wider* (the surplus is dropped); a narrower source
+    /// may rely on column defaults, so it isn't.
+    pub(super) fn diagnose_insert_arity(
+        &mut self,
+        target: &TableReference,
+        explicit: bool,
+        target_columns: usize,
+        source_columns: usize,
+    ) {
+        let mismatch = if explicit {
+            source_columns != target_columns
+        } else {
+            source_columns > target_columns
+        };
+        if mismatch {
+            self.record_insert_columns_arity_mismatch(target, target_columns, source_columns);
+        }
     }
 
     /// Flag a CTAS / CREATE VIEW (without an explicit column list) whose source
@@ -669,6 +694,21 @@ fn inferred_name(expr: &SqlExpr) -> Option<Ident> {
         SqlExpr::CompoundIdentifier(parts) => parts.last().cloned(),
         _ => None,
     }
+}
+
+/// The name of the query output a positional ordinal key (`GROUP BY 1` /
+/// `ORDER BY 1`) refers to — the 1-based n-th [`Scope::query_outputs`] entry,
+/// if it has one. `None` for a non-integer / zero / out-of-range position, or
+/// an anonymous output: the caller then binds the literal as written.
+fn ordinal_output_name(expr: &SqlExpr, scope: &Scope) -> Option<Ident> {
+    let SqlExpr::Value(v) = expr else {
+        return None;
+    };
+    let Value::Number(digits, _) = &v.value else {
+        return None;
+    };
+    let n: usize = digits.parse().ok()?;
+    scope.query_outputs.get(n.checked_sub(1)?)?.name.clone()
 }
 
 /// The `ON` predicate of a join operator, if any.

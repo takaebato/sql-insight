@@ -356,6 +356,42 @@ mod expr_arm_coverage {
     }
 
     #[test]
+    fn function_subquery_argument() {
+        // A function called with a subquery argument (`f((SELECT …))`): the
+        // subquery's columns are walked as reads (value-position).
+        assert_unordered_eq!(reads("SELECT f((SELECT x FROM t)) FROM t"), vec![c("x")]);
+    }
+
+    #[test]
+    fn named_window_reference_with_frame() {
+        // `OVER w` references a `WINDOW w AS (…)` definition: the function arg is
+        // a value, and the named window's ORDER BY key + frame-bound expressions
+        // surface as (row-positioning) reads.
+        assert_unordered_eq!(
+            reads(
+                "SELECT SUM(a) OVER w FROM t \
+                 WINDOW w AS (ORDER BY b ROWS BETWEEN c PRECEDING AND d FOLLOWING)"
+            ),
+            vec![c("a"), c("b"), c("c"), c("d")]
+        );
+    }
+
+    #[test]
+    fn cluster_by() {
+        // Hive `CLUSTER BY` keys are row-positioning reads.
+        assert_unordered_eq!(reads("SELECT a FROM t CLUSTER BY b"), vec![c("a"), c("b")]);
+    }
+
+    #[test]
+    fn distribute_by() {
+        // Hive `DISTRIBUTE BY` keys are row-positioning reads.
+        assert_unordered_eq!(
+            reads("SELECT a FROM t DISTRIBUTE BY b"),
+            vec![c("a"), c("b")]
+        );
+    }
+
+    #[test]
     fn limit_offset_comma() {
         // The `LIMIT <offset>, <limit>` form (`OffsetCommaLimit`): both
         // operands are filter-position reads (here literals).
@@ -873,6 +909,25 @@ mod relation_arm_coverage {
     }
 
     #[test]
+    fn parameterized_table_function_is_opaque() {
+        // `generate_series(1, 10) AS g` is a table-valued function, not a base
+        // table: a reference through its alias (`g.value`) is a synthetic
+        // source, dropped from reads, and `generate_series` is not a real table
+        // read. (It used to be scanned as a real table, surfacing a phantom
+        // `generate_series.value` base read.) Literal args contribute nothing.
+        assert_unordered_eq!(
+            reads("SELECT g.value FROM generate_series(1, 10) AS g"),
+            vec![]
+        );
+        // A column argument is still walked (here `t` is not in FROM, so it's
+        // unresolved) — proving the args read like any other opaque factor.
+        assert_unordered_eq!(
+            reads("SELECT g.v FROM generate_series(t.a) AS g"),
+            vec![unresolved("a")]
+        );
+    }
+
+    #[test]
     fn pivot() {
         let result = op("SELECT * FROM t PIVOT(SUM(t.amt) FOR t.mon IN ('a', 'b'))");
         assert_unordered_eq!(result.reads, vec![c("t", "amt"), c("t", "mon")]);
@@ -1301,14 +1356,13 @@ mod relation_arm_coverage {
     }
 
     #[test]
-    fn update_tuple_assignment_target_is_skipped() {
-        // `AssignmentTarget::Tuple(_)` returns `None` from
-        // `assignment_target_parts`, so the SET position is skipped:
-        // no writes emitted (tuple targets are not yet supported for
-        // column-level pairing). The RHS literals contribute no reads.
+    fn update_tuple_assignment_writes_each_target_column() {
+        // `AssignmentTarget::Tuple` expands to one write per target column,
+        // paired positionally with the RHS row value. The literals `(1, 2)`
+        // contribute no reads.
         let result = op("UPDATE t SET (a, b) = (1, 2)");
         assert_unordered_eq!(result.reads, vec![]);
-        assert_eq!(result.writes, vec![]);
+        assert_eq!(result.writes, vec![w("t", "a"), w("t", "b")]);
     }
 
     #[test]

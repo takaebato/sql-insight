@@ -1009,6 +1009,61 @@ mod output_alias_visibility {
     }
 
     #[test]
+    fn group_by_ordinal_reads_like_the_named_column() {
+        // `GROUP BY 1` is the 1st output (`a`, an identity output), so it reads
+        // `t.a` a second time — occurrence-consistent with `GROUP BY a`.
+        assert_column_ops(
+            "SELECT a FROM t GROUP BY 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn group_by_ordinal_of_introduced_alias_is_suppressed() {
+        // `GROUP BY 1` here is `a + b AS x` (an introduced alias) — like
+        // `GROUP BY x`, it binds Derived and adds no read; the dependency on
+        // `a`, `b` is already counted at the projection.
+        assert_column_ops(
+            "SELECT a + b AS x FROM t GROUP BY 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "a"), out("x", 0)),
+                    transformation(col("t", "b"), out("x", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn order_by_ordinal_reads_the_referenced_output() {
+        // `ORDER BY 2` is the 2nd output (`b`), so it reads `t.b` again — like
+        // `ORDER BY b`. (`a` is read once, at the projection.)
+        assert_column_ops(
+            "SELECT a, b FROM t ORDER BY 2",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("t", "b"), out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn having_computed_alias_is_suppressed() {
         // `s` = `SUM(a)` is a computed alias; HAVING s references the
         // aggregate output, not a stored column.
@@ -1019,6 +1074,59 @@ mod output_alias_visibility {
                 reads: vec![read("t", "a")],
                 writes: vec![],
                 lineage: vec![transformation(col("t", "a"), out("s", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn qualify_window_alias_is_suppressed() {
+        // `rn` aliases a window output; QUALIFY references it post-projection,
+        // not a stored column — so no phantom `t.rn` read. The real dependency
+        // (the window's `PARTITION BY a`) is counted at the projection.
+        assert_column_ops(
+            "SELECT a, ROW_NUMBER() OVER (PARTITION BY a) AS rn FROM t QUALIFY rn = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn qualify_window_key_is_a_read() {
+        // A window key referenced only in QUALIFY's inline window (`b` is not
+        // projected) is a genuine new read — QUALIFY adds reads even as it
+        // suppresses alias references. Still no lineage (filter position).
+        assert_column_ops(
+            "SELECT a FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY b) = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn qualify_base_column_is_a_read() {
+        // A QUALIFY referencing a real column (not an output alias) is a
+        // (filter-position) read, like any predicate.
+        assert_column_ops(
+            "SELECT a, b FROM t QUALIFY b > 0",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("t", "b"), out("b", 1)),
+                ],
                 diagnostics: vec![],
             },
         );

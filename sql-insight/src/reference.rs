@@ -552,3 +552,66 @@ impl TryFrom<&ObjectName> for TableReference {
         Self::try_from_name(obj_name)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::ast::{SetExpr, Statement};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    /// The first FROM factor of `SELECT 1 FROM <from>` — a handle on a parsed
+    /// `TableFactor` (and, for a `Table`, its `ObjectName`) to drive the public
+    /// `TryFrom` conversions.
+    fn first_table_factor(from: &str) -> TableFactor {
+        let sql = format!("SELECT 1 FROM {from}");
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, &sql).unwrap();
+        let Statement::Query(query) = stmts.remove(0) else {
+            panic!("expected a query");
+        };
+        let SetExpr::Select(select) = *query.body else {
+            panic!("expected a SELECT");
+        };
+        select.from.into_iter().next().unwrap().relation
+    }
+
+    #[test]
+    fn try_from_object_name_keeps_catalog_schema_name_and_displays_all_parts() {
+        let factor = first_table_factor("cat.sch.tbl");
+        let TableFactor::Table { name, .. } = &factor else {
+            panic!("expected a table factor");
+        };
+        let reference = TableReference::try_from(name).unwrap();
+        assert_eq!(reference.catalog.as_ref().unwrap().value, "cat");
+        assert_eq!(reference.schema.as_ref().unwrap().value, "sch");
+        assert_eq!(reference.name.value, "tbl");
+        // Display renders every present part (the three-part / catalog branch).
+        assert_eq!(reference.to_string(), "cat.sch.tbl");
+    }
+
+    #[test]
+    fn try_from_table_factor_converts_a_table_and_rejects_a_derived_factor() {
+        let table = first_table_factor("a.b");
+        let reference = TableReference::try_from(&table).unwrap();
+        assert_eq!(reference.schema.as_ref().unwrap().value, "a");
+        assert_eq!(reference.name.value, "b");
+        // A non-`Table` factor names no stored table — an analysis error.
+        let derived = first_table_factor("(SELECT 1) AS d");
+        assert!(matches!(
+            TableReference::try_from(&derived),
+            Err(Error::AnalysisError(_))
+        ));
+    }
+
+    #[test]
+    fn try_from_insert_takes_the_target_name() {
+        let mut stmts =
+            Parser::parse_sql(&GenericDialect {}, "INSERT INTO a.b VALUES (1)").unwrap();
+        let Statement::Insert(insert) = stmts.remove(0) else {
+            panic!("expected an insert");
+        };
+        let reference = TableReference::try_from(&insert).unwrap();
+        assert_eq!(reference.schema.as_ref().unwrap().value, "a");
+        assert_eq!(reference.name.value, "b");
+    }
+}

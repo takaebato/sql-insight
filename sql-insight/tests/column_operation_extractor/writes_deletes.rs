@@ -167,6 +167,7 @@ mod writes {
 
 mod delete {
     use super::*;
+    use sql_insight::sqlparser::dialect::MySqlDialect;
 
     #[test]
     fn delete_qualified_predicate_is_a_read() {
@@ -175,6 +176,24 @@ mod delete {
             ColumnOperation {
                 statement_kind: StatementKind::Delete,
                 reads: vec![read("t1", "id")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn delete_order_by_keys_are_reads_constant_limit_is_not() {
+        // MySQL `DELETE … ORDER BY … LIMIT`: ORDER BY keys reference the
+        // target's columns (reads, filter position); the constant LIMIT adds
+        // no read. Neither feeds lineage.
+        assert_column_ops_with_dialect(
+            &MySqlDialect {},
+            "DELETE FROM t WHERE flag = 1 ORDER BY priority DESC LIMIT 5",
+            ColumnOperation {
+                statement_kind: StatementKind::Delete,
+                reads: vec![read("t", "flag"), read("t", "priority")],
                 writes: vec![],
                 lineage: vec![],
                 diagnostics: vec![],

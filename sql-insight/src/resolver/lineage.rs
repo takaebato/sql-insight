@@ -134,6 +134,9 @@ pub(super) fn collect_column_lineage(
                     MergeClause::Delete => {}
                 }
             }
+            // RETURNING / OUTPUT projects the affected rows (target + source),
+            // traced through the source like the other DMLs' RETURNING.
+            returning_lineage(&m.returning, &m.source, &mut context, &mut edges);
         }
         // A bare query (or unmodelled root): one `QueryOutput` group per
         // projection (a set operation has one per branch — positions restart

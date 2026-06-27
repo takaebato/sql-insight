@@ -2,6 +2,7 @@ use crate::support::*;
 
 mod projections {
     use super::*;
+    use sql_insight::sqlparser::dialect::PostgreSqlDialect;
 
     #[test]
     fn select_bare_column_emits_passthrough_edge_to_query_output() {
@@ -43,6 +44,23 @@ mod projections {
                     transformation(col("t1", "a"), out_anon(0)),
                     transformation(col("t1", "b"), out_anon(0)),
                 ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn in_subquery_in_value_position_flows_lhs_not_the_subquery() {
+        // `a IN (subquery)` projected as a value: the LHS `a` flows to the
+        // output (a boolean transformation of it, symmetric with `a IN (list)`);
+        // the subquery's `s.x` is a membership test — a read, never a source.
+        assert_column_ops(
+            "SELECT (a IN (SELECT x FROM s)) AS f FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("s", "x")],
+                writes: vec![],
+                lineage: vec![transformation(col("t", "a"), out("f", 0))],
                 diagnostics: vec![],
             },
         );
@@ -243,6 +261,44 @@ mod projections {
                 reads: vec![read("t1", "b")],
                 writes: vec![write("t1", "a")],
                 lineage: vec![transformation(col("t1", "b"), relation("t1", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn update_tuple_set_subquery_pairs_each_target_with_its_output() {
+        // `SET (a, b) = (SELECT x, y FROM s)`: the one subquery is read once,
+        // and each target column pairs with its positional output (a ← x via
+        // output 0, b ← y via output 1) — not the first output for both.
+        assert_column_ops_with_dialect(
+            &PostgreSqlDialect {},
+            "UPDATE t SET (a, b) = (SELECT x, y FROM s)",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("s", "x"), read("s", "y")],
+                writes: vec![write("t", "a"), write("t", "b")],
+                lineage: vec![
+                    transformation(col("s", "x"), relation("t", "a")),
+                    transformation(col("s", "y"), relation("t", "b")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn update_tuple_set_row_value_pairs_each_target_element_wise() {
+        // `SET (a, b) = (10, c)`: a row value — each element is one target's
+        // value (a ← 10, no source; b ← c passthrough).
+        assert_column_ops_with_dialect(
+            &PostgreSqlDialect {},
+            "UPDATE t SET (a, b) = (10, c)",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t", "c")],
+                writes: vec![write("t", "a"), write("t", "b")],
+                lineage: vec![passthrough(col("t", "c"), relation("t", "b"))],
                 diagnostics: vec![],
             },
         );

@@ -2,6 +2,7 @@ use crate::support::*;
 
 mod reported {
     use super::*;
+    use sql_insight::sqlparser::dialect::BigQueryDialect;
 
     #[test]
     fn unsupported_statement_reports_diagnostic() {
@@ -96,6 +97,24 @@ mod reported {
     }
 
     #[test]
+    fn wildcard_replace_expression_contributes_reads_and_lineage() {
+        // The `*` stays suppressed, but a `REPLACE (expr AS col)` is a real
+        // value-producing output: `products.price` reads and feeds `price`
+        // (Transformation), exactly like a standalone `price * 1.1 AS price`.
+        assert_column_ops_with_dialect(
+            &BigQueryDialect {},
+            "SELECT * REPLACE (price * 1.1 AS price) FROM products",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("products", "price")],
+                writes: vec![],
+                lineage: vec![transformation(col("products", "price"), out("price", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
     fn multiple_statements_produce_multiple_results() {
         let sql = "SELECT t1.a FROM t1; SELECT t2.b FROM t2";
         assert_nth_column_ops(
@@ -168,6 +187,23 @@ mod reported {
                     passthrough(col("s", "y"), relation("t", "b")),
                 ],
                 diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_values_arity_mismatch_is_flagged() {
+        // An explicit column list against a VALUES row: 3 columns, 2 values →
+        // flagged like the SELECT-source case. All three columns still surface
+        // as writes (from syntax); a VALUES source has no traceable lineage.
+        assert_column_ops(
+            "INSERT INTO t (a, b, c) VALUES (1, 2)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "c")],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsArityMismatch)],
             },
         );
     }

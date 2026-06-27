@@ -251,13 +251,16 @@ pub(crate) struct Delete {
 }
 
 /// `MERGE INTO target USING source ON on WHEN ...`: the `clauses` drive
-/// writes / lineage (UPDATE SET / INSERT VALUES).
+/// writes / lineage (UPDATE SET / INSERT VALUES). `returning` projects the
+/// affected rows — the `RETURNING` (Snowflake) / `OUTPUT` (MSSQL) clause's
+/// select items, over the target + source scope, like the other DML roots.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Merge {
     pub(crate) target: TableWrite,
     pub(crate) source: Box<LogicalPlan>,
     pub(crate) on: Vec<Expr>,
     pub(crate) clauses: Vec<MergeClause>,
+    pub(crate) returning: Vec<NamedExpr>,
 }
 
 /// One `WHEN [NOT] MATCHED ...` action of a [`Merge`].
@@ -368,9 +371,14 @@ pub(crate) enum Expr {
         partition: Vec<Expr>,
         order: Vec<Expr>,
     },
-    /// A scalar subquery (value position): its first output column's origins
-    /// flow into the enclosing value (as a `Transformation`).
-    Subquery(Box<LogicalPlan>),
+    /// A subquery in value position: the `output`-th output column's origins
+    /// flow into the enclosing value (as a `Transformation`). `output` is 0 for
+    /// a scalar `(SELECT …)`; a tuple assignment `SET (a, b) = (SELECT x, y …)`
+    /// binds one per target column, each projecting its positional output.
+    Subquery {
+        plan: Box<LogicalPlan>,
+        output: usize,
+    },
     /// `EXISTS (subquery)` (filter position): a test, never a value origin.
     Exists(Box<LogicalPlan>),
     /// `expr IN (subquery)` (filter position).
@@ -417,7 +425,7 @@ impl Expr {
             }
             Expr::Window { arg, .. } => vec![arg],
             Expr::Column(_)
-            | Expr::Subquery(_)
+            | Expr::Subquery { .. }
             | Expr::Exists(_)
             | Expr::InSubquery { .. }
             | Expr::Filter(_)
@@ -436,7 +444,7 @@ impl Expr {
             Expr::Filter(exprs) => exprs.iter().collect(),
             Expr::Column(_)
             | Expr::Call { .. }
-            | Expr::Subquery(_)
+            | Expr::Subquery { .. }
             | Expr::Exists(_)
             | Expr::Fanin(_) => Vec::new(),
         }
@@ -448,8 +456,14 @@ impl Expr {
     /// it for the source-table feed).
     pub(super) fn value_subplans(&self) -> Vec<&LogicalPlan> {
         match self {
-            Expr::Subquery(plan) => vec![plan],
-            Expr::Column(_)
+            Expr::Subquery { plan, output: 0 } => vec![plan],
+            // `output > 0` is a tuple `SET (a, b) = (SELECT …)` clone: every
+            // target column clones the same subquery, differing only in which
+            // output it projects. Expose the shared plan once (at output 0
+            // above) so reads / source-feeds stay occurrence-correct; column
+            // lineage traces each output separately via `origins`, not here.
+            Expr::Subquery { .. }
+            | Expr::Column(_)
             | Expr::Call { .. }
             | Expr::Case { .. }
             | Expr::Window { .. }
@@ -471,7 +485,7 @@ impl Expr {
             | Expr::Call { .. }
             | Expr::Case { .. }
             | Expr::Window { .. }
-            | Expr::Subquery(_)
+            | Expr::Subquery { .. }
             | Expr::Filter(_)
             | Expr::Fanin(_) => Vec::new(),
         }
@@ -593,6 +607,7 @@ pub(super) fn own_exprs(op: &LogicalPlan) -> Vec<&Expr> {
                     MergeClause::Delete => {}
                 }
             }
+            exprs.extend(m.returning.iter().map(|ne| &ne.expr));
             exprs
         }
         LogicalPlan::Scan(_)
