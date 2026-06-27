@@ -257,7 +257,7 @@ impl<'a> Binder<'a> {
     ) -> Vec<NamedExpr> {
         items
             .iter()
-            .filter_map(|i| self.bind_select_item(i, scope))
+            .flat_map(|i| self.bind_select_item(i, scope))
             .collect()
     }
 
@@ -458,7 +458,7 @@ impl<'a> Binder<'a> {
         let exprs: Vec<NamedExpr> = select
             .projection
             .iter()
-            .filter_map(|item| self.bind_select_item(item, &scope))
+            .flat_map(|item| self.bind_select_item(item, &scope))
             .collect();
         let clause_scope = scope.with_query_outputs(self.output_cols(&exprs));
         // GROUP BY → an `Aggregate` over the filtered rows; its keys are reads.

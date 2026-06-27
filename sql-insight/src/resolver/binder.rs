@@ -49,8 +49,8 @@ use sqlparser::ast::{
 
 use sqlparser::ast::{
     AccessExpr, ConnectByKind, Distinct, FunctionArgumentClause, LimitClause, ListAggOnOverflow,
-    NamedWindowExpr, SelectItemQualifiedWildcardKind, Subscript, TopQuantity, WindowFrameBound,
-    WindowSpec, WindowType,
+    NamedWindowExpr, SelectItemQualifiedWildcardKind, Subscript, TopQuantity,
+    WildcardAdditionalOptions, WindowFrameBound, WindowSpec, WindowType,
 };
 use sqlparser::tokenizer::Span;
 

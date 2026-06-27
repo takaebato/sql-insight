@@ -818,7 +818,7 @@ impl<'a> Binder<'a> {
         returning
             .iter()
             .flatten()
-            .filter_map(|item| self.bind_select_item(item, scope))
+            .flat_map(|item| self.bind_select_item(item, scope))
             .collect()
     }
 

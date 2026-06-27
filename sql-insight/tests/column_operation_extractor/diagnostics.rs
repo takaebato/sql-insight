@@ -2,6 +2,7 @@ use crate::support::*;
 
 mod reported {
     use super::*;
+    use sql_insight::sqlparser::dialect::BigQueryDialect;
 
     #[test]
     fn unsupported_statement_reports_diagnostic() {
@@ -90,6 +91,24 @@ mod reported {
                 reads: vec![],
                 writes: vec![],
                 lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn wildcard_replace_expression_contributes_reads_and_lineage() {
+        // The `*` stays suppressed, but a `REPLACE (expr AS col)` is a real
+        // value-producing output: `products.price` reads and feeds `price`
+        // (Transformation), exactly like a standalone `price * 1.1 AS price`.
+        assert_column_ops_with_dialect(
+            &BigQueryDialect {},
+            "SELECT * REPLACE (price * 1.1 AS price) FROM products",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("products", "price")],
+                writes: vec![],
+                lineage: vec![transformation(col("products", "price"), out("price", 0))],
                 diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
             },
         );

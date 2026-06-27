@@ -5,26 +5,26 @@
 use super::*;
 
 impl<'a> Binder<'a> {
-    pub(super) fn bind_select_item(
-        &mut self,
-        item: &SelectItem,
-        scope: &Scope,
-    ) -> Option<NamedExpr> {
+    pub(super) fn bind_select_item(&mut self, item: &SelectItem, scope: &Scope) -> Vec<NamedExpr> {
         match item {
-            SelectItem::UnnamedExpr(expr) => Some(NamedExpr {
+            SelectItem::UnnamedExpr(expr) => vec![NamedExpr {
                 name: inferred_name(expr),
                 expr: self.bind_expr(expr, scope),
-            }),
-            SelectItem::ExprWithAlias { expr, alias } => Some(NamedExpr {
+            }],
+            SelectItem::ExprWithAlias { expr, alias } => vec![NamedExpr {
                 name: Some(alias.clone()),
                 expr: self.bind_expr(expr, scope),
-            }),
+            }],
             // A wildcard isn't expanded (the rigor cost is too high for a
             // SQL-text-only library); record it so consumers know this
-            // projection's column lineage is incomplete, and skip it.
+            // projection's column lineage is incomplete. A `REPLACE (expr AS
+            // col)` clause is a real value-producing output, though — bind each
+            // replacement as a named output (its reads / lineage are exactly a
+            // standalone `expr AS col`; only the output position is best-effort,
+            // since the wildcard's own columns aren't enumerated).
             SelectItem::Wildcard(options) => {
                 self.record_wildcard_suppressed("wildcard `*`", options.wildcard_token.0.span);
-                None
+                self.replace_outputs(options, scope)
             }
             SelectItem::QualifiedWildcard(kind, options) => {
                 let description = match kind {
@@ -38,18 +38,41 @@ impl<'a> Binder<'a> {
                 self.record_wildcard_suppressed(&description, options.wildcard_token.0.span);
                 // `(expr).*` still projects its base expression as one
                 // Transformation output (a structural field access); `alias.*`
-                // has no inspectable base.
-                match kind {
-                    SelectItemQualifiedWildcardKind::Expr(expr) => Some(NamedExpr {
+                // has no inspectable base. Either way a `REPLACE` clause's
+                // explicit outputs follow.
+                let mut out = match kind {
+                    SelectItemQualifiedWildcardKind::Expr(expr) => vec![NamedExpr {
                         name: None,
                         expr: Expr::Call {
                             args: vec![self.bind_expr(expr, scope)],
                         },
-                    }),
-                    SelectItemQualifiedWildcardKind::ObjectName(_) => None,
-                }
+                    }],
+                    SelectItemQualifiedWildcardKind::ObjectName(_) => Vec::new(),
+                };
+                out.extend(self.replace_outputs(options, scope));
+                out
             }
         }
+    }
+
+    /// A wildcard's `REPLACE (expr AS col, …)` outputs: each replacement is a
+    /// value-producing column named by `col`, bound like a standalone
+    /// `expr AS col` (its reads / lineage are identical). The wildcard's other
+    /// columns stay unexpanded.
+    fn replace_outputs(
+        &mut self,
+        options: &WildcardAdditionalOptions,
+        scope: &Scope,
+    ) -> Vec<NamedExpr> {
+        options
+            .opt_replace
+            .iter()
+            .flat_map(|replace| &replace.items)
+            .map(|element| NamedExpr {
+                name: Some(element.column_name.clone()),
+                expr: self.bind_expr(&element.expr, scope),
+            })
+            .collect()
     }
 
     /// Resolve a `sqlparser` expression into a bound [`Expr`], mirroring the
