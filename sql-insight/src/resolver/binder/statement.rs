@@ -375,12 +375,20 @@ impl<'a> Binder<'a> {
                 input = combine(input, node);
             }
         }
-        // WHERE: a filter over the read input (picks which rows update; its
-        // reads / subqueries do not feed the new value).
-        if let Some(predicate) = &update.selection {
+        // WHERE + the MySQL `LIMIT` tail are filter-position reads (they pick /
+        // bound which rows update; their reads / subqueries never feed the new
+        // value). A `LIMIT` is normally a constant, so it adds no read, but it's
+        // bound for parity with SELECT / DELETE rather than silently dropped.
+        let mut filter_reads: Vec<Expr> = update
+            .selection
+            .iter()
+            .map(|predicate| self.bind_expr(predicate, &scope))
+            .collect();
+        filter_reads.extend(update.limit.iter().map(|e| self.bind_expr(e, &scope)));
+        if !filter_reads.is_empty() {
             input = LogicalPlan::Filter(Filter {
                 input: Box::new(input),
-                predicate: vec![self.bind_expr(predicate, &scope)],
+                predicate: filter_reads,
             });
         }
         // SET assignments resolve against the target + FROM scope; each writes
@@ -463,10 +471,21 @@ impl<'a> Binder<'a> {
                 targets.push(target);
             }
         }
-        if let Some(predicate) = &delete.selection {
+        // WHERE + the MySQL `ORDER BY` / `LIMIT` tail are filter-position reads
+        // (row selection / positioning / count), none feeding lineage. ORDER BY
+        // keys reference the target's columns, so they read it (source/sink); a
+        // constant LIMIT adds no read but is bound for parity, not dropped.
+        let mut filter_reads: Vec<Expr> = delete
+            .selection
+            .iter()
+            .map(|predicate| self.bind_expr(predicate, &scope))
+            .collect();
+        filter_reads.extend(self.order_by_expr_keys(&delete.order_by, &scope));
+        filter_reads.extend(delete.limit.iter().map(|e| self.bind_expr(e, &scope)));
+        if !filter_reads.is_empty() {
             input = LogicalPlan::Filter(Filter {
                 input: Box::new(input),
-                predicate: vec![self.bind_expr(predicate, &scope)],
+                predicate: filter_reads,
             });
         }
         // RETURNING resolves against the FROM / USING scope (which holds the
