@@ -585,6 +585,17 @@ impl<'a> Binder<'a> {
             TableFactor::Table {
                 name, alias, args, ..
             } => {
+                // `foo(args)` in FROM is a table-valued function, not a base
+                // table — bind it as an opaque table-producing factor (like
+                // UNNEST / `TableFactor::Function`): its produced columns are
+                // dynamic, so a reference through its alias is a synthetic source
+                // and the function name is *not* a real table read. The argument
+                // expressions read against the sibling scope.
+                if let Some(args) = args {
+                    let bound =
+                        self.bind_function_arg_list(&args.args, &Scope::from_relations(left));
+                    return self.opaque(LogicalPlan::Empty, bound, alias.as_ref());
+                }
                 let Some(written) = self.table_ref(name) else {
                     return (LogicalPlan::Empty, Scope::default());
                 };
@@ -611,19 +622,7 @@ impl<'a> Binder<'a> {
                         );
                     }
                 }
-                let (scan, scope) = self.bind_named_table(&written, alias_name);
-                // A parameterised table reference `foo(args)`: the argument
-                // expressions read against the surrounding (sibling) scope —
-                // attach them as a non-feeding filter over the scan.
-                let node = match args {
-                    Some(args) => LogicalPlan::Filter(Filter {
-                        input: Box::new(scan),
-                        predicate: self
-                            .bind_function_arg_list(&args.args, &Scope::from_relations(left)),
-                    }),
-                    None => scan,
-                };
-                (node, scope)
+                self.bind_named_table(&written, alias_name)
             }
             // A derived table `(<subquery>) AS d`: bind the subquery, expose
             // its output columns as a synthetic relation under the alias. A

@@ -873,6 +873,25 @@ mod relation_arm_coverage {
     }
 
     #[test]
+    fn parameterized_table_function_is_opaque() {
+        // `generate_series(1, 10) AS g` is a table-valued function, not a base
+        // table: a reference through its alias (`g.value`) is a synthetic
+        // source, dropped from reads, and `generate_series` is not a real table
+        // read. (It used to be scanned as a real table, surfacing a phantom
+        // `generate_series.value` base read.) Literal args contribute nothing.
+        assert_unordered_eq!(
+            reads("SELECT g.value FROM generate_series(1, 10) AS g"),
+            vec![]
+        );
+        // A column argument is still walked (here `t` is not in FROM, so it's
+        // unresolved) — proving the args read like any other opaque factor.
+        assert_unordered_eq!(
+            reads("SELECT g.v FROM generate_series(t.a) AS g"),
+            vec![unresolved("a")]
+        );
+    }
+
+    #[test]
     fn pivot() {
         let result = op("SELECT * FROM t PIVOT(SUM(t.amt) FOR t.mon IN ('a', 'b'))");
         assert_unordered_eq!(result.reads, vec![c("t", "amt"), c("t", "mon")]);
