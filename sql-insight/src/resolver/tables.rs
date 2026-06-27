@@ -95,7 +95,21 @@ fn merge_clause_writes(clause: &MergeClause, target: &TableReference) -> Vec<Col
 pub(super) fn collect_table_writes(plan: &LogicalPlan) -> Vec<TableReference> {
     match peel_with(plan) {
         LogicalPlan::Insert(i) => vec![i.target.clone()],
-        LogicalPlan::Update(u) => vec![u.target.clone()],
+        // The distinct tables the SET assignments write — the root for a
+        // single-table UPDATE, but each qualified relation for a multi-table
+        // `UPDATE t1 JOIN t2 SET t1.a = …, t2.b = …` (a table set in several
+        // columns counts once; assignment order preserved).
+        LogicalPlan::Update(u) => {
+            let mut tables: Vec<TableReference> = Vec::new();
+            for a in &u.assignments {
+                if let Some(table) = &a.target.table {
+                    if !tables.contains(table) {
+                        tables.push(table.clone());
+                    }
+                }
+            }
+            tables
+        }
         // A DELETE removes rows from each of its targets.
         LogicalPlan::Delete(d) => d.targets.clone(),
         LogicalPlan::CreateTableAs(c) => vec![c.target.clone()],

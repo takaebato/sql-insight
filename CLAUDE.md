@@ -43,8 +43,16 @@ Rules that bite if forgotten (the why is in `ARCHITECTURE.md`):
   `a AS x`) doesn't (binds `Derived`). `lineage` is symmetric.
 - **value vs filter is structural** — value → `lineage` source; filter-only
   → in `reads` but not `lineage`. No tag.
-- **A DML target is not a `Scan`** — named on the DML root, so it surfaces
-  only via `writes` / `table_writes`, never `reads`.
+- **Reads = source/sink** — a scanned relation (FROM / JOIN / subquery) always
+  reads (a source: its rows feed/filter, even `SELECT COUNT(*) FROM t`); a DML
+  write target (the sink, named on the root, not a scan) reads only when its
+  *own* data is referenced (`UPDATE t SET a=a+1`, `DELETE … WHERE t.flag`, an
+  upsert) — a constant `UPDATE t SET a=1` / plain INSERT stays write-only. A
+  target that is *also* scanned as a source (`INSERT INTO t SELECT * FROM t`)
+  reads through that scan.
+- **A multi-table UPDATE writes per SET-target** — `UPDATE t1 JOIN t2 SET
+  t2.col = …` writes (and lineage-targets) `t2`, the relation its qualifier
+  resolves to, not the root (`Assignment.target` carries the resolved table).
 - **Best-effort** — an unrepresentable construct is dropped + flagged, not
   `?`-bailed; per-statement `Vec<Result<_, Error>>` (a *parse* error fails
   the whole call).

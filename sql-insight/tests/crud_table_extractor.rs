@@ -294,7 +294,9 @@ mod delete_statement {
         let sql = "(DELETE FROM t WHERE id = 1)";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![],
+            // `t.id` is read by the WHERE — the target's own data is consumed,
+            // so it reads as well as deletes.
+            read_tables: vec![table("t")],
             update_tables: vec![],
             delete_tables: vec![table("t")],
             diagnostics: vec![],
@@ -415,19 +417,35 @@ mod update_statement {
 
     #[test]
     fn test_update_statement_with_alias() {
-        // Behavior change vs the legacy implementation: joined tables
-        // (`t2` here) are now classified as `read_tables` rather than
-        // bundled into `update_tables`. This matches the SQL semantics
-        // — only `t1` is being updated; `t2` is a join partner.
+        // `t1` is updated AND a join source — `t1_alias.a` is read by the ON, so
+        // its own data is consumed. So `t1` is both a read and an update; `t2`
+        // and `t3` are read-only sources.
         let sql = "UPDATE t1 AS t1_alias INNER JOIN t2 ON t1_alias.a = t2.a SET t1_alias.b = t2.b WHERE t2.c = (SELECT c FROM t3)";
         let expected = vec![Ok(CrudTables {
             create_tables: vec![],
-            read_tables: vec![table("t2"), table("t3")],
+            read_tables: vec![table("t1"), table("t2"), table("t3")],
             update_tables: vec![table("t1")],
             delete_tables: vec![],
             diagnostics: vec![],
         })];
         assert_crud_table_extraction(sql, expected, all_dialects());
+    }
+
+    #[test]
+    fn test_multi_table_update_buckets_set_target_and_reads_sources() {
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        // `UPDATE t1 JOIN t2 SET t2.b = t1.c`: only `t2` is updated (the SET
+        // target's resolved table); both `t1` and `t2` are read (their `id`
+        // columns are consumed by the ON).
+        let sql = "UPDATE t1 JOIN t2 ON t1.id = t2.id SET t2.b = t1.c";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![table("t1"), table("t2")],
+            update_tables: vec![table("t2")],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
     }
 
     #[test]
@@ -462,8 +480,10 @@ mod merge {
         assert_eq!(
             result,
             vec![Ok(CrudTables {
+                // `tgt.id` is read by the ON (to match), so the target reads as
+                // well as updates; `src` is the read source.
                 create_tables: vec![],
-                read_tables: vec![table("src")],
+                read_tables: vec![table("src"), table("tgt")],
                 update_tables: vec![table("tgt")],
                 delete_tables: vec![],
                 diagnostics: vec![],
@@ -483,8 +503,10 @@ mod merge {
         assert_eq!(
             result,
             vec![Ok(CrudTables {
+                // `tgt.id` is read by the ON, so the target reads as well as
+                // (insert-)creates; `src` is the read source.
                 create_tables: vec![table("tgt")],
-                read_tables: vec![table("src")],
+                read_tables: vec![table("tgt"), table("src")],
                 update_tables: vec![],
                 delete_tables: vec![],
                 diagnostics: vec![],
@@ -499,8 +521,10 @@ mod merge {
                      WHEN MATCHED AND t2_alias.b = 2 THEN UPDATE SET t1_alias.b = t2_alias.b \
                      WHEN NOT MATCHED THEN INSERT (a, b) VALUES (t2_alias.a, t2_alias.b)";
         let expected = vec![Ok(CrudTables {
+            // `t1_alias.a` is read by the ON, so the target `t1` reads as well
+            // as create/update/delete; `t2` is the read source.
             create_tables: vec![table("t1")],
-            read_tables: vec![table("t2")],
+            read_tables: vec![table("t1"), table("t2")],
             update_tables: vec![table("t1")],
             delete_tables: vec![table("t1")],
             diagnostics: vec![],

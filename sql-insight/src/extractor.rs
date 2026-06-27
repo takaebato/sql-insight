@@ -116,22 +116,24 @@ pub enum StatementKind {
     /// `INSERT INTO ...`. Writes to one target table; reads from the
     /// `VALUES` / `SELECT` source. Emits source → target lineage.
     Insert,
-    /// `UPDATE ... SET ...`. The target is a write, not a scan, so at
-    /// *table* granularity it is in `writes` only (not `reads`); joined /
-    /// sub-query sources are reads. At *column* granularity a target column
-    /// read by a SET right-hand side or `WHERE` (e.g. `SET a = a + 1`)
-    /// surfaces in `reads`. Emits lineage from SET sources into the target
-    /// columns.
+    /// `UPDATE ... SET ...`. The target is a write; it *also* reads when its
+    /// own data is referenced — a SET right-hand side or `WHERE` column
+    /// (`SET a = a + 1`, `WHERE id = 5`) surfaces it in `reads` at both column
+    /// and table granularity, while a constant `SET a = 1` keeps it write-only.
+    /// Joined / sub-query sources are reads. A multi-table `UPDATE t1 JOIN t2
+    /// SET t2.col = …` writes (and lineage-targets) the relation the qualifier
+    /// resolves to, not the root. Emits lineage from SET sources into the
+    /// target columns.
     Update,
-    /// `DELETE FROM ...`. Removes whole rows: the target is in `writes`
-    /// (table granularity) but has no column-level writes and no lineage —
-    /// nothing is written into a column. At column granularity, a target
-    /// column referenced in `WHERE` surfaces in `reads`.
+    /// `DELETE FROM ...`. Removes whole rows: the target is in `writes` with no
+    /// column-level writes and no lineage. It reads when its own data is
+    /// referenced — a `WHERE` column surfaces it in `reads` (column and table);
+    /// a bare `DELETE FROM t` reads nothing.
     Delete,
-    /// `MERGE INTO ... USING ...`. The target is a write (in `writes`, not a
-    /// scan); at column granularity a target column referenced in `ON` / a
-    /// `WHEN` predicate or `SET` surfaces in `reads`. Each `WHEN` clause may
-    /// emit lineage from the source into the target's update / insert columns.
+    /// `MERGE INTO ... USING ...`. The target is a write; it also reads — its
+    /// columns in `ON` / a `WHEN` predicate or `SET` surface in `reads` (column
+    /// and table granularity). Each `WHEN` clause may emit lineage from the
+    /// source into the target's update / insert columns.
     Merge,
     /// `CREATE TABLE ...`. The new table is a write target. CREATE
     /// TABLE AS (CTAS) also reads from its SELECT and emits per-column

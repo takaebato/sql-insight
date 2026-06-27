@@ -78,10 +78,21 @@ flag bags — spawn a child binder (`with_ctes` / `with_outer`) and thread the
 `Scope`.
 
 A DML target is **not a `Scan`** — it's named on the DML root
-(`Insert.target`, …), and the root's `input` carries only the *read*
-relations, so a write target never lands in `reads`. Its columns are still
-bound (for SET / WHERE / RETURNING) via a scratch target `Scope`, discarded
-after.
+(`Insert.target`, …), and the root's `input` carries only the source
+relations. Its columns are still bound (for SET / WHERE / RETURNING) via a
+scratch target `Scope`, discarded after.
+
+**Reads are a source/sink split.** A scanned relation (a source) always reads
+— its rows feed or filter, even with no column named (`SELECT COUNT(*) FROM
+t`). The write target (the sink) reads only when its *own* data is referenced
+— a column in a `WHERE` / `ON` / SET-RHS (`UPDATE t SET a = a + 1`, `DELETE …
+WHERE t.flag`, an upsert). A constant `UPDATE t SET a = 1` references no
+target column, so the sink stays write-only; a target *also* scanned as a
+source (`INSERT INTO t SELECT * FROM t`) reads through that scan.
+`collect_table_reads` = every `Scan` ∪ any referenced relation not already
+scanned (the sink). A multi-table `UPDATE t1 JOIN t2 SET t2.col = …` writes
+(and lineage-targets) the relation each SET qualifier resolves to, carried on
+`Assignment.target`, not the root.
 
 ### Value vs filter is structural
 

@@ -28,10 +28,23 @@ pub(super) fn collect_reads(plan: &LogicalPlan) -> Vec<ColumnRead> {
     out
 }
 
-/// Every base table scanned (read role), occurrence-based. Backs
-/// [`crate::resolver::table_reads`].
+/// Every base table read, occurrence-based — a data-flow **source/sink** split:
+///
+/// - A **source** is every `Scan` (a FROM / JOIN / subquery relation): its rows
+///   flow out or filter the query, so it reads even with no column named
+///   (`SELECT COUNT(*) FROM t`), and even when it's also the write target
+///   (`INSERT INTO t SELECT * FROM t` reads `t` through its source scan).
+/// - The **sink** — a DML write target (named on the root, not itself scanned)
+///   — reads only when its *own existing* data is referenced: a column in a
+///   `WHERE` / `ON` / SET-RHS (`UPDATE t SET a=a+1`, `DELETE … WHERE t.flag`, a
+///   multi-table `UPDATE t1 JOIN t2 SET t2.b=t1.c`'s `t1`, an upsert reading the
+///   target). A plain INSERT / CTAS / constant `UPDATE t SET a=1` references no
+///   target column, so the sink stays write-only.
+///
+/// Backs [`crate::resolver::table_reads`].
 pub(super) fn collect_table_reads(plan: &LogicalPlan) -> Vec<TableRead> {
     let mut out = Vec::new();
+    // Sources: every scanned relation (occurrence-based).
     walk_plan(plan, &mut |o| {
         if let LogicalPlan::Scan(s) = o {
             out.push(TableRead {
@@ -40,6 +53,22 @@ pub(super) fn collect_table_reads(plan: &LogicalPlan) -> Vec<TableRead> {
             });
         }
     });
+    // A relation referenced by a column read but not itself scanned — the DML
+    // root, whose own data is consumed (the only non-`Scan` relation a base
+    // column can resolve to). Added once, its table-level resolution mirroring
+    // the column's.
+    for read in collect_reads(plan) {
+        let Some(table) = &read.reference.table else {
+            continue;
+        };
+        if out.iter().any(|r| &r.reference == table) {
+            continue;
+        }
+        out.push(TableRead {
+            reference: table.clone(),
+            resolution: read.resolution,
+        });
+    }
     out
 }
 

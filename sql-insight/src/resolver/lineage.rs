@@ -11,7 +11,7 @@
 
 use sqlparser::ast::Ident;
 
-use super::logical_plan::{peel_with, Expr, LogicalPlan, MergeClause, NamedExpr};
+use super::logical_plan::{peel_with, Expr, LogicalPlan, MergeClause, NamedExpr, Update};
 use super::origins::{
     conflict_value_origins, enter_withs, origins_of_expr, output_operands, TraceContext,
 };
@@ -360,16 +360,12 @@ pub(super) fn collect_table_lineage(
             }
             &i.target
         }
-        // UPDATE feeds from the FROM relations (the read `input`) AND any value
-        // subquery in a SET RHS; the WHERE predicate / a self-reference to the
-        // target do not feed.
-        LogicalPlan::Update(u) => {
-            feeding_scans(&u.input, &mut context, &mut fed_ctes, &mut sources);
-            for a in &u.assignments {
-                expr_feeding(&a.value, &mut context, &mut fed_ctes, &mut sources);
-            }
-            &u.target
-        }
+        // UPDATE is per-assignment: each SET RHS's feeding sources flow into
+        // *that assignment's* resolved target table — a multi-table
+        // `UPDATE t1 JOIN t2 SET t2.b = t1.c` writes t1.c into t2, not the root.
+        // (Handled out of line since it has several targets, unlike the
+        // single-target DML below.)
+        LogicalPlan::Update(u) => return update_table_lineage(u, &mut context),
         // CTAS / CREATE VIEW move data like INSERT; ALTER / DROP do not.
         LogicalPlan::CreateTableAs(c) => {
             feeding_scans(&c.input, &mut context, &mut fed_ctes, &mut sources);
@@ -429,6 +425,46 @@ pub(super) fn collect_table_lineage(
             target: target.clone(),
         })
         .collect()
+}
+
+/// Table lineage for an UPDATE: each SET assignment's RHS value feeds *its own*
+/// resolved target table — so a multi-table `UPDATE t1 JOIN t2 SET t2.b = t1.c`
+/// emits `t1 → t2`, not the root. The sources are the RHS value's traced base
+/// columns projected to their tables (mirroring the column lineage, so the two
+/// surfaces agree), as distinct `source → target` table pairs. A self-flow
+/// (`SET a = a + 1` → `t → t`) is kept, matching both the column lineage (which
+/// carries `t.a → t.a`) and the self-insert table edge (`INSERT INTO t SELECT *
+/// FROM t` → `t → t`). The WHERE predicate and joined relations don't feed on
+/// their own; only a value through a SET RHS does.
+fn update_table_lineage<'a>(
+    u: &'a Update,
+    context: &mut TraceContext<'a>,
+) -> Vec<TableLineageEdge> {
+    let mut edges: Vec<TableLineageEdge> = Vec::new();
+    for a in &u.assignments {
+        let Some(target) = &a.target.table else {
+            continue;
+        };
+        for (read, _kind) in origins_of_expr(&a.value, &u.input, context) {
+            let Some(source) = read.reference.table else {
+                continue;
+            };
+            if edges
+                .iter()
+                .any(|e| e.source.reference == source && &e.target == target)
+            {
+                continue; // distinct (source, target) pairs
+            }
+            edges.push(TableLineageEdge {
+                source: TableRead {
+                    reference: source,
+                    resolution: read.resolution,
+                },
+                target: target.clone(),
+            });
+        }
+    }
+    edges
 }
 
 /// Collect the read-role scans that feed data up through `op` (a value / data

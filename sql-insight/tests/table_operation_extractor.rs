@@ -403,7 +403,7 @@ mod update {
             "UPDATE t1 SET a = 1 WHERE id IN (SELECT id FROM t2)",
             TableOperation {
                 statement_kind: StatementKind::Update,
-                reads: vec![read("t2")],
+                reads: vec![read("t1"), read("t2")],
                 writes: vec![table("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
@@ -413,18 +413,20 @@ mod update {
 
     #[test]
     fn update_with_from_clause_treats_from_as_read() {
-        // FROM t2 contributes rows to the UPDATE target → t2 → t1
-        // lineage edge. SET RHS scalar subquery from t3 feeds the new
-        // value → t3 → t1 lineage edge. WHERE predicate subquery from
-        // t4 is predicate-only → no lineage.
+        // All four relations are read: `t1` (its `id` filters the WHERE), the
+        // FROM `t2`, and the subquery sources `t3` / `t4`. Lineage is
+        // per-assignment — only a value flowing through a SET RHS feeds: the
+        // `t3` scalar subquery feeds `a` → `t3 → t1`. `t2` is in FROM but its
+        // data never reaches a SET value (here it's an unjoined cross product),
+        // so it reads without feeding; the `t4` WHERE subquery is predicate-only.
         assert_ops_with(
             "UPDATE t1 SET a = (SELECT b FROM t3) FROM t2 WHERE t1.id IN (SELECT id FROM t4)",
             &PostgreSqlDialect {},
             TableOperation {
                 statement_kind: StatementKind::Update,
-                reads: vec![read("t2"), read("t3"), read("t4")],
+                reads: vec![read("t1"), read("t2"), read("t3"), read("t4")],
                 writes: vec![table("t1")],
-                lineage: vec![edge("t2", "t1"), edge("t3", "t1")],
+                lineage: vec![edge("t3", "t1")],
                 diagnostics: vec![],
             },
         );
@@ -454,7 +456,7 @@ mod delete {
             "DELETE FROM t1 WHERE id IN (SELECT id FROM t2)",
             TableOperation {
                 statement_kind: StatementKind::Delete,
-                reads: vec![read("t2")],
+                reads: vec![read("t1"), read("t2")],
                 writes: vec![table("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
@@ -519,7 +521,7 @@ mod merge {
              WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
             TableOperation {
                 statement_kind: StatementKind::Merge,
-                reads: vec![read("t2")],
+                reads: vec![read("t1"), read("t2")],
                 writes: vec![table("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
@@ -927,7 +929,7 @@ mod lineage {
             "UPDATE t1 SET col = 1 WHERE id IN (SELECT id FROM t2)",
             TableOperation {
                 statement_kind: StatementKind::Update,
-                reads: vec![read("t2")],
+                reads: vec![read("t1"), read("t2")],
                 writes: vec![table("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
@@ -944,7 +946,7 @@ mod lineage {
             "UPDATE (t1 JOIN t2 ON t1.a = t2.a) SET t1.b = t2.b",
             TableOperation {
                 statement_kind: StatementKind::Update,
-                reads: vec![read("t2")],
+                reads: vec![read("t1"), read("t2")],
                 writes: vec![table("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
@@ -1043,7 +1045,7 @@ mod lineage {
              WHEN MATCHED THEN UPDATE SET t1.b = t2.b",
             TableOperation {
                 statement_kind: StatementKind::Merge,
-                reads: vec![read("t2")],
+                reads: vec![read("t1"), read("t2")],
                 writes: vec![table("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
@@ -1060,7 +1062,7 @@ mod lineage {
              WHEN NOT MATCHED THEN INSERT (a) VALUES (t2.b)",
             TableOperation {
                 statement_kind: StatementKind::Merge,
-                reads: vec![read("t2")],
+                reads: vec![read("t1"), read("t2")],
                 writes: vec![table("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
@@ -1078,7 +1080,7 @@ mod lineage {
             "MERGE INTO t1 USING t2 ON t1.id = t2.id WHEN NOT MATCHED THEN INSERT ROW",
             TableOperation {
                 statement_kind: StatementKind::Merge,
-                reads: vec![read("t2")],
+                reads: vec![read("t1"), read("t2")],
                 writes: vec![table("t1")],
                 lineage: vec![edge("t2", "t1")],
                 diagnostics: vec![],
@@ -1097,7 +1099,7 @@ mod lineage {
              WHEN MATCHED THEN DELETE",
             TableOperation {
                 statement_kind: StatementKind::Merge,
-                reads: vec![read("t2")],
+                reads: vec![read("t1"), read("t2")],
                 writes: vec![table("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
@@ -1358,7 +1360,7 @@ mod lineage {
             "DELETE FROM t1 WHERE id IN (SELECT id FROM t2)",
             TableOperation {
                 statement_kind: StatementKind::Delete,
-                reads: vec![read("t2")],
+                reads: vec![read("t1"), read("t2")],
                 writes: vec![table("t1")],
                 lineage: vec![],
                 diagnostics: vec![],
@@ -1500,6 +1502,170 @@ mod catalog_resolution {
                 source: cataloged("staging"),
                 target: pub_table("orders"),
             }]
+        );
+    }
+}
+
+/// The multi-table UPDATE write attribution and the data-flow source/sink read
+/// model (a write target reads only when its own data is referenced; every
+/// scanned source reads unconditionally).
+mod read_write_model {
+    use super::*;
+
+    #[test]
+    fn multi_table_update_writes_each_set_target_to_its_own_table() {
+        // `SET t1.a = …, t2.b = …`: each write attributes to the qualifier's
+        // resolved table, not the root. `t2.b = t2.c` is an intra-`t2` flow.
+        assert_ops_with(
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET t1.a = 1, t2.b = t2.c",
+            &MySqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1"), read("t2")],
+                writes: vec![table("t1"), table("t2")],
+                lineage: vec![edge("t2", "t2")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn multi_table_update_cross_table_lineage_keeps_direction() {
+        // `SET t2.b = t1.c`: writes `t2`; the source `t1` feeds it → `t1 → t2`
+        // (not the reversed/root-anchored edge the old model produced).
+        assert_ops_with(
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET t2.b = t1.c",
+            &MySqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1"), read("t2")],
+                writes: vec![table("t2")],
+                lineage: vec![edge("t1", "t2")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn table_writes_dedups_a_table_set_in_several_columns() {
+        // Table-level writes are per-table: one `t` even for two SET columns.
+        assert_ops(
+            "UPDATE t SET a = 1, b = 2",
+            TableOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![table("t")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn constant_update_does_not_read_the_target() {
+        // The sink references none of its own data → write-only (no read).
+        assert_ops(
+            "UPDATE t SET a = 1",
+            TableOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![table("t")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn self_referencing_update_reads_the_target_with_self_edge() {
+        // `SET a = a + 1` consumes `t.a` → the sink reads; intra-table self-edge
+        // mirrors the column lineage (`t.a → t.a`).
+        assert_ops(
+            "UPDATE t SET a = a + 1",
+            TableOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t")],
+                writes: vec![table("t")],
+                lineage: vec![edge("t", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn cross_join_constant_update_reads_only_the_joined_scan() {
+        // No ON / WHERE, constant SETs: neither table's data is referenced. `t2`
+        // reads as a joined scan source; `t1` (the target root, not scanned)
+        // stays write-only. Both are written.
+        assert_ops_with(
+            "UPDATE t1 CROSS JOIN t2 SET t1.a = 1, t2.b = 2",
+            &MySqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t2")],
+                writes: vec![table("t1"), table("t2")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn self_insert_reads_the_source_scan() {
+        // The write target is also scanned as a source (`SELECT * FROM t`), so
+        // it reads through that scan — the role split has no blind spot here.
+        assert_ops(
+            "INSERT INTO t SELECT * FROM t",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("t")],
+                writes: vec![table("t")],
+                lineage: vec![edge("t", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn delete_without_predicate_does_not_read_target() {
+        assert_ops(
+            "DELETE FROM t",
+            TableOperation {
+                statement_kind: StatementKind::Delete,
+                reads: vec![],
+                writes: vec![table("t")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn delete_with_predicate_reads_target() {
+        assert_ops(
+            "DELETE FROM t WHERE flag = 1",
+            TableOperation {
+                statement_kind: StatementKind::Delete,
+                reads: vec![read("t")],
+                writes: vec![table("t")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn count_star_source_reads_the_scanned_table() {
+        // A scanned source with no column named still reads (its rows feed).
+        assert_ops(
+            "SELECT COUNT(*) FROM t",
+            TableOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
         );
     }
 }

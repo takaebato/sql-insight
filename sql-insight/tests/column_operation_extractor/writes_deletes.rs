@@ -112,6 +112,23 @@ mod writes {
     }
 
     #[test]
+    fn self_referencing_update_reads_and_self_lineages_the_target() {
+        // `SET a = a + 1` reads `t.a` and writes `t.a`, with an intra-table
+        // `t.a → t.a` edge (a transformation). The table surfaces mirror this
+        // (table reads `t`, table lineage `t → t`).
+        assert_column_ops(
+            "UPDATE t SET a = a + 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t", "a")],
+                writes: vec![write("t", "a")],
+                lineage: vec![transformation(col("t", "a"), relation("t", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn multi_table_update_set_joined_table_from_root_column() {
         use sql_insight::sqlparser::dialect::MySqlDialect;
         // `SET t2.b = t1.c`: writes t2.b, lineage from t1.c (the root is the
