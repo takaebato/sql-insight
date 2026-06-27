@@ -196,6 +196,17 @@ mod expr_arm_coverage {
     }
 
     #[test]
+    fn within_group_aggregated_value_flows_to_output() {
+        // An ordered-set aggregate's `WITHIN GROUP (ORDER BY a)` key is the
+        // aggregated value (`percentile_cont` of `a`), so `a` reads *and* flows
+        // to the output (Transformation) — unlike a function's internal
+        // `ORDER BY` (a row-positioning filter).
+        let sql = "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY t.a) AS med FROM t";
+        assert_unordered_eq!(reads(sql), vec![c("a")]);
+        assert_unordered_eq!(lineage(sql), vec![transformation(c("a"), out("med", 0))]);
+    }
+
+    #[test]
     fn listagg_on_overflow_error() {
         assert_unordered_eq!(
             reads("SELECT LISTAGG(t.a, ',' ON OVERFLOW ERROR) FROM t"),

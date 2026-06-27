@@ -488,7 +488,11 @@ impl<'a> Binder<'a> {
         if let Some(filter) = &function.filter {
             suppressed.push(self.bind_expr(filter, scope));
         }
-        suppressed.extend(
+        // `WITHIN GROUP (ORDER BY expr)` keys an ordered-set aggregate
+        // (`percentile_cont(0.5) WITHIN GROUP (ORDER BY salary)` → the
+        // percentile *of* salary) — `expr` is the aggregated value, so it's a
+        // value operand (an origin), not a row-positioning filter.
+        args.extend(
             function
                 .within_group
                 .iter()
@@ -496,8 +500,8 @@ impl<'a> Binder<'a> {
         );
         // A window function `f(args) OVER (…)` is an `Expr::Window`: the value
         // arguments flow (a transformation), the PARTITION BY / ORDER BY keys
-        // (+ frame bounds) and any FILTER / WITHIN GROUP are row-positioning
-        // (filter — reads, never origins).
+        // (+ frame bounds) and any FILTER are row-positioning (filter — reads,
+        // never origins).
         match &function.over {
             Some(WindowType::WindowSpec(spec)) => {
                 let partition = spec
