@@ -19,6 +19,22 @@ mod reported {
     }
 
     #[test]
+    fn recursive_cte_anchor_diagnostic_is_not_duplicated() {
+        // A recursive CTE binds its anchor twice (once to learn its column
+        // shape, once for real); a diagnostic the anchor raises must surface
+        // only once, not per bind. (Focused on the diagnostic — the recursive
+        // body's reads / lineage are pinned elsewhere.)
+        let op = extract(
+            "WITH RECURSIVE r AS (SELECT id FROM a.b.c.d UNION SELECT id FROM r) SELECT id FROM r",
+        );
+        let kinds: Vec<_> = op.diagnostics.iter().map(|d| d.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![ColumnLevelDiagnosticKind::TooManyTableQualifiers]
+        );
+    }
+
+    #[test]
     fn update_non_table_target_reports_diagnostic() {
         // A derived / subquery UPDATE target can't be a write target — flagged
         // (like a MERGE into a non-table target), not dropped silently. The

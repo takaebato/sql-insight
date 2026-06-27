@@ -50,10 +50,18 @@ impl<'a> Binder<'a> {
         let name = cte.alias.name.clone();
         let inner_env = if recursive {
             let provisional = match cte.query.body.as_ref() {
-                SetExpr::SetOperation { left, .. } => self
-                    .in_ctes(env.to_vec(), |b| b.bind_set_expr(left))
-                    .1
-                    .exposed_columns(Some(&cte.alias)),
+                SetExpr::SetOperation { left, .. } => {
+                    // This binds the anchor only to learn its column shape; the
+                    // real bind below binds it again, so discard any diagnostics
+                    // it raises here — otherwise they'd be reported twice.
+                    let saved = self.diagnostics.len();
+                    let columns = self
+                        .in_ctes(env.to_vec(), |b| b.bind_set_expr(left))
+                        .1
+                        .exposed_columns(Some(&cte.alias));
+                    self.diagnostics.truncate(saved);
+                    columns
+                }
                 _ => Vec::new(),
             };
             let mut e = env.to_vec();
