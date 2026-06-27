@@ -153,6 +153,31 @@ mod merge {
     }
 
     #[test]
+    fn merge_insert_arity_mismatch_is_flagged() {
+        // 3 target columns, 2 values: the surplus column is dropped (no value to
+        // pair with), flagged like a plain INSERT arity mismatch.
+        assert_column_ops(
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.x, s.y)",
+            ColumnOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![
+                    read("t", "id"),
+                    read("s", "id"),
+                    read("s", "x"),
+                    read("s", "y"),
+                ],
+                writes: vec![write("t", "a"), write("t", "b")],
+                lineage: vec![
+                    passthrough(col("s", "x"), relation("t", "a")),
+                    passthrough(col("s", "y"), relation("t", "b")),
+                ],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsArityMismatch)],
+            },
+        );
+    }
+
+    #[test]
     fn merge_when_not_matched_insert_emits_lineage_and_write() {
         assert_column_ops(
             "MERGE INTO t USING s ON t.id = s.id \

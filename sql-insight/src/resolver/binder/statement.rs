@@ -160,21 +160,29 @@ impl<'a> Binder<'a> {
         if columns.is_empty() && insert.source.is_some() {
             self.record_insert_columns_unresolved(&target, source_wildcard);
         }
-        // An *explicit* target column list whose count differs from the source
-        // query's projected columns: relation lineage zips to the shorter side,
-        // silently dropping the surplus. Flag it. (Only when the source exposes
-        // a determinate projection — a `VALUES` / pure-wildcard source yields no
-        // operands here, and a wildcard-bearing source is indeterminate.)
-        if !insert.columns.is_empty() && !source_wildcard {
-            if let Some(operand) = output_operands(&input).first() {
-                let outputs = operand.outputs;
-                if !outputs.is_empty() && outputs.len() != columns.len() {
-                    self.record_insert_columns_arity_mismatch(
-                        &target,
-                        columns.len(),
-                        outputs.len(),
-                    );
-                }
+        // The source's determinate value count: a `VALUES` row width, or a
+        // SELECT's projected output count. `None` when indeterminate (a
+        // wildcard-bearing source, or no inspectable operand).
+        let source_count = if source_wildcard {
+            None
+        } else {
+            match &input {
+                LogicalPlan::Values(v) => v.rows.first().map(Vec::len),
+                other => output_operands(other)
+                    .first()
+                    .map(|operand| operand.outputs.len())
+                    .filter(|n| *n > 0),
+            }
+        };
+        if let Some(source_count) = source_count {
+            if !insert.columns.is_empty() {
+                // An explicit list must match the source exactly — either
+                // direction silently zips to the shorter side.
+                self.diagnose_insert_arity(&target, true, columns.len(), source_count);
+            } else if !m.columns.is_empty() {
+                // A column-less target filled from the catalog: a wider source
+                // overflows the table, dropping its surplus columns.
+                self.diagnose_insert_arity(&target, false, m.columns.len(), source_count);
             }
         }
         // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: extra writes + their
@@ -546,6 +554,27 @@ impl<'a> Binder<'a> {
                             // is always the missing catalog.
                             if columns.is_empty() && !row.is_empty() {
                                 self.record_insert_columns_unresolved(&target, false);
+                            }
+                            // Arity (mirrors `bind_insert`): an explicit column
+                            // list must match the row exactly; a column-less
+                            // catalog-filled target is flagged only when the row
+                            // overflows it.
+                            if !row.is_empty() {
+                                if !insert.columns.is_empty() {
+                                    self.diagnose_insert_arity(
+                                        &target,
+                                        true,
+                                        columns.len(),
+                                        row.len(),
+                                    );
+                                } else if !catalog_cols.is_empty() {
+                                    self.diagnose_insert_arity(
+                                        &target,
+                                        false,
+                                        catalog_cols.len(),
+                                        row.len(),
+                                    );
+                                }
                             }
                             clauses.push(MergeClause::Insert {
                                 columns: self.column_writes(&target, &catalog_cols, columns),

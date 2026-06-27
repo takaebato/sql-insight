@@ -192,6 +192,23 @@ mod reported {
     }
 
     #[test]
+    fn insert_values_arity_mismatch_is_flagged() {
+        // An explicit column list against a VALUES row: 3 columns, 2 values →
+        // flagged like the SELECT-source case. All three columns still surface
+        // as writes (from syntax); a VALUES source has no traceable lineage.
+        assert_column_ops(
+            "INSERT INTO t (a, b, c) VALUES (1, 2)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "c")],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsArityMismatch)],
+            },
+        );
+    }
+
+    #[test]
     fn insert_with_wildcard_source_drops_lineage_and_skips_arity_diagnostic() {
         // A wildcard in the source projection (`SELECT *, y`) makes the column
         // count / positions indeterminate (wildcards aren't expanded), so the

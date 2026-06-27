@@ -283,6 +283,30 @@ impl<'a> Binder<'a> {
         });
     }
 
+    /// Record an INSERT / MERGE-INSERT arity mismatch between the target columns
+    /// and the source values *if* they disagree (a no-op otherwise) — the caller
+    /// passes the two determinate counts (no wildcard). An **explicit** column
+    /// list must match exactly: either direction silently zips to the shorter
+    /// side. A **column-less** target filled from the catalog is flagged only
+    /// when the source is *wider* (the surplus is dropped); a narrower source
+    /// may rely on column defaults, so it isn't.
+    pub(super) fn diagnose_insert_arity(
+        &mut self,
+        target: &TableReference,
+        explicit: bool,
+        target_columns: usize,
+        source_columns: usize,
+    ) {
+        let mismatch = if explicit {
+            source_columns != target_columns
+        } else {
+            source_columns > target_columns
+        };
+        if mismatch {
+            self.record_insert_columns_arity_mismatch(target, target_columns, source_columns);
+        }
+    }
+
     /// Flag a CTAS / CREATE VIEW (without an explicit column list) whose source
     /// projects unaliased expressions: those columns have no name recoverable
     /// from the SQL text, so they're dropped from column `writes` / `lineage`.

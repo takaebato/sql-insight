@@ -207,8 +207,8 @@ mod catalog_strict {
 
     #[test]
     fn catalog_insert_without_explicit_columns_source_longer_than_target() {
-        // 3 source projections vs t = [x, y] — pair what fits,
-        // surplus source column gets no lineage.
+        // 3 source projections vs t = [x, y] — pair what fits, the surplus
+        // source column gets no lineage, and the overflow is flagged.
         let catalog = TestCatalog::default().with("t", vec!["x", "y"]);
         assert_column_ops_with_catalog(
             "INSERT INTO t SELECT a, b, c FROM s",
@@ -221,7 +221,7 @@ mod catalog_strict {
                     passthrough(col("s", "a"), relation("t", "x")),
                     passthrough(col("s", "b"), relation("t", "y")),
                 ],
-                diagnostics: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsArityMismatch)],
             },
         );
     }
