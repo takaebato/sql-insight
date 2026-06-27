@@ -13,7 +13,7 @@ use super::logical_plan::{Binding, BoundColumn, Cte, Expr, LogicalPlan, NamedExp
 use super::reads::column_read;
 use crate::casing::{CaseRule, IdentifierCasing};
 use crate::extractor::ColumnLineageKind;
-use crate::reference::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
+use crate::reference::{ColumnRead, ColumnReference, ColumnWrite, ResolutionKind, TableReference};
 
 /// CTE environment for expanding `CteRef`s during a trace, plus the
 /// active-set that terminates a recursive self-reference and the dialect
@@ -374,7 +374,7 @@ fn trace_nth_output<'a>(
 /// pseudo-column itself (a synthetic lineage source, not a read).
 pub(super) fn conflict_value_origins<'a>(
     value: &'a Expr,
-    columns: &[Ident],
+    columns: &[ColumnWrite],
     source: &'a LogicalPlan,
     context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
@@ -384,7 +384,10 @@ pub(super) fn conflict_value_origins<'a>(
         // fanning out to every set-operation branch. A source with no
         // inspectable projection (VALUES) keeps the `EXCLUDED.col` pseudo-source.
         Expr::Column(c) if matches!(c.binding, Binding::Derived) => {
-            let Some(i) = columns.iter().position(|t| context.eq_column(t, &c.name)) else {
+            let Some(i) = columns
+                .iter()
+                .position(|t| context.eq_column(&t.reference.name, &c.name))
+            else {
                 return Vec::new();
             };
             let operands = output_operands(source);

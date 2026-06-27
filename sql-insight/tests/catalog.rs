@@ -304,7 +304,11 @@ fn columnless_insert_from_wildcard_source_drops_writes_and_flags() {
 
     // A determinate projection still fills from the catalog (first two columns).
     let plain = op("INSERT INTO t SELECT p, q FROM s");
-    let written: Vec<_> = plain.writes.iter().map(|w| w.name.value.as_str()).collect();
+    let written: Vec<_> = plain
+        .writes
+        .iter()
+        .map(|w| w.reference.name.value.as_str())
+        .collect();
     assert_eq!(written, ["a", "b"]);
     assert!(
         plain.diagnostics.is_empty(),

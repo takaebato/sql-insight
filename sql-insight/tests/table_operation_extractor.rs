@@ -64,7 +64,7 @@ fn twrite(name: &str) -> TableWrite {
 fn edge(source: &str, target: &str) -> TableLineageEdge {
     TableLineageEdge {
         source: read(source),
-        target: table(target),
+        target: twrite(target),
     }
 }
 
@@ -1513,7 +1513,7 @@ mod catalog_resolution {
             ops.lineage,
             vec![TableLineageEdge {
                 source: cataloged("t2"),
-                target: table("t1"),
+                target: twrite("t1"),
             }]
         );
     }
@@ -1552,7 +1552,7 @@ mod catalog_resolution {
             ops.lineage,
             vec![TableLineageEdge {
                 source: cataloged("staging"),
-                target: pub_table("orders"),
+                target: cataloged_write("orders"),
             }]
         );
     }

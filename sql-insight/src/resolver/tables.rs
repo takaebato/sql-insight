@@ -5,46 +5,43 @@
 //!   targets, CTAS / CREATE VIEW / ALTER columns, MERGE WHEN-clause writes),
 //!   qualified by the target relation.
 //! - `table_writes` — one entry per DML target, paired with its catalog-match
-//!   [`ResolutionKind`](crate::ResolutionKind) (a [`TableWrite`]).
+//!   [`ResolutionKind`] (a [`TableWrite`]).
 
 use sqlparser::ast::Ident;
 
 use super::logical_plan::{peel_with, LogicalPlan, MergeClause};
 use super::origins::output_operands;
-use crate::reference::{ColumnReference, TableReference, TableWrite};
+use crate::reference::{ColumnReference, ColumnWrite, ResolutionKind, TableReference, TableWrite};
 
 // ===== writes ============================================================
 
 /// Every column the statement writes — a DML root's target columns, qualified
 /// by the write target. Order follows source order (the public contract). A
 /// leading `WITH` is peeled. Backs [`crate::resolver::writes`].
-pub(super) fn collect_writes(plan: &LogicalPlan) -> Vec<ColumnReference> {
+pub(super) fn collect_writes(plan: &LogicalPlan) -> Vec<ColumnWrite> {
     match peel_with(plan) {
-        // INSERT columns, then any ON CONFLICT DO UPDATE SET targets (extra
-        // writes on the same relation).
+        // INSERT columns (already catalog-resolved), then any ON CONFLICT DO
+        // UPDATE SET targets (extra writes on the same relation).
         LogicalPlan::Insert(i) => {
-            let mut w = qualify(&i.columns, &i.target.reference);
+            let mut w = i.columns.clone();
             w.extend(i.on_conflict.iter().map(|a| a.target.clone()));
             w
         }
         // Each SET assignment writes its (already resolved) target column.
         LogicalPlan::Update(u) => u.assignments.iter().map(|a| a.target.clone()).collect(),
         // CTAS / CREATE VIEW write the new relation's columns; ALTER TABLE
-        // writes its column-naming operations' columns.
+        // writes its column-naming operations' columns. These are freshly
+        // created / altered, so they carry `Inferred` (no catalog column yet).
         LogicalPlan::CreateTableAs(c) => {
             created_relation_writes(&c.columns, &c.input, &c.target.reference)
         }
         LogicalPlan::CreateView(c) => {
             created_relation_writes(&c.columns, &c.input, &c.target.reference)
         }
-        LogicalPlan::AlterTable(a) => qualify(&a.columns, &a.target.reference),
+        LogicalPlan::AlterTable(a) => inferred_writes(&a.columns, &a.target.reference),
         // MERGE writes each WHEN action's target columns (UPDATE SET targets;
         // INSERT columns paired with values).
-        LogicalPlan::Merge(m) => m
-            .clauses
-            .iter()
-            .flat_map(|clause| merge_clause_writes(clause, &m.target.reference))
-            .collect(),
+        LogicalPlan::Merge(m) => m.clauses.iter().flat_map(merge_clause_writes).collect(),
         // No column writes: read-only / structural query operators, the bare
         // FROM-less / synthetic relations, and DML / DDL whose target rows go
         // wholesale (DELETE / DROP / TRUNCATE) — none qualify a column with a
@@ -69,8 +66,8 @@ pub(super) fn collect_writes(plan: &LogicalPlan) -> Vec<ColumnReference> {
     }
 }
 
-/// The columns one MERGE WHEN action writes, qualified by the target.
-fn merge_clause_writes(clause: &MergeClause, target: &TableReference) -> Vec<ColumnReference> {
+/// The columns one MERGE WHEN action writes (already catalog-resolved).
+fn merge_clause_writes(clause: &MergeClause) -> Vec<ColumnWrite> {
     match clause {
         MergeClause::Update { assignments } => {
             assignments.iter().map(|a| a.target.clone()).collect()
@@ -80,10 +77,7 @@ fn merge_clause_writes(clause: &MergeClause, target: &TableReference) -> Vec<Col
         MergeClause::Insert { columns, values } => columns
             .iter()
             .zip(values)
-            .map(|(name, _)| ColumnReference {
-                table: Some(target.clone()),
-                name: name.clone(),
-            })
+            .map(|(cw, _)| cw.clone())
             .collect(),
         MergeClause::Delete => Vec::new(),
     }
@@ -102,7 +96,7 @@ pub(super) fn collect_table_writes(plan: &LogicalPlan) -> Vec<TableWrite> {
         LogicalPlan::Update(u) => {
             let mut out: Vec<TableWrite> = Vec::new();
             for a in &u.assignments {
-                if let Some(table) = &a.target.table {
+                if let Some(table) = &a.target.reference.table {
                     if out.iter().any(|w| &w.reference == table) {
                         continue;
                     }
@@ -141,13 +135,18 @@ pub(super) fn collect_table_writes(plan: &LogicalPlan) -> Vec<TableWrite> {
     }
 }
 
-/// Qualify bare written column names with the write target.
-fn qualify(columns: &[Ident], target: &TableReference) -> Vec<ColumnReference> {
+/// Qualify bare written column names with the write target as `Inferred`
+/// [`ColumnWrite`]s — for freshly created / altered relations, whose columns
+/// aren't in any catalog yet.
+fn inferred_writes(columns: &[Ident], target: &TableReference) -> Vec<ColumnWrite> {
     columns
         .iter()
-        .map(|name| ColumnReference {
-            table: Some(target.clone()),
-            name: name.clone(),
+        .map(|name| ColumnWrite {
+            reference: ColumnReference {
+                table: Some(target.clone()),
+                name: name.clone(),
+            },
+            resolution: ResolutionKind::Inferred,
         })
         .collect()
 }
@@ -162,20 +161,17 @@ fn created_relation_writes(
     explicit: &[Ident],
     input: &LogicalPlan,
     target: &TableReference,
-) -> Vec<ColumnReference> {
+) -> Vec<ColumnWrite> {
     if !explicit.is_empty() {
-        return qualify(explicit, target);
+        return inferred_writes(explicit, target);
     }
-    match output_operands(input).first() {
+    let names: Vec<Ident> = match output_operands(input).first() {
         Some(operand) => operand
             .outputs
             .iter()
             .filter_map(|ne| ne.name.clone())
-            .map(|name| ColumnReference {
-                table: Some(target.clone()),
-                name,
-            })
             .collect(),
         None => Vec::new(),
-    }
+    };
+    inferred_writes(&names, target)
 }

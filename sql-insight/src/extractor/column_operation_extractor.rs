@@ -32,7 +32,7 @@ use crate::catalog::Catalog;
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
 use crate::error::Error;
 use crate::extractor::{classify_statement, ExtractorOptions, StatementKind};
-use crate::reference::{ColumnRead, ColumnReference};
+use crate::reference::{ColumnRead, ColumnWrite};
 use sqlparser::ast::{Ident, Statement};
 use sqlparser::dialect::Dialect;
 
@@ -113,7 +113,7 @@ pub struct ColumnOperation {
     /// Columns read by the statement. Occurrence-based: a column
     /// referenced more than once appears more than once (e.g.
     /// `SELECT a FROM t WHERE a > 0` yields `t.a` twice). Each entry pairs
-    /// the [`ColumnReference`] identity with its
+    /// the [`ColumnReference`](crate::ColumnReference) identity with its
     /// [`ResolutionKind`](crate::ResolutionKind). **In source order** — by
     /// each read's written token span (`reference.name.span`), a deterministic
     /// function of the SQL rather than the internal traversal. References that
@@ -124,10 +124,13 @@ pub struct ColumnOperation {
     /// to fold case-equivalent spellings).
     pub reads: Vec<ColumnRead>,
     /// Columns written by the statement, in source (column-list) order.
-    /// Occurrence-based like `reads`. Write targets come straight from SQL
-    /// syntax and are always `ResolutionKind::Cataloged` by construction,
-    /// so the resolution field is elided here.
-    pub writes: Vec<ColumnReference>,
+    /// Occurrence-based like `reads`. Each [`ColumnWrite`] pairs the identity
+    /// with the column's catalog match against its target —
+    /// [`Cataloged`](crate::ResolutionKind::Cataloged) when the column is in
+    /// the target's catalog columns, else
+    /// [`Inferred`](crate::ResolutionKind::Inferred) (catalog-free, target
+    /// columns unknown, or a freshly created / altered relation).
+    pub writes: Vec<ColumnWrite>,
     /// Lineage edges. Statements that physically move data emit collapsed
     /// end-to-end edges (source → `ColumnTarget::Relation`); a bare
     /// `SELECT` emits source → `ColumnTarget::QueryOutput` edges. **In source
@@ -174,8 +177,11 @@ pub struct ColumnLineageEdge {
 pub enum ColumnTarget {
     /// A column in a real relation receiving the inbound lineage edge — INSERT /
     /// UPDATE / MERGE target columns, or columns of the new relation
-    /// produced by CTAS / CREATE VIEW / ALTER VIEW.
-    Relation(ColumnReference),
+    /// produced by CTAS / CREATE VIEW / ALTER VIEW. Carries the column's
+    /// catalog [`ResolutionKind`](crate::ResolutionKind) (via [`ColumnWrite`]),
+    /// the write-side counterpart of [`ColumnLineageEdge::source`]'s
+    /// [`ColumnRead`].
+    Relation(ColumnWrite),
     /// A transient column produced by a top-level SELECT projection
     /// that is not piped into a named relation. `name` follows
     /// the projection's explicit alias or inferred single-column name

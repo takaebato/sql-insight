@@ -40,7 +40,7 @@ fn main() {
         for edge in &ops.lineage {
             println!(
                 "  {} -> {}",
-                edge.source.reference.name.value, edge.target.name.value
+                edge.source.reference.name.value, edge.target.reference.name.value
             );
         }
         if !ops.diagnostics.is_empty() {

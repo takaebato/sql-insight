@@ -51,11 +51,12 @@ fn main() {
         let target = match &edge.target {
             ColumnTarget::Relation(c) => format!(
                 "{}.{}",
-                c.table
+                c.reference
+                    .table
                     .as_ref()
                     .map(|t| t.name.value.as_str())
                     .unwrap_or("?"),
-                c.name.value
+                c.reference.name.value
             ),
             ColumnTarget::QueryOutput { name, position } => format!(
                 "<output #{} {}>",

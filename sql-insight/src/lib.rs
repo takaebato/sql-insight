@@ -236,8 +236,8 @@ pub use casing::{CaseRule, IdentifierCasing};
 // every other module's public surface.
 mod reference;
 pub use reference::{
-    ColumnIdentityKey, ColumnRead, ColumnReference, ResolutionKind, TableIdentityKey, TableRead,
-    TableReference, TableWrite,
+    ColumnIdentityKey, ColumnRead, ColumnReference, ColumnWrite, ResolutionKind, TableIdentityKey,
+    TableRead, TableReference, TableWrite,
 };
 
 // `sqlparser` is re-exported so consumers can name `Dialect` /

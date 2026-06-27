@@ -64,7 +64,7 @@ use super::origins::output_operands;
 use crate::casing::{CaseRule, IdentifierStyle};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
-use crate::reference::{ResolutionKind, TableRead, TableReference, TableWrite};
+use crate::reference::{ColumnWrite, ResolutionKind, TableRead, TableReference, TableWrite};
 
 // The bind pass is split by concern; each submodule adds an `impl Binder`
 // block over the shared types — the `Binder` context and free helpers here,

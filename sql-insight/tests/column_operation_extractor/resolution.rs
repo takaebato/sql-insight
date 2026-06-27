@@ -4,6 +4,7 @@ mod catalog_strict {
     use super::*;
     use sql_insight::catalog::{Catalog, CatalogTable};
     use sql_insight::sqlparser::ast::Ident;
+    use sql_insight::sqlparser::dialect::MySqlDialect;
 
     /// Builder over a real [`Catalog`], registering every table under a
     /// `public` schema (bare query refs resolve against it by
@@ -23,8 +24,17 @@ mod catalog_strict {
     }
 
     fn assert_column_ops_with_catalog(sql: &str, catalog: &TestCatalog, expected: ColumnOperation) {
+        assert_column_ops_with_catalog_dialect(&GenericDialect {}, sql, catalog, expected);
+    }
+
+    fn assert_column_ops_with_catalog_dialect(
+        dialect: &dyn Dialect,
+        sql: &str,
+        catalog: &TestCatalog,
+        expected: ColumnOperation,
+    ) {
         let options = ExtractorOptions::new().with_catalog(&catalog.catalog);
-        let actual = extract_column_operations_with_options(&GenericDialect {}, sql, options)
+        let actual = extract_column_operations_with_options(dialect, sql, options)
             .unwrap()
             .into_iter()
             .next()
@@ -37,18 +47,34 @@ mod catalog_strict {
     // so the resolver canonicalizes it. Override the bare top-level
     // `write` / `relation` helpers to carry the `public.<name>` identity.
     // (Sources like `s` are unregistered and stay bare via `read` / `col`.)
-    fn write(table_name: &str, col: &str) -> ColumnReference {
-        ColumnReference {
-            table: Some(cataloged_table(table_name)),
-            name: col.into(),
+    fn write(table_name: &str, col: &str) -> ColumnWrite {
+        ColumnWrite {
+            reference: ColumnReference {
+                table: Some(cataloged_table(table_name)),
+                name: col.into(),
+            },
+            resolution: ResolutionKind::Cataloged,
         }
     }
 
     fn relation(table_name: &str, col: &str) -> ColumnTarget {
-        ColumnTarget::Relation(ColumnReference {
-            table: Some(cataloged_table(table_name)),
-            name: col.into(),
-        })
+        ColumnTarget::Relation(write(table_name, col))
+    }
+
+    // Canonical (`public`) table, but a column the catalog *doesn't* list — so
+    // the column resolves `Inferred` even though the table is registered.
+    fn write_inferred(table_name: &str, col: &str) -> ColumnWrite {
+        ColumnWrite {
+            reference: ColumnReference {
+                table: Some(cataloged_table(table_name)),
+                name: col.into(),
+            },
+            resolution: ResolutionKind::Inferred,
+        }
+    }
+
+    fn relation_inferred(table_name: &str, col: &str) -> ColumnTarget {
+        ColumnTarget::Relation(write_inferred(table_name, col))
     }
 
     #[test]
@@ -202,7 +228,8 @@ mod catalog_strict {
 
     #[test]
     fn catalog_insert_explicit_columns_override_catalog_schema() {
-        // Explicit (q) wins over catalog [x, y, z].
+        // Explicit (q) wins over catalog [x, y, z]. `q` isn't a catalog column
+        // of `t`, so it resolves `Inferred` (the table is still canonical).
         let catalog = TestCatalog::default().with("t", vec!["x", "y", "z"]);
         assert_column_ops_with_catalog(
             "INSERT INTO t (q) SELECT a FROM s",
@@ -210,10 +237,81 @@ mod catalog_strict {
             ColumnOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s", "a")],
-                writes: vec![write("t", "q")],
-                lineage: vec![passthrough(col("s", "a"), relation("t", "q"))],
+                writes: vec![write_inferred("t", "q")],
+                lineage: vec![passthrough(col("s", "a"), relation_inferred("t", "q"))],
                 diagnostics: vec![],
             },
+        );
+    }
+
+    #[test]
+    fn write_column_resolution_is_cataloged_only_when_listed() {
+        // A written column in the target's catalog columns resolves `Cataloged`;
+        // one that isn't (`z`) resolves `Inferred` — the write-side mirror of a
+        // base column read.
+        let catalog = TestCatalog::default().with("t", vec!["a", "b"]);
+        assert_column_ops_with_catalog(
+            "INSERT INTO t (a, z) VALUES (1, 2)",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![write("t", "a"), write_inferred("t", "z")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn update_set_column_resolution_cataloged_vs_inferred() {
+        // A SET target in the catalog → Cataloged; one that isn't (`z`) →
+        // Inferred — the UPDATE write path, symmetric with INSERT.
+        let catalog = TestCatalog::default().with("t", vec!["a", "b"]);
+        assert_column_ops_with_catalog(
+            "UPDATE t SET a = 1, z = 2",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![write("t", "a"), write_inferred("t", "z")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn multi_table_update_resolves_each_set_target_against_its_own_catalog() {
+        // Each SET target resolves against *its own* table's catalog columns:
+        // `t1.a` is listed (Cataloged), `t2.z` isn't (Inferred). (Asserts the
+        // per-column resolution directly, sidestepping MySQL's canonical
+        // backtick quoting of the surfaced identities.)
+        let catalog = TestCatalog::default()
+            .with("t1", vec!["a", "id"])
+            .with("t2", vec!["b", "id"]);
+        let options = ExtractorOptions::new().with_catalog(&catalog.catalog);
+        let op = extract_column_operations_with_options(
+            &MySqlDialect {},
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET t1.a = 1, t2.z = 2",
+            options,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .unwrap();
+        let writes: Vec<_> = op
+            .writes
+            .iter()
+            .map(|w| (w.reference.name.value.as_str(), w.resolution))
+            .collect();
+        assert_eq!(
+            writes,
+            vec![
+                ("a", ResolutionKind::Cataloged),
+                ("z", ResolutionKind::Inferred),
+            ]
         );
     }
 

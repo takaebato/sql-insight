@@ -726,14 +726,17 @@ mod relation_arm_coverage {
     /// Write-side build: stays bare [`ColumnReference`] since
     /// `writes` is `Vec<ColumnReference>` (write targets come from
     /// SQL syntax and don't carry a resolution).
-    fn w(table: &str, name: &str) -> ColumnReference {
-        ColumnReference {
-            table: Some(TableReference {
-                catalog: None,
-                schema: None,
-                name: table.into(),
-            }),
-            name: name.into(),
+    fn w(table: &str, name: &str) -> ColumnWrite {
+        ColumnWrite {
+            reference: ColumnReference {
+                table: Some(TableReference {
+                    catalog: None,
+                    schema: None,
+                    name: table.into(),
+                }),
+                name: name.into(),
+            },
+            resolution: ResolutionKind::Inferred,
         }
     }
 
@@ -1262,13 +1265,16 @@ mod relation_arm_coverage {
         let result = op("UPDATE schema.t SET schema.t.col = 1");
         assert_eq!(
             result.writes,
-            vec![ColumnReference {
-                table: Some(TableReference {
-                    catalog: None,
-                    schema: Some("schema".into()),
-                    name: "t".into(),
-                }),
-                name: "col".into(),
+            vec![ColumnWrite {
+                reference: ColumnReference {
+                    table: Some(TableReference {
+                        catalog: None,
+                        schema: Some("schema".into()),
+                        name: "t".into(),
+                    }),
+                    name: "col".into(),
+                },
+                resolution: ResolutionKind::Inferred,
             }]
         );
     }
@@ -1280,13 +1286,16 @@ mod relation_arm_coverage {
         let result = op("UPDATE catalog.schema.t SET catalog.schema.t.col = 1");
         assert_eq!(
             result.writes,
-            vec![ColumnReference {
-                table: Some(TableReference {
-                    catalog: Some("catalog".into()),
-                    schema: Some("schema".into()),
-                    name: "t".into(),
-                }),
-                name: "col".into(),
+            vec![ColumnWrite {
+                reference: ColumnReference {
+                    table: Some(TableReference {
+                        catalog: Some("catalog".into()),
+                        schema: Some("schema".into()),
+                        name: "t".into(),
+                    }),
+                    name: "col".into(),
+                },
+                resolution: ResolutionKind::Inferred,
             }]
         );
     }

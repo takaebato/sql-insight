@@ -9,7 +9,7 @@ use sql_insight::extractor::{
     ColumnTarget, StatementKind, TableOperation,
 };
 use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::{ColumnReference, TableReference};
+use sql_insight::{ColumnWrite, TableReference};
 use std::collections::HashSet;
 
 /// Curated corpus chosen to stress the major shapes the resolver
@@ -86,13 +86,13 @@ fn column_read_table(r: &sql_insight::ColumnRead) -> Option<TableReference> {
     r.reference.table.clone()
 }
 
-fn column_write_table(w: &ColumnReference) -> Option<TableReference> {
-    w.table.clone()
+fn column_write_table(w: &ColumnWrite) -> Option<TableReference> {
+    w.reference.table.clone()
 }
 
 fn edge_relation_table(f: &ColumnLineageEdge) -> Option<TableReference> {
     match &f.target {
-        ColumnTarget::Relation(c) => c.table.clone(),
+        ColumnTarget::Relation(c) => c.reference.table.clone(),
         ColumnTarget::QueryOutput { .. } => None,
     }
 }

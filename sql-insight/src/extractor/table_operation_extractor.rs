@@ -24,7 +24,7 @@ use crate::catalog::Catalog;
 use crate::diagnostic::{TableLevelDiagnostic, TableLevelDiagnosticKind};
 use crate::error::Error;
 use crate::extractor::{classify_statement, ExtractorOptions, StatementKind};
-use crate::reference::{TableRead, TableReference, TableWrite};
+use crate::reference::{TableRead, TableWrite};
 use crate::resolver::MergeActions;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
@@ -148,9 +148,10 @@ pub struct TableLineageEdge {
     /// The feeding source table, paired with its catalog-match
     /// [`ResolutionKind`](crate::ResolutionKind).
     pub source: TableRead,
-    /// The write target. Bare [`TableReference`] — trivially resolved
-    /// by construction.
-    pub target: TableReference,
+    /// The write target, paired with its catalog-match
+    /// [`ResolutionKind`](crate::ResolutionKind) — the write-side counterpart
+    /// of `source` ([`TableWrite`]).
+    pub target: TableWrite,
 }
 
 /// Struct-style entry point. Equivalent to the free

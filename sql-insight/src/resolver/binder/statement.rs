@@ -117,7 +117,7 @@ impl<'a> Binder<'a> {
         // VALUES / SELECT source) — each assignment is a value column named by
         // its target, like a single-row UPDATE.
         if insert.source.is_none() && !insert.assignments.is_empty() {
-            return self.bind_insert_set(insert, target, m.resolution);
+            return self.bind_insert_set(insert, target, m.resolution, m.columns);
         }
         let (input, scope) = match &insert.source {
             Some(source) => self.bind_query(source),
@@ -187,6 +187,10 @@ impl<'a> Binder<'a> {
         // RETURNING resolves against the target alone (the source query's
         // scope is already popped).
         let returning = self.bind_returning(&insert.returning, &self.target_scope(&target));
+        // Each written column carries its catalog match against the target
+        // (`Cataloged` if listed, else `Inferred` — a catalog-filled column is
+        // by definition listed).
+        let columns = self.column_writes(&target, &m.columns, columns);
         LogicalPlan::Insert(Insert {
             target: TableWrite {
                 reference: target,
@@ -201,6 +205,32 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// Wrap written column names as [`ColumnWrite`]s, each resolved against the
+    /// target's catalog column list: `Cataloged` when listed, else `Inferred`
+    /// (catalog-free, target columns unknown, or an unlisted column). Shared by
+    /// the INSERT / MERGE-insert write paths.
+    fn column_writes(
+        &self,
+        target: &TableReference,
+        catalog_columns: &[Ident],
+        columns: Vec<Ident>,
+    ) -> Vec<ColumnWrite> {
+        columns
+            .into_iter()
+            .map(|name| ColumnWrite {
+                resolution: if self.list_has(catalog_columns, &name) {
+                    ResolutionKind::Cataloged
+                } else {
+                    ResolutionKind::Inferred
+                },
+                reference: crate::reference::ColumnReference {
+                    table: Some(target.clone()),
+                    name,
+                },
+            })
+            .collect()
+    }
+
     /// MySQL `INSERT INTO t SET col = expr, …`: bind the assignment form like a
     /// single-row UPDATE — each assignment is a value column named by its target
     /// (resolved against the target's own columns), placed in a `Projection` so the
@@ -210,6 +240,7 @@ impl<'a> Binder<'a> {
         insert: &SqlInsert,
         target: TableReference,
         resolution: ResolutionKind,
+        catalog_columns: Vec<Ident>,
     ) -> LogicalPlan {
         let scope = self.target_scope(&target);
         let mut columns = Vec::new();
@@ -228,6 +259,7 @@ impl<'a> Binder<'a> {
             None => (Vec::new(), Vec::new()),
         };
         let returning = self.bind_returning(&insert.returning, &scope);
+        let columns = self.column_writes(&target, &catalog_columns, columns);
         LogicalPlan::Insert(Insert {
             target: TableWrite {
                 reference: target,
@@ -493,8 +525,9 @@ impl<'a> Binder<'a> {
                                 .iter()
                                 .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
                                 .collect();
+                            let catalog_cols = self.catalog_columns(&target);
                             let columns = if explicit.is_empty() {
-                                self.catalog_columns(&target)
+                                catalog_cols.clone()
                             } else {
                                 explicit
                             };
@@ -513,7 +546,7 @@ impl<'a> Binder<'a> {
                                 self.record_insert_columns_unresolved(&target, false);
                             }
                             clauses.push(MergeClause::Insert {
-                                columns,
+                                columns: self.column_writes(&target, &catalog_cols, columns),
                                 values: row,
                             });
                         }
@@ -697,7 +730,7 @@ impl<'a> Binder<'a> {
         target: &AssignmentTarget,
         scope: &Scope,
         root: &TableReference,
-    ) -> Option<(crate::reference::ColumnReference, ResolutionKind)> {
+    ) -> Option<(ColumnWrite, ResolutionKind)> {
         let AssignmentTarget::ColumnName(name) = target else {
             return None; // tuple `SET (a, b) = …` — not modelled
         };
@@ -716,16 +749,26 @@ impl<'a> Binder<'a> {
                 .iter()
                 .find_map(|rel| self.writable_qualifier_table(rel, qualifier))?
         };
-        // Re-match the resolved write-target table for its catalog resolution
-        // (so the per-target table write carries it). `table` is canonical, so
-        // this reproduces the root scan's / joined relation's resolution.
-        let resolution = self.table_write(&table).resolution;
+        // Re-match the resolved write-target table (`table` is canonical, so
+        // this reproduces the root scan's / joined relation's catalog match):
+        // its `resolution` is the table-level write resolution; whether the
+        // written `column` is in its catalog column list is the column-level
+        // one (`Cataloged` if listed, else `Inferred` — mirroring a base read).
+        let m = self.table_match(&table);
+        let column_resolution = if self.list_has(&m.columns, &column) {
+            ResolutionKind::Cataloged
+        } else {
+            ResolutionKind::Inferred
+        };
         Some((
-            crate::reference::ColumnReference {
-                table: Some(table),
-                name: column,
+            ColumnWrite {
+                reference: crate::reference::ColumnReference {
+                    table: Some(table),
+                    name: column,
+                },
+                resolution: column_resolution,
             },
-            resolution,
+            m.resolution,
         ))
     }
 

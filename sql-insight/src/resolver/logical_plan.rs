@@ -8,7 +8,7 @@
 
 use sqlparser::ast::Ident;
 
-use crate::reference::{ColumnReference, ResolutionKind, TableRead, TableReference, TableWrite};
+use crate::reference::{ColumnWrite, ResolutionKind, TableRead, TableReference, TableWrite};
 
 // ===== the logical plan ==================================================
 
@@ -216,7 +216,9 @@ pub(crate) struct Values {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Insert {
     pub(crate) target: TableWrite,
-    pub(crate) columns: Vec<Ident>,
+    /// Written target columns, each catalog-resolved against the target
+    /// (explicit list, or catalog-filled for a column-less INSERT).
+    pub(crate) columns: Vec<ColumnWrite>,
     pub(crate) input: Box<LogicalPlan>,
     pub(crate) returning: Vec<NamedExpr>,
     pub(crate) on_conflict: Vec<Assignment>,
@@ -265,7 +267,7 @@ pub(crate) enum MergeClause {
     Update { assignments: Vec<Assignment> },
     /// `WHEN NOT MATCHED ... INSERT (columns) VALUES (values)`.
     Insert {
-        columns: Vec<Ident>,
+        columns: Vec<ColumnWrite>,
         values: Vec<Expr>,
     },
     /// `WHEN MATCHED ... DELETE` — removes rows, no writes / lineage.
@@ -495,7 +497,10 @@ pub(crate) struct NamedExpr {
 /// surfaces its [`ResolutionKind`] without the walker re-deriving it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Assignment {
-    pub(crate) target: ColumnReference,
+    /// The written column, catalog-resolved against its target table
+    /// (`target.resolution` is the *column*-level match).
+    pub(crate) target: ColumnWrite,
+    /// How the catalog matched the write-target *table* (for `table_writes`).
     pub(crate) target_resolution: ResolutionKind,
     pub(crate) value: Expr,
 }

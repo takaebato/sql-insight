@@ -9,7 +9,7 @@ pub use sql_insight::extractor::{
 };
 pub use sql_insight::sqlparser::ast::Ident;
 pub use sql_insight::sqlparser::dialect::{Dialect, GenericDialect};
-pub use sql_insight::{ColumnRead, ColumnReference, ResolutionKind, TableReference};
+pub use sql_insight::{ColumnRead, ColumnReference, ColumnWrite, ResolutionKind, TableReference};
 
 /// Order-insensitive multiset equality for the `reads` / `lineage`
 /// surfaces. The public API returns them in source order, but these tests
@@ -128,13 +128,16 @@ pub fn unresolved(col: &str) -> ColumnRead {
     }
 }
 
-// Write-side helpers stay as `ColumnReference` — write targets come
-// straight from SQL syntax and are always `ResolutionKind::Cataloged` by
-// construction, so attaching a resolution field would be dead weight.
-pub fn write(table_name: &str, col: &str) -> ColumnReference {
-    ColumnReference {
-        table: Some(table(table_name)),
-        name: col.into(),
+// Write-side helper — catalog-free, so every written column resolves to
+// `Inferred` (its target's catalog columns aren't known). The catalog-aware
+// (`Cataloged`) variants live in the `resolution` module's local helpers.
+pub fn write(table_name: &str, col: &str) -> ColumnWrite {
+    ColumnWrite {
+        reference: ColumnReference {
+            table: Some(table(table_name)),
+            name: col.into(),
+        },
+        resolution: ResolutionKind::Inferred,
     }
 }
 
@@ -153,10 +156,7 @@ pub fn out_anon(position: usize) -> ColumnTarget {
 }
 
 pub fn relation(table_name: &str, col: &str) -> ColumnTarget {
-    ColumnTarget::Relation(ColumnReference {
-        table: Some(table(table_name)),
-        name: col.into(),
-    })
+    ColumnTarget::Relation(write(table_name, col))
 }
 
 pub fn passthrough(source: ColumnRead, target: ColumnTarget) -> ColumnLineageEdge {
