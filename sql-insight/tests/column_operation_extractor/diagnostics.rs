@@ -19,6 +19,23 @@ mod reported {
     }
 
     #[test]
+    fn update_non_table_target_reports_diagnostic() {
+        // A derived / subquery UPDATE target can't be a write target — flagged
+        // (like a MERGE into a non-table target), not dropped silently. The
+        // statement_kind stays Update; nothing is written.
+        assert_column_ops(
+            "UPDATE (SELECT 1) x SET a = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
     fn over_qualified_read_table_reports_diagnostic() {
         // A FROM table with more than `catalog.schema.name` segments can't
         // be represented, so it's dropped (the projected `a` is left
