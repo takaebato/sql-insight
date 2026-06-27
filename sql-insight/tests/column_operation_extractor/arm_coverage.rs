@@ -356,6 +356,42 @@ mod expr_arm_coverage {
     }
 
     #[test]
+    fn function_subquery_argument() {
+        // A function called with a subquery argument (`f((SELECT …))`): the
+        // subquery's columns are walked as reads (value-position).
+        assert_unordered_eq!(reads("SELECT f((SELECT x FROM t)) FROM t"), vec![c("x")]);
+    }
+
+    #[test]
+    fn named_window_reference_with_frame() {
+        // `OVER w` references a `WINDOW w AS (…)` definition: the function arg is
+        // a value, and the named window's ORDER BY key + frame-bound expressions
+        // surface as (row-positioning) reads.
+        assert_unordered_eq!(
+            reads(
+                "SELECT SUM(a) OVER w FROM t \
+                 WINDOW w AS (ORDER BY b ROWS BETWEEN c PRECEDING AND d FOLLOWING)"
+            ),
+            vec![c("a"), c("b"), c("c"), c("d")]
+        );
+    }
+
+    #[test]
+    fn cluster_by() {
+        // Hive `CLUSTER BY` keys are row-positioning reads.
+        assert_unordered_eq!(reads("SELECT a FROM t CLUSTER BY b"), vec![c("a"), c("b")]);
+    }
+
+    #[test]
+    fn distribute_by() {
+        // Hive `DISTRIBUTE BY` keys are row-positioning reads.
+        assert_unordered_eq!(
+            reads("SELECT a FROM t DISTRIBUTE BY b"),
+            vec![c("a"), c("b")]
+        );
+    }
+
+    #[test]
     fn limit_offset_comma() {
         // The `LIMIT <offset>, <limit>` form (`OffsetCommaLimit`): both
         // operands are filter-position reads (here literals).

@@ -615,6 +615,24 @@ mod on_conflict {
     }
 
     #[test]
+    fn pg_on_conflict_do_update_set_subquery_value() {
+        // DO UPDATE SET x = (SELECT max(y) FROM s): the conflict-action value is
+        // a subquery — its column flows to the SET target (Transformation, via
+        // `max`). `x` is written twice (the INSERT column + the SET target).
+        assert_column_ops_with_dialect(
+            "INSERT INTO t (x) VALUES (1) ON CONFLICT (x) DO UPDATE SET x = (SELECT max(y) FROM s)",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "y")],
+                writes: vec![write("t", "x"), write("t", "x")],
+                lineage: vec![transformation(col("s", "y"), relation("t", "x"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn pg_on_conflict_do_nothing_is_indistinguishable_from_plain_insert() {
         assert_column_ops_with_dialect(
             "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO NOTHING",
