@@ -140,8 +140,10 @@ pub(super) fn origins_of_expr<'a>(
         }
         // The function argument is value; partition / order keys are filter.
         Expr::Window { arg, .. } => transform(origins_of_expr(arg, input, context)),
-        // A scalar subquery's first output column flows as a transformation.
-        Expr::Subquery(plan) => transform(scalar_subquery_origins(plan, context)),
+        // A subquery's `output`-th column flows as a transformation.
+        Expr::Subquery { plan, output } => {
+            transform(subquery_output_origins(plan, *output, context))
+        }
         // A merge-column fan-in: each owning side is its own origin, traced
         // like a column ref — a real-table side is a `Passthrough` base read,
         // a derived / CTE side traces into its producing subquery (so a
@@ -341,15 +343,18 @@ fn origins_into<'a>(
 /// value) — fanning across **every** set-operation branch (each branch's
 /// position-0 output), not just the leftmost, since the branches merge
 /// positionally.
-fn scalar_subquery_origins<'a>(
+fn subquery_output_origins<'a>(
     op: &'a LogicalPlan,
+    output: usize,
     context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
-    // Position 0 of every branch. `output_operands` accumulates each peeled
+    // The `output`-th column of every branch (0 for a scalar subquery; the i-th
+    // for a tuple `SET (a, b) = (SELECT x, y)` assignment — a set-op body fans
+    // the position over each branch). `output_operands` accumulates each peeled
     // `With`'s CTE declarations onto the operand and `trace_nth_output`
     // registers them — so a `CteRef` in the body (including the subquery's *own*
     // leading `WITH`, which `TraceContext::new` doesn't see) resolves.
-    trace_nth_output(&output_operands(op), 0, context)
+    trace_nth_output(&output_operands(op), output, context)
 }
 
 /// Trace the `i`-th output column of every operand — the positional fan-out
@@ -422,7 +427,9 @@ pub(super) fn conflict_value_origins<'a>(
         Expr::Window { arg, .. } => {
             transform(conflict_value_origins(arg, columns, source, context))
         }
-        Expr::Subquery(plan) => transform(scalar_subquery_origins(plan, context)),
+        Expr::Subquery { plan, output } => {
+            transform(subquery_output_origins(plan, *output, context))
+        }
         Expr::Fanin(refs) => refs
             .iter()
             .filter_map(|c| column_read(c).map(|r| (r, ColumnLineageKind::Passthrough)))

@@ -284,7 +284,10 @@ impl<'a> Binder<'a> {
                 self.call([member_of.value.as_ref(), member_of.array.as_ref()], scope)
             }
             // A scalar subquery (value position): its output flows in.
-            SqlExpr::Subquery(query) => Expr::Subquery(Box::new(self.bind_subquery(query, scope))),
+            SqlExpr::Subquery(query) => Expr::Subquery {
+                plan: Box::new(self.bind_subquery(query, scope)),
+                output: 0,
+            },
             // Tests (filter position): columns read, never an origin.
             SqlExpr::Exists { subquery, .. } => {
                 Expr::Exists(Box::new(self.bind_subquery(subquery, scope)))
@@ -477,7 +480,10 @@ impl<'a> Binder<'a> {
                 }
             }
         } else if let FunctionArguments::Subquery(query) = &function.args {
-            args.push(Expr::Subquery(Box::new(self.bind_subquery(query, scope))));
+            args.push(Expr::Subquery {
+                plan: Box::new(self.bind_subquery(query, scope)),
+                output: 0,
+            });
         }
         if let Some(filter) = &function.filter {
             suppressed.push(self.bind_expr(filter, scope));

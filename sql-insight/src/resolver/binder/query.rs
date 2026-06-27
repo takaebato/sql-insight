@@ -836,7 +836,10 @@ impl<'a> Binder<'a> {
                 .map(|o| self.bind_expr(&o.expr, scope))
                 .collect(),
             PivotValueSource::Subquery(query) => {
-                vec![Expr::Subquery(Box::new(self.bind_subquery(query, scope)))]
+                vec![Expr::Subquery {
+                    plan: Box::new(self.bind_subquery(query, scope)),
+                    output: 0,
+                }]
             }
         }
     }

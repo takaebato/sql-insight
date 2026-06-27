@@ -316,16 +316,7 @@ impl<'a> Binder<'a> {
         // A conflict-action SET always targets the insert target's own columns.
         let bound = assignments
             .iter()
-            .filter_map(|a| {
-                let value = self.bind_expr(&a.value, &scope);
-                let (target, target_resolution) =
-                    self.assignment_target(&a.target, &scope, target)?;
-                Some(Assignment {
-                    target,
-                    target_resolution,
-                    value,
-                })
-            })
+            .flat_map(|a| self.bind_assignment(a, &scope, target))
             .collect();
         let predicate = selection
             .map(|s| self.bind_expr(s, &scope))
@@ -393,20 +384,12 @@ impl<'a> Binder<'a> {
         }
         // SET assignments resolve against the target + FROM scope; each writes
         // its resolved target table (the root, or the relation a qualifier names
-        // in a multi-table `UPDATE t1 JOIN t2 SET t2.col = …`).
+        // in a multi-table `UPDATE t1 JOIN t2 SET t2.col = …`). A tuple
+        // `SET (a, b) = …` expands to one assignment per target column.
         let assignments = update
             .assignments
             .iter()
-            .filter_map(|a| {
-                let value = self.bind_expr(&a.value, &scope);
-                let (target, target_resolution) =
-                    self.assignment_target(&a.target, &scope, &target)?;
-                Some(Assignment {
-                    target,
-                    target_resolution,
-                    value,
-                })
-            })
+            .flat_map(|a| self.bind_assignment(a, &scope, &target))
             .collect();
         // RETURNING resolves against the statement scope (target + FROM).
         let returning = self.bind_returning(&update.returning, &scope);
@@ -592,20 +575,11 @@ impl<'a> Binder<'a> {
                         on.push(self.bind_expr(predicate, &scope));
                     }
                     // A MERGE WHEN UPDATE always targets the merge target's
-                    // own columns.
+                    // own columns (a tuple SET expands per target column).
                     let assignments = update
                         .assignments
                         .iter()
-                        .filter_map(|a| {
-                            let value = self.bind_expr(&a.value, &scope);
-                            let (target, target_resolution) =
-                                self.assignment_target(&a.target, &scope, &target)?;
-                            Some(Assignment {
-                                target,
-                                target_resolution,
-                                value,
-                            })
-                        })
+                        .flat_map(|a| self.bind_assignment(a, &scope, &target))
                         .collect();
                     clauses.push(MergeClause::Update { assignments });
                 }
@@ -746,22 +720,96 @@ impl<'a> Binder<'a> {
         })
     }
 
-    /// Resolve a SET assignment's target to the column it writes, qualified by
-    /// its **resolved table**: an unqualified column writes the DML `root`; a
-    /// qualified `t2.col` (a multi-table `UPDATE t1 JOIN t2 SET t2.col = …`)
-    /// writes whichever in-scope real table the qualifier names. Returns `None`
-    /// — dropped (+ flagged by the caller) — for a tuple target (`SET (a,b)=…`,
-    /// not modelled) or a qualifier that names no writable table (a derived
-    /// table / CTE / unknown alias can't be a write target).
-    fn assignment_target(
+    /// Bind one SET assignment into the per-column [`Assignment`]s it writes —
+    /// one for a single `col = expr`, several for a tuple `(a, b) = …` (one per
+    /// target column). See [`bind_tuple_assignment`](Self::bind_tuple_assignment)
+    /// for the tuple pairing. `root` is the DML target an unqualified column
+    /// writes; `scope` resolves a qualified `t2.col` and the RHS reads.
+    pub(super) fn bind_assignment(
+        &mut self,
+        assignment: &SqlAssignment,
+        scope: &Scope,
+        root: &TableReference,
+    ) -> Vec<Assignment> {
+        match &assignment.target {
+            AssignmentTarget::ColumnName(name) => {
+                let value = self.bind_expr(&assignment.value, scope);
+                self.resolve_assignment_column(name, scope, root)
+                    .map(|(target, target_resolution)| Assignment {
+                        target,
+                        target_resolution,
+                        value,
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            AssignmentTarget::Tuple(names) => {
+                self.bind_tuple_assignment(names, &assignment.value, scope, root)
+            }
+        }
+    }
+
+    /// Expand a tuple `SET (a, b, …) = rhs` into one [`Assignment`] per target,
+    /// pairing each with its positional value: a row value `(e0, e1)`
+    /// element-wise; a `(SELECT x, y)` subquery by output column (each target
+    /// projects its positional output via [`Expr::Subquery`]'s `output`). The
+    /// subquery is bound once (reads count once); each target's value clones
+    /// that plan, differing only in which output column it projects — so the
+    /// reads walker must see the subquery on exactly one target (the first; the
+    /// rest carry `output > 0`, which it skips). Targets past the RHS arity, or
+    /// that resolve to no writable table, are dropped.
+    fn bind_tuple_assignment(
+        &mut self,
+        names: &[ObjectName],
+        rhs: &SqlExpr,
+        scope: &Scope,
+        root: &TableReference,
+    ) -> Vec<Assignment> {
+        let values: Vec<Expr> = match rhs {
+            // `(a, b) = (e0, e1)` — a row value: each element is one value.
+            SqlExpr::Tuple(elems) => elems.iter().map(|e| self.bind_expr(e, scope)).collect(),
+            // `(a, b) = (SELECT x, y …)` — each target projects its positional
+            // output column of the one subquery.
+            SqlExpr::Subquery(query) => {
+                let plan = self.bind_subquery(query, scope);
+                (0..names.len())
+                    .map(|output| Expr::Subquery {
+                        plan: Box::new(plan.clone()),
+                        output,
+                    })
+                    .collect()
+            }
+            // Any other RHS on a tuple target isn't SQL we model row-wise; bind
+            // it once so its reads still surface (paired with the first target).
+            other => vec![self.bind_expr(other, scope)],
+        };
+        names
+            .iter()
+            .zip(values)
+            .filter_map(|(name, value)| {
+                self.resolve_assignment_column(name, scope, root).map(
+                    |(target, target_resolution)| Assignment {
+                        target,
+                        target_resolution,
+                        value,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Resolve a SET assignment's target column to the column it writes,
+    /// qualified by its **resolved table**: an unqualified column writes the DML
+    /// `root`; a qualified `t2.col` (a multi-table `UPDATE t1 JOIN t2 SET t2.col
+    /// = …`) writes whichever in-scope real table the qualifier names. Returns
+    /// `None` — dropped — for a qualifier that names no writable table (a
+    /// derived table / CTE / unknown alias can't be a write target).
+    fn resolve_assignment_column(
         &self,
-        target: &AssignmentTarget,
+        name: &ObjectName,
         scope: &Scope,
         root: &TableReference,
     ) -> Option<(ColumnWrite, ResolutionKind)> {
-        let AssignmentTarget::ColumnName(name) = target else {
-            return None; // tuple `SET (a, b) = …` — not modelled
-        };
         let parts: Vec<Ident> = name
             .0
             .iter()

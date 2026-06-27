@@ -1301,14 +1301,13 @@ mod relation_arm_coverage {
     }
 
     #[test]
-    fn update_tuple_assignment_target_is_skipped() {
-        // `AssignmentTarget::Tuple(_)` returns `None` from
-        // `assignment_target_parts`, so the SET position is skipped:
-        // no writes emitted (tuple targets are not yet supported for
-        // column-level pairing). The RHS literals contribute no reads.
+    fn update_tuple_assignment_writes_each_target_column() {
+        // `AssignmentTarget::Tuple` expands to one write per target column,
+        // paired positionally with the RHS row value. The literals `(1, 2)`
+        // contribute no reads.
         let result = op("UPDATE t SET (a, b) = (1, 2)");
         assert_unordered_eq!(result.reads, vec![]);
-        assert_eq!(result.writes, vec![]);
+        assert_eq!(result.writes, vec![w("t", "a"), w("t", "b")]);
     }
 
     #[test]

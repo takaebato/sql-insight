@@ -37,14 +37,15 @@
 //! named on the root, never a read scan.
 
 use sqlparser::ast::{
-    AlterTable as SqlAlterTable, AlterTableOperation, AssignmentTarget, CreateTable,
-    CreateTableLikeKind, CreateView as SqlCreateView, Cte as SqlCte, Delete as SqlDelete,
-    Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, GroupByWithModifier, Ident, Insert as SqlInsert, JoinConstraint, JoinOperator,
-    JsonPathElem, Merge as SqlMerge, MergeAction, MergeInsertKind, ObjectName, ObjectType,
-    OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind, OutputClause, PipeOperator,
-    PivotValueSource, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
-    TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind, Values as SqlValues,
+    AlterTable as SqlAlterTable, AlterTableOperation, Assignment as SqlAssignment,
+    AssignmentTarget, CreateTable, CreateTableLikeKind, CreateView as SqlCreateView, Cte as SqlCte,
+    Delete as SqlDelete, Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, GroupByWithModifier, Ident, Insert as SqlInsert,
+    JoinConstraint, JoinOperator, JsonPathElem, Merge as SqlMerge, MergeAction, MergeInsertKind,
+    ObjectName, ObjectType, OnConflictAction, OnInsert, OrderBy, OrderByExpr, OrderByKind,
+    OutputClause, PipeOperator, PivotValueSource, Query, Select, SelectItem, SetExpr, Statement,
+    TableAlias, TableFactor, TableObject, TableWithJoins, Update as SqlUpdate, UpdateTableFromKind,
+    Values as SqlValues,
 };
 
 use sqlparser::ast::{
