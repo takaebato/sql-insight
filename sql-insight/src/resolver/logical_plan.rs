@@ -8,7 +8,7 @@
 
 use sqlparser::ast::Ident;
 
-use crate::reference::{ColumnReference, ResolutionKind, TableReference, TableWrite};
+use crate::reference::{ColumnReference, ResolutionKind, TableRead, TableReference, TableWrite};
 
 // ===== the logical plan ==================================================
 
@@ -281,10 +281,10 @@ pub(crate) enum MergeClause {
 /// it contributes no write / lineage edge without shifting later positions).
 ///
 /// `schema_source` is the table a `CREATE TABLE t LIKE src` / `... CLONE src`
-/// copies its shape from (`input` is then [`LogicalPlan::Empty`]). It is a
-/// structural reference — the new table's *columns* aren't known here (no
-/// wildcard expansion) and no row data moves — so it surfaces only in the flat
-/// table list, never as a column read / write / lineage edge.
+/// shapes itself from (`input` is then [`LogicalPlan::Empty`]). Either way the
+/// source is *read* (it surfaces in `reads`); they differ in data flow — see
+/// [`SchemaSource`]. The new table's *columns* aren't known here (no wildcard
+/// expansion), so no column read / write / lineage edge is produced.
 ///
 /// `source_wildcard` mirrors [`Insert::source_wildcard`]: the source projection
 /// holds an unexpanded wildcard, so an *explicit* column list can't be paired
@@ -297,8 +297,19 @@ pub(crate) struct CreateTableAs {
     pub(crate) target: TableWrite,
     pub(crate) columns: Vec<Ident>,
     pub(crate) input: Box<LogicalPlan>,
-    pub(crate) schema_source: Option<TableReference>,
+    pub(crate) schema_source: Option<SchemaSource>,
     pub(crate) source_wildcard: bool,
+}
+
+/// The `CREATE TABLE t LIKE src` / `CLONE src` shape source on a
+/// [`CreateTableAs`]. The `source` is always read; `copies_data` distinguishes
+/// the two: `LIKE` copies only the column definitions (zero rows) — a schema
+/// dependency with no data flow — while `CLONE` (Snowflake / BigQuery) copies
+/// the data too, so it also feeds `source → target` table lineage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SchemaSource {
+    pub(crate) source: TableRead,
+    pub(crate) copies_data: bool,
 }
 
 /// `CREATE VIEW target (columns) AS <input>`. `columns` is the explicit column

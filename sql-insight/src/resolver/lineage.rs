@@ -384,9 +384,16 @@ pub(super) fn collect_table_lineage(
         // (Handled out of line since it has several targets, unlike the
         // single-target DML below.)
         LogicalPlan::Update(u) => return update_table_lineage(u, &mut context),
-        // CTAS / CREATE VIEW move data like INSERT; ALTER / DROP do not.
+        // CTAS / CREATE VIEW move data like INSERT; ALTER / DROP do not. A
+        // `CLONE src` copies the data, so its shape source feeds `src → target`
+        // (a `LIKE src` copies only the schema → no edge).
         LogicalPlan::CreateTableAs(c) => {
             feeding_scans(&c.input, &mut context, &mut fed_ctes, &mut sources);
+            if let Some(schema_source) = &c.schema_source {
+                if schema_source.copies_data {
+                    sources.push(schema_source.source.clone());
+                }
+            }
             &c.target.reference
         }
         LogicalPlan::CreateView(c) => {

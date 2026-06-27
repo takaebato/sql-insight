@@ -57,13 +57,14 @@ use sqlparser::tokenizer::Span;
 use super::logical_plan::{
     Aggregate, AlterTable, Assignment, Binding, BoundColumn, Columns, CreateTableAs, CreateView,
     Cte, CteRef, Delete, Drop, Expr, Filter, Insert, Join, LogicalPlan, Merge, MergeClause,
-    NamedExpr, Projection, Scan, SetOp, Sort, SubqueryAlias, TableFunction, Update, Values, With,
+    NamedExpr, Projection, Scan, SchemaSource, SetOp, Sort, SubqueryAlias, TableFunction, Update,
+    Values, With,
 };
 use super::origins::output_operands;
 use crate::casing::{CaseRule, IdentifierStyle};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::diagnostic::{ColumnLevelDiagnostic, ColumnLevelDiagnosticKind};
-use crate::reference::{ResolutionKind, TableReference, TableWrite};
+use crate::reference::{ResolutionKind, TableRead, TableReference, TableWrite};
 
 // The bind pass is split by concern; each submodule adds an `impl Binder`
 // block over the shared types — the `Binder` context and free helpers here,

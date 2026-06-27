@@ -277,9 +277,8 @@ fn collect_flat_into(plan: &LogicalPlan, out: &mut Vec<TableReference>) {
         LogicalPlan::Merge(m) => out.push(m.target.reference.clone()),
         LogicalPlan::CreateTableAs(c) => {
             out.push(c.target.reference.clone());
-            // `LIKE` / `CLONE` schema template — a referenced table with no
-            // row-data role, surfaced only in this flat list.
-            out.extend(c.schema_source.clone());
+            // `LIKE` / `CLONE` shape source — also surfaced in `reads`.
+            out.extend(c.schema_source.iter().map(|s| s.source.reference.clone()));
         }
         LogicalPlan::CreateView(c) => out.push(c.target.reference.clone()),
         LogicalPlan::AlterTable(a) => out.push(a.target.reference.clone()),

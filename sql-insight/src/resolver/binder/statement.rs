@@ -779,6 +779,22 @@ impl<'a> Binder<'a> {
     /// outputs. A plain `CREATE TABLE t (cols)` (no query) is a target-only
     /// create — its column definitions aren't writes — so it binds with no
     /// columns / input.
+    /// The `LIKE` / `CLONE` shape source of a target-only `CREATE TABLE`,
+    /// catalog-matched as a [`TableRead`] (it's read either way). `copies_data`
+    /// is `true` for `CLONE` (data copied → feeds lineage), `false` for `LIKE`
+    /// (schema only). `None` if the source name isn't representable.
+    fn schema_source(&mut self, name: &ObjectName, copies_data: bool) -> Option<SchemaSource> {
+        let written = self.table_ref(name)?;
+        let m = self.table_match(&written);
+        Some(SchemaSource {
+            source: TableRead {
+                reference: m.table,
+                resolution: m.resolution,
+            },
+            copies_data,
+        })
+    }
+
     pub(super) fn bind_create_table(&mut self, create: &CreateTable) -> LogicalPlan {
         let Some(written) = self.table_ref(&create.name) else {
             return LogicalPlan::Empty;
@@ -787,21 +803,18 @@ impl<'a> Binder<'a> {
         let target = m.table;
         let resolution = m.resolution;
         let Some(query) = create.query.as_ref() else {
-            // No `AS <query>`: a target-only create. `LIKE src` / `CLONE src`
-            // copies another table's shape — capture that source so it still
-            // surfaces in the flat table list (it is a structural reference,
-            // not a row-data read; see `CreateTableAs::schema_source`).
-            let schema_source = create
-                .like
-                .as_ref()
-                .map(|k| match k {
-                    CreateTableLikeKind::Plain(l) | CreateTableLikeKind::Parenthesized(l) => {
-                        &l.name
-                    }
-                })
-                .or(create.clone.as_ref())
-                .and_then(|name| self.table_ref(name))
-                .map(|src| self.table_match(&src).table);
+            // No `AS <query>`: a target-only create. `LIKE src` copies only the
+            // column definitions (schema, no rows); `CLONE src` copies the data
+            // too. Both read `src`; only CLONE feeds `src → target` lineage
+            // (see `SchemaSource`).
+            let like_name = create.like.as_ref().map(|k| match k {
+                CreateTableLikeKind::Plain(l) | CreateTableLikeKind::Parenthesized(l) => &l.name,
+            });
+            let schema_source = match (like_name, create.clone.as_ref()) {
+                (Some(name), _) => self.schema_source(name, false),
+                (None, Some(name)) => self.schema_source(name, true),
+                (None, None) => None,
+            };
             return LogicalPlan::CreateTableAs(CreateTableAs {
                 target: TableWrite {
                     reference: target,

@@ -98,9 +98,11 @@
 //!
 //! `reads` / `writes` follow a relation's **syntactic role in the
 //! written SQL**, not what is physically touched at runtime: an
-//! unreferenced CTE body's tables and a `SELECT COUNT(*) FROM t` both
-//! read, even though no row data is consumed. The actual data-flow
-//! precision lives in `lineage`.
+//! unreferenced CTE body's tables, a `SELECT COUNT(*) FROM t`, and a
+//! `CREATE TABLE t LIKE src` source all read, even though no row data is
+//! consumed. The actual data-flow precision lives in `lineage` — e.g.
+//! `LIKE` (schema only) emits none, while `CLONE` (data copied) feeds
+//! `src → t`.
 //!
 //! For column-level lineage, [`extractor::ColumnLineageKind`] makes one
 //! clean distinction: `Passthrough` (the value is forwarded unchanged; a

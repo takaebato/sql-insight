@@ -686,6 +686,39 @@ mod ddl {
             },
         );
     }
+
+    #[test]
+    fn create_table_like_reads_the_shape_source_without_lineage() {
+        // `LIKE src` copies only the column definitions (no rows): `src` is
+        // read (its schema is consumed) but no data flows, so no lineage.
+        assert_ops(
+            "CREATE TABLE t LIKE src",
+            TableOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("src")],
+                writes: vec![twrite("t")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn create_table_clone_reads_the_source_and_feeds_lineage() {
+        // `CLONE src` (Snowflake) copies the data too: `src` is read AND feeds
+        // `src → t` table lineage, like `CREATE TABLE t AS SELECT * FROM src`.
+        assert_ops_with(
+            "CREATE TABLE t CLONE src",
+            &sql_insight::sqlparser::dialect::SnowflakeDialect {},
+            TableOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("src")],
+                writes: vec![twrite("t")],
+                lineage: vec![edge("src", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
 }
 
 mod lineage {
