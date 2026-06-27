@@ -52,13 +52,9 @@ pub(super) fn collect_column_lineage(
             // ON CONFLICT DO UPDATE SET col = value: each `value → target.col`,
             // an `EXCLUDED.x` ref mapped to the source's like-positioned output.
             for a in &i.on_conflict {
-                let target = ColumnTarget::Relation(ColumnReference {
-                    table: Some(i.target.clone()),
-                    name: a.target.clone(),
-                });
                 emit_edges(
                     conflict_value_origins(&a.value, &i.columns, src, &mut context),
-                    target,
+                    ColumnTarget::Relation(a.target.clone()),
                     &mut edges,
                 );
             }
@@ -69,13 +65,9 @@ pub(super) fn collect_column_lineage(
         // FROM derived table) traces through `input`.
         LogicalPlan::Update(u) => {
             for a in &u.assignments {
-                let target = ColumnTarget::Relation(ColumnReference {
-                    table: Some(u.target.clone()),
-                    name: a.target.clone(),
-                });
                 emit_edges(
                     origins_of_expr(&a.value, &u.input, &mut context),
-                    target,
+                    ColumnTarget::Relation(a.target.clone()),
                     &mut edges,
                 );
             }
@@ -112,7 +104,7 @@ pub(super) fn collect_column_lineage(
                     MergeClause::Update { assignments } => {
                         for a in assignments {
                             merge_value_edges(
-                                &a.target,
+                                &a.target.name,
                                 &a.value,
                                 &m.target,
                                 &m.source,

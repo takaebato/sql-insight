@@ -184,6 +184,18 @@ pub fn assert_column_ops(sql: &str, expected: ColumnOperation) {
     assert_nth_column_ops(sql, 0, expected);
 }
 
+/// Like `assert_column_ops` but parses with `dialect` — for dialect-specific
+/// syntax (e.g. a MySQL multi-table `UPDATE t1 JOIN t2 SET …`).
+pub fn assert_column_ops_with_dialect(dialect: &dyn Dialect, sql: &str, expected: ColumnOperation) {
+    let actual = extract_column_operations(dialect, sql)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no statement in result for SQL: {sql}"))
+        .unwrap();
+    assert_column_ops_inner(sql, 0, actual, expected);
+}
+
 /// Like `assert_column_ops` but for multi-statement batches —
 /// targets the statement at `index`. Compose multiple calls to
 /// pin down each statement in a batch independently.

@@ -8,7 +8,7 @@
 
 use sqlparser::ast::Ident;
 
-use crate::reference::{ResolutionKind, TableReference};
+use crate::reference::{ColumnReference, ResolutionKind, TableReference};
 
 // ===== the logical plan ==================================================
 
@@ -472,10 +472,14 @@ pub(crate) struct NamedExpr {
 }
 
 /// A `col = expr` assignment (UPDATE SET, MySQL INSERT … SET, ON CONFLICT
-/// DO UPDATE SET, MERGE UPDATE).
+/// DO UPDATE SET, MERGE UPDATE). `target` carries the *resolved* table it
+/// writes — the DML root for a single-table statement, or the relation a
+/// qualifier names in a multi-table `UPDATE t1 JOIN t2 SET t2.col = …` — so a
+/// write / lineage edge attributes to the right table rather than assuming the
+/// root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Assignment {
-    pub(crate) target: Ident,
+    pub(crate) target: ColumnReference,
     pub(crate) value: Expr,
 }
 

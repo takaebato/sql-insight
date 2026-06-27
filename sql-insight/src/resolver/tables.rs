@@ -29,21 +29,11 @@ pub(super) fn collect_writes(plan: &LogicalPlan) -> Vec<ColumnReference> {
         // writes on the same relation).
         LogicalPlan::Insert(i) => {
             let mut w = qualify(&i.columns, &i.target);
-            w.extend(i.on_conflict.iter().map(|a| ColumnReference {
-                table: Some(i.target.clone()),
-                name: a.target.clone(),
-            }));
+            w.extend(i.on_conflict.iter().map(|a| a.target.clone()));
             w
         }
-        // Each SET assignment writes its target column.
-        LogicalPlan::Update(u) => u
-            .assignments
-            .iter()
-            .map(|a| ColumnReference {
-                table: Some(u.target.clone()),
-                name: a.target.clone(),
-            })
-            .collect(),
+        // Each SET assignment writes its (already resolved) target column.
+        LogicalPlan::Update(u) => u.assignments.iter().map(|a| a.target.clone()).collect(),
         // CTAS / CREATE VIEW write the new relation's columns; ALTER TABLE
         // writes its column-naming operations' columns.
         LogicalPlan::CreateTableAs(c) => created_relation_writes(&c.columns, &c.input, &c.target),
@@ -83,13 +73,9 @@ pub(super) fn collect_writes(plan: &LogicalPlan) -> Vec<ColumnReference> {
 /// The columns one MERGE WHEN action writes, qualified by the target.
 fn merge_clause_writes(clause: &MergeClause, target: &TableReference) -> Vec<ColumnReference> {
     match clause {
-        MergeClause::Update { assignments } => assignments
-            .iter()
-            .map(|a| ColumnReference {
-                table: Some(target.clone()),
-                name: a.target.clone(),
-            })
-            .collect(),
+        MergeClause::Update { assignments } => {
+            assignments.iter().map(|a| a.target.clone()).collect()
+        }
         // Only columns paired with a value are written (a column-less / short
         // INSERT writes nothing; `zip` stops at the shorter side).
         MergeClause::Insert { columns, values } => columns

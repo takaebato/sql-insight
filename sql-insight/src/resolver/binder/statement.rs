@@ -274,16 +274,13 @@ impl<'a> Binder<'a> {
             // `OnInsert` is non-exhaustive; an unmodelled action is a no-op.
             _ => return (Vec::new(), Vec::new()),
         };
+        // A conflict-action SET always targets the insert target's own columns.
         let bound = assignments
             .iter()
-            .flat_map(|a| {
-                assignment_target_columns(&a.target)
-                    .into_iter()
-                    .map(move |column| (column, &a.value))
-            })
-            .map(|(column, value)| Assignment {
-                target: column,
-                value: self.bind_expr(value, &scope),
+            .filter_map(|a| {
+                let value = self.bind_expr(&a.value, &scope);
+                let target = self.assignment_target(&a.target, &scope, target)?;
+                Some(Assignment { target, value })
             })
             .collect();
         let predicate = selection
@@ -340,18 +337,16 @@ impl<'a> Binder<'a> {
                 predicate: vec![self.bind_expr(predicate, &scope)],
             });
         }
-        // SET assignments resolve against the target + FROM scope.
+        // SET assignments resolve against the target + FROM scope; each writes
+        // its resolved target table (the root, or the relation a qualifier names
+        // in a multi-table `UPDATE t1 JOIN t2 SET t2.col = …`).
         let assignments = update
             .assignments
             .iter()
-            .flat_map(|a| {
-                assignment_target_columns(&a.target)
-                    .into_iter()
-                    .map(move |column| (column, &a.value))
-            })
-            .map(|(column, value)| Assignment {
-                target: column,
-                value: self.bind_expr(value, &scope),
+            .filter_map(|a| {
+                let value = self.bind_expr(&a.value, &scope);
+                let target = self.assignment_target(&a.target, &scope, &target)?;
+                Some(Assignment { target, value })
             })
             .collect();
         // RETURNING resolves against the statement scope (target + FROM).
@@ -524,17 +519,15 @@ impl<'a> Binder<'a> {
                     {
                         on.push(self.bind_expr(predicate, &scope));
                     }
+                    // A MERGE WHEN UPDATE always targets the merge target's
+                    // own columns.
                     let assignments = update
                         .assignments
                         .iter()
-                        .flat_map(|a| {
-                            assignment_target_columns(&a.target)
-                                .into_iter()
-                                .map(move |column| (column, &a.value))
-                        })
-                        .map(|(column, value)| Assignment {
-                            target: column,
-                            value: self.bind_expr(value, &scope),
+                        .filter_map(|a| {
+                            let value = self.bind_expr(&a.value, &scope);
+                            let target = self.assignment_target(&a.target, &scope, &target)?;
+                            Some(Assignment { target, value })
                         })
                         .collect();
                     clauses.push(MergeClause::Update { assignments });
@@ -656,6 +649,68 @@ impl<'a> Binder<'a> {
             table: m.table,
             columns,
         })
+    }
+
+    /// Resolve a SET assignment's target to the column it writes, qualified by
+    /// its **resolved table**: an unqualified column writes the DML `root`; a
+    /// qualified `t2.col` (a multi-table `UPDATE t1 JOIN t2 SET t2.col = …`)
+    /// writes whichever in-scope real table the qualifier names. Returns `None`
+    /// — dropped (+ flagged by the caller) — for a tuple target (`SET (a,b)=…`,
+    /// not modelled) or a qualifier that names no writable table (a derived
+    /// table / CTE / unknown alias can't be a write target).
+    fn assignment_target(
+        &self,
+        target: &AssignmentTarget,
+        scope: &Scope,
+        root: &TableReference,
+    ) -> Option<crate::reference::ColumnReference> {
+        let AssignmentTarget::ColumnName(name) = target else {
+            return None; // tuple `SET (a, b) = …` — not modelled
+        };
+        let parts: Vec<Ident> = name
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident().cloned())
+            .collect();
+        let column = parts.last()?.clone();
+        let table = if parts.len() == 1 {
+            root.clone() // unqualified → the DML root target
+        } else {
+            let qualifier = &parts[..parts.len() - 1];
+            scope
+                .relations
+                .iter()
+                .find_map(|rel| self.writable_qualifier_table(rel, qualifier))?
+        };
+        Some(crate::reference::ColumnReference {
+            table: Some(table),
+            name: column,
+        })
+    }
+
+    /// The table a SET qualifier names, iff it's a *writable* relation — a real
+    /// table matched the way a column qualifier is (an aliased table by its
+    /// alias, a non-aliased one right-anchored). A derived table / CTE / table
+    /// function isn't writable, so it yields `None`.
+    fn writable_qualifier_table(
+        &self,
+        rel: &Relation,
+        qualifier: &[Ident],
+    ) -> Option<TableReference> {
+        match rel {
+            Relation::Table {
+                alias: Some(alias),
+                table,
+                ..
+            } => matches!(qualifier, [q] if self.eq(self.style.casing.table_alias, q, alias))
+                .then(|| table.clone()),
+            Relation::Table {
+                alias: None, table, ..
+            } => TableReference::try_from_parts(qualifier)
+                .filter(|q| self.qualifier_matches_table(q, table))
+                .map(|_| table.clone()),
+            Relation::Derived { .. } | Relation::TableFunction { .. } => None,
+        }
     }
 
     /// Bind a `RETURNING` clause's projected columns against `scope` — a value
