@@ -790,6 +790,23 @@ mod lineage {
     }
 
     #[test]
+    fn values_scalar_subquery_feeds_the_target() {
+        // A scalar subquery in a VALUES cell feeds the target like an
+        // `INSERT … SELECT` value: `s -> t`. (The VALUES source fed nothing
+        // before — it produced no lineage at all.)
+        assert_ops(
+            "INSERT INTO t (a) VALUES ((SELECT x FROM s))",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s")],
+                writes: vec![twrite("t")],
+                lineage: vec![edge("s", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn aggregate_source_feeds_lineage() {
         // The source projects an aggregate over a GROUP BY — feeding still
         // traces through the `Aggregate` to the scanned table.

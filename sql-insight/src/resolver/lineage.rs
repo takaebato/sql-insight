@@ -242,6 +242,24 @@ fn relation_lineage<'a>(
     context: &mut TraceContext<'a>,
     out: &mut Vec<ColumnLineageEdge>,
 ) {
+    // A VALUES source has no projection operand, so pair each row's value cells
+    // positionally with the target columns directly: a scalar subquery in a
+    // cell flows like an `INSERT … SELECT` value. Several rows each contribute,
+    // so a target column collects sources from every row (the leading `WITH` was
+    // already entered into `context` by the caller). Constant cells trace to no
+    // origin. Resolution-blind to row arity here — the arity check is separate.
+    if let LogicalPlan::Values(values) = input {
+        for row in &values.rows {
+            for (target_column, expr) in columns.iter().zip(row) {
+                emit_edges(
+                    origins_of_expr(expr, input, context),
+                    ColumnTarget::Relation(target_column.clone()),
+                    out,
+                );
+            }
+        }
+        return;
+    }
     for operand in output_operands(input) {
         let outputs = operand.outputs;
         operand.trace(context, |src_input, cx| {
@@ -591,8 +609,16 @@ fn feeding_scans<'a>(
                 feeding_scans(body, context, fed_ctes, out)
             });
         }
-        // A nested data-mover feeds through its source; DELETE / DROP / ALTER /
-        // VALUES move no row data into a feeding path.
+        // A VALUES source moves its row cells into the target: a value-position
+        // subquery in a cell feeds (a scalar `(SELECT … FROM s)`), mirroring the
+        // column-level relation lineage. Constant cells feed nothing.
+        LogicalPlan::Values(v) => {
+            for expr in v.rows.iter().flatten() {
+                expr_feeding(expr, context, fed_ctes, out);
+            }
+        }
+        // A nested data-mover feeds through its source; DELETE / DROP / ALTER
+        // move no row data into a feeding path.
         LogicalPlan::Insert(i) => feeding_scans(&i.input, context, fed_ctes, out),
         LogicalPlan::Update(u) => feeding_scans(&u.input, context, fed_ctes, out),
         LogicalPlan::CreateTableAs(c) => feeding_scans(&c.input, context, fed_ctes, out),
@@ -601,7 +627,6 @@ fn feeding_scans<'a>(
         LogicalPlan::Delete(_)
         | LogicalPlan::Drop(_)
         | LogicalPlan::AlterTable(_)
-        | LogicalPlan::Values(_)
         | LogicalPlan::Empty => {}
     }
 }
