@@ -61,9 +61,14 @@ pub(super) fn collect_table_reads(plan: &LogicalPlan) -> Vec<TableRead> {
         _ => {}
     });
     // A relation referenced by a column read but not itself scanned — the DML
-    // root, whose own data is consumed (the only non-`Scan` relation a base
-    // column can resolve to). Added once, its table-level resolution mirroring
-    // the column's.
+    // root (sink), whose own data is consumed (the only non-`Scan` relation a
+    // base column can resolve to). Added once, with the *table-level* catalog
+    // match as its resolution (mirroring its `TableWrite`), not the first hitting
+    // column's — a column's resolution reflects whether that *column* is
+    // cataloged (so it varies with which columns are referenced, and in which
+    // order), whereas the sink read should reflect whether the *table* is, like
+    // the write side.
+    let writes = super::tables::collect_table_writes(plan);
     for read in collect_reads(plan) {
         let Some(table) = &read.reference.table else {
             continue;
@@ -71,9 +76,14 @@ pub(super) fn collect_table_reads(plan: &LogicalPlan) -> Vec<TableRead> {
         if out.iter().any(|r| &r.reference == table) {
             continue;
         }
+        let resolution = writes
+            .iter()
+            .find(|w| &w.reference == table)
+            .map(|w| w.resolution)
+            .unwrap_or(read.resolution);
         out.push(TableRead {
             reference: table.clone(),
-            resolution: read.resolution,
+            resolution,
         });
     }
     out

@@ -1556,6 +1556,27 @@ mod catalog_resolution {
     }
 
     #[test]
+    fn dml_sink_read_resolution_is_table_level_not_operand_order() {
+        // The UPDATE sink's table read mirrors the *table*'s catalog match — like
+        // its write (Cataloged: `users` is registered) — not the first hitting
+        // column's resolution, which would otherwise flip with SET operand order
+        // (`id` is a cataloged column → Cataloged; `legacy_id` is not → Inferred).
+        let catalog = Catalog::from_ddl(
+            &GenericDialect {},
+            "CREATE TABLE public.users (id INT, name TEXT)",
+        )
+        .unwrap();
+        for sql in [
+            "UPDATE users SET name = id + users.legacy_id",
+            "UPDATE users SET name = users.legacy_id + id",
+        ] {
+            let ops = ops_with_catalog(sql, &catalog);
+            assert_eq!(ops.reads, vec![cataloged("users")], "reads — {sql}");
+            assert_eq!(ops.writes, vec![cataloged_write("users")], "writes — {sql}");
+        }
+    }
+
+    #[test]
     fn ambiguous_registration_marks_read_ambiguous() {
         // Bare `users` right-anchored-matches two registrations under
         // different schemas (no default schema to disambiguate) →
