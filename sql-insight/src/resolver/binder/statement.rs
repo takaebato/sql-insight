@@ -112,6 +112,13 @@ impl<'a> Binder<'a> {
             return LogicalPlan::Empty;
         };
         let m = self.table_match(&written);
+        // The target is a real table, never a CTE (you can't INSERT into a
+        // read-only CTE): a name that matches a declared CTE and isn't a catalog
+        // table is the CTE — flag and drop rather than fabricate a write.
+        if m.resolution != ResolutionKind::Cataloged && self.is_declared_cte(&written) {
+            self.record_unsupported_dml_target("INSERT", &written);
+            return LogicalPlan::Empty;
+        }
         let target = m.table;
         // MySQL `INSERT INTO t SET col = expr, …`: the assignment form (no
         // VALUES / SELECT source) — each assignment is a value column named by
@@ -348,13 +355,14 @@ impl<'a> Binder<'a> {
         let (target_factor, joins) = flatten_dml_target(&update.table);
         // The root's own resolution isn't needed here — each SET assignment
         // carries its write-target table's resolution (`assignment_target`).
+        let diagnostics_before = self.diagnostics.len();
         let Some((target_relation, target, _)) = self.target_relation(target_factor) else {
-            // A non-table target (derived table / subquery / table function)
-            // can't be a write target — flag it (like `bind_merge`) rather than
-            // dropping silently. A plain table that failed to resolve is already
-            // flagged by `table_ref` (e.g. too many qualifiers), so don't
-            // double-report it.
-            if !matches!(target_factor, TableFactor::Table { .. }) {
+            // A non-writable target (a CTE name, derived table, subquery, table
+            // function, or join) can't be a write target — flag it (like
+            // `bind_merge`) rather than dropping silently. A plain table that
+            // failed to resolve already flagged itself (e.g. `table_ref`'s too-
+            // many-qualifiers), so flag only when nothing was reported.
+            if self.diagnostics.len() == diagnostics_before {
                 self.record_unsupported_dml_target("UPDATE", target_factor);
             }
             return LogicalPlan::Empty;
@@ -513,12 +521,16 @@ impl<'a> Binder<'a> {
             self.record_unsupported_dml_target("MERGE", &merge.table);
             return LogicalPlan::Empty;
         }
+        let diagnostics_before = self.diagnostics.len();
         let Some((target_relation, target, target_resolution)) = self.target_relation(&merge.table)
         else {
-            // A non-table MERGE target (derived table / subquery / table
-            // function) can't be a write target — flag it rather than dropping
-            // the whole statement silently (best-effort drop + flag).
-            self.record_unsupported_dml_target("MERGE", &merge.table);
+            // A non-writable MERGE target (a CTE name, derived table, subquery,
+            // or table function) can't be a write target — flag it rather than
+            // dropping the whole statement silently. A name that flagged itself
+            // (e.g. too many qualifiers) isn't double-reported.
+            if self.diagnostics.len() == diagnostics_before {
+                self.record_unsupported_dml_target("MERGE", &merge.table);
+            }
             return LogicalPlan::Empty;
         };
         let mut scope = Scope::single(target_relation);
@@ -652,32 +664,92 @@ impl<'a> Binder<'a> {
         &mut self,
         factor: &TableFactor,
     ) -> Option<(Relation, TableReference, ResolutionKind)> {
-        // Reuse the table-factor binder for catalog matching / column
-        // knowledge; the target isn't read (it's named on the DML root), but
-        // the scan's `resolution` is the catalog match we keep for the write.
-        let (scan, scope) = self.bind_table_factor(factor, &[]);
-        let relation = scope.relations.into_iter().next()?;
-        match &relation {
-            Relation::Table { table, .. } => {
-                let resolution = match &scan {
-                    LogicalPlan::Scan(s) => s.resolution,
-                    _ => ResolutionKind::Inferred,
-                };
-                let target = table.clone();
-                Some((relation, target, resolution))
-            }
-            Relation::Derived { .. } | Relation::TableFunction { .. } => None,
+        // A DML target is a real table, never a CTE: a database resolves the
+        // target against the catalog, not the `WITH` list (a CTE is read-only —
+        // Postgres errors `relation "c" does not exist` for `WITH c … UPDATE c`,
+        // and updates the *base* table when one shares the CTE's name). So
+        // resolve a plain name CTE-blind via `bind_named_table` (which skips the
+        // `CteRef` shortcut `bind_table_factor` takes); a non-name factor
+        // (subquery / derived / join / table function) is never a writable
+        // table. Either way a non-table target returns `None` and the caller
+        // flags it.
+        let TableFactor::Table {
+            name,
+            alias,
+            args: None,
+            ..
+        } = factor
+        else {
+            return None;
+        };
+        // `table_ref` flags an over-qualified name (and returns `None`) itself.
+        let written = self.table_ref(name)?;
+        let m = self.table_match(&written);
+        // A name that matches a declared CTE and isn't a catalog table is the
+        // CTE, not a writable table — not a target.
+        if m.resolution != ResolutionKind::Cataloged && self.is_declared_cte(&written) {
+            return None;
         }
+        let alias_name = alias.as_ref().map(|a| a.name.clone());
+        let (scan, scope) = self.bind_named_table(&written, alias_name);
+        let relation = scope.relations.into_iter().next()?;
+        let Relation::Table { table, .. } = &relation else {
+            return None;
+        };
+        let resolution = match &scan {
+            LogicalPlan::Scan(s) => s.resolution,
+            _ => ResolutionKind::Inferred,
+        };
+        let target = table.clone();
+        Some((relation, target, resolution))
+    }
+
+    /// Whether a bare (single-segment) target name matches a CTE declared in
+    /// scope — used to reject a DML target that names a CTE (a CTE is read-only,
+    /// never a writable table). Mirrors the CTE lookup `bind_table_factor` does
+    /// for a FROM reference, but here it gates flagging, not resolution.
+    pub(super) fn is_declared_cte(&self, written: &TableReference) -> bool {
+        written.schema.is_none()
+            && written.catalog.is_none()
+            && self
+                .context
+                .ctes
+                .iter()
+                .any(|c| self.eq(self.style.casing.table_alias, &c.name, &written.name))
     }
 
     /// The plain-table deletion targets of a FROM `TableWithJoins` (its
     /// relation plus any joined relations), catalog-canonicalised.
-    pub(super) fn twj_table_targets(&self, twj: &TableWithJoins) -> Vec<TableWrite> {
-        std::iter::once(&twj.relation)
+    pub(super) fn twj_table_targets(&mut self, twj: &TableWithJoins) -> Vec<TableWrite> {
+        let writtens: Vec<TableReference> = std::iter::once(&twj.relation)
             .chain(twj.joins.iter().map(|join| &join.relation))
             .filter_map(|factor| TableReference::try_from(factor).ok())
-            .map(|written| self.table_write(&written))
+            .collect();
+        writtens
+            .into_iter()
+            .filter_map(|written| self.writable_target("DELETE", &written))
             .collect()
+    }
+
+    /// Resolve a DML target *name* to its real-table [`TableWrite`], or `None`
+    /// (recording a diagnostic) when the name is a declared CTE rather than a
+    /// writable base table. A catalog match wins (a base table sharing the CTE's
+    /// name is the real target); an uncatalogued name that is *not* a CTE stays
+    /// an `Inferred` table (the usual catalog-free best effort).
+    pub(super) fn writable_target(
+        &mut self,
+        statement: &str,
+        written: &TableReference,
+    ) -> Option<TableWrite> {
+        let m = self.table_match(written);
+        if m.resolution != ResolutionKind::Cataloged && self.is_declared_cte(written) {
+            self.record_unsupported_dml_target(statement, written);
+            return None;
+        }
+        Some(TableWrite {
+            reference: m.table,
+            resolution: m.resolution,
+        })
     }
 
     /// Resolve an explicit `DELETE` target name to its real table: a
@@ -690,10 +762,10 @@ impl<'a> Binder<'a> {
         scope: &Scope,
     ) -> Option<TableWrite> {
         let written = self.table_ref(name)?;
-        Some(
-            self.scope_target(&written, scope)
-                .unwrap_or_else(|| self.table_write(&written)),
-        )
+        if let Some(target) = self.scope_target(&written, scope) {
+            return Some(target);
+        }
+        self.writable_target("DELETE", &written)
     }
 
     /// If a `written` DELETE-target name matches an in-scope real-table

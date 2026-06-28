@@ -416,6 +416,27 @@ fn from_ddl_with_casing_aligns_the_catalog_with_a_casing_override() {
 }
 
 #[test]
+fn dml_target_resolves_to_the_base_table_not_a_shadowing_cte() {
+    // A DML target name is resolved against the catalog, never the WITH list: a
+    // base table sharing a CTE's name is the real (Cataloged) write target,
+    // mirroring Postgres (which updates the base table, ignoring the CTE; only a
+    // CTE-*only* name errors / is flagged).
+    let catalog = Catalog::from_ddl(&GenericDialect {}, "CREATE TABLE c (x INT)").unwrap();
+    let op = extract_column_operations_with_options(
+        &GenericDialect {},
+        "WITH c AS (SELECT 1 AS x) UPDATE c SET x = 1",
+        ExtractorOptions::new().with_catalog(&catalog),
+    )
+    .unwrap()
+    .remove(0)
+    .unwrap();
+    assert_eq!(op.diagnostics, vec![]);
+    assert_eq!(op.writes.len(), 1);
+    assert_eq!(op.writes[0].resolution, ResolutionKind::Cataloged);
+    assert_eq!(op.writes[0].reference.name.value, "x");
+}
+
+#[test]
 fn from_ddl_unquoted_registration_canonicalizes_the_surfaced_identity() {
     // The Cataloged read surfaces the catalog's stored (folded) identity, not
     // the query's written casing.
