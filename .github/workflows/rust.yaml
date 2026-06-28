@@ -99,32 +99,16 @@ jobs:
         # `--codecov` (vs `--lcov`) preserves region coverage on Codecov's UI;
         # `--lcov` collapses to line-only there.
         run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
-      # Push: secrets are available, upload directly.
+      # Upload straight from this job: it has the source tree checked out, which
+      # Codecov needs to path-fix the report — without it every file is dropped
+      # and the commit lands as "error" with 0% coverage.
+      #   push + same-repo PR: CODECOV_TOKEN is present -> authenticated upload.
+      #   fork PR: secrets are withheld, so the empty token makes codecov-action
+      #   fall back to tokenless upload (public repo; v4+ prefixes the branch).
       - name: Upload coverage reports to Codecov
-        if: github.event_name == 'push'
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6.0.2
         with:
           files: codecov.json
-          fail_ci_if_error: true
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          token: ${{ secrets.CODECOV_TOKEN }}
           slug: takaebato/sql-insight
-      # PR (incl. forks): no secrets here, so stash the report + PR id as an
-      # artifact for the Coverage report workflow to upload with the token.
-      - name: Save coverage metadata
-        if: github.event_name == 'pull_request'
-        run: |
-          {
-            echo "PR_NUMBER=${{ github.event.pull_request.number }}"
-            echo "PR_SHA=${{ github.event.pull_request.head.sha }}"
-          } > coverage-meta.env
-      - name: Upload coverage artifact
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
-        with:
-          name: coverage
-          path: |
-            codecov.json
-            coverage-meta.env
-          if-no-files-found: error
-          retention-days: 1
+          fail_ci_if_error: true
