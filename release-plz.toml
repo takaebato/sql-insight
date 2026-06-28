@@ -1,0 +1,111 @@
+# release-plz configuration.
+#
+# Versions are independent per crate (each bumps only on its own changes), but
+# the git tag and GitHub Release follow the *library* only: `sql-insight` owns a
+# single plain `vX.Y.Z` tag, matching the project's existing tag history. The CLI
+# publishes to crates.io and keeps its own changelog, but is not tagged or
+# GitHub-released here — crates.io is the record of its versions (the common
+# "flagship-crate tag" pattern). This is safe because release-plz baselines a
+# *published* crate on crates.io (its version + recorded commit), not on a git
+# tag, so the CLI's bump and changelog are computed correctly without a CLI tag.
+# A breaking library bump still cascades a small CLI bump (release-plz updates
+# the CLI's `sql-insight` dependency requirement).
+#
+# See https://release-plz.dev/docs/config for the full schema.
+
+[workspace]
+# Default for all crates: no git tag / GitHub Release. The library re-enables
+# both below, so only it is tagged + released.
+git_tag_enable = false
+git_release_enable = false
+
+[changelog]
+# Keep a Changelog format. `protect_breaking_commits` keeps breaking changes
+# visible even if a future skip rule would otherwise drop them.
+protect_breaking_commits = true
+
+# Changelog preamble. Kept in sync with the header already in each CHANGELOG.md
+# (Keep a Changelog 1.1.0) so release-plz strips and re-inserts it cleanly —
+# release-plz's built-in default links 1.0.0, so we override it here.
+header = '''
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+'''
+
+# Group order is set by the `<!-- N -->` sort prefixes (Tera sorts groups
+# alphabetically); the prefixes are hidden at render time by `striptags` in the
+# body below. Internal types are bucketed into "Other Changes" rather than
+# dropped, so their contributors still get credited. The trailing `.*` catches
+# anything unmatched so it never lands in an unnamed group; merge commits are
+# skipped first so they don't show up via that catch-all (relevant mainly for the
+# first run's backlog — squash-merged history has no merge commits).
+commit_parsers = [
+    { message = "^Merge ", skip = true },
+    { message = "^feat", group = "<!-- 0 -->Added" },
+    { message = "^revert", group = "<!-- 1 -->Changed" },
+    { message = "^deprecate", group = "<!-- 2 -->Deprecated" },
+    { message = "^fix", group = "<!-- 3 -->Fixed" },
+    { message = "^perf", group = "<!-- 4 -->Performance" },
+    { message = "^docs", group = "<!-- 5 -->Documentation" },
+    { message = "^refactor", group = "<!-- 6 -->Other Changes" },
+    { message = "^test", group = "<!-- 6 -->Other Changes" },
+    { message = "^ci", group = "<!-- 6 -->Other Changes" },
+    { message = "^build", group = "<!-- 6 -->Other Changes" },
+    { message = "^chore", group = "<!-- 6 -->Other Changes" },
+    { message = ".*", group = "<!-- 6 -->Other Changes" },
+]
+
+# Custom body: a top "Breaking Changes" section (every commit flagged
+# `commit.breaking`, via `!` or a BREAKING CHANGE footer), then the normal groups
+# with breaking commits excluded and empty groups skipped — so a breaking change
+# is listed once, at the top. `striptags` honors the `<!-- N -->` sort prefixes;
+# ` by @user in #PR` adds attribution (commit.remote.* is filled by release-plz's
+# GitHub integration in CI).
+body = '''
+
+## [{{ version }}]{%- if release_link -%}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% set breaking = commits | filter(attribute="breaking", value=true) -%}
+{% if breaking | length > 0 %}
+### ⚠️ Breaking Changes
+
+{% for commit in breaking %}
+{%- if commit.scope -%}
+- *({{ commit.scope }})* {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}{% if commit.remote.pr_number %} in #{{ commit.remote.pr_number }}{% endif %}
+{% else -%}
+- {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}{% if commit.remote.pr_number %} in #{{ commit.remote.pr_number }}{% endif %}
+{% endif -%}
+{% endfor -%}
+{% endif -%}
+{% for group, group_commits in commits | group_by(attribute="group") %}
+{%- set rest = group_commits | filter(attribute="breaking", value=false) -%}
+{% if rest | length > 0 %}
+### {{ group | striptags | trim | upper_first }}
+
+{% for commit in rest %}
+{%- if commit.scope -%}
+- *({{ commit.scope }})* {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}{% if commit.remote.pr_number %} in #{{ commit.remote.pr_number }}{% endif %}{%- if commit.links %} ({% for link in commit.links %}[{{ link.text }}]({{ link.href }}) {% endfor -%}){% endif %}
+{% else -%}
+- {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}{% if commit.remote.pr_number %} in #{{ commit.remote.pr_number }}{% endif %}
+{% endif -%}
+{% endfor -%}
+{% endif -%}
+{% endfor %}'''
+
+[[package]]
+name = "sql-insight"
+# The library owns the single plain `vX.Y.Z` tag + GitHub Release. Its changelog
+# lives at the default per-crate location (sql-insight/CHANGELOG.md), same as the
+# CLI's (sql-insight-cli/CHANGELOG.md).
+git_tag_enable = true
+git_release_enable = true
+git_tag_name = "v{{ version }}"
+
+# sql-insight-cli inherits the workspace defaults: it versions and publishes to
+# crates.io independently and keeps its own sql-insight-cli/CHANGELOG.md, but is
+# not tagged or GitHub-released (crates.io is the record of its versions).

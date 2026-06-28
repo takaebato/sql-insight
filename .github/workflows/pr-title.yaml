@@ -1,0 +1,75 @@
+name: PR Title
+
+# Enforce Conventional Commits on the PR title. With squash-merge configured to
+# use the PR title as the commit subject, this keeps `master` history clean and
+# machine-readable, which is what release-plz reads to compute version bumps and
+# the changelog.
+on:
+  pull_request_target:
+    types: [ opened, edited, reopened, synchronize ]
+
+# `write` is needed to post/update the validation comment. The job never checks
+# out PR code, so pull_request_target stays safe (no untrusted code runs); the
+# elevated token is what lets the comment work on PRs from forks too.
+permissions:
+  pull-requests: write
+
+jobs:
+  validate:
+    name: Validate PR title (Conventional Commits)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        id: lint_pr_title
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Allowed types. Scopes stay unrestricted (e.g. `feat(cli):`).
+          types: |
+            feat
+            fix
+            docs
+            refactor
+            perf
+            test
+            ci
+            build
+            chore
+            revert
+            deprecate
+          # A single-commit PR may be squashed using the commit message instead
+          # of the PR title, so validate that lone commit too.
+          validateSingleCommit: true
+
+      # On failure: post (or update) a sticky comment with the error. The lint
+      # step still fails the job, so the required check blocks merge; `always()`
+      # just lets this comment run despite that failure.
+      # NOTE: keep the "Allowed types" list below in sync with `types:` above.
+      - if: always() && (steps.lint_pr_title.outputs.error_message != null)
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
+        with:
+          header: pr-title-lint
+          message: |
+            ❌ **PR title doesn't follow the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) spec.**
+
+            Use `<type>(<optional scope>): <subject>`, with a trailing `!` for a breaking change (e.g. `feat!: …`).
+
+            Allowed types: `feat` `fix` `docs` `refactor` `perf` `test` `ci` `build` `chore` `revert` `deprecate`
+
+            <details><summary>Details</summary>
+
+            ```
+            ${{ steps.lint_pr_title.outputs.error_message }}
+            ```
+
+            </details>
+
+      # On success: update the same comment in place to show it's resolved.
+      # (Prefer `delete: true` over `message` here if you'd rather leave no
+      # comment on PRs whose title was valid from the start.)
+      - if: ${{ steps.lint_pr_title.outputs.error_message == null }}
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
+        with:
+          header: pr-title-lint
+          message: |
+            ✅ PR title follows the Conventional Commits spec.
