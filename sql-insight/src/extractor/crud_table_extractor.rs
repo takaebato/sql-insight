@@ -137,13 +137,20 @@ impl CrudTableExtractor {
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
     ) -> Result<CrudTables, Error> {
-        let (ops, merge_actions, insert_updates) =
+        let (ops, merge_actions, insert_updates, cte_crud) =
             TableOperationExtractor::extract_inner(statement, catalog, style)?;
         // CRUD buckets carry the same `ResolutionKind` as the table operation:
         // reads as `TableRead`, the create / update / delete buckets as
         // `TableWrite`.
         let reads = ops.reads;
-        let writes = ops.writes;
+        // With data-modifying CTEs the flat write list spans several roots with
+        // different verbs, so the outer-kind match below must bucket only the
+        // outer root's *own* writes; each CTE's writes are added afterwards by
+        // that CTE's verb. Without them, the flat list is the outer's writes.
+        let writes = match &cte_crud {
+            Some(c) => c.outer_writes.clone(),
+            None => ops.writes,
+        };
         let diagnostics = ops.diagnostics;
 
         let mut crud = CrudTables {
@@ -237,6 +244,15 @@ impl CrudTableExtractor {
                         resolution: w.resolution,
                     }));
             }
+        }
+
+        // Each data-modifying CTE's write target lands in its own verb's bucket
+        // (an INSERT CTE → create, DELETE → delete, UPDATE → update), regardless
+        // of the outer kind handled above.
+        if let Some(c) = cte_crud {
+            crud.create_tables.extend(c.create);
+            crud.update_tables.extend(c.update);
+            crud.delete_tables.extend(c.delete);
         }
 
         Ok(crud)

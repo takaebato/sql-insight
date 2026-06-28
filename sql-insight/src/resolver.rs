@@ -162,3 +162,84 @@ pub(crate) fn insert_updates_on_conflict(plan: &LogicalPlan) -> bool {
     use logical_plan::peel_with;
     matches!(peel_with(plan), LogicalPlan::Insert(i) if !i.on_conflict.is_empty())
 }
+
+/// Whether the statement carries a *data-modifying CTE* — a write root that
+/// isn't the outer root (`WITH c AS (INSERT … RETURNING …) SELECT … FROM c`).
+/// Such a statement classifies by its outer verb (often a read `SELECT`) yet
+/// still moves data, so the lineage gate must look past the outer kind.
+pub(crate) fn has_data_modifying_cte(plan: &LogicalPlan) -> bool {
+    use logical_plan::{dml_roots, peel_with};
+    let outer = peel_with(plan);
+    dml_roots(plan)
+        .iter()
+        .any(|root| !std::ptr::eq(*root, outer))
+}
+
+/// The CRUD-bucket contribution of a statement's *data-modifying CTEs* — each
+/// CTE body's write target placed in the bucket its own verb implies (INSERT →
+/// create, UPDATE → update, DELETE → delete), independent of the outer verb that
+/// `StatementKind` reports. `outer_writes` carries the outer root's *own* write
+/// targets so the CRUD extractor buckets them by the outer kind (not the flat
+/// union of all roots, which would mis-place the CTE writes). `None` when the
+/// statement has no data-modifying CTE — the flat write list is already correct.
+pub(crate) struct DataModifyingCteCrud {
+    pub(crate) create: Vec<TableWrite>,
+    pub(crate) update: Vec<TableWrite>,
+    pub(crate) delete: Vec<TableWrite>,
+    pub(crate) outer_writes: Vec<TableWrite>,
+}
+
+pub(crate) fn data_modifying_cte_crud(plan: &LogicalPlan) -> Option<DataModifyingCteCrud> {
+    use logical_plan::{dml_roots, peel_with};
+    let outer = peel_with(plan);
+    let roots = dml_roots(plan);
+    if roots.iter().all(|root| std::ptr::eq(*root, outer)) {
+        return None;
+    }
+    let mut crud = DataModifyingCteCrud {
+        create: Vec::new(),
+        update: Vec::new(),
+        delete: Vec::new(),
+        outer_writes: Vec::new(),
+    };
+    for root in roots {
+        let targets = tables::write_root_tables(root);
+        if std::ptr::eq(root, outer) {
+            crud.outer_writes = targets;
+            continue;
+        }
+        match root {
+            // An upsert CTE both inserts and updates, like the outer-root upsert.
+            LogicalPlan::Insert(i) => {
+                crud.create.extend(targets.iter().cloned());
+                if !i.on_conflict.is_empty() {
+                    crud.update.extend(targets);
+                }
+            }
+            LogicalPlan::Update(_) | LogicalPlan::AlterTable(_) => crud.update.extend(targets),
+            LogicalPlan::Delete(_) | LogicalPlan::Drop(_) => crud.delete.extend(targets),
+            LogicalPlan::CreateTableAs(_) | LogicalPlan::CreateView(_) => {
+                crud.create.extend(targets)
+            }
+            // A MERGE can't appear as a CTE body in practice; bucket its target
+            // conservatively as a write rather than dropping it.
+            LogicalPlan::Merge(_) => crud.create.extend(targets),
+            // Not a write root — contributes nothing. Listed so a new variant
+            // forces a bucket decision.
+            LogicalPlan::Scan(_)
+            | LogicalPlan::Filter(_)
+            | LogicalPlan::Join(_)
+            | LogicalPlan::Aggregate(_)
+            | LogicalPlan::Projection(_)
+            | LogicalPlan::Sort(_)
+            | LogicalPlan::SetOp(_)
+            | LogicalPlan::SubqueryAlias(_)
+            | LogicalPlan::TableFunction(_)
+            | LogicalPlan::With(_)
+            | LogicalPlan::CteRef(_)
+            | LogicalPlan::Values(_)
+            | LogicalPlan::Empty => {}
+        }
+    }
+    Some(crud)
+}

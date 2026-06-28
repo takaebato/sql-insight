@@ -203,13 +203,22 @@ impl TableOperationExtractor {
         statement: &Statement,
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
-    ) -> Result<(TableOperation, Option<MergeActions>, bool), Error> {
+    ) -> Result<
+        (
+            TableOperation,
+            Option<MergeActions>,
+            bool,
+            Option<crate::resolver::DataModifyingCteCrud>,
+        ),
+        Error,
+    > {
         let statement_kind = classify_statement(statement);
         if statement_kind == StatementKind::Unsupported {
             return Ok((
                 unsupported_table_operation(statement_kind, statement),
                 None,
                 false,
+                None,
             ));
         }
         let (plan, column_diagnostics) = crate::resolver::build(statement, catalog, style);
@@ -224,8 +233,12 @@ impl TableOperationExtractor {
         // target rows, so it moves no data even though the source is a
         // feeding input — read that off the IR-derived `MergeActions` rather
         // than re-walking the raw `Statement::Merge`.
-        let emits_lineage =
+        let outer_moves_data =
             writes_data(&statement_kind) && merge_actions.is_none_or(|a| a.writes_data());
+        // A data-modifying CTE (`WITH c AS (INSERT …) SELECT …`) moves data even
+        // though the statement classifies by its read outer verb, so it emits
+        // lineage independently of the outer kind / MERGE gate above.
+        let emits_lineage = outer_moves_data || crate::resolver::has_data_modifying_cte(&plan);
         let lineage = if emits_lineage {
             crate::resolver::table_lineage(&plan, style.casing)
         } else {
@@ -244,7 +257,8 @@ impl TableOperationExtractor {
                 .filter_map(|d| d.to_table_level())
                 .collect(),
         };
-        Ok((op, merge_actions, insert_updates))
+        let cte_crud = crate::resolver::data_modifying_cte_crud(&plan);
+        Ok((op, merge_actions, insert_updates, cte_crud))
     }
 }
 

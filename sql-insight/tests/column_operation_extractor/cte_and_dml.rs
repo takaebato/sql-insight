@@ -1092,3 +1092,83 @@ mod alter_table {
         );
     }
 }
+
+mod data_modifying_cte {
+    //! A data-modifying CTE (Postgres `WITH c AS (INSERT / UPDATE / DELETE …
+    //! [RETURNING …]) …`) is a write root *inside* the WITH, even when the outer
+    //! statement is a read `SELECT`. Its writes / lineage surface like a
+    //! top-level DML — previously the walkers peeled to the outer body and
+    //! dropped them, mis-reporting the statement as read-only.
+    //!
+    //! Known limit: tracing a value *through* such a CTE's `RETURNING` columns
+    //! is best-effort. The CTE's own data-flow (`source → target`) is captured,
+    //! but a consumer of its `RETURNING` (the outer query, or a later CTE that
+    //! reads it) follows the `CteRef` to the body's *input* scans rather than
+    //! its write target — so the outer output column stays `Unresolved`. The
+    //! writes / table-writes / CRUD effects are exact regardless.
+    use super::*;
+
+    #[test]
+    fn insert_cte_writes_and_flows_to_its_target() {
+        assert_column_ops(
+            "WITH c AS (INSERT INTO x (a) SELECT v FROM s) SELECT 1 AS one",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "v")],
+                writes: vec![write("x", "a")],
+                lineage: vec![passthrough(col("s", "v"), relation("x", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn update_cte_writes_and_flows_to_its_target() {
+        assert_column_ops(
+            "WITH c AS (UPDATE z SET a = b + 1) SELECT 1 AS one",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("z", "b")],
+                writes: vec![write("z", "a")],
+                lineage: vec![transformation(col("z", "b"), relation("z", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn delete_cte_reads_its_predicate_and_writes_no_columns() {
+        // DELETE removes whole rows: the predicate column is a read, but there
+        // are no column-level writes and no lineage.
+        assert_column_ops(
+            "WITH c AS (DELETE FROM y WHERE k = 1) SELECT 1 AS one",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("y", "k")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn multiple_data_modifying_ctes_each_surface() {
+        // Two sibling data-modifying CTEs both contribute their writes / lineage.
+        assert_column_ops(
+            "WITH a AS (INSERT INTO x (c1) SELECT v FROM s), \
+                  b AS (UPDATE z SET d = e + 1) \
+             SELECT 1 AS one",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "v"), read("z", "e")],
+                writes: vec![write("x", "c1"), write("z", "d")],
+                lineage: vec![
+                    passthrough(col("s", "v"), relation("x", "c1")),
+                    transformation(col("z", "e"), relation("z", "d")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+}

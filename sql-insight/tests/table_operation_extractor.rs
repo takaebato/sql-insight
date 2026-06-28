@@ -1768,3 +1768,82 @@ mod read_write_model {
         );
     }
 }
+
+mod data_modifying_cte {
+    //! A data-modifying CTE (Postgres `WITH c AS (INSERT / UPDATE / DELETE …) …`)
+    //! is a write root inside the WITH even when the outer statement is a read
+    //! `SELECT`: its write target and data-flow lineage surface like a top-level
+    //! DML, rather than being dropped with the statement mis-read as read-only.
+    use super::*;
+
+    #[test]
+    fn insert_cte_surfaces_write_and_lineage() {
+        assert_ops_with(
+            "WITH c AS (INSERT INTO x (a) SELECT v FROM s) SELECT 1 AS one",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s")],
+                writes: vec![twrite("x")],
+                lineage: vec![edge("s", "x")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn delete_cte_surfaces_write_target_without_lineage() {
+        assert_ops_with(
+            "WITH c AS (DELETE FROM y WHERE k = 1) SELECT 1 AS one",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("y")],
+                writes: vec![twrite("y")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn shared_cte_feeds_each_data_modifying_cte_target() {
+        // A plain CTE referenced by two data-modifying CTEs feeds *each* target
+        // once (per-target dedup keys on the body identity), so both edges
+        // appear.
+        assert_ops_with(
+            "WITH sh AS (SELECT v FROM src), \
+                  a AS (INSERT INTO x (c) SELECT v FROM sh), \
+                  b AS (INSERT INTO y (d) SELECT v FROM sh) \
+             SELECT 1 AS one",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("src")],
+                writes: vec![twrite("x"), twrite("y")],
+                lineage: vec![edge("src", "x"), edge("src", "y")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn delete_only_merge_outer_with_data_modifying_cte_keeps_only_cte_lineage() {
+        // A data-modifying CTE forces lineage past the kind gate; a delete-only
+        // MERGE outer must still self-suppress its (non-data-moving) source
+        // feed, so only the CTE's `src -> x` edge appears — not a spurious
+        // `u -> t` from a MERGE that moves no data.
+        assert_ops_with(
+            "WITH c AS (INSERT INTO x (a) SELECT v FROM src) \
+             MERGE INTO t USING u ON t.id = u.id WHEN MATCHED THEN DELETE",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![read("src"), read("t"), read("u")],
+                writes: vec![twrite("x"), twrite("t")],
+                lineage: vec![edge("src", "x")],
+                diagnostics: vec![],
+            },
+        );
+    }
+}

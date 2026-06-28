@@ -688,6 +688,69 @@ pub(super) fn peel_with(op: &LogicalPlan) -> &LogicalPlan {
     node
 }
 
+/// Every DML / DDL write **root** a statement carries: the peeled outer root,
+/// plus each *data-modifying* CTE body (`WITH c AS (INSERT … RETURNING …) …`) —
+/// recursively, so multiple sibling and nested data-modifying CTEs are all
+/// collected. A read-only body / CTE contributes nothing. Backs the write /
+/// CRUD / lineage walkers, since one statement can have more than one write
+/// root. (A data-modifying CTE nested inside another root's *source* query is
+/// not reached — only CTE declarations are descended, like the binder's shape.)
+pub(super) fn dml_roots(op: &LogicalPlan) -> Vec<&LogicalPlan> {
+    let mut out = Vec::new();
+    collect_dml_roots(op, &mut out);
+    out
+}
+
+/// Whether a node is a DML / DDL write root (the variants [`dml_roots`]
+/// collects) — used to tell a read-only outer body (which emits `QueryOutput`
+/// lineage) from a write root (which emits target lineage).
+pub(super) fn is_dml_root(op: &LogicalPlan) -> bool {
+    matches!(
+        op,
+        LogicalPlan::Insert(_)
+            | LogicalPlan::Update(_)
+            | LogicalPlan::Delete(_)
+            | LogicalPlan::Merge(_)
+            | LogicalPlan::CreateTableAs(_)
+            | LogicalPlan::CreateView(_)
+            | LogicalPlan::AlterTable(_)
+            | LogicalPlan::Drop(_)
+    )
+}
+
+fn collect_dml_roots<'a>(op: &'a LogicalPlan, out: &mut Vec<&'a LogicalPlan>) {
+    match op {
+        LogicalPlan::With(w) => {
+            for cte in &w.ctes {
+                collect_dml_roots(&cte.body, out);
+            }
+            collect_dml_roots(&w.body, out);
+        }
+        LogicalPlan::Insert(_)
+        | LogicalPlan::Update(_)
+        | LogicalPlan::Delete(_)
+        | LogicalPlan::Merge(_)
+        | LogicalPlan::CreateTableAs(_)
+        | LogicalPlan::CreateView(_)
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => out.push(op),
+        // Read-only / structural roots write nothing — listed explicitly so a
+        // new `LogicalPlan` variant forces a write-root decision here.
+        LogicalPlan::Scan(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Projection(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::SetOp(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::TableFunction(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty => {}
+    }
+}
+
 /// Pre-order walk of the structural tree — structural children, the sub-plans
 /// nested in this node's own expressions (a `WHERE … IN (SELECT …)` / scalar
 /// subquery), and on a `With` each declared CTE body — invoking `f` at every
