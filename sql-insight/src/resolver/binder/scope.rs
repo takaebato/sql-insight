@@ -143,14 +143,19 @@ impl Scope {
         let alias_columns: Vec<&Ident> = alias
             .map(|a| a.columns.iter().map(|c| &c.name).collect())
             .unwrap_or_default();
-        self.query_outputs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, o)| {
+        // An explicit column-alias list (`… AS d(x, y)`) declares the exposed
+        // columns by position; past it, the body's own output names apply. Drive
+        // by the longer of the two so the declared alias names survive even when
+        // the body exposes no names (a `SELECT *` whose outputs are unexpanded) —
+        // otherwise a reference to an aliased column would dangle as a phantom
+        // unresolved read instead of binding to this derived relation.
+        let len = alias_columns.len().max(self.query_outputs.len());
+        (0..len)
+            .filter_map(|i| {
                 alias_columns
                     .get(i)
                     .map(|n| (*n).clone())
-                    .or_else(|| o.name.clone())
+                    .or_else(|| self.query_outputs.get(i).and_then(|o| o.name.clone()))
             })
             .collect()
     }

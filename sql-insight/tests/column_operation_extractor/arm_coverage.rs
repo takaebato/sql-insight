@@ -888,6 +888,24 @@ mod relation_arm_coverage {
     }
 
     #[test]
+    fn alias_columns_over_wildcard_body_bind_to_the_derived_relation() {
+        // A derived table / CTE whose body is `SELECT *` but which declares its
+        // columns via an alias list: a reference to a declared column binds to
+        // the derived relation (a `Derived` column → dropped from reads), not a
+        // phantom unresolved read. The wildcard's incompleteness is flagged
+        // separately (`WildcardSuppressed`), and the alias list is authoritative
+        // — a column *not* in it stays unresolved.
+        assert_unordered_eq!(
+            reads("SELECT x.c1 FROM (SELECT * FROM t) x (c1)"),
+            Vec::new()
+        );
+        assert_unordered_eq!(
+            reads("WITH cte (c1) AS (SELECT * FROM t) SELECT c1 FROM cte"),
+            Vec::new()
+        );
+    }
+
+    #[test]
     fn pipe_union_branch_reads_surface() {
         // A `|> UNION ALL (subquery)` pipe: the branch query's reads surface
         // (modelled as a filter-position subquery) alongside the input's.
