@@ -443,6 +443,23 @@ mod insert_statement {
         })];
         assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
     }
+
+    #[test]
+    fn test_with_wrapped_insert_overwrite_keeps_the_delete_bucket() {
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        // `WITH … INSERT OVERWRITE …` parses as a Query-wrapped Insert, so the
+        // OVERWRITE flag must be read off the peeled insert, not the outer
+        // Query — otherwise the Delete bucket is lost.
+        let sql = "WITH s AS (SELECT a FROM src) INSERT OVERWRITE t1 SELECT a FROM s";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![cwrite(table("t1"))],
+            read_tables: vec![cread(table("src"))],
+            update_tables: vec![],
+            delete_tables: vec![cwrite(table("t1"))],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
+    }
 }
 
 mod update_statement {

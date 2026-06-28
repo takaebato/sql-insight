@@ -27,7 +27,7 @@ use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::extractor::{ExtractorOptions, StatementKind, TableOperationExtractor};
 use crate::reference::{TableRead, TableReference, TableWrite};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Insert, SetExpr, Statement};
 use sqlparser::dialect::Dialect;
 
 /// Parse `sql` under `dialect` and return one [`CrudTables`] per
@@ -168,8 +168,10 @@ impl CrudTableExtractor {
                 }
                 // `REPLACE INTO` / `INSERT OVERWRITE` delete the conflicting /
                 // existing rows of the target before inserting, so the target is
-                // also a delete (unlike an upsert, which updates in place).
-                if matches!(statement, Statement::Insert(i) if i.replace_into || i.overwrite) {
+                // also a delete (unlike an upsert, which updates in place). Peel
+                // a `WITH … INSERT OVERWRITE …` wrapper (parsed as a Query-
+                // wrapped Insert) so the flags are read off the real insert.
+                if peel_to_insert(statement).is_some_and(|i| i.replace_into || i.overwrite) {
                     crud.delete_tables = writes.clone();
                 }
                 crud.create_tables = writes;
@@ -256,5 +258,27 @@ impl CrudTableExtractor {
         }
 
         Ok(crud)
+    }
+}
+
+/// The underlying `INSERT` of a statement, peeling a `WITH` / parenthesis
+/// wrapper. `WITH … INSERT OVERWRITE …` parses as a `Query`-wrapped `Insert`
+/// (the verb rides `query.body`), so the REPLACE / OVERWRITE flags must be read
+/// off the real insert, not the outer `Statement::Query`. `None` for any
+/// non-INSERT statement.
+fn peel_to_insert(statement: &Statement) -> Option<&Insert> {
+    match statement {
+        Statement::Insert(insert) => Some(insert),
+        Statement::Query(query) => {
+            let mut body = query.body.as_ref();
+            loop {
+                match body {
+                    SetExpr::Insert(inner) => return peel_to_insert(inner),
+                    SetExpr::Query(inner) => body = inner.body.as_ref(),
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
     }
 }
