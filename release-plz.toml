@@ -24,6 +24,20 @@ git_release_enable = false
 # visible even if a future skip rule would otherwise drop them.
 protect_breaking_commits = true
 
+# Changelog preamble. Kept in sync with the header already in each CHANGELOG.md
+# (Keep a Changelog 1.1.0) so release-plz strips and re-inserts it cleanly —
+# release-plz's built-in default links 1.0.0, so we override it here.
+header = '''
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+'''
+
 # Group order is set by the `<!-- N -->` sort prefixes (Tera sorts groups
 # alphabetically); the prefixes are hidden at render time by `striptags` in the
 # body below. Internal types are bucketed into "Other Changes" rather than
