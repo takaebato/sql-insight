@@ -741,11 +741,21 @@ impl<'a> Binder<'a> {
         exprs
             .iter()
             .map(|ne| {
+                // An identity output re-reads a real base column (so a later
+                // clause-alias / pipe reference to it reads that column). Only a
+                // `Base` column qualifies: a `Derived` passthrough (a pipe-
+                // carried alias, a derived-table column) traces back through the
+                // projection chain, not to a base table — marking it identity
+                // would let a later stage fall through to the base relation and
+                // fabricate a phantom read.
                 let identity = match &ne.expr {
-                    Expr::Column(c) => ne
-                        .name
-                        .as_ref()
-                        .is_some_and(|n| self.eq(self.style.casing.column, n, &c.name)),
+                    Expr::Column(c) => {
+                        matches!(c.binding, Binding::Base { .. })
+                            && ne
+                                .name
+                                .as_ref()
+                                .is_some_and(|n| self.eq(self.style.casing.column, n, &c.name))
+                    }
                     _ => false,
                 };
                 OutputCol {
