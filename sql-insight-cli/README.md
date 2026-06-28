@@ -15,10 +15,12 @@ cargo install sql-insight-cli
 
 ## Commands
 
-- `format` — pretty-print SQL to a standardized layout (comments are not
-  preserved — the parser does not retain them in the AST).
+- `format` — re-emit SQL in a standardized layout: single-line by default,
+  or multi-line indented with `--pretty` (comments are not preserved — the
+  parser does not retain them in the AST).
 - `normalize` — abstract literals to placeholders (`--unify-in-list` /
-  `--unify-values` collapse repetitive shapes).
+  `--unify-values` collapse repetitive shapes; `--alphabetize-insert-columns`
+  sorts INSERT column lists, only with `--unify-values`).
 - `extract crud` — tables bucketed by Create / Read / Update / Delete.
 - `extract table-ops` — table-level reads / writes / lineage per statement.
 - `extract column-ops` — the same at column granularity, with lineage kinds.
@@ -43,6 +45,15 @@ guessing.
 $ sql-insight format "SELECT   *   FROM users   WHERE id = 1;"
 SELECT * FROM users WHERE id = 1
 
+$ sql-insight format --pretty "SELECT a, b FROM users WHERE id = 1"
+SELECT
+  a,
+  b
+FROM
+  users
+WHERE
+  id = 1
+
 $ sql-insight normalize "SELECT * FROM users WHERE id = 1"
 SELECT * FROM users WHERE id = ?
 
@@ -58,7 +69,10 @@ $ sql-insight extract column-ops "INSERT INTO users (name) SELECT LOWER(name) FR
 
 ## Options (extract commands)
 
-- `--dialect <name>` — parse under a specific dialect (default `generic`).
+`--dialect <name>` is available on **every** command (`format` / `normalize` /
+`extract`) — parse under a specific dialect (default `generic`). The options
+below are specific to `extract`:
+
 - `--format <text|json>` — `json` emits one array of per-statement results.
 - `--ddl-file <path>` — a DDL file (`CREATE TABLE`s) to resolve against;
   enables catalog-aware analysis (canonicalized identities, strict columns).

@@ -6,6 +6,7 @@ use sql_insight::extractor::{
     extract_table_operations_with_options, ColumnLineageKind, ColumnOperation, ColumnTarget,
     ExtractorOptions, TableOperation,
 };
+use sql_insight::formatter::FormatterOptions;
 use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::sqlparser::dialect::{self, Dialect};
 use sql_insight::{
@@ -25,19 +26,30 @@ fn get_dialect(dialect_name: Option<&str>) -> Result<Box<dyn dialect::Dialect>, 
 pub struct FormatExecutor {
     sql: String,
     dialect_name: Option<String>,
+    options: FormatterOptions,
 }
 
 impl FormatExecutor {
     pub fn new(sql: String, dialect_name: Option<String>) -> Self {
-        Self { sql, dialect_name }
+        Self {
+            sql,
+            dialect_name,
+            options: FormatterOptions::new(),
+        }
+    }
+
+    pub fn with_options(mut self, options: FormatterOptions) -> Self {
+        self.options = options;
+        self
     }
 }
 
 impl CliExecutable for FormatExecutor {
     fn execute(&self) -> Result<Vec<String>, Error> {
-        sql_insight::formatter::format(
+        sql_insight::formatter::format_with_options(
             get_dialect(self.dialect_name.as_deref())?.as_ref(),
             self.sql.as_ref(),
+            self.options.clone(),
         )
     }
 }

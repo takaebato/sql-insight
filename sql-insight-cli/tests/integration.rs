@@ -25,6 +25,20 @@ mod integration {
         }
 
         #[test]
+        fn test_format_pretty() {
+            // `--pretty` switches to sqlparser's multi-line alternate form
+            // (one item per line, indented), applied per statement.
+            sql_insight_cmd()
+                .arg("format")
+                .arg("--pretty")
+                .arg("select a, b from t1 where c = 1;")
+                .assert()
+                .success()
+                .stdout("SELECT\n  a,\n  b\nFROM\n  t1\nWHERE\n  c = 1\n")
+                .stderr("");
+        }
+
+        #[test]
         fn test_format_with_dialect() {
             sql_insight_cmd()
                 .arg("format")
