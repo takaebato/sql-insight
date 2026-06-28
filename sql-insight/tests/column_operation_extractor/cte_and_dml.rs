@@ -154,8 +154,10 @@ mod merge {
 
     #[test]
     fn merge_insert_arity_mismatch_is_flagged() {
-        // 3 target columns, 2 values: the surplus column is dropped (no value to
-        // pair with), flagged like a plain INSERT arity mismatch.
+        // 3 target columns, 2 values: every *named* target column is a write
+        // (`t.c` too — a named insert target is written regardless of value
+        // count, like a plain INSERT), flagged for the arity mismatch. Lineage
+        // only pairs the columns that have a value (`s.x → t.a`, `s.y → t.b`).
         assert_column_ops(
             "MERGE INTO t USING s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.x, s.y)",
@@ -167,7 +169,7 @@ mod merge {
                     read("s", "x"),
                     read("s", "y"),
                 ],
-                writes: vec![write("t", "a"), write("t", "b")],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "c")],
                 lineage: vec![
                     passthrough(col("s", "x"), relation("t", "a")),
                     passthrough(col("s", "y"), relation("t", "b")),

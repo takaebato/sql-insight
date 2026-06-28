@@ -81,13 +81,12 @@ fn merge_clause_writes(clause: &MergeClause) -> Vec<ColumnWrite> {
         MergeClause::Update { assignments } => {
             assignments.iter().map(|a| a.target.clone()).collect()
         }
-        // Only columns paired with a value are written (a column-less / short
-        // INSERT writes nothing; `zip` stops at the shorter side).
-        MergeClause::Insert { columns, values } => columns
-            .iter()
-            .zip(values)
-            .map(|(cw, _)| cw.clone())
-            .collect(),
+        // Every named target column is a write, regardless of how many values
+        // are supplied (an arity mismatch is flagged separately) — matching a
+        // plain INSERT. A column-less MERGE INSERT has no names here, so it
+        // writes nothing. (Lineage, which *pairs* a column with its value, zips
+        // to the shorter side on its own path.)
+        MergeClause::Insert { columns, .. } => columns.clone(),
         MergeClause::Delete => Vec::new(),
     }
 }
