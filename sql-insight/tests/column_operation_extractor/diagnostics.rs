@@ -51,6 +51,76 @@ mod reported {
         );
     }
 
+    /// A DML target *name* that matches a declared CTE is the CTE, not a
+    /// writable table — a CTE is read-only. A database resolves the target
+    /// against the catalog, not the WITH list (Postgres errors `relation "c"
+    /// does not exist`, and updates the *base* table when one shares the name).
+    /// Catalog-free, all four DML flag it and drop, consistently — neither
+    /// fabricating a write (INSERT used to surface `c.x`) nor dropping silently
+    /// (UPDATE / DELETE used to).
+    fn assert_cte_target_flagged(sql: &str, kind: StatementKind) {
+        assert_column_ops(
+            sql,
+            ColumnOperation {
+                statement_kind: kind,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_into_a_cte_name_reports_diagnostic() {
+        assert_cte_target_flagged(
+            "WITH c AS (SELECT 1 AS x) INSERT INTO c (x) VALUES (1)",
+            StatementKind::Insert,
+        );
+    }
+
+    #[test]
+    fn update_a_cte_name_reports_diagnostic() {
+        assert_cte_target_flagged(
+            "WITH c AS (SELECT 1 AS x) UPDATE c SET x = 1",
+            StatementKind::Update,
+        );
+    }
+
+    #[test]
+    fn delete_from_a_cte_name_reports_diagnostic() {
+        assert_cte_target_flagged(
+            "WITH c AS (SELECT 1 AS x) DELETE FROM c WHERE x = 1",
+            StatementKind::Delete,
+        );
+    }
+
+    #[test]
+    fn merge_into_a_cte_name_reports_diagnostic() {
+        assert_cte_target_flagged(
+            "WITH c AS (SELECT 1 AS x) MERGE INTO c USING s ON c.x = s.x \
+             WHEN MATCHED THEN UPDATE SET x = 1",
+            StatementKind::Merge,
+        );
+    }
+
+    #[test]
+    fn data_modifying_cte_survives_a_flagged_cte_target_update() {
+        // A *valid* data-modifying CTE (`d` inserts into `x`) and an *invalid*
+        // CTE-target UPDATE (`c` is read-only) compose: the real write is still
+        // surfaced, and only the bad target is flagged.
+        assert_column_ops(
+            "WITH d AS (INSERT INTO x (a) VALUES (1)), c AS (SELECT 1 AS y) UPDATE c SET y = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![write("x", "a")],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
     #[test]
     fn over_qualified_read_table_reports_diagnostic() {
         // A FROM table with more than `catalog.schema.name` segments can't

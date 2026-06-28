@@ -770,6 +770,43 @@ mod lineage {
     }
 
     #[test]
+    fn value_position_in_subquery_lhs_feeds_the_target() {
+        // The LHS of `… IN (…)` in *value* position feeds the target — even when
+        // it is a scalar subquery: `s2 -> dst` appears, matching the column edge
+        // `s2.y -> dst.f`. (Regression: the LHS used to be classified as a
+        // filter on the table side, dropping `s2 -> dst` and disagreeing with
+        // column lineage.) The RHS membership subquery `s` stays a filter — read
+        // but never a feeding source.
+        assert_ops(
+            "INSERT INTO dst (f) SELECT (SELECT y FROM s2) IN (SELECT x FROM s) FROM t",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s2"), read("s"), read("t")],
+                writes: vec![twrite("dst")],
+                lineage: vec![edge("s2", "dst"), edge("t", "dst")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn values_scalar_subquery_feeds_the_target() {
+        // A scalar subquery in a VALUES cell feeds the target like an
+        // `INSERT … SELECT` value: `s -> t`. (The VALUES source fed nothing
+        // before — it produced no lineage at all.)
+        assert_ops(
+            "INSERT INTO t (a) VALUES ((SELECT x FROM s))",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s")],
+                writes: vec![twrite("t")],
+                lineage: vec![edge("s", "t")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn aggregate_source_feeds_lineage() {
         // The source projects an aggregate over a GROUP BY — feeding still
         // traces through the `Aggregate` to the scanned table.
@@ -1519,6 +1556,27 @@ mod catalog_resolution {
     }
 
     #[test]
+    fn dml_sink_read_resolution_is_table_level_not_operand_order() {
+        // The UPDATE sink's table read mirrors the *table*'s catalog match — like
+        // its write (Cataloged: `users` is registered) — not the first hitting
+        // column's resolution, which would otherwise flip with SET operand order
+        // (`id` is a cataloged column → Cataloged; `legacy_id` is not → Inferred).
+        let catalog = Catalog::from_ddl(
+            &GenericDialect {},
+            "CREATE TABLE public.users (id INT, name TEXT)",
+        )
+        .unwrap();
+        for sql in [
+            "UPDATE users SET name = id + users.legacy_id",
+            "UPDATE users SET name = users.legacy_id + id",
+        ] {
+            let ops = ops_with_catalog(sql, &catalog);
+            assert_eq!(ops.reads, vec![cataloged("users")], "reads — {sql}");
+            assert_eq!(ops.writes, vec![cataloged_write("users")], "writes — {sql}");
+        }
+    }
+
+    #[test]
     fn ambiguous_registration_marks_read_ambiguous() {
         // Bare `users` right-anchored-matches two registrations under
         // different schemas (no default schema to disambiguate) →
@@ -1763,6 +1821,85 @@ mod read_write_model {
                 reads: vec![read("t")],
                 writes: vec![],
                 lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+}
+
+mod data_modifying_cte {
+    //! A data-modifying CTE (Postgres `WITH c AS (INSERT / UPDATE / DELETE …) …`)
+    //! is a write root inside the WITH even when the outer statement is a read
+    //! `SELECT`: its write target and data-flow lineage surface like a top-level
+    //! DML, rather than being dropped with the statement mis-read as read-only.
+    use super::*;
+
+    #[test]
+    fn insert_cte_surfaces_write_and_lineage() {
+        assert_ops_with(
+            "WITH c AS (INSERT INTO x (a) SELECT v FROM s) SELECT 1 AS one",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s")],
+                writes: vec![twrite("x")],
+                lineage: vec![edge("s", "x")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn delete_cte_surfaces_write_target_without_lineage() {
+        assert_ops_with(
+            "WITH c AS (DELETE FROM y WHERE k = 1) SELECT 1 AS one",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("y")],
+                writes: vec![twrite("y")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn shared_cte_feeds_each_data_modifying_cte_target() {
+        // A plain CTE referenced by two data-modifying CTEs feeds *each* target
+        // once (per-target dedup keys on the body identity), so both edges
+        // appear.
+        assert_ops_with(
+            "WITH sh AS (SELECT v FROM src), \
+                  a AS (INSERT INTO x (c) SELECT v FROM sh), \
+                  b AS (INSERT INTO y (d) SELECT v FROM sh) \
+             SELECT 1 AS one",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("src")],
+                writes: vec![twrite("x"), twrite("y")],
+                lineage: vec![edge("src", "x"), edge("src", "y")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn delete_only_merge_outer_with_data_modifying_cte_keeps_only_cte_lineage() {
+        // A data-modifying CTE forces lineage past the kind gate; a delete-only
+        // MERGE outer must still self-suppress its (non-data-moving) source
+        // feed, so only the CTE's `src -> x` edge appears — not a spurious
+        // `u -> t` from a MERGE that moves no data.
+        assert_ops_with(
+            "WITH c AS (INSERT INTO x (a) SELECT v FROM src) \
+             MERGE INTO t USING u ON t.id = u.id WHEN MATCHED THEN DELETE",
+            &PostgreSqlDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![read("src"), read("t"), read("u")],
+                writes: vec![twrite("x"), twrite("t")],
+                lineage: vec![edge("src", "x")],
                 diagnostics: vec![],
             },
         );

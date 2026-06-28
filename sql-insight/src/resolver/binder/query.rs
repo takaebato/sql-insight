@@ -569,7 +569,7 @@ impl<'a> Binder<'a> {
     /// known column list (a catalog-free table, an opaque table function)
     /// contributes nothing, so a catalog-free NATURAL join yields no merge
     /// columns (an unqualified reference stays ambiguous rather than fanning in).
-    fn natural_merge_columns(&self, left: &Scope, right: &Scope) -> Vec<Ident> {
+    pub(super) fn natural_merge_columns(&self, left: &Scope, right: &Scope) -> Vec<Ident> {
         let right_columns: Vec<&Ident> = right
             .relations
             .iter()

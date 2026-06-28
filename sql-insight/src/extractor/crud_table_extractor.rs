@@ -27,7 +27,7 @@ use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::extractor::{ExtractorOptions, StatementKind, TableOperationExtractor};
 use crate::reference::{TableRead, TableReference, TableWrite};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Insert, SetExpr, Statement};
 use sqlparser::dialect::Dialect;
 
 /// Parse `sql` under `dialect` and return one [`CrudTables`] per
@@ -137,13 +137,20 @@ impl CrudTableExtractor {
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
     ) -> Result<CrudTables, Error> {
-        let (ops, merge_actions, insert_updates) =
+        let (ops, merge_actions, insert_updates, cte_crud) =
             TableOperationExtractor::extract_inner(statement, catalog, style)?;
         // CRUD buckets carry the same `ResolutionKind` as the table operation:
         // reads as `TableRead`, the create / update / delete buckets as
         // `TableWrite`.
         let reads = ops.reads;
-        let writes = ops.writes;
+        // With data-modifying CTEs the flat write list spans several roots with
+        // different verbs, so the outer-kind match below must bucket only the
+        // outer root's *own* writes; each CTE's writes are added afterwards by
+        // that CTE's verb. Without them, the flat list is the outer's writes.
+        let writes = match &cte_crud {
+            Some(c) => c.outer_writes.clone(),
+            None => ops.writes,
+        };
         let diagnostics = ops.diagnostics;
 
         let mut crud = CrudTables {
@@ -161,8 +168,10 @@ impl CrudTableExtractor {
                 }
                 // `REPLACE INTO` / `INSERT OVERWRITE` delete the conflicting /
                 // existing rows of the target before inserting, so the target is
-                // also a delete (unlike an upsert, which updates in place).
-                if matches!(statement, Statement::Insert(i) if i.replace_into || i.overwrite) {
+                // also a delete (unlike an upsert, which updates in place). Peel
+                // a `WITH … INSERT OVERWRITE …` wrapper (parsed as a Query-
+                // wrapped Insert) so the flags are read off the real insert.
+                if peel_to_insert(statement).is_some_and(|i| i.replace_into || i.overwrite) {
                     crud.delete_tables = writes.clone();
                 }
                 crud.create_tables = writes;
@@ -239,6 +248,37 @@ impl CrudTableExtractor {
             }
         }
 
+        // Each data-modifying CTE's write target lands in its own verb's bucket
+        // (an INSERT CTE → create, DELETE → delete, UPDATE → update), regardless
+        // of the outer kind handled above.
+        if let Some(c) = cte_crud {
+            crud.create_tables.extend(c.create);
+            crud.update_tables.extend(c.update);
+            crud.delete_tables.extend(c.delete);
+        }
+
         Ok(crud)
+    }
+}
+
+/// The underlying `INSERT` of a statement, peeling a `WITH` / parenthesis
+/// wrapper. `WITH … INSERT OVERWRITE …` parses as a `Query`-wrapped `Insert`
+/// (the verb rides `query.body`), so the REPLACE / OVERWRITE flags must be read
+/// off the real insert, not the outer `Statement::Query`. `None` for any
+/// non-INSERT statement.
+fn peel_to_insert(statement: &Statement) -> Option<&Insert> {
+    match statement {
+        Statement::Insert(insert) => Some(insert),
+        Statement::Query(query) => {
+            let mut body = query.body.as_ref();
+            loop {
+                match body {
+                    SetExpr::Insert(inner) => return peel_to_insert(inner),
+                    SetExpr::Query(inner) => body = inner.body.as_ref(),
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
     }
 }

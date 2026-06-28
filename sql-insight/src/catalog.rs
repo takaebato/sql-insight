@@ -141,7 +141,20 @@ impl Catalog {
             if create.columns.is_empty() {
                 continue;
             }
-            let parts: Vec<&Ident> = create.name.0.iter().filter_map(|p| p.as_ident()).collect();
+            // Every name segment must be a plain identifier. A non-identifier
+            // segment (e.g. Snowflake `IDENTIFIER('t')`) makes the table's
+            // identity unrepresentable — skip the whole CREATE rather than
+            // dropping the segment and registering a mis-segmented phantom (an
+            // `s.IDENTIFIER('t')` would otherwise register as table `s`).
+            let Some(parts) = create
+                .name
+                .0
+                .iter()
+                .map(|p| p.as_ident())
+                .collect::<Option<Vec<&Ident>>>()
+            else {
+                continue;
+            };
             let name = |id: &Ident| casing.table.normalize(id);
             let table = match parts.as_slice() {
                 [n] => CatalogTable::unqualified(name(n)),

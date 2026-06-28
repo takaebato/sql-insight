@@ -371,6 +371,32 @@ mod integration {
         }
 
         #[test]
+        fn test_ddl_file_catalog_uses_the_casing_override() {
+            // The `--ddl-file` catalog is built with the same `--casing` override
+            // as the extraction, so a lookup still matches. Under `--casing
+            // upper`, the registered table folds to `USERS` and the read is
+            // `(cataloged)` — without the override applied to the catalog, the
+            // dialect-default stored name wouldn't fold to the overridden query's
+            // and the lookup would silently miss.
+            let mut schema = NamedTempFile::new().unwrap();
+            schema.write_all(b"CREATE TABLE users (id INT);").unwrap();
+            sql_insight_cmd()
+                .arg("extract")
+                .arg("column-ops")
+                .arg("--casing")
+                .arg("upper")
+                .arg("--ddl-file")
+                .arg(schema.path())
+                .arg("SELECT id FROM users")
+                .assert()
+                .success()
+                .stdout(
+                    "[1] Select\n  reads:   \"USERS\".id (cataloged)\n  lineage: \"USERS\".id (cataloged) -> id\n",
+                )
+                .stderr("");
+        }
+
+        #[test]
         fn test_write_target_shows_catalog_resolution() {
             // A DML write target carries the catalog match too: the registered
             // `users` insert target prints `(cataloged)`, like a read would.

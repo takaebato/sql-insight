@@ -154,8 +154,12 @@ impl CliExecutable for ExtractExecutor {
     fn execute(&self) -> Result<Vec<String>, Error> {
         let dialect = get_dialect(self.dialect_name.as_deref())?;
         let dialect = dialect.as_ref();
-        let catalog = self.load_catalog(dialect)?;
+        // Resolve the casing override first: the catalog must be built with the
+        // same casing the extraction uses, or a `--casing` override silently
+        // breaks every catalog lookup (the stored identity wouldn't match what a
+        // query reference folds to).
         let casing = self.casing.resolve(dialect);
+        let catalog = self.load_catalog(dialect, casing)?;
 
         let mut options = ExtractorOptions::new();
         if let Some(catalog) = &catalog {
@@ -198,13 +202,21 @@ impl ExtractExecutor {
     /// — defaults alone still build a (table-less) catalog, so a bare ref
     /// qualifies to `--default-schema` even without a DDL file. Unqualified
     /// DDL tables register schema-less (no fabricated schema).
-    fn load_catalog(&self, dialect: &dyn Dialect) -> Result<Option<Catalog>, Error> {
+    fn load_catalog(
+        &self,
+        dialect: &dyn Dialect,
+        casing: Option<IdentifierCasing>,
+    ) -> Result<Option<Catalog>, Error> {
         if self.ddl_file.is_none()
             && self.default_schema.is_none()
             && self.default_catalog.is_none()
         {
             return Ok(None);
         }
+        // Register identifiers with the same casing the extraction uses (the
+        // `--casing` override, else the dialect default) so the catalog's
+        // canonical form matches what a query reference folds to.
+        let casing = casing.unwrap_or_else(|| IdentifierCasing::for_dialect(dialect));
         let mut catalog = match &self.ddl_file {
             Some(path) => {
                 let ddl = std::fs::read_to_string(path).map_err(|e| {
@@ -213,7 +225,7 @@ impl ExtractExecutor {
                 // Prefix the DDL-file context so a parse error in the catalog
                 // file isn't mistaken for one in the analysed query (whose own
                 // errors surface per-statement, unprefixed).
-                Catalog::from_ddl(dialect, &ddl).map_err(|e| {
+                Catalog::from_ddl_with_casing(dialect, &ddl, casing).map_err(|e| {
                     Error::ArgumentError(format!("Failed to parse DDL file {path}: {e}"))
                 })?
             }

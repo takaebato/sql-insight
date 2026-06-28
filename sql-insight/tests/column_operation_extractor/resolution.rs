@@ -57,10 +57,6 @@ mod catalog_strict {
         }
     }
 
-    fn relation(table_name: &str, col: &str) -> ColumnTarget {
-        ColumnTarget::Relation(write(table_name, col))
-    }
-
     // Canonical (`public`) table, but a column the catalog *doesn't* list — so
     // the column resolves `Inferred` even though the table is registered.
     fn write_inferred(table_name: &str, col: &str) -> ColumnWrite {
@@ -71,6 +67,24 @@ mod catalog_strict {
             },
             resolution: ResolutionKind::Inferred,
         }
+    }
+
+    // A column-less INSERT fills its column list from the catalog, so the written
+    // column surfaces in the catalog's canonical (quoted) form — like the table
+    // — not as a plain identifier, so a later reference to the same column
+    // matches and dedups.
+    fn filled_write(table_name: &str, col: &str) -> ColumnWrite {
+        ColumnWrite {
+            reference: ColumnReference {
+                table: Some(cataloged_table(table_name)),
+                name: Ident::with_quote('"', col),
+            },
+            resolution: ResolutionKind::Cataloged,
+        }
+    }
+
+    fn filled_relation(table_name: &str, col: &str) -> ColumnTarget {
+        ColumnTarget::Relation(filled_write(table_name, col))
     }
 
     fn relation_inferred(table_name: &str, col: &str) -> ColumnTarget {
@@ -195,10 +209,10 @@ mod catalog_strict {
             ColumnOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s", "a"), read("s", "b")],
-                writes: vec![write("t", "x"), write("t", "y")],
+                writes: vec![filled_write("t", "x"), filled_write("t", "y")],
                 lineage: vec![
-                    passthrough(col("s", "a"), relation("t", "x")),
-                    passthrough(col("s", "b"), relation("t", "y")),
+                    passthrough(col("s", "a"), filled_relation("t", "x")),
+                    passthrough(col("s", "b"), filled_relation("t", "y")),
                 ],
                 diagnostics: vec![],
             },
@@ -216,10 +230,10 @@ mod catalog_strict {
             ColumnOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("s", "a"), read("s", "b"), read("s", "c")],
-                writes: vec![write("t", "x"), write("t", "y")],
+                writes: vec![filled_write("t", "x"), filled_write("t", "y")],
                 lineage: vec![
-                    passthrough(col("s", "a"), relation("t", "x")),
-                    passthrough(col("s", "b"), relation("t", "y")),
+                    passthrough(col("s", "a"), filled_relation("t", "x")),
+                    passthrough(col("s", "b"), filled_relation("t", "y")),
                 ],
                 diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsArityMismatch)],
             },
@@ -333,10 +347,10 @@ mod catalog_strict {
                     read("s", "id"),
                     read("s", "a"),
                 ],
-                writes: vec![write("t", "id"), write("t", "a")],
+                writes: vec![filled_write("t", "id"), filled_write("t", "a")],
                 lineage: vec![
-                    passthrough(col("s", "id"), relation("t", "id")),
-                    passthrough(col("s", "a"), relation("t", "a")),
+                    passthrough(col("s", "id"), filled_relation("t", "id")),
+                    passthrough(col("s", "a"), filled_relation("t", "a")),
                 ],
                 diagnostics: vec![],
             },

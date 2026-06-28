@@ -237,11 +237,15 @@ impl<'a> Binder<'a> {
     /// statement then binds to nothing, so an `UnsupportedStatement` (it
     /// projects to the table level) signals the empty surfaces are a coverage
     /// gap, not "nothing there". `message` shows the offending target.
-    pub(super) fn record_unsupported_dml_target(&mut self, statement: &str, factor: &TableFactor) {
+    pub(super) fn record_unsupported_dml_target(
+        &mut self,
+        statement: &str,
+        target: &dyn std::fmt::Display,
+    ) {
         self.diagnostics.push(ColumnLevelDiagnostic {
             kind: ColumnLevelDiagnosticKind::UnsupportedStatement,
             message: format!(
-                "{statement} target `{factor}` is not a plain table (a derived table / subquery / table function) — the statement can't be analyzed and is dropped"
+                "{statement} target `{target}` is not a writable base table (a CTE name, derived table, subquery, table function, or join) — the statement can't be analyzed and is dropped"
             ),
             span: None,
         });

@@ -67,6 +67,63 @@ mod projections {
     }
 
     #[test]
+    fn in_subquery_scalar_lhs_flows_to_the_target() {
+        // The LHS of `… IN (…)` in value position is a value source even when it
+        // is itself a scalar subquery: `s2.y` flows to the target `dst.f`. The
+        // membership subquery `s` stays a filter. (The table-lineage side used
+        // to classify the LHS as a filter, dropping `s2 -> dst` and
+        // contradicting this column edge — pinned together in the table-op
+        // suite.)
+        assert_column_ops(
+            "INSERT INTO dst (f) SELECT (SELECT y FROM s2) IN (SELECT x FROM s) FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s2", "y"), read("s", "x")],
+                writes: vec![write("dst", "f")],
+                lineage: vec![transformation(col("s2", "y"), relation("dst", "f"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn values_scalar_subquery_flows_to_the_target() {
+        // A scalar subquery in a VALUES cell is a value source for its column,
+        // exactly like the equivalent `INSERT … SELECT` (previously dropped —
+        // the VALUES source produced no lineage).
+        assert_column_ops(
+            "INSERT INTO t (a) VALUES ((SELECT x FROM s))",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "x")],
+                writes: vec![write("t", "a")],
+                lineage: vec![transformation(col("s", "x"), relation("t", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn multi_row_values_pair_each_row_with_the_target_columns() {
+        // Each row's cells pair positionally with the columns; a column collects
+        // sources from every row (col `a` ← row 2's `s2.y`, col `b` ← row 1's
+        // `s.x`). Constant cells trace to no source.
+        assert_column_ops(
+            "INSERT INTO t (a, b) VALUES (1, (SELECT x FROM s)), ((SELECT y FROM s2), 2)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "x"), read("s2", "y")],
+                writes: vec![write("t", "a"), write("t", "b")],
+                lineage: vec![
+                    transformation(col("s", "x"), relation("t", "b")),
+                    transformation(col("s2", "y"), relation("t", "a")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn select_mixed_projection_separates_targets_by_position() {
         assert_column_ops(
             "SELECT a, a + b FROM t1",

@@ -9,17 +9,26 @@
 
 use sqlparser::ast::Ident;
 
-use super::logical_plan::{peel_with, LogicalPlan, MergeClause};
+use super::logical_plan::{dml_roots, LogicalPlan, MergeClause};
 use super::origins::output_operands;
 use crate::reference::{ColumnReference, ColumnWrite, ResolutionKind, TableReference, TableWrite};
 
 // ===== writes ============================================================
 
-/// Every column the statement writes — a DML root's target columns, qualified
-/// by the write target. Order follows source order (the public contract). A
-/// leading `WITH` is peeled. Backs [`crate::resolver::writes`].
+/// Every column the statement writes — each DML root's target columns,
+/// qualified by the write target. Order follows source order (the public
+/// contract). Collects from the peeled outer root *and* every data-modifying
+/// CTE body (`WITH c AS (INSERT …) …`). Backs [`crate::resolver::writes`].
 pub(super) fn collect_writes(plan: &LogicalPlan) -> Vec<ColumnWrite> {
-    match peel_with(plan) {
+    dml_roots(plan)
+        .into_iter()
+        .flat_map(write_root_columns)
+        .collect()
+}
+
+/// The columns one DML / DDL write root targets.
+fn write_root_columns(root: &LogicalPlan) -> Vec<ColumnWrite> {
+    match root {
         // INSERT columns (already catalog-resolved), then any ON CONFLICT DO
         // UPDATE SET targets (extra writes on the same relation).
         LogicalPlan::Insert(i) => {
@@ -72,21 +81,29 @@ fn merge_clause_writes(clause: &MergeClause) -> Vec<ColumnWrite> {
         MergeClause::Update { assignments } => {
             assignments.iter().map(|a| a.target.clone()).collect()
         }
-        // Only columns paired with a value are written (a column-less / short
-        // INSERT writes nothing; `zip` stops at the shorter side).
-        MergeClause::Insert { columns, values } => columns
-            .iter()
-            .zip(values)
-            .map(|(cw, _)| cw.clone())
-            .collect(),
+        // Every named target column is a write, regardless of how many values
+        // are supplied (an arity mismatch is flagged separately) — matching a
+        // plain INSERT. A column-less MERGE INSERT has no names here, so it
+        // writes nothing. (Lineage, which *pairs* a column with its value, zips
+        // to the shorter side on its own path.)
+        MergeClause::Insert { columns, .. } => columns.clone(),
         MergeClause::Delete => Vec::new(),
     }
 }
 
-/// Every table the statement writes to — one per DML target. A leading `WITH`
-/// is peeled. Backs [`crate::resolver::table_writes`].
+/// Every table the statement writes to — one per DML target, across the peeled
+/// outer root and every data-modifying CTE body. Backs
+/// [`crate::resolver::table_writes`].
 pub(super) fn collect_table_writes(plan: &LogicalPlan) -> Vec<TableWrite> {
-    match peel_with(plan) {
+    dml_roots(plan)
+        .into_iter()
+        .flat_map(write_root_tables)
+        .collect()
+}
+
+/// The table(s) one DML / DDL write root targets.
+pub(super) fn write_root_tables(root: &LogicalPlan) -> Vec<TableWrite> {
+    match root {
         LogicalPlan::Insert(i) => vec![i.target.clone()],
         // The distinct tables the SET assignments write — the root for a
         // single-table UPDATE, but each qualified relation for a multi-table

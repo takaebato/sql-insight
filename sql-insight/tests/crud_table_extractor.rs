@@ -443,6 +443,23 @@ mod insert_statement {
         })];
         assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
     }
+
+    #[test]
+    fn test_with_wrapped_insert_overwrite_keeps_the_delete_bucket() {
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        // `WITH … INSERT OVERWRITE …` parses as a Query-wrapped Insert, so the
+        // OVERWRITE flag must be read off the peeled insert, not the outer
+        // Query — otherwise the Delete bucket is lost.
+        let sql = "WITH s AS (SELECT a FROM src) INSERT OVERWRITE t1 SELECT a FROM s";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![cwrite(table("t1"))],
+            read_tables: vec![cread(table("src"))],
+            update_tables: vec![],
+            delete_tables: vec![cwrite(table("t1"))],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(GenericDialect {})]);
+    }
 }
 
 mod update_statement {
@@ -758,5 +775,90 @@ mod ddl {
                 diagnostics: vec![],
             })]
         );
+    }
+}
+
+mod data_modifying_cte {
+    //! A data-modifying CTE (Postgres `WITH c AS (INSERT / UPDATE / DELETE …) …`)
+    //! is a write root inside the WITH. The statement classifies by its outer
+    //! verb (here a read `SELECT`), but each CTE's target is bucketed by *that
+    //! CTE's* verb — INSERT → Create, UPDATE → Update, DELETE → Delete — not
+    //! folded into the outer kind.
+    use super::*;
+    use sql_insight::sqlparser::dialect::PostgreSqlDialect;
+
+    fn pg() -> Vec<Box<dyn Dialect>> {
+        vec![Box::new(PostgreSqlDialect {})]
+    }
+
+    #[test]
+    fn insert_cte_buckets_target_as_create() {
+        let sql = "WITH c AS (INSERT INTO x (a) SELECT v FROM s) SELECT 1 AS one";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![cwrite(table("x"))],
+            read_tables: vec![cread(table("s"))],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, pg());
+    }
+
+    #[test]
+    fn delete_cte_buckets_target_as_delete() {
+        let sql = "WITH c AS (DELETE FROM y WHERE k = 1) SELECT 1 AS one";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![cread(table("y"))],
+            update_tables: vec![],
+            delete_tables: vec![cwrite(table("y"))],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, pg());
+    }
+
+    #[test]
+    fn update_cte_buckets_target_as_update() {
+        let sql = "WITH c AS (UPDATE z SET a = b + 1) SELECT 1 AS one";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![cread(table("z"))],
+            update_tables: vec![cwrite(table("z"))],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, pg());
+    }
+
+    #[test]
+    fn sibling_inserts_into_same_target_surface_per_occurrence() {
+        // Two data-modifying CTEs writing the same table each contribute a
+        // create occurrence (occurrence-based, like reads) — not deduped.
+        let sql = "WITH a AS (INSERT INTO x (c) SELECT v FROM s1), \
+                        b AS (INSERT INTO x (d) SELECT v FROM s2) \
+                   SELECT 1 AS one";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![cwrite(table("x")), cwrite(table("x"))],
+            read_tables: vec![cread(table("s1")), cread(table("s2"))],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, pg());
+    }
+
+    #[test]
+    fn sibling_data_modifying_ctes_bucket_by_their_own_verbs() {
+        let sql = "WITH a AS (INSERT INTO x (c1) SELECT v FROM s), \
+                        b AS (UPDATE z SET d = e + 1) \
+                   SELECT 1 AS one";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![cwrite(table("x"))],
+            read_tables: vec![cread(table("s")), cread(table("z"))],
+            update_tables: vec![cwrite(table("z"))],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, pg());
     }
 }

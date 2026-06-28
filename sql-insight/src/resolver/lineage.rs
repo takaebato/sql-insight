@@ -11,7 +11,9 @@
 
 use sqlparser::ast::Ident;
 
-use super::logical_plan::{peel_with, Expr, LogicalPlan, MergeClause, NamedExpr, Update};
+use super::logical_plan::{
+    dml_roots, is_dml_root, peel_with, Expr, LogicalPlan, MergeClause, NamedExpr, Update,
+};
 use super::origins::{
     conflict_value_origins, enter_withs, origins_of_expr, output_operands, TraceContext,
 };
@@ -36,31 +38,61 @@ pub(super) fn collect_column_lineage(
 ) -> Vec<ColumnLineageEdge> {
     let mut context = TraceContext::new(plan, casing);
     let mut edges = Vec::new();
-    match peel_with(plan) {
+    // Each DML root — the outer root and every data-modifying CTE body
+    // (`WITH c AS (INSERT … RETURNING …) …`) — pairs its source with its write
+    // target (`Relation` edges). Only the outer root's RETURNING is a statement
+    // output (`QueryOutput`); a CTE body's RETURNING feeds the CTE, consumed by
+    // the outer query, so it is not emitted as a statement output.
+    let outer = peel_with(plan);
+    for root in dml_roots(plan) {
+        dml_relation_lineage(root, std::ptr::eq(root, outer), &mut context, &mut edges);
+    }
+    // A read-only outer body additionally emits its `QueryOutput` edges (a DML
+    // outer root's outputs are its target columns, already handled above).
+    if !is_dml_root(outer) {
+        query_output_lineage(plan, &mut context, &mut edges);
+    }
+    edges
+}
+
+/// The `source → Relation` column edges one DML / DDL write root emits — its
+/// write-target columns paired with the source. Read-only / structural nodes
+/// and pure row movers (DELETE without RETURNING, ALTER / DROP) emit none.
+/// `is_outer` gates the RETURNING projection: only the outer root's RETURNING is
+/// a statement `QueryOutput`; a data-modifying CTE body's is internal.
+fn dml_relation_lineage<'a>(
+    root: &'a LogicalPlan,
+    is_outer: bool,
+    context: &mut TraceContext<'a>,
+    edges: &mut Vec<ColumnLineageEdge>,
+) {
+    match root {
         // INSERT … <source>: pair the source's outputs with the target columns.
         // A statement-level `WITH` rides on the source (the parser attaches it
         // there, so the `With` is *inside* `input`, not above the `Insert`);
         // `enter_withs` pushes its CTEs into the context so a `CteRef` resolves.
         LogicalPlan::Insert(i) => {
-            let src = enter_withs(&i.input, &mut context);
+            let src = enter_withs(&i.input, context);
             // A wildcard in the source projection makes positions indeterminate,
             // so positional pairing would mis-attribute (`SELECT *, y` → which
             // target does `y` feed?). Drop the relation lineage — the target
             // columns still surface as `writes`, flagged by `WildcardSuppressed`
             // — matching a pure `SELECT *` source (no operands to pair).
             if !i.source_wildcard {
-                relation_lineage(&i.columns, src, &mut context, &mut edges);
+                relation_lineage(&i.columns, src, context, edges);
             }
             // ON CONFLICT DO UPDATE SET col = value: each `value → target.col`,
             // an `EXCLUDED.x` ref mapped to the source's like-positioned output.
             for a in &i.on_conflict {
                 emit_edges(
-                    conflict_value_origins(&a.value, &i.columns, src, &mut context),
+                    conflict_value_origins(&a.value, &i.columns, src, context),
                     ColumnTarget::Relation(a.target.clone()),
-                    &mut edges,
+                    edges,
                 );
             }
-            returning_lineage(&i.returning, &i.input, &mut context, &mut edges);
+            if is_outer {
+                returning_lineage(&i.returning, &i.input, context, edges);
+            }
         }
         // UPDATE … SET col = expr: each assignment's RHS value traces to its
         // target column (`Relation` edge). A `Derived` RHS ref (a column of a
@@ -68,44 +100,36 @@ pub(super) fn collect_column_lineage(
         LogicalPlan::Update(u) => {
             for a in &u.assignments {
                 emit_edges(
-                    origins_of_expr(&a.value, &u.input, &mut context),
+                    origins_of_expr(&a.value, &u.input, context),
                     ColumnTarget::Relation(a.target.clone()),
-                    &mut edges,
+                    edges,
                 );
             }
-            returning_lineage(&u.returning, &u.input, &mut context, &mut edges);
+            if is_outer {
+                returning_lineage(&u.returning, &u.input, context, edges);
+            }
         }
         // DELETE moves no data (rows go wholesale) — its only lineage is a
-        // RETURNING projection of the deleted rows.
+        // RETURNING projection of the deleted rows (a statement-level output).
         LogicalPlan::Delete(d) => {
-            returning_lineage(&d.returning, &d.input, &mut context, &mut edges)
+            if is_outer {
+                returning_lineage(&d.returning, &d.input, context, edges);
+            }
         }
         // CTAS / CREATE VIEW move data like INSERT, but the new relation's
         // column *names* are the source outputs' own (unless an explicit list
         // overrides) — so pair each output with its own name, not a separately
         // derived list that could drift in length.
         LogicalPlan::CreateTableAs(c) => {
-            let src = enter_withs(&c.input, &mut context);
+            let src = enter_withs(&c.input, context);
             if pairs_positionally(c.source_wildcard, &c.columns) {
-                created_relation_lineage(
-                    &c.columns,
-                    &c.target.reference,
-                    src,
-                    &mut context,
-                    &mut edges,
-                );
+                created_relation_lineage(&c.columns, &c.target.reference, src, context, edges);
             }
         }
         LogicalPlan::CreateView(c) => {
-            let src = enter_withs(&c.input, &mut context);
+            let src = enter_withs(&c.input, context);
             if pairs_positionally(c.source_wildcard, &c.columns) {
-                created_relation_lineage(
-                    &c.columns,
-                    &c.target.reference,
-                    src,
-                    &mut context,
-                    &mut edges,
-                );
+                created_relation_lineage(&c.columns, &c.target.reference, src, context, edges);
             }
         }
         // MERGE: each WHEN action's value traces to its target column (an
@@ -117,18 +141,12 @@ pub(super) fn collect_column_lineage(
                 match clause {
                     MergeClause::Update { assignments } => {
                         for a in assignments {
-                            merge_value_edges(
-                                &a.target,
-                                &a.value,
-                                &m.source,
-                                &mut context,
-                                &mut edges,
-                            );
+                            merge_value_edges(&a.target, &a.value, &m.source, context, edges);
                         }
                     }
                     MergeClause::Insert { columns, values } => {
                         for (column, value) in columns.iter().zip(values) {
-                            merge_value_edges(column, value, &m.source, &mut context, &mut edges);
+                            merge_value_edges(column, value, &m.source, context, edges);
                         }
                     }
                     MergeClause::Delete => {}
@@ -136,12 +154,12 @@ pub(super) fn collect_column_lineage(
             }
             // RETURNING / OUTPUT projects the affected rows (target + source),
             // traced through the source like the other DMLs' RETURNING.
-            returning_lineage(&m.returning, &m.source, &mut context, &mut edges);
+            if is_outer {
+                returning_lineage(&m.returning, &m.source, context, edges);
+            }
         }
-        // A bare query (or unmodelled root): one `QueryOutput` group per
-        // projection (a set operation has one per branch — positions restart
-        // per branch, mirroring the resolver). DDL that names a table but
-        // moves no value (`AlterTable` / `Drop`) flows here too — it emits no
+        // Read-only / structural nodes are not write roots, and DDL that names a
+        // table but moves no value (`AlterTable` / `Drop`) emits no relation
         // lineage. Listed explicitly so a new `LogicalPlan` variant forces a
         // routing decision rather than landing here by default.
         LogicalPlan::Scan(_)
@@ -158,9 +176,8 @@ pub(super) fn collect_column_lineage(
         | LogicalPlan::Values(_)
         | LogicalPlan::Empty
         | LogicalPlan::AlterTable(_)
-        | LogicalPlan::Drop(_) => query_output_lineage(plan, &mut context, &mut edges),
+        | LogicalPlan::Drop(_) => {}
     }
-    edges
 }
 
 /// Bare-query lineage: each output column becomes a `QueryOutput` target at
@@ -225,6 +242,24 @@ fn relation_lineage<'a>(
     context: &mut TraceContext<'a>,
     out: &mut Vec<ColumnLineageEdge>,
 ) {
+    // A VALUES source has no projection operand, so pair each row's value cells
+    // positionally with the target columns directly: a scalar subquery in a
+    // cell flows like an `INSERT … SELECT` value. Several rows each contribute,
+    // so a target column collects sources from every row (the leading `WITH` was
+    // already entered into `context` by the caller). Constant cells trace to no
+    // origin. Resolution-blind to row arity here — the arity check is separate.
+    if let LogicalPlan::Values(values) = input {
+        for row in &values.rows {
+            for (target_column, expr) in columns.iter().zip(row) {
+                emit_edges(
+                    origins_of_expr(expr, input, context),
+                    ColumnTarget::Relation(target_column.clone()),
+                    out,
+                );
+            }
+        }
+        return;
+    }
     for operand in output_operands(input) {
         let outputs = operand.outputs;
         operand.trace(context, |src_input, cx| {
@@ -341,27 +376,42 @@ pub(super) fn collect_table_lineage(
     plan: &LogicalPlan,
     casing: IdentifierCasing,
 ) -> Vec<TableLineageEdge> {
-    // `TraceContext::new` peels leading WITHs and keeps their CTE bodies, so a `CteRef`
-    // on the feeding path resolves to the body's feeding scans. `fed_ctes`
-    // is the set of CTE bodies already fed: a CTE body materializes once, so it feeds
-    // the target once regardless of how many `CteRef`s point at it. It keys on
-    // the resolved body's *identity* (its pointer), not the CTE name, so two
-    // distinct CTEs that happen to share a name (shadowing across scopes) each
-    // feed — a name key would collapse them. (The active-set on `context` terminates
-    // a *recursive* self-reference; this set folds *distinct* references to the
-    // *same* declaration — orthogonal concerns.)
+    // `TraceContext::new` peels leading WITHs and keeps their CTE bodies, so a
+    // `CteRef` on the feeding path resolves to the body's feeding scans. Each
+    // DML root — the outer root and every data-modifying CTE body — contributes
+    // its own `source → target` edges (a read-only outer body has none).
     let mut context = TraceContext::new(plan, casing);
+    dml_roots(plan)
+        .into_iter()
+        .flat_map(|root| dml_table_lineage(root, &mut context))
+        .collect()
+}
+
+/// The `source → target` table edges one DML root emits: its feeding sources
+/// paired with its write target. UPDATE fans per-assignment-target out of line.
+///
+/// `fed_ctes` is the set of CTE bodies already fed *this target*: a CTE body
+/// materializes once, so it feeds the target once regardless of how many
+/// `CteRef`s point at it. It keys on the resolved body's *identity* (its
+/// pointer), not the CTE name, so two distinct CTEs that happen to share a name
+/// (shadowing across scopes) each feed — a name key would collapse them. (The
+/// active-set on `context` terminates a *recursive* self-reference; this set
+/// folds *distinct* references to the *same* declaration — orthogonal concerns.)
+fn dml_table_lineage<'a>(
+    root: &'a LogicalPlan,
+    context: &mut TraceContext<'a>,
+) -> Vec<TableLineageEdge> {
     let mut sources = Vec::new();
     let mut fed_ctes: Vec<usize> = Vec::new();
-    let target = match peel_with(plan) {
+    let target = match root {
         LogicalPlan::Insert(i) => {
-            feeding_scans(&i.input, &mut context, &mut fed_ctes, &mut sources);
+            feeding_scans(&i.input, context, &mut fed_ctes, &mut sources);
             // ON CONFLICT DO UPDATE SET col = value: a value-position subquery
             // (`= (SELECT … FROM other)`) feeds the target, like an UPDATE SET
             // RHS. An `EXCLUDED.x` ref feeds nothing new — it names the INSERT
             // source row, already collected from `i.input`.
             for a in &i.on_conflict {
-                expr_feeding(&a.value, &mut context, &mut fed_ctes, &mut sources);
+                expr_feeding(&a.value, context, &mut fed_ctes, &mut sources);
             }
             &i.target
         }
@@ -370,12 +420,12 @@ pub(super) fn collect_table_lineage(
         // `UPDATE t1 JOIN t2 SET t2.b = t1.c` writes t1.c into t2, not the root.
         // (Handled out of line since it has several targets, unlike the
         // single-target DML below.)
-        LogicalPlan::Update(u) => return update_table_lineage(u, &mut context),
+        LogicalPlan::Update(u) => return update_table_lineage(u, context),
         // CTAS / CREATE VIEW move data like INSERT; ALTER / DROP do not. A
         // `CLONE src` copies the data, so its shape source feeds `src → target`
         // (a `LIKE src` copies only the schema → no edge).
         LogicalPlan::CreateTableAs(c) => {
-            feeding_scans(&c.input, &mut context, &mut fed_ctes, &mut sources);
+            feeding_scans(&c.input, context, &mut fed_ctes, &mut sources);
             if let Some(schema_source) = &c.schema_source {
                 if schema_source.copies_data {
                     sources.push(schema_source.source.clone());
@@ -384,24 +434,34 @@ pub(super) fn collect_table_lineage(
             &c.target
         }
         LogicalPlan::CreateView(c) => {
-            feeding_scans(&c.input, &mut context, &mut fed_ctes, &mut sources);
+            feeding_scans(&c.input, context, &mut fed_ctes, &mut sources);
             &c.target
         }
         // MERGE feeds from the source relation plus each *written* WHEN value
         // (an UPDATE SET RHS; an INSERT value paired with a column). The ON /
-        // predicate reads and an unpaired INSERT value do not feed.
+        // predicate reads and an unpaired INSERT value do not feed. A MERGE
+        // whose clauses are *only* DELETEs moves no data — its source picks
+        // target rows but feeds nothing — so don't feed the source then. (For a
+        // non-CTE root the lineage gate already skips this; the self-check also
+        // covers a data-modifying-CTE statement, which bypasses that gate.)
         LogicalPlan::Merge(m) => {
-            feeding_scans(&m.source, &mut context, &mut fed_ctes, &mut sources);
+            let writes_data = m
+                .clauses
+                .iter()
+                .any(|c| matches!(c, MergeClause::Insert { .. } | MergeClause::Update { .. }));
+            if writes_data {
+                feeding_scans(&m.source, context, &mut fed_ctes, &mut sources);
+            }
             for clause in &m.clauses {
                 match clause {
                     MergeClause::Update { assignments } => {
                         for a in assignments {
-                            expr_feeding(&a.value, &mut context, &mut fed_ctes, &mut sources);
+                            expr_feeding(&a.value, context, &mut fed_ctes, &mut sources);
                         }
                     }
                     MergeClause::Insert { columns, values } => {
                         for (_col, value) in columns.iter().zip(values) {
-                            expr_feeding(value, &mut context, &mut fed_ctes, &mut sources);
+                            expr_feeding(value, context, &mut fed_ctes, &mut sources);
                         }
                     }
                     MergeClause::Delete => {}
@@ -409,10 +469,10 @@ pub(super) fn collect_table_lineage(
             }
             &m.target
         }
-        // No table lineage: a bare query (no target), DDL that moves no value
-        // (`Drop` / `Truncate` modelled as `Drop` / `AlterTable`), and the
-        // structural / synthetic operators reached at root. Listed explicitly
-        // so a new `LogicalPlan` variant forces a target decision.
+        // No table lineage: a bare query / read root (no target), DELETE (rows
+        // go wholesale, no value moved), and DDL that moves no value (`Drop` /
+        // `Truncate` modelled as `Drop` / `AlterTable`). Listed explicitly so a
+        // new `LogicalPlan` variant forces a target decision.
         LogicalPlan::Scan(_)
         | LogicalPlan::Filter(_)
         | LogicalPlan::Join(_)
@@ -549,8 +609,16 @@ fn feeding_scans<'a>(
                 feeding_scans(body, context, fed_ctes, out)
             });
         }
-        // A nested data-mover feeds through its source; DELETE / DROP / ALTER /
-        // VALUES move no row data into a feeding path.
+        // A VALUES source moves its row cells into the target: a value-position
+        // subquery in a cell feeds (a scalar `(SELECT … FROM s)`), mirroring the
+        // column-level relation lineage. Constant cells feed nothing.
+        LogicalPlan::Values(v) => {
+            for expr in v.rows.iter().flatten() {
+                expr_feeding(expr, context, fed_ctes, out);
+            }
+        }
+        // A nested data-mover feeds through its source; DELETE / DROP / ALTER
+        // move no row data into a feeding path.
         LogicalPlan::Insert(i) => feeding_scans(&i.input, context, fed_ctes, out),
         LogicalPlan::Update(u) => feeding_scans(&u.input, context, fed_ctes, out),
         LogicalPlan::CreateTableAs(c) => feeding_scans(&c.input, context, fed_ctes, out),
@@ -559,7 +627,6 @@ fn feeding_scans<'a>(
         LogicalPlan::Delete(_)
         | LogicalPlan::Drop(_)
         | LogicalPlan::AlterTable(_)
-        | LogicalPlan::Values(_)
         | LogicalPlan::Empty => {}
     }
 }

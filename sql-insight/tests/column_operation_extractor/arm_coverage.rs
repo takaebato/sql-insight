@@ -337,6 +337,46 @@ mod expr_arm_coverage {
     }
 
     #[test]
+    fn pipe_later_stage_ref_to_a_computed_column_is_not_a_base_read() {
+        // `SELECT a + b AS s` makes `s` a computed (Derived) output. A later
+        // stage referencing `s` traces back through the projection (a → s, b → s)
+        // — it must not fall through to a phantom `t.s` base read. (The Derived
+        // passthrough was wrongly marked an identity output, so the next stage
+        // resolved `s` against the still-in-scope base table.)
+        assert_column_ops(
+            "FROM t |> SELECT a + b AS s |> SELECT s |> WHERE s > 0",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "a"), out("s", 0)),
+                    transformation(col("t", "b"), out("s", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn pipe_renamed_column_carried_through_extend_traces_the_rename() {
+        // A renamed column (`a AS x`) carried through an EXTEND stage stays
+        // Derived: the final `SELECT x` traces `t.a -> x`, not a phantom
+        // `t.x -> x` (the rename was lost when the carried column was marked an
+        // identity output).
+        assert_column_ops(
+            "FROM t |> SELECT a AS x |> EXTEND 1 AS y |> SELECT x",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("x", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn pipe_pivot() {
         // The pivot's aggregate (`SUM(x)`) and value-source column (`k`) are
         // reads; `x` also appears in the projection.
@@ -884,6 +924,24 @@ mod relation_arm_coverage {
         assert_unordered_eq!(
             reads("SELECT x.c1 FROM (WITH w AS (SELECT a FROM s) SELECT w.a FROM w) x (c1)"),
             vec![c("s", "a")]
+        );
+    }
+
+    #[test]
+    fn alias_columns_over_wildcard_body_bind_to_the_derived_relation() {
+        // A derived table / CTE whose body is `SELECT *` but which declares its
+        // columns via an alias list: a reference to a declared column binds to
+        // the derived relation (a `Derived` column → dropped from reads), not a
+        // phantom unresolved read. The wildcard's incompleteness is flagged
+        // separately (`WildcardSuppressed`), and the alias list is authoritative
+        // — a column *not* in it stays unresolved.
+        assert_unordered_eq!(
+            reads("SELECT x.c1 FROM (SELECT * FROM t) x (c1)"),
+            Vec::new()
+        );
+        assert_unordered_eq!(
+            reads("WITH cte (c1) AS (SELECT * FROM t) SELECT c1 FROM cte"),
+            Vec::new()
         );
     }
 

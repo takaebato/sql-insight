@@ -280,11 +280,11 @@ impl<'a> Binder<'a> {
     /// hit. (The matched columns are quote-wrapped for case-folded resolution;
     /// the written column list takes the plain identifier.)
     pub(super) fn catalog_columns(&self, target: &TableReference) -> Vec<Ident> {
-        self.table_match(target)
-            .columns
-            .iter()
-            .map(|c| Ident::new(&c.value))
-            .collect()
+        // Keep each column in its canonical form (quoted as `canonical_quote`
+        // dictates), not re-wrapped as a plain identifier — so a column-less
+        // MERGE INSERT fills a case-exact column like `"MyCol"` quoted, matching
+        // the catalog (Cataloged) and a user's own quoted reference.
+        self.table_match(target).columns
     }
 
     pub(super) fn eq(&self, fold: CaseRule, a: &Ident, b: &Ident) -> bool {

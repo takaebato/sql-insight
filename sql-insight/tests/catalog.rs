@@ -416,6 +416,86 @@ fn from_ddl_with_casing_aligns_the_catalog_with_a_casing_override() {
 }
 
 #[test]
+fn dml_target_resolves_to_the_base_table_not_a_shadowing_cte() {
+    // A DML target name is resolved against the catalog, never the WITH list: a
+    // base table sharing a CTE's name is the real (Cataloged) write target,
+    // mirroring Postgres (which updates the base table, ignoring the CTE; only a
+    // CTE-*only* name errors / is flagged).
+    let catalog = Catalog::from_ddl(&GenericDialect {}, "CREATE TABLE c (x INT)").unwrap();
+    let op = extract_column_operations_with_options(
+        &GenericDialect {},
+        "WITH c AS (SELECT 1 AS x) UPDATE c SET x = 1",
+        ExtractorOptions::new().with_catalog(&catalog),
+    )
+    .unwrap()
+    .remove(0)
+    .unwrap();
+    assert_eq!(op.diagnostics, vec![]);
+    assert_eq!(op.writes.len(), 1);
+    assert_eq!(op.writes[0].resolution, ResolutionKind::Cataloged);
+    assert_eq!(op.writes[0].reference.name.value, "x");
+}
+
+#[test]
+fn column_less_insert_fills_a_case_exact_column_quoted_and_cataloged() {
+    // A column-less INSERT fills its column list from the catalog in the
+    // canonical (quoted) form — like the table — so a case-exact column matches
+    // the catalog (Cataloged, not Inferred) and a user's own `"MyCol"`
+    // reference. The filled name previously surfaced unquoted and missed.
+    use sql_insight::sqlparser::dialect::SnowflakeDialect;
+    let catalog =
+        Catalog::from_ddl(&SnowflakeDialect {}, r#"CREATE TABLE t ("MyCol" INT)"#).unwrap();
+    let op = extract_column_operations_with_options(
+        &SnowflakeDialect {},
+        "INSERT INTO t SELECT 1",
+        ExtractorOptions::new().with_catalog(&catalog),
+    )
+    .unwrap()
+    .remove(0)
+    .unwrap();
+    assert_eq!(op.writes.len(), 1);
+    assert_eq!(op.writes[0].reference.name.value, "MyCol");
+    assert_eq!(op.writes[0].reference.name.quote_style, Some('"'));
+    assert_eq!(op.writes[0].resolution, ResolutionKind::Cataloged);
+}
+
+#[test]
+fn from_ddl_skips_a_table_with_a_non_identifier_name_segment() {
+    // A name segment that isn't a plain identifier (Snowflake `IDENTIFIER('t')`)
+    // makes the table's identity unrepresentable — the whole CREATE is skipped,
+    // not mis-segmented into a phantom (`myschema.IDENTIFIER('t')` must not
+    // register as table `myschema`). A valid CREATE in the same DDL still
+    // registers.
+    use sql_insight::sqlparser::dialect::SnowflakeDialect;
+    let catalog = Catalog::from_ddl(
+        &SnowflakeDialect {},
+        "CREATE TABLE myschema.IDENTIFIER('t') (id INT); CREATE TABLE good (a INT)",
+    )
+    .unwrap();
+    let resolution = |sql: &str| -> ResolutionKind {
+        extract_column_operations_with_options(
+            &SnowflakeDialect {},
+            sql,
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap()
+        .reads
+        .first()
+        .unwrap()
+        .resolution
+    };
+    // The mis-segmented `myschema` phantom is not registered.
+    assert_eq!(
+        resolution("SELECT id FROM myschema"),
+        ResolutionKind::Inferred
+    );
+    // The valid sibling table still registers (the skip is per-statement).
+    assert_eq!(resolution("SELECT a FROM good"), ResolutionKind::Cataloged);
+}
+
+#[test]
 fn from_ddl_unquoted_registration_canonicalizes_the_surfaced_identity() {
     // The Cataloged read surfaces the catalog's stored (folded) identity, not
     // the query's written casing.

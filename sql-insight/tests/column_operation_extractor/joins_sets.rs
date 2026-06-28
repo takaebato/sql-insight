@@ -499,6 +499,27 @@ mod join_using_and_natural {
     }
 
     #[test]
+    fn update_join_using_column_fans_in_to_the_set_target() {
+        // The UPDATE target-clause join fans in its USING merge column like a
+        // SELECT join: the unqualified `id` resolves to both joined tables
+        // (t1.id + t2.id), each a read and a lineage source into the SET target
+        // — not a single ambiguous ref (the FROM-clause path already fanned in).
+        assert_column_ops(
+            "UPDATE t1 JOIN t2 USING (id) SET t2.a = id",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1", "id"), read("t2", "id")],
+                writes: vec![write("t2", "a")],
+                lineage: vec![
+                    passthrough(col("t1", "id"), relation("t2", "a")),
+                    passthrough(col("t2", "id"), relation("t2", "a")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn join_using_qualified_id_resolves_to_named_table() {
         // Qualifying the ref sidesteps the USING ambiguity: `t1.id`
         // resolves to t1 unambiguously. Use this in real-world
