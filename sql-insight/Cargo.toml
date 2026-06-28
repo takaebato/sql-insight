@@ -30,3 +30,6 @@ sqlparser = { version = "0.61.0", features = ["visitor"] }
 thiserror = "1.0.56"
 indexmap = "2.6.0"
 serde = { version = "1.0.228", features = ["derive"], optional = true }
+
+[dev-dependencies]
+version-sync = "0.9.5"
