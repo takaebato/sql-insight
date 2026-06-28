@@ -437,6 +437,29 @@ fn dml_target_resolves_to_the_base_table_not_a_shadowing_cte() {
 }
 
 #[test]
+fn column_less_insert_fills_a_case_exact_column_quoted_and_cataloged() {
+    // A column-less INSERT fills its column list from the catalog in the
+    // canonical (quoted) form — like the table — so a case-exact column matches
+    // the catalog (Cataloged, not Inferred) and a user's own `"MyCol"`
+    // reference. The filled name previously surfaced unquoted and missed.
+    use sql_insight::sqlparser::dialect::SnowflakeDialect;
+    let catalog =
+        Catalog::from_ddl(&SnowflakeDialect {}, r#"CREATE TABLE t ("MyCol" INT)"#).unwrap();
+    let op = extract_column_operations_with_options(
+        &SnowflakeDialect {},
+        "INSERT INTO t SELECT 1",
+        ExtractorOptions::new().with_catalog(&catalog),
+    )
+    .unwrap()
+    .remove(0)
+    .unwrap();
+    assert_eq!(op.writes.len(), 1);
+    assert_eq!(op.writes[0].reference.name.value, "MyCol");
+    assert_eq!(op.writes[0].reference.name.quote_style, Some('"'));
+    assert_eq!(op.writes[0].resolution, ResolutionKind::Cataloged);
+}
+
+#[test]
 fn from_ddl_skips_a_table_with_a_non_identifier_name_segment() {
     // A name segment that isn't a plain identifier (Snowflake `IDENTIFIER('t')`)
     // makes the table's identity unrepresentable — the whole CREATE is skipped,

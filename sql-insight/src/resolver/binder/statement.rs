@@ -142,12 +142,16 @@ impl<'a> Binder<'a> {
             .is_some_and(|q| source_has_wildcard(q));
         // The written column list: an explicit `(a, b)` wins; otherwise a
         // column-less INSERT fills from the target's catalog columns (reusing
-        // the `table_match` list above, plain identifiers), truncated to the
-        // source's projected arity. But a wildcard source has indeterminate
-        // arity — the `*` isn't in `query_outputs`, so the visible count is too
-        // low — and the catalog columns can't be positionally paired: leave the
-        // list empty so the drop + flag guard below fires rather than
-        // mis-truncating to the undercounted outputs.
+        // the `table_match` list above), truncated to the source's projected
+        // arity. The catalog columns are kept in their canonical form (quoted as
+        // `canonical_quote` dictates), not re-wrapped as plain identifiers — so a
+        // case-exact column like `"MyCol"` surfaces quoted and matches both the
+        // catalog (→ `Cataloged`, not `Inferred`) and a user's own quoted
+        // reference. But a wildcard source has indeterminate arity — the `*`
+        // isn't in `query_outputs`, so the visible count is too low — and the
+        // catalog columns can't be positionally paired: leave the list empty so
+        // the drop + flag guard below fires rather than mis-truncating to the
+        // undercounted outputs.
         let columns = if !insert.columns.is_empty() {
             insert.columns.clone()
         } else if source_wildcard {
@@ -156,7 +160,7 @@ impl<'a> Binder<'a> {
             m.columns
                 .iter()
                 .take(scope.query_outputs.len())
-                .map(|c| Ident::new(&c.value))
+                .cloned()
                 .collect()
         };
         // A column-list-less INSERT whose target columns can't be determined
