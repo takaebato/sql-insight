@@ -1,0 +1,42 @@
+# cargo-deny — supply-chain, license, and source gate.
+# Run locally with `cargo deny check`; CI runs it on every push / PR.
+
+[graph]
+# Check the full feature set (e.g. the `serde` optional feature), not just the
+# defaults, so feature-gated dependencies are scanned too.
+all-features = true
+
+[advisories]
+# RUSTSEC advisories: vulnerabilities and unmaintained crates are denied by
+# default; reject yanked crates too. Add IDs to `ignore` only with a documented
+# rationale.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses actually present in the dependency tree:
+#   - Unicode-3.0: unicode-ident's expression ANDs it in.
+#   - BSL-1.0: rustyline's Windows clipboard deps (clipboard-win / error-code).
+#   - Apache-2.0 WITH LLVM-exception: ar_archive_writer, pulled via cc's build
+#     path (sqlparser -> recursive -> stacker -> psm -> cc).
+# memchr ("Unlicense OR MIT") and foldhash 0.1.5 are satisfied via MIT/Apache-2.0,
+# so their other licenses (Unlicense / Zlib) need not be allowed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "BSL-1.0",
+]
+
+[bans]
+# Duplicate versions of a crate are surfaced but not fatal (common transitively).
+multiple-versions = "warn"
+# Wildcard ("*") version requirements are rejected — they defeat the lockfile.
+wildcards = "deny"
+
+[sources]
+# Only crates.io — reject crates from unknown registries or git remotes.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

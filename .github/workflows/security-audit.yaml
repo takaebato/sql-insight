@@ -1,0 +1,42 @@
+name: Security Audit
+
+# cargo-deny runs only when the dependency set or policy changes (paths filter),
+# on pull requests and master pushes, plus a daily schedule. On PRs it runs the
+# deterministic checks only (bans / licenses / sources) — a newly-published RUSTSEC
+# advisory is an external event that should not fail an unrelated PR. Master pushes
+# and the daily schedule run the full check, including advisories.
+on:
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/security-audit.yaml'
+  push:
+    branches: [ "master" ]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/security-audit.yaml'
+  schedule:
+    - cron: '0 22 * * *' # daily at 22:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check (deterministic — pull requests)
+        if: github.event_name == 'pull_request'
+        run: cargo deny check bans licenses sources
+      - name: cargo deny check (full — master push & schedule)
+        if: github.event_name != 'pull_request'
+        run: cargo deny check
