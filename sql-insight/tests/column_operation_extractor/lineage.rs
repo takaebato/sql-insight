@@ -67,6 +67,26 @@ mod projections {
     }
 
     #[test]
+    fn in_subquery_scalar_lhs_flows_to_the_target() {
+        // The LHS of `… IN (…)` in value position is a value source even when it
+        // is itself a scalar subquery: `s2.y` flows to the target `dst.f`. The
+        // membership subquery `s` stays a filter. (The table-lineage side used
+        // to classify the LHS as a filter, dropping `s2 -> dst` and
+        // contradicting this column edge — pinned together in the table-op
+        // suite.)
+        assert_column_ops(
+            "INSERT INTO dst (f) SELECT (SELECT y FROM s2) IN (SELECT x FROM s) FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s2", "y"), read("s", "x")],
+                writes: vec![write("dst", "f")],
+                lineage: vec![transformation(col("s2", "y"), relation("dst", "f"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn select_mixed_projection_separates_targets_by_position() {
         assert_column_ops(
             "SELECT a, a + b FROM t1",

@@ -770,6 +770,26 @@ mod lineage {
     }
 
     #[test]
+    fn value_position_in_subquery_lhs_feeds_the_target() {
+        // The LHS of `… IN (…)` in *value* position feeds the target — even when
+        // it is a scalar subquery: `s2 -> dst` appears, matching the column edge
+        // `s2.y -> dst.f`. (Regression: the LHS used to be classified as a
+        // filter on the table side, dropping `s2 -> dst` and disagreeing with
+        // column lineage.) The RHS membership subquery `s` stays a filter — read
+        // but never a feeding source.
+        assert_ops(
+            "INSERT INTO dst (f) SELECT (SELECT y FROM s2) IN (SELECT x FROM s) FROM t",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s2"), read("s"), read("t")],
+                writes: vec![twrite("dst")],
+                lineage: vec![edge("s2", "dst"), edge("t", "dst")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn aggregate_source_feeds_lineage() {
         // The source projects an aggregate over a GROUP BY — feeding still
         // traces through the `Aggregate` to the scanned table.

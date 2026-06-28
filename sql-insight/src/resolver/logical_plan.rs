@@ -424,10 +424,14 @@ impl Expr {
                 v
             }
             Expr::Window { arg, .. } => vec![arg],
+            // `a IN (subquery)`: the LHS is a value operand — the IN result is a
+            // boolean transformation of it (`origins_of_expr` traces it the same
+            // way). The subquery side is the membership test, a filter
+            // (`filter_subplans`).
+            Expr::InSubquery { expr, .. } => vec![expr],
             Expr::Column(_)
             | Expr::Subquery { .. }
             | Expr::Exists(_)
-            | Expr::InSubquery { .. }
             | Expr::Filter(_)
             | Expr::Fanin(_) => Vec::new(),
         }
@@ -440,12 +444,12 @@ impl Expr {
             Expr::Window {
                 partition, order, ..
             } => partition.iter().chain(order).collect(),
-            Expr::InSubquery { expr, .. } => vec![expr],
             Expr::Filter(exprs) => exprs.iter().collect(),
             Expr::Column(_)
             | Expr::Call { .. }
             | Expr::Subquery { .. }
             | Expr::Exists(_)
+            | Expr::InSubquery { .. }
             | Expr::Fanin(_) => Vec::new(),
         }
     }
