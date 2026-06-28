@@ -24,6 +24,12 @@ git_release_enable = false
 # visible even if a future skip rule would otherwise drop them.
 protect_breaking_commits = true
 
+# Keep non-conventional commits (no `type:` prefix) instead of dropping them;
+# they land in "Other Changes" via the catch-all parser. This matters for the
+# historical backlog (commits predating the PR-title convention) — new commits
+# are all conventional, so it is a no-op going forward.
+filter_unconventional = false
+
 # Changelog preamble. Kept in sync with the header already in each CHANGELOG.md
 # (Keep a Changelog 1.1.0) so release-plz strips and re-inserts it cleanly —
 # release-plz's built-in default links 1.0.0, so we override it here.
