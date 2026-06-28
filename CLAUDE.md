@@ -88,3 +88,11 @@ Rules that bite if forgotten (the why is in `ARCHITECTURE.md`):
   variants). Per-construct "arm coverage" modules (one case per AST variant)
   are encouraged — they pin behavior and force a test when a `match` grows.
   Err toward more coverage.
+
+## Pull requests
+
+- **PR titles follow [Conventional Commits](https://www.conventionalcommits.org/)**,
+  CI-enforced via `.github/workflows/pr-title.yaml`. Squash-merge uses the title
+  as the commit subject, which release-plz reads to compute per-crate version
+  bumps and changelogs — so `fix:` / `feat:` / `feat!:` (breaking) on the title
+  is what ships. Allowed types live in that workflow.
