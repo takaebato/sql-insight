@@ -65,8 +65,9 @@ commit_parsers = [
 # `commit.breaking`, via `!` or a BREAKING CHANGE footer), then the normal groups
 # with breaking commits excluded and empty groups skipped — so a breaking change
 # is listed once, at the top. `striptags` honors the `<!-- N -->` sort prefixes;
-# ` by @user in #PR` adds attribution (commit.remote.* is filled by release-plz's
-# GitHub integration in CI).
+# ` by @user` credits the author. The PR link comes from the subject's `(#N)`,
+# which release-plz's default commit_preprocessor turns into a markdown link, so
+# it is not repeated here (squash merges put `(#N)` in the subject).
 body = '''
 
 ## [{{ version }}]{%- if release_link -%}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
@@ -76,9 +77,9 @@ body = '''
 
 {% for commit in breaking %}
 {%- if commit.scope -%}
-- *({{ commit.scope }})* {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}{% if commit.remote.pr_number %} in #{{ commit.remote.pr_number }}{% endif %}
+- *({{ commit.scope }})* {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}
 {% else -%}
-- {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}{% if commit.remote.pr_number %} in #{{ commit.remote.pr_number }}{% endif %}
+- {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}
 {% endif -%}
 {% endfor -%}
 {% endif -%}
@@ -89,9 +90,9 @@ body = '''
 
 {% for commit in rest %}
 {%- if commit.scope -%}
-- *({{ commit.scope }})* {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}{% if commit.remote.pr_number %} in #{{ commit.remote.pr_number }}{% endif %}{%- if commit.links %} ({% for link in commit.links %}[{{ link.text }}]({{ link.href }}) {% endfor -%}){% endif %}
+- *({{ commit.scope }})* {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}{%- if commit.links %} ({% for link in commit.links %}[{{ link.text }}]({{ link.href }}) {% endfor -%}){% endif %}
 {% else -%}
-- {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}{% if commit.remote.pr_number %} in #{{ commit.remote.pr_number }}{% endif %}
+- {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}
 {% endif -%}
 {% endfor -%}
 {% endif -%}
