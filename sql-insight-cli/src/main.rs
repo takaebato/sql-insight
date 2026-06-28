@@ -6,6 +6,7 @@ use crate::executor::{
 };
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use sql_insight::error::Error;
+use sql_insight::formatter::FormatterOptions;
 use sql_insight::normalizer::NormalizerOptions;
 use sql_insight::CaseRule;
 use std::io::{self, IsTerminal, Read};
@@ -38,6 +39,18 @@ struct CommonOptions {
     /// Read statements interactively from a prompt (terminate each with `;`).
     #[clap(short, long, group = "source")]
     interactive: bool,
+}
+
+#[derive(Parser, Debug)]
+struct FormatCommandOptions {
+    #[clap(flatten)]
+    common_options: CommonOptions,
+    /// Pretty-print each statement across multiple indented lines (one item
+    /// per line) instead of the default single line. For example, `SELECT a,
+    /// b FROM t1` becomes a multi-line block with `a` / `b` indented under
+    /// `SELECT`.
+    #[clap(long)]
+    pretty: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -92,7 +105,7 @@ impl ProcessType {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Format SQL
-    Format(CommonOptions),
+    Format(FormatCommandOptions),
     /// Normalize SQL
     Normalize(NormalizeCommandOptions),
     /// Extract what a statement touches, at a chosen granularity
@@ -227,7 +240,7 @@ impl Commands {
     /// The source / dialect options shared by every command.
     fn common(&self) -> &CommonOptions {
         match self {
-            Commands::Format(opts) => opts,
+            Commands::Format(opts) => &opts.common_options,
             Commands::Normalize(opts) => &opts.common_options,
             Commands::Extract { target } => target.common(),
         }
@@ -318,7 +331,10 @@ impl Commands {
 
     fn executor(&self, sql: String) -> Box<dyn CliExecutable> {
         match self {
-            Commands::Format(opts) => Box::new(FormatExecutor::new(sql, opts.dialect.clone())),
+            Commands::Format(opts) => Box::new(
+                FormatExecutor::new(sql, opts.common_options.dialect.clone())
+                    .with_options(FormatterOptions::new().with_pretty(opts.pretty)),
+            ),
             Commands::Normalize(opts) => Box::new(
                 NormalizeExecutor::new(sql, opts.common_options.dialect.clone()).with_options(
                     NormalizerOptions::new()
