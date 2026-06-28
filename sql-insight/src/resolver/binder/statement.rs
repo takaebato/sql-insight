@@ -369,10 +369,20 @@ impl<'a> Binder<'a> {
         };
         let mut scope = Scope::single(target_relation);
         let mut input = LogicalPlan::Empty;
-        // Joins on the UPDATE target clause are read relations.
+        // Joins on the UPDATE target clause are read relations. They fan in
+        // merge columns like a SELECT join (`bind_table_with_joins`): a `USING
+        // (col)` names them, a NATURAL join takes the schema-common columns —
+        // both computed before the right scope is absorbed — so an unqualified
+        // reference resolves to both sides instead of staying `Ambiguous`.
         for j in joins {
             let (node, jscope) = self.bind_table_factor(&j.relation, &scope.relations);
-            scope.relations.extend(jscope.relations);
+            let merge = if join_is_natural(&j.join_operator) {
+                self.natural_merge_columns(&scope, &jscope)
+            } else {
+                join_using(&j.join_operator)
+            };
+            scope.absorb(jscope);
+            scope.add_merge_columns(merge);
             let on = join_on(&j.join_operator)
                 .map(|e| self.bind_expr(e, &scope))
                 .into_iter()
