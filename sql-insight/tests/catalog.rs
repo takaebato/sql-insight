@@ -437,6 +437,42 @@ fn dml_target_resolves_to_the_base_table_not_a_shadowing_cte() {
 }
 
 #[test]
+fn from_ddl_skips_a_table_with_a_non_identifier_name_segment() {
+    // A name segment that isn't a plain identifier (Snowflake `IDENTIFIER('t')`)
+    // makes the table's identity unrepresentable — the whole CREATE is skipped,
+    // not mis-segmented into a phantom (`myschema.IDENTIFIER('t')` must not
+    // register as table `myschema`). A valid CREATE in the same DDL still
+    // registers.
+    use sql_insight::sqlparser::dialect::SnowflakeDialect;
+    let catalog = Catalog::from_ddl(
+        &SnowflakeDialect {},
+        "CREATE TABLE myschema.IDENTIFIER('t') (id INT); CREATE TABLE good (a INT)",
+    )
+    .unwrap();
+    let resolution = |sql: &str| -> ResolutionKind {
+        extract_column_operations_with_options(
+            &SnowflakeDialect {},
+            sql,
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap()
+        .reads
+        .first()
+        .unwrap()
+        .resolution
+    };
+    // The mis-segmented `myschema` phantom is not registered.
+    assert_eq!(
+        resolution("SELECT id FROM myschema"),
+        ResolutionKind::Inferred
+    );
+    // The valid sibling table still registers (the skip is per-statement).
+    assert_eq!(resolution("SELECT a FROM good"), ResolutionKind::Cataloged);
+}
+
+#[test]
 fn from_ddl_unquoted_registration_canonicalizes_the_surfaced_identity() {
     // The Cataloged read surfaces the catalog's stored (folded) identity, not
     // the query's written casing.
