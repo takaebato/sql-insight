@@ -1,0 +1,46 @@
+name: Coverage report
+
+# Uploads fork-PR coverage to Codecov with the token (the PR build can't — forks
+# get no secrets). Runs after the Rust workflow; never executes fork code.
+on:
+  workflow_run:
+    workflows: [ "Rust" ]
+    types: [ completed ]
+
+permissions:
+  contents: read
+  actions: read   # download an artifact from the triggering run
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Download coverage artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: coverage
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Read coverage metadata
+        id: meta
+        # Anchored regexes accept only an int / 40-hex SHA, so the untrusted
+        # artifact can't inject into $GITHUB_OUTPUT; a missing line fails the step.
+        run: |
+          set -euo pipefail
+          grep -m1 -E '^PR_NUMBER=[0-9]+$'    coverage-meta.env >> "$GITHUB_OUTPUT"
+          grep -m1 -E '^PR_SHA=[0-9a-f]{40}$' coverage-meta.env >> "$GITHUB_OUTPUT"
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6.0.2
+        with:
+          files: codecov.json
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: takaebato/sql-insight
+          # This run's CI env is the wrong commit; pin the report to the PR.
+          override_commit: ${{ steps.meta.outputs.PR_SHA }}
+          override_pr: ${{ steps.meta.outputs.PR_NUMBER }}
+          override_branch: ${{ github.event.workflow_run.head_branch }}
