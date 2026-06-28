@@ -36,6 +36,7 @@ jobs:
             build
             chore
             revert
+            deprecate
           # A single-commit PR may be squashed using the commit message instead
           # of the PR title, so validate that lone commit too.
           validateSingleCommit: true
@@ -53,7 +54,7 @@ jobs:
 
             Use `<type>(<optional scope>): <subject>`, with a trailing `!` for a breaking change (e.g. `feat!: …`).
 
-            Allowed types: `feat` `fix` `docs` `refactor` `perf` `test` `ci` `build` `chore` `revert`
+            Allowed types: `feat` `fix` `docs` `refactor` `perf` `test` `ci` `build` `chore` `revert` `deprecate`
 
             <details><summary>Details</summary>
 

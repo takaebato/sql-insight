@@ -34,16 +34,17 @@ protect_breaking_commits = true
 commit_parsers = [
     { message = "^Merge ", skip = true },
     { message = "^feat", group = "<!-- 0 -->Added" },
-    { message = "^fix", group = "<!-- 1 -->Fixed" },
-    { message = "^perf", group = "<!-- 2 -->Performance" },
-    { message = "^docs", group = "<!-- 3 -->Documentation" },
-    { message = "^revert", group = "<!-- 4 -->Changed" },
-    { message = "^refactor", group = "<!-- 5 -->Other Changes" },
-    { message = "^test", group = "<!-- 5 -->Other Changes" },
-    { message = "^ci", group = "<!-- 5 -->Other Changes" },
-    { message = "^build", group = "<!-- 5 -->Other Changes" },
-    { message = "^chore", group = "<!-- 5 -->Other Changes" },
-    { message = ".*", group = "<!-- 5 -->Other Changes" },
+    { message = "^revert", group = "<!-- 1 -->Changed" },
+    { message = "^deprecate", group = "<!-- 2 -->Deprecated" },
+    { message = "^fix", group = "<!-- 3 -->Fixed" },
+    { message = "^perf", group = "<!-- 4 -->Performance" },
+    { message = "^docs", group = "<!-- 5 -->Documentation" },
+    { message = "^refactor", group = "<!-- 6 -->Other Changes" },
+    { message = "^test", group = "<!-- 6 -->Other Changes" },
+    { message = "^ci", group = "<!-- 6 -->Other Changes" },
+    { message = "^build", group = "<!-- 6 -->Other Changes" },
+    { message = "^chore", group = "<!-- 6 -->Other Changes" },
+    { message = ".*", group = "<!-- 6 -->Other Changes" },
 ]
 
 # Custom body: a top "Breaking Changes" section (every commit flagged
