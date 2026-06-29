@@ -33,7 +33,7 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   compile:
     runs-on: ubuntu-latest
@@ -43,7 +43,7 @@ jobs:
         with:
           toolchain: stable
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - run: cargo check --all-targets --all-features
+      - run: cargo check --locked --all-targets --all-features
 
   msrv:
     runs-on: ubuntu-latest
@@ -67,7 +67,7 @@ jobs:
         with:
           toolchain: stable
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - run: cargo doc --document-private-items --no-deps --workspace --all-features
+      - run: cargo doc --locked --document-private-items --no-deps --workspace --all-features
 
   test:
     runs-on: ubuntu-latest
@@ -79,7 +79,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Test
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
 
   test-coverage:
     runs-on: ubuntu-latest
@@ -98,7 +98,7 @@ jobs:
       - name: Coverage
         # `--codecov` (vs `--lcov`) preserves region coverage on Codecov's UI;
         # `--lcov` collapses to line-only there.
-        run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
+        run: cargo llvm-cov --locked --all-features --workspace --codecov --output-path codecov.json
       # Upload straight from this job: it has the source tree checked out, which
       # Codecov needs to path-fix the report — without it every file is dropped
       # and the commit lands as "error" with 0% coverage.
