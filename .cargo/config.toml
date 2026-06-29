@@ -1,0 +1,20 @@
+# Dependency cooldown: refuse crates.io versions published less than 14 days ago,
+# so a freshly published (possibly compromised) release stays out of Cargo.lock
+# until it has had time to be vetted or yanked.
+#
+# `min-publish-age` is an UNSTABLE cargo feature: it only takes effect on a
+# nightly toolchain (>= 2026-06-21). Stable cargo silently ignores this config,
+# so it is harmless for the (stable) CI and for contributors on stable.
+# Regenerate the lock with the cooldown applied via:
+#
+#     cargo +nightly generate-lockfile
+#
+# Renovate enforces the same 14-day window for its update PRs via
+# `minimumReleaseAge` (renovate.json). Tracking issue for stabilization:
+# https://github.com/rust-lang/cargo/issues/17009
+
+[unstable]
+min-publish-age = true
+
+[registry]
+global-min-publish-age = "14 days"
