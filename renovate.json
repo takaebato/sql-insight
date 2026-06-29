@@ -4,5 +4,6 @@
     "config:base",
     "helpers:pinGitHubActionDigests",
     ":disableDependencyDashboard"
-  ]
+  ],
+  "minimumReleaseAge": "14 days"
 }
