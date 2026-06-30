@@ -68,19 +68,29 @@ commit_parsers = [
 # ` by @user` credits the author. The PR link comes from the subject's `(#N)`,
 # which release-plz's default commit_preprocessor turns into a markdown link, so
 # it is not repeated here (squash merges put `(#N)` in the subject).
+#
+# Each breaking change is a `####` heading (its subject) plus an optional block:
+# the text wrapped between `**▼ changelog ▼**` / `**▲ changelog ▲**` in the PR
+# description (see .github/pull_request_template.md), sliced from
+# `commit.raw_message` (not `commit.body`, whose footer parsing would eat a
+# `label:` line). The block may span paragraphs and code fences and carry
+# `**sql-insight:**` / `**sql-insight-cli:**` labels. No markers → just the heading.
 body = '''
 
 ## [{{ version }}]{%- if release_link -%}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
 {% set breaking = commits | filter(attribute="breaking", value=true) -%}
 {% if breaking | length > 0 %}
 ### ⚠️ Breaking Changes
-
 {% for commit in breaking %}
-{%- if commit.scope -%}
-- *({{ commit.scope }})* {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}
-{% else -%}
-- {{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}
-{% endif -%}
+#### {% if commit.scope %}*({{ commit.scope }})* {% endif %}{{ commit.message }}
+{%- set parts = commit.raw_message | default(value="") | split(pat="**▼ changelog ▼**") -%}
+{%- if parts | length > 1 -%}
+{%- set note = parts | last | split(pat="**▲ changelog ▲**") | first | trim -%}
+{%- if note %}
+
+{{ note }}
+{%- endif -%}
+{%- endif %}
 {% endfor -%}
 {% endif -%}
 {% for group, group_commits in commits | group_by(attribute="group") %}
