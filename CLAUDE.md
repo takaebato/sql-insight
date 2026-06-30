@@ -96,3 +96,10 @@ Rules that bite if forgotten (the why is in `ARCHITECTURE.md`):
   as the commit subject, which release-plz reads to compute per-crate version
   bumps and changelogs — so `fix:` / `feat:` / `feat!:` (breaking) on the title
   is what ships. Allowed types live in that workflow.
+- **Breaking-change changelog notes live in the PR description**, between the
+  `**▼ changelog ▼**` / `**▲ changelog ▲**` markers (uncomment the block in
+  `.github/pull_request_template.md`; `!` on the title flags it breaking). Label
+  with `**sql-insight:**` / `**sql-insight-cli:**` and write only what applies.
+  release-plz slices that range into each crate's CHANGELOG "Breaking Changes"
+  section; it can't route per crate, so both labels land in both changelogs. Keep
+  notes short — what changed plus the replacement; link rustdoc for usage.
