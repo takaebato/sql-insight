@@ -2,7 +2,7 @@
 name = "sql-insight"
 description = "A utility for SQL query analysis, formatting, and transformation."
 documentation = "https://docs.rs/sql-insight/"
-keywords = ["sql", "lineage", "crud", "analysis", "query"]
+keywords = ["sql", "lineage", "crud", "analysis", "normalization"]
 include = [
     "src/**/*.rs",
     "Cargo.toml",
