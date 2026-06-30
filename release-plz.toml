@@ -1,23 +1,21 @@
 # release-plz configuration.
 #
-# Versions are independent per crate (each bumps only on its own changes), but
-# the git tag and GitHub Release follow the *library* only: `sql-insight` owns a
-# single plain `vX.Y.Z` tag, matching the project's existing tag history. The CLI
-# publishes to crates.io and keeps its own changelog, but is not tagged or
-# GitHub-released here — crates.io is the record of its versions (the common
-# "flagship-crate tag" pattern). This is safe because release-plz baselines a
-# *published* crate on crates.io (its version + recorded commit), not on a git
-# tag, so the CLI's bump and changelog are computed correctly without a CLI tag.
-# A breaking library bump still cascades a small CLI bump (release-plz updates
-# the CLI's `sql-insight` dependency requirement).
+# Versions are independent per crate (each bumps only on its own changes), and so
+# are tags and GitHub Releases: each crate gets its own `<crate>-vX.Y.Z` tag and
+# Release (release-plz's default for a multi-package workspace). release-plz
+# baselines a *published* crate on crates.io (its version + recorded commit), not
+# on a git tag, so per-crate bumps and changelogs are computed correctly. A
+# breaking library bump still cascades a small CLI bump (release-plz updates the
+# CLI's `sql-insight` dependency requirement). Tags from before this switch use
+# the old plain `vX.Y.Z` scheme (the library's history) and are left as-is.
 #
 # See https://release-plz.dev/docs/config for the full schema.
 
 [workspace]
-# Default for all crates: no git tag / GitHub Release. The library re-enables
-# both below, so only it is tagged + released.
-git_tag_enable = false
-git_release_enable = false
+# Every crate is tagged + GitHub-released, under release-plz's default per-crate
+# tag name `{{ package }}-v{{ version }}` (so no `git_tag_name` override here).
+git_tag_enable = true
+git_release_enable = true
 
 [changelog]
 # Keep a Changelog format. `protect_breaking_commits` keeps breaking changes
@@ -107,16 +105,3 @@ body = '''
 {% endfor -%}
 {% endif -%}
 {% endfor %}'''
-
-[[package]]
-name = "sql-insight"
-# The library owns the single plain `vX.Y.Z` tag + GitHub Release. Its changelog
-# lives at the default per-crate location (sql-insight/CHANGELOG.md), same as the
-# CLI's (sql-insight-cli/CHANGELOG.md).
-git_tag_enable = true
-git_release_enable = true
-git_tag_name = "v{{ version }}"
-
-# sql-insight-cli inherits the workspace defaults: it versions and publishes to
-# crates.io independently and keeps its own sql-insight-cli/CHANGELOG.md, but is
-# not tagged or GitHub-released (crates.io is the record of its versions).
