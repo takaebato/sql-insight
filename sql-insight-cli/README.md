@@ -9,8 +9,27 @@ A command-line interface to [sql-insight](https://github.com/takaebato/sql-insig
 
 ## Installation
 
+Build from source:
+
 ```bash
 cargo install sql-insight-cli
+```
+
+Skip the compile — fetch the prebuilt `sql-insight` binary attached to
+the GitHub Release ([cargo-binstall](https://github.com/cargo-bins/cargo-binstall)
+required):
+
+```bash
+cargo binstall sql-insight-cli
+```
+
+Or download the archive for your platform directly from
+[Releases](https://github.com/takaebato/sql-insight/releases) (Linux musl
+x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64). Each archive is
+signed with GitHub Artifact Attestations — verify the download:
+
+```bash
+gh attestation verify sql-insight-<target>.tar.gz --repo takaebato/sql-insight
 ```
 
 ## Commands
@@ -65,6 +84,34 @@ $ sql-insight extract column-ops "INSERT INTO users (name) SELECT LOWER(name) FR
   reads:   employees.name
   writes:  users.name
   lineage: employees.name -> users.name [transform]
+```
+
+## Shell completions and man page
+
+The CLI can print a static shell-completion script or its man page to
+stdout — the same subcommands packagers call at install time.
+
+Shell completions:
+
+```bash
+# bash
+sql-insight completions bash > ~/.local/share/bash-completion/completions/sql-insight
+# zsh (needs a dir on $fpath; add e.g. `fpath=(~/.zsh/completions $fpath)` to ~/.zshrc)
+sql-insight completions zsh > ~/.zsh/completions/_sql-insight
+# fish
+sql-insight completions fish > ~/.config/fish/completions/sql-insight.fish
+```
+
+Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
+
+Man page:
+
+```bash
+# read it directly
+sql-insight man | man -l -
+# or install per-user (add ~/.local/share/man to MANPATH if needed)
+mkdir -p ~/.local/share/man/man1
+sql-insight man > ~/.local/share/man/man1/sql-insight.1
 ```
 
 ## Options (extract commands)

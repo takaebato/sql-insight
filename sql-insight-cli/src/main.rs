@@ -4,7 +4,8 @@ use crate::executor::{
     CasingOverride, CliExecutable, ExtractExecutor, ExtractKind, FormatExecutor, NormalizeExecutor,
     OutputFormat,
 };
-use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
 use sql_insight::error::Error;
 use sql_insight::formatter::FormatterOptions;
 use sql_insight::normalizer::NormalizerOptions;
@@ -113,6 +114,13 @@ enum Commands {
         #[command(subcommand)]
         target: ExtractTarget,
     },
+    /// Print a shell completion script (bash, zsh, fish, …) to stdout
+    Completions {
+        /// Shell to generate the completion script for
+        shell: Shell,
+    },
+    /// Print the man page (roff) to stdout
+    Man,
 }
 
 /// Extraction granularities — thin wrappers over the library's extractors.
@@ -243,6 +251,11 @@ impl Commands {
             Commands::Format(opts) => &opts.common_options,
             Commands::Normalize(opts) => &opts.common_options,
             Commands::Extract { target } => target.common(),
+            // Utility commands take no SQL input; main dispatches them before
+            // ever reaching the SQL path that calls this.
+            Commands::Completions { .. } | Commands::Man => {
+                unreachable!("completions/man are handled in main")
+            }
         }
     }
 
@@ -344,14 +357,38 @@ impl Commands {
                 ),
             ),
             Commands::Extract { target } => target.executor(sql),
+            Commands::Completions { .. } | Commands::Man => {
+                unreachable!("completions/man are handled in main")
+            }
         }
     }
 }
 
 fn main() -> ExitCode {
     let args = Cli::parse();
-    let result = args.command.execute();
-    match result {
+    // Utility commands take no SQL input — render straight to stdout.
+    match &args.command {
+        Commands::Completions { shell } => {
+            generate(
+                *shell,
+                &mut Cli::command(),
+                "sql-insight",
+                &mut io::stdout(),
+            );
+            return ExitCode::SUCCESS;
+        }
+        Commands::Man => {
+            return match clap_mangen::Man::new(Cli::command()).render(&mut io::stdout()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Commands::Format(_) | Commands::Normalize(_) | Commands::Extract { .. } => {}
+    }
+    match args.command.execute() {
         Ok(result) => {
             for r in result {
                 println!("{}", r);

@@ -683,6 +683,59 @@ mod integration {
         }
     }
 
+    mod completions_and_man {
+        use super::*;
+
+        #[test]
+        fn test_completions_bash_starts_with_function() {
+            // The static bash completion script begins with the function
+            // definition `_sql-insight() {` — a stable marker of a real
+            // clap_complete emission, not a stray usage/error message.
+            sql_insight_cmd()
+                .arg("completions")
+                .arg("bash")
+                .assert()
+                .success()
+                .stdout(predicate::str::starts_with("_sql-insight() {"))
+                .stderr("");
+        }
+
+        #[test]
+        fn test_completions_zsh_starts_with_compdef() {
+            // The zsh script begins with `#compdef sql-insight`.
+            sql_insight_cmd()
+                .arg("completions")
+                .arg("zsh")
+                .assert()
+                .success()
+                .stdout(predicate::str::starts_with("#compdef sql-insight"))
+                .stderr("");
+        }
+
+        #[test]
+        fn test_completions_unknown_shell_fails() {
+            // clap's ValueEnum rejects an unknown shell name before we generate.
+            sql_insight_cmd()
+                .arg("completions")
+                .arg("not-a-shell")
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("invalid value"));
+        }
+
+        #[test]
+        fn test_man_emits_roff_header() {
+            // clap_mangen emits a `.TH` header with the program name — the
+            // shape any real `man` reader expects.
+            sql_insight_cmd()
+                .arg("man")
+                .assert()
+                .success()
+                .stdout(predicate::str::contains(".TH sql-insight 1"))
+                .stderr("");
+        }
+    }
+
     mod invalid_cases {
         use super::*;
 
