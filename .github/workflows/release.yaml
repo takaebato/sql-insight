@@ -1,0 +1,122 @@
+name: Release
+
+# release-plz reads Conventional Commits on `master` and:
+#   - release-plz-pr: opens/updates a "Release PR" that bumps versions and
+#     updates CHANGELOG.md (nothing is published — this PR is the review point).
+#   - release-plz-release: once that PR is merged, publishes to crates.io and
+#     creates the git tag + GitHub Release.
+#   - upload-cli-binaries: when that release includes sql-insight-cli, builds the
+#     `sql-insight` binary for each target and attaches it to the CLI's Release.
+on:
+  push:
+    branches: [ master ]
+
+permissions:
+  contents: read
+
+jobs:
+  release-plz-release:
+    name: Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      releases: ${{ steps.release-plz.outputs.releases }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Attach prebuilt `sql-insight` binaries to the CLI's GitHub Release. Runs in
+  # this same workflow (not a tag-triggered one) because release-plz creates the
+  # tag/release with the default GITHUB_TOKEN, whose events can't trigger another
+  # workflow; the `ref` input uploads to the tag release-plz just created. Gated
+  # on sql-insight-cli actually being released this run.
+  upload-cli-binaries:
+    name: Upload sql-insight binary (${{ matrix.target }})
+    needs: release-plz-release
+    if: contains(needs.release-plz-release.outputs.releases, 'sql-insight-cli')
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          # x86_64 pins macos-13 (the last Intel runner; macos-latest is arm64
+          # now); aarch64 tracks macos-latest (arm64, native).
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Resolve CLI release tag
+        id: tag
+        shell: bash
+        env:
+          RELEASES: ${{ needs.release-plz-release.outputs.releases }}
+        run: |
+          tag=$(printf '%s' "$RELEASES" | jq -r '.[] | select(.package_name == "sql-insight-cli") | .tag')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Build and upload binary
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
+        with:
+          bin: sql-insight
+          target: ${{ matrix.target }}
+          archive: sql-insight-$target
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  release-plz-pr:
+    name: Release PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    # Avoid two PR-update runs racing on the same branch.
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - name: Run release-plz
+        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
