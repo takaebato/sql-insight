@@ -20,6 +20,20 @@ repository = { workspace = true }
 license = { workspace = true }
 authors = { workspace = true }
 
+# cargo-binstall: fetch the prebuilt `sql-insight` binary from the CLI's GitHub
+# Release (built by .github/workflows/release.yaml) instead of compiling. The tag
+# is per-crate (`sql-insight-cli-v{version}`) and the archive is
+# `sql-insight-<target>`, so the pkg-url is spelled out; Windows ships a .zip, the
+# rest a .tar.gz. First resolvable from the next CLI release under this scheme.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/sql-insight-cli-v{ version }/sql-insight-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/sql-insight-cli-v{ version }/sql-insight-{ target }.zip"
+pkg-fmt = "zip"
+
 [[bin]]
 name = "sql-insight"
 path = "src/main.rs"
