@@ -34,7 +34,7 @@ use std::ops::{ControlFlow, Deref};
 
 use crate::error::Error;
 use sqlparser::ast::{Expr, Insert, Statement, VisitMut, VisitorMut};
-use sqlparser::ast::{Query, SetExpr, TopQuantity, Value};
+use sqlparser::ast::{Parens, Query, SetExpr, TopQuantity, Value, ValueWithSpan};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 use std::ops::DerefMut;
@@ -141,9 +141,12 @@ impl VisitorMut for Normalizer {
                         row.is_empty() || row.iter().all(|expr| matches!(expr, Expr::Value(_)))
                     })
                 {
-                    *rows = vec![vec![Expr::Value(
+                    // `Values::rows` is `Vec<Parens<Vec<Expr>>>` (each row
+                    // tracks its own parentheses tokens); wrap the collapsed
+                    // sentinel row accordingly.
+                    *rows = vec![Parens::with_empty_span(vec![Expr::Value(
                         Value::Placeholder("...".into()).with_empty_span(),
-                    )]];
+                    )])];
                 }
             }
         }
@@ -164,13 +167,24 @@ impl VisitorMut for Normalizer {
             {
                 if let Some(Query { body, .. }) = source.as_deref() {
                     if let SetExpr::Values(v) = body.deref() {
+                        // `Parens` equality ignores its parenthesis tokens
+                        // (their `PartialEq` is always-equal), so this compares
+                        // the row content alone — matching the sentinel above.
                         if v.rows
-                            == vec![vec![Expr::Value(
+                            == vec![Parens::with_empty_span(vec![Expr::Value(
                                 Value::Placeholder("...".into()).with_empty_span(),
-                            )]]
+                            )])]
                         {
                             if columns.len() > 1 {
-                                columns.sort_by_key(|s| s.value.to_lowercase());
+                                // `Insert::columns` is now `Vec<ObjectName>`;
+                                // sort by the (unquoted) final identifier part,
+                                // preserving the old `Ident::value` key.
+                                columns.sort_by_key(|s| {
+                                    s.0.last()
+                                        .and_then(|p| p.as_ident())
+                                        .map(|i| i.value.to_lowercase())
+                                        .unwrap_or_default()
+                                });
                             }
                             if after_columns.len() > 1 {
                                 after_columns.sort_by_key(|s| s.value.to_lowercase());
@@ -199,13 +213,14 @@ impl VisitorMut for Normalizer {
         ControlFlow::Continue(())
     }
 
-    fn pre_visit_value(&mut self, value: &mut Value) -> ControlFlow<Self::Break> {
+    fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
         // The base contract: *every* literal `Value` becomes `?`, wherever the
         // AST holds it. `pre_visit_expr` only catches an `Expr::Value`; a
         // literal kept in a bare `Value` field — `DATE '…'` / `TIMESTAMP '…'`
         // (`TypedString`), a `LIKE … ESCAPE '!'` char, a `MATCH … AGAINST '…'`
-        // search string — is reached only through this hook.
-        *value = Value::Placeholder("?".into());
+        // search string — is reached only through this hook. The visitor now
+        // hands us a `ValueWithSpan`; rewrite the inner `value`, keeping the span.
+        value.value = Value::Placeholder("?".into());
         ControlFlow::Continue(())
     }
 

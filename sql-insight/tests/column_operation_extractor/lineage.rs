@@ -50,6 +50,27 @@ mod projections {
     }
 
     #[test]
+    fn expr_with_multi_column_aliases_binds_the_expression_once() {
+        // Spark `expr AS (a, b, …)`: one expression projected under several
+        // output names. `reads` is occurrence-based, so `t.arr` is read exactly
+        // once; the expression's lineage attaches to the first alias (`k`), and
+        // the tail alias (`v`) is an extra output that traces to nothing —
+        // splitting one expression's lineage across N outputs isn't
+        // representable without re-reading it. (`GenericDialect` parses the
+        // multi-column alias.)
+        assert_column_ops(
+            "SELECT explode(t.arr) AS (k, v) FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "arr")],
+                writes: vec![],
+                lineage: vec![transformation(col("t", "arr"), out("k", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn in_subquery_in_value_position_flows_lhs_not_the_subquery() {
         // `a IN (subquery)` projected as a value: the LHS `a` flows to the
         // output (a boolean transformation of it, symmetric with `a IN (list)`);
@@ -771,6 +792,15 @@ mod cte_derived_rename {
 
 mod lambda {
     use super::*;
+    use sql_insight::sqlparser::dialect::DuckDbDialect;
+
+    /// Lambdas need a lambda-aware dialect: `GenericDialect` (used by the
+    /// default `assert_column_ops`) parses `x -> …` as the JSON-arrow
+    /// operator, so the parameter would leak as a column read. DuckDB parses
+    /// it as a real `Lambda`, exercising the binder's lambda-scoping path.
+    fn assert_lambda_ops(sql: &str, expected: ColumnOperation) {
+        assert_column_ops_with_dialect(&DuckDbDialect {}, sql, expected);
+    }
 
     #[test]
     fn lambda_param_is_not_traced_into_a_same_named_derived_column() {
@@ -779,7 +809,7 @@ mod lambda {
         // `s.x`. Only the array argument (`arr` → `s.arr`) flows to the output.
         // (A `Derived` binding instead of a dedicated `Local` would mis-trace
         // `x` into the derived subquery and emit a spurious `s.x → r`.)
-        assert_column_ops(
+        assert_lambda_ops(
             "SELECT transform(arr, x -> x) AS r FROM (SELECT arr, x FROM s) d",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
@@ -799,7 +829,7 @@ mod lambda {
         // in the resolution stack and doesn't over-shadow an inner scope. Both
         // the array arg (`t1.arr`) and the body value (`t2.x`) flow to the
         // anonymous output as a transformation.
-        assert_column_ops(
+        assert_lambda_ops(
             "SELECT transform(arr, x -> (SELECT x FROM t2)) FROM t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
@@ -820,7 +850,7 @@ mod lambda {
         // scope, so a bare `x` resolves to `t3.x`. A flat "parameter checked
         // first" rule would have wrongly shadowed both `t2` and `t3`; the frame
         // stack places the parameter at its correct depth.
-        assert_column_ops(
+        assert_lambda_ops(
             "SELECT transform(arr, x -> (SELECT (SELECT x FROM t3) FROM t2)) FROM t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
@@ -842,7 +872,7 @@ mod lambda {
         // (→ s.k), shadowing the lambda parameter — the parameter is not a false
         // read. Both the array arg (`t1.arr`) and the body value (`s.k`, through
         // the CTE) flow to the anonymous output.
-        assert_column_ops(
+        assert_lambda_ops(
             "SELECT transform(arr, x -> (WITH c AS (SELECT k AS x FROM s) SELECT x FROM c)) FROM t1",
             ColumnOperation {
                 statement_kind: StatementKind::Select,

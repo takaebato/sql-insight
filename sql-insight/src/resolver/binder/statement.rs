@@ -107,6 +107,12 @@ impl<'a> Binder<'a> {
         let name = match &insert.table {
             TableObject::TableName(name) => name,
             TableObject::TableFunction(function) => &function.name,
+            // Oracle `INSERT INTO (SELECT …) …`: the target is a subquery, not a
+            // writable base table — drop + flag (like a CTE / derived target).
+            TableObject::TableQuery(query) => {
+                self.record_unsupported_dml_target("INSERT", query.as_ref());
+                return LogicalPlan::Empty;
+            }
         };
         let Some(written) = self.table_ref(name) else {
             return LogicalPlan::Empty;
@@ -153,7 +159,13 @@ impl<'a> Binder<'a> {
         // the drop + flag guard below fires rather than mis-truncating to the
         // undercounted outputs.
         let columns = if !insert.columns.is_empty() {
-            insert.columns.clone()
+            // `Insert::columns` is `Vec<ObjectName>`; a target column is named
+            // by its final identifier part (mirrors the MERGE-insert path).
+            insert
+                .columns
+                .iter()
+                .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
+                .collect()
         } else if source_wildcard {
             Vec::new()
         } else {
@@ -575,11 +587,13 @@ impl<'a> Binder<'a> {
                             } else {
                                 explicit
                             };
-                            // A MERGE INSERT is a single VALUES row.
+                            // A MERGE INSERT is a single VALUES row. Each row is
+                            // now a `Parens<Vec<Expr>>`; flatten through its
+                            // inner expressions (via `Deref`).
                             let row: Vec<Expr> = values
                                 .rows
                                 .iter()
-                                .flatten()
+                                .flat_map(|row| row.iter())
                                 .map(|e| self.bind_expr(e, &scope))
                                 .collect();
                             // Column-list-less and no catalog to fill the target
@@ -1226,7 +1240,9 @@ fn source_has_wildcard(query: &Query) -> bool {
         match body {
             SetExpr::Select(select) => select.projection.iter().any(|item| match item {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => true,
-                SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => false,
+                SelectItem::UnnamedExpr(_)
+                | SelectItem::ExprWithAlias { .. }
+                | SelectItem::ExprWithAliases { .. } => false,
             }),
             SetExpr::Query(q) => body_has_wildcard(&q.body),
             SetExpr::SetOperation { left, right, .. } => {

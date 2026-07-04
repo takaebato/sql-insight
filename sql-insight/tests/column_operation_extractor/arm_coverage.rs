@@ -12,7 +12,10 @@ use crate::support::*;
 /// Generic parse is quirky are reshaped (`Interval` via `+`, `Subscript`
 /// on a bare identifier) or omitted (`Convert` parses its type arg as a
 /// value and drops the real column; `Interpolate` rejects a qualified
-/// name) and are left to higher-level tests.
+/// name) and are left to higher-level tests. Two arms need a non-Generic
+/// parse: `ARRAY[...]` literals (`reads_pg`, PostgreSQL) and lambda
+/// `x -> …` (`reads_duck`, DuckDB — `GenericDialect` parses `->` as the
+/// JSON-arrow operator, not a lambda).
 #[cfg(test)]
 mod expr_arm_coverage {
     use super::*;
@@ -32,6 +35,18 @@ mod expr_arm_coverage {
     fn reads_pg(sql: &str) -> Vec<ColumnRead> {
         use sql_insight::sqlparser::dialect::PostgreSqlDialect;
         extract_column_operations(&PostgreSqlDialect {}, sql)
+            .unwrap()
+            .remove(0)
+            .unwrap()
+            .reads
+    }
+
+    /// Like [`reads`], but parses under DuckDB — the built-in dialect used
+    /// for lambda `x -> …` syntax (`GenericDialect` parses `->` as the
+    /// JSON-arrow operator instead).
+    fn reads_duck(sql: &str) -> Vec<ColumnRead> {
+        use sql_insight::sqlparser::dialect::DuckDbDialect;
+        extract_column_operations(&DuckDbDialect {}, sql)
             .unwrap()
             .remove(0)
             .unwrap()
@@ -138,21 +153,30 @@ mod expr_arm_coverage {
 
     #[test]
     fn lambda() {
+        // Lambdas parse under DuckDB (`GenericDialect` reads `->` as the
+        // JSON-arrow operator, which would leak the parameter as a column).
         // A real column in the body is read; the lambda parameter is a local,
         // not a column.
         assert_unordered_eq!(
-            reads("SELECT transform(t.arr, x -> t.a) FROM t"),
+            reads_duck("SELECT transform(t.arr, x -> t.a) FROM t"),
             vec![c("arr"), c("a")]
         );
         // A bare reference to the parameter `x` adds no read (a previous
         // version wrongly read `t.x`).
         assert_unordered_eq!(
-            reads("SELECT transform(t.arr, x -> x + 1) FROM t"),
+            reads_duck("SELECT transform(t.arr, x -> x + 1) FROM t"),
             vec![c("arr")]
         );
         // Mixed: the parameter is suppressed, the real column `t.a` stays.
         assert_unordered_eq!(
-            reads("SELECT transform(t.arr, x -> x + t.a) FROM t"),
+            reads_duck("SELECT transform(t.arr, x -> x + t.a) FROM t"),
+            vec![c("arr"), c("a")]
+        );
+        // A *typed* parameter (`x INT`): sqlparser now carries an optional
+        // data type on each lambda parameter, but the binder only tracks the
+        // name — so `x` is still a local and the type `INT` is not a read.
+        assert_unordered_eq!(
+            reads_duck("SELECT transform(t.arr, x INT -> x + t.a) FROM t"),
             vec![c("arr"), c("a")]
         );
     }

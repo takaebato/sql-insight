@@ -332,8 +332,18 @@ impl TableReference {
         let name = match &value.table {
             TableObject::TableName(object_name) => object_name,
             TableObject::TableFunction(function) => &function.name,
+            // Oracle `INSERT INTO (SELECT …) …`: a subquery target names no
+            // stored table, so it can't become a `TableReference`.
+            TableObject::TableQuery(_) => {
+                return Err(Error::AnalysisError(
+                    "INSERT target is a subquery, not a named table".to_string(),
+                ))
+            }
         };
-        Ok((Self::try_from_name(name)?, value.table_alias.clone()))
+        // `Insert::table_alias` is now a `TableAliasWithoutColumns`; the public
+        // pair still exposes just the alias identifier.
+        let alias = value.table_alias.as_ref().map(|a| a.alias.clone());
+        Ok((Self::try_from_name(name)?, alias))
     }
 
     /// Parse a `TableFactor::Table` into (identity, alias) pair. Other
@@ -613,5 +623,23 @@ mod tests {
         let reference = TableReference::try_from(&insert).unwrap();
         assert_eq!(reference.schema.as_ref().unwrap().value, "a");
         assert_eq!(reference.name.value, "b");
+    }
+
+    #[test]
+    fn from_insert_with_alias_extracts_the_target_alias_identifier() {
+        // `INSERT INTO t AS foo …` (PostgreSQL): the target alias is a
+        // `TableAliasWithoutColumns`. The pair keeps the base table (`t`) plus
+        // just the alias identifier (`foo`), dropping the `explicit`
+        // (`AS`-was-written) flag the analysis doesn't need.
+        use sqlparser::dialect::PostgreSqlDialect;
+        let mut stmts =
+            Parser::parse_sql(&PostgreSqlDialect {}, "INSERT INTO t AS foo (a) VALUES (1)")
+                .unwrap();
+        let Statement::Insert(insert) = stmts.remove(0) else {
+            panic!("expected an insert");
+        };
+        let (reference, alias) = TableReference::from_insert_with_alias(&insert).unwrap();
+        assert_eq!(reference.name.value, "t");
+        assert_eq!(alias.unwrap().value, "foo");
     }
 }

@@ -639,6 +639,10 @@ fn alter_table_op_target_columns(op: &AlterTableOperation) -> Vec<Ident> {
         | AlterTableOperation::OwnerTo { .. }
         | AlterTableOperation::ClusterBy { .. }
         | AlterTableOperation::DropClusteringKey
+        // Redshift `ALTER SORTKEY (cols)` reorders storage; the columns are
+        // references to existing columns, not columns this op writes/creates —
+        // so, like `ClusterBy`, it names no target column.
+        | AlterTableOperation::AlterSortKey { .. }
         | AlterTableOperation::SuspendRecluster
         | AlterTableOperation::ResumeRecluster
         | AlterTableOperation::Refresh { .. }
@@ -736,7 +740,13 @@ fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
         | JoinOperator::RightAnti(c)
         | JoinOperator::StraightJoin(c) => Some(c),
         JoinOperator::AsOf { constraint, .. } => Some(constraint),
-        JoinOperator::CrossApply | JoinOperator::OuterApply => None,
+        // No `ON`/`USING` predicate: APPLY correlates through the relation
+        // itself; ClickHouse `ARRAY JOIN` unnests an array expression inline.
+        JoinOperator::CrossApply
+        | JoinOperator::OuterApply
+        | JoinOperator::ArrayJoin
+        | JoinOperator::LeftArrayJoin
+        | JoinOperator::InnerArrayJoin => None,
     }
 }
 
