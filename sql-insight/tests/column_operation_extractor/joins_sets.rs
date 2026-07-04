@@ -898,4 +898,39 @@ mod join_arm_coverage {
             vec![read("t", "a"), read("u", "id")]
         );
     }
+
+    // ClickHouse `ARRAY JOIN` (and its `LEFT` / `INNER` forms) unnest an array
+    // expression inline and carry no `ON` predicate (join_constraint → None,
+    // like CROSS APPLY). The array expression is not itself a scanned relation,
+    // so only the projection's `t.a` surfaces. `GenericDialect` parses all
+    // three forms.
+    #[test]
+    fn array_join() {
+        assert_unordered_eq!(
+            join_reads("SELECT t.a FROM t ARRAY JOIN t.arr", &GenericDialect {}),
+            vec![read("t", "a")]
+        );
+    }
+
+    #[test]
+    fn left_array_join() {
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT t.a FROM t LEFT ARRAY JOIN t.arr",
+                &GenericDialect {}
+            ),
+            vec![read("t", "a")]
+        );
+    }
+
+    #[test]
+    fn inner_array_join() {
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT t.a FROM t INNER ARRAY JOIN t.arr",
+                &GenericDialect {}
+            ),
+            vec![read("t", "a")]
+        );
+    }
 }

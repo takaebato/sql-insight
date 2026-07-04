@@ -407,7 +407,9 @@ impl<'a> Binder<'a> {
     /// falling through to the correlation stack (a `(VALUES (t.a)) AS v` reads
     /// the enclosing / sibling `t.a` like a derived subquery's body).
     pub(super) fn bind_values(&mut self, values: &SqlValues) -> (LogicalPlan, Scope) {
-        let width = values.rows.iter().map(Vec::len).max().unwrap_or(0);
+        // `rows` is `Vec<Parens<Vec<Expr>>>`; each `Parens` derefs to its inner
+        // row `Vec`, so `row.len()` is the column count.
+        let width = values.rows.iter().map(|row| row.len()).max().unwrap_or(0);
         let rows: Vec<Vec<Expr>> = values
             .rows
             .iter()

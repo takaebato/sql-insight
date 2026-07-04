@@ -2,7 +2,7 @@ use crate::support::*;
 
 mod reported {
     use super::*;
-    use sql_insight::sqlparser::dialect::BigQueryDialect;
+    use sql_insight::sqlparser::dialect::{BigQueryDialect, OracleDialect};
 
     #[test]
     fn unsupported_statement_reports_diagnostic() {
@@ -43,6 +43,25 @@ mod reported {
             "UPDATE (SELECT 1) x SET a = 1",
             ColumnOperation {
                 statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_into_subquery_target_reports_diagnostic() {
+        // Oracle `INSERT INTO (SELECT …) …`: the target is a subquery, not a
+        // writable base table — flagged (like the non-table UPDATE / MERGE
+        // target above), not dropped silently. The statement_kind stays Insert;
+        // nothing is written. (`OracleDialect` parses the subquery target.)
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT a FROM t) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
                 reads: vec![],
                 writes: vec![],
                 lineage: vec![],

@@ -1001,7 +1001,7 @@ mod alter_table {
     //! BOTH the old and new names — both ends of the rename are
     //! useful for downstream lineage consumers tracking column
     //! history. Schema-level operations (constraints, partitions,
-    //! RENAME TABLE) contribute no column writes.
+    //! RENAME TABLE, CLUSTER BY, SORTKEY) contribute no column writes.
     use super::*;
 
     #[test]
@@ -1084,6 +1084,24 @@ mod alter_table {
         // surface (the table itself stays in table_op writes).
         assert_column_ops(
             "ALTER TABLE t ADD CONSTRAINT uq UNIQUE (a)",
+            ColumnOperation {
+                statement_kind: StatementKind::AlterTable,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn alter_table_alter_sort_key_emits_no_column_writes() {
+        // Redshift `ALTER SORTKEY (cols)` reorders storage and only
+        // references existing columns — like ADD CONSTRAINT / CLUSTER BY
+        // it's schema-level, so no column writes surface (the table itself
+        // stays in table_op writes).
+        assert_column_ops(
+            "ALTER TABLE t ALTER SORTKEY (a, b)",
             ColumnOperation {
                 statement_kind: StatementKind::AlterTable,
                 reads: vec![],

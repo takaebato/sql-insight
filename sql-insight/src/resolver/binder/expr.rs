@@ -15,6 +15,31 @@ impl<'a> Binder<'a> {
                 name: Some(alias.clone()),
                 expr: self.bind_expr(expr, scope),
             }],
+            // Spark `expr AS (a, b, …)`: one expression projected under several
+            // output names (e.g. `explode(arr) AS (key, value)`). Because
+            // `reads` is occurrence-based, the expression's columns must be
+            // counted exactly once — so only the first alias carries the bound
+            // expression (with its reads / lineage); the remaining aliases are
+            // extra output columns that trace to nothing, like a
+            // `(VALUES …) AS v(x)` derived column. Splitting one expression's
+            // lineage across N outputs isn't representable without re-reading
+            // it, so those tail outputs are best-effort.
+            SelectItem::ExprWithAliases { expr, aliases } => {
+                let bound = self.bind_expr(expr, scope);
+                let mut names = aliases.iter();
+                let head = NamedExpr {
+                    name: names.next().cloned(),
+                    expr: bound,
+                };
+                std::iter::once(head)
+                    .chain(names.map(|a| NamedExpr {
+                        name: Some(a.clone()),
+                        // An empty `Call` reads nothing and originates from
+                        // nothing (a `Derived` output).
+                        expr: Expr::Call { args: Vec::new() },
+                    }))
+                    .collect()
+            }
             // A wildcard isn't expanded (the rigor cost is too high for a
             // SQL-text-only library); record it so consumers know this
             // projection's column lineage is incomplete. A `REPLACE (expr AS
@@ -277,7 +302,9 @@ impl<'a> Binder<'a> {
             // resolves its own columns first, the enclosing query last.
             SqlExpr::Lambda(lambda) => self.in_lambda(
                 scope.relations.clone(),
-                lambda.params.iter().cloned(),
+                // A lambda param is now a `LambdaFunctionParameter` (name +
+                // optional type); the binder only tracks the bound name.
+                lambda.params.iter().map(|p| p.name.clone()),
                 |b| b.call([lambda.body.as_ref()], &Scope::default()),
             ),
             SqlExpr::MemberOf(member_of) => {

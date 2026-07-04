@@ -203,6 +203,41 @@ fn test_do_not_alphabetize_insert_columns_when_values_not_unified() {
 }
 
 #[test]
+fn test_alphabetize_insert_columns_is_case_insensitive_and_preserves_case() {
+    // The sort key is the column name lowercased, so `B` orders before `C` but
+    // after `a`; the written case (`B`, `C`) is preserved in the output. Each
+    // column is now an `ObjectName`, keyed on its final identifier part.
+    let sql = "INSERT INTO t1 (B, a, C) VALUES (1, 2, 3)";
+    let expected = vec!["INSERT INTO t1 (a, B, C) VALUES (...)".into()];
+    assert_normalize(
+        sql,
+        expected,
+        all_dialects(),
+        NormalizerOptions::new()
+            .with_unify_values(true)
+            .with_alphabetize_insert_columns(true),
+    );
+}
+
+#[test]
+fn test_alphabetize_insert_columns_sorts_quoted_by_unquoted_value() {
+    // A quoted column sorts by its *unquoted* identifier value (`"Z"` → `z`,
+    // ordering last), not by its rendered form (which would sort the `"` before
+    // letters and place it first); the quotes are preserved in the output.
+    // `"…"`-quoting is the GenericDialect's identifier quote.
+    let sql = r#"INSERT INTO t1 ("Z", a, m) VALUES (1, 2, 3)"#;
+    let expected = vec![r#"INSERT INTO t1 (a, m, "Z") VALUES (...)"#.into()];
+    assert_normalize(
+        sql,
+        expected,
+        vec![Box::new(sql_insight::sqlparser::dialect::GenericDialect {})],
+        NormalizerOptions::new()
+            .with_unify_values(true)
+            .with_alphabetize_insert_columns(true),
+    );
+}
+
+#[test]
 fn test_typed_string_literal_value_is_normalized() {
     // A `DATE` / `TIMESTAMP '…'` literal is a `TypedString`, whose value is a
     // bare `Value` field (not an `Expr::Value`) — it must still normalize so
