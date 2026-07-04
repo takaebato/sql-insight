@@ -391,7 +391,14 @@ impl<'a> Binder<'a> {
         // both computed before the right scope is absorbed — so an unqualified
         // reference resolves to both sides instead of staying `Ambiguous`.
         for j in joins {
-            let (node, jscope) = self.bind_table_factor(&j.relation, &scope.relations);
+            // An ARRAY JOIN operand is an unnested array column, not a joined
+            // table (same special case as `bind_table_with_joins`).
+            let (node, jscope) = if is_array_join(&j.join_operator) {
+                let visible = scope.relations.clone();
+                self.bind_array_join(&j.relation, &visible)
+            } else {
+                self.bind_table_factor(&j.relation, &scope.relations)
+            };
             let merge = if join_is_natural(&j.join_operator) {
                 self.natural_merge_columns(&scope, &jscope)
             } else {

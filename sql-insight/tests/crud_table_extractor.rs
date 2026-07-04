@@ -66,6 +66,69 @@ mod basic {
     }
 
     #[test]
+    fn array_join_operand_is_not_a_read_table() {
+        // ClickHouse `ARRAY JOIN arr` unnests an array *column* of `t`.
+        // sqlparser parses the operand as a table factor, but it is not a
+        // scanned table — so only `t` is a read table, never a phantom `arr`.
+        // (`GenericDialect` parses ARRAY JOIN; not all dialects do.)
+        let sql = "SELECT s FROM t ARRAY JOIN arr";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![cread(table("t"))],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(
+            sql,
+            expected,
+            vec![Box::new(sql_insight::sqlparser::dialect::GenericDialect {})],
+        );
+    }
+
+    #[test]
+    fn array_join_derived_operand_keeps_its_reads() {
+        // Not valid ClickHouse, but sqlparser parses a derived subquery as the
+        // ARRAY JOIN operand — it falls back to the normal factor path
+        // (best-effort), so the subquery's `u` read survives instead of being
+        // silently dropped.
+        let sql = "SELECT s FROM t ARRAY JOIN (SELECT arr FROM u) AS x";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![cread(table("t")), cread(table("u"))],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(
+            sql,
+            expected,
+            vec![Box::new(sql_insight::sqlparser::dialect::GenericDialect {})],
+        );
+    }
+
+    #[test]
+    fn update_array_join_operand_is_not_a_read_table() {
+        // The UPDATE target's join clause takes the same ARRAY JOIN special
+        // case as SELECT: the operand is `t`'s array column, not a table — so
+        // no phantom `arr` read table. Reading `t.arr` references the write
+        // target's own data, so `t` itself surfaces as a read.
+        let sql = "UPDATE t ARRAY JOIN arr SET a = 1";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![cread(table("t"))],
+            update_tables: vec![cwrite(table("t"))],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(
+            sql,
+            expected,
+            vec![Box::new(sql_insight::sqlparser::dialect::GenericDialect {})],
+        );
+    }
+
+    #[test]
     fn test_multiple_statements() {
         let sql = "SELECT a FROM t1; SELECT b FROM t2";
         let expected = vec![

@@ -787,6 +787,17 @@ fn join_is_natural(op: &JoinOperator) -> bool {
     matches!(join_constraint(op), Some(JoinConstraint::Natural))
 }
 
+/// Whether a join operator is a ClickHouse `ARRAY JOIN` / `LEFT ARRAY JOIN` /
+/// `INNER ARRAY JOIN` — which unnests an array expression inline rather than
+/// joining a relation, so its operand is a column expression, not a scanned
+/// table.
+fn is_array_join(op: &JoinOperator) -> bool {
+    matches!(
+        op,
+        JoinOperator::ArrayJoin | JoinOperator::LeftArrayJoin | JoinOperator::InnerArrayJoin
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
