@@ -150,15 +150,21 @@ pub struct ColumnRead {
 /// ([`ResolutionKind`]). The write-role counterpart of [`ColumnRead`], kept a
 /// distinct type so a read can't be passed where a write is meant.
 ///
-/// `resolution` is the column's catalog match against its (always pinned) write
-/// target: [`Cataloged`](ResolutionKind::Cataloged) when the column is in the
-/// target's catalog column list, else [`Inferred`](ResolutionKind::Inferred)
+/// `resolution` is the column's catalog match against its write target:
+/// [`Cataloged`](ResolutionKind::Cataloged) when the column is in the target's
+/// catalog column list, else [`Inferred`](ResolutionKind::Inferred)
 /// (catalog-free, the target's columns aren't known, the column isn't listed,
-/// or a freshly created / altered relation). A written column's owning table is
-/// always pinned and the column is named, so
-/// [`Unresolved`](ResolutionKind::Unresolved) /
-/// [`Ambiguous`](ResolutionKind::Ambiguous) never arise — mirroring how a base
-/// column read resolves against its relation's column list.
+/// or a freshly created / altered relation).
+///
+/// The owning table is pinned whenever the statement names the sink — every
+/// INSERT / DDL write, a qualified `SET t2.col`, and an unqualified SET with
+/// one writable relation. Only an **unqualified SET among several writable
+/// relations** (a multi-table `UPDATE t1 JOIN t2 SET col = …`) is *inferred*,
+/// with the same rules as a read: a sole candidate pins its owner, several
+/// candidates surface [`Ambiguous`](ResolutionKind::Ambiguous) and none
+/// [`Unresolved`](ResolutionKind::Unresolved) — `table: None`, the column
+/// still named, exactly like an unattributed [`ColumnRead`]. An unattributed
+/// write contributes no table-level write.
 ///
 /// [`ColumnOperation::writes`]: crate::extractor::ColumnOperation::writes
 /// [`ColumnTarget::Relation`]: crate::extractor::ColumnTarget::Relation

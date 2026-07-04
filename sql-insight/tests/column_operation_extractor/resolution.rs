@@ -496,6 +496,174 @@ mod catalog_strict {
             },
         );
     }
+
+    // ===== unqualified SET write attribution =============================
+    //
+    // An unqualified SET target in a *multi-table* UPDATE is attributed with
+    // the read side's candidate rules over the writable relations (see
+    // `resolve_assignment_column`'s attribution matrix). These pin one test
+    // per matrix row. Real MySQL agrees: an ambiguous unqualified column in a
+    // multi-table UPDATE is an error (1052), so no side is fabricated.
+
+    /// A written column the attribution couldn't pin — surfaced with
+    /// `table: None`, exactly like an unattributed read.
+    fn write_unattributed(col: &str, resolution: ResolutionKind) -> ColumnWrite {
+        ColumnWrite {
+            reference: ColumnReference {
+                table: None,
+                name: col.into(),
+            },
+            resolution,
+        }
+    }
+
+    #[test]
+    fn unqualified_set_attributes_to_the_sole_catalog_owner() {
+        // Only t2 lists `a` — the write pins t2 (previously the root t1).
+        let catalog = TestCatalog::default()
+            .with("t1", vec!["id", "x"])
+            .with("t2", vec!["id", "a"]);
+        assert_column_ops_with_catalog(
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET a = 1",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read_confirmed("t1", "id"), read_confirmed("t2", "id")],
+                writes: vec![write("t2", "a")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn unqualified_set_witness_over_suspect_downgrades() {
+        // t2 (registered, lists `a`) is the sole witness; the unregistered t1
+        // is an Unknown suspect — the witness wins but downgrades to
+        // `Inferred`, exactly like a read.
+        let catalog = TestCatalog::default().with("t2", vec!["id", "a"]);
+        assert_column_ops_with_catalog(
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET a = 1",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1", "id"), read_confirmed("t2", "id")],
+                writes: vec![write_inferred("t2", "a")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn unqualified_set_with_several_owners_is_ambiguous() {
+        // Both tables list `a`: real MySQL rejects the statement (error 1052),
+        // so no write target exists to pin — the write surfaces unattributed
+        // (`table: None`, `Ambiguous`) and contributes no table-level write.
+        let catalog = TestCatalog::default()
+            .with("t1", vec!["id", "a"])
+            .with("t2", vec!["id", "a"]);
+        assert_column_ops_with_catalog(
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET a = 1",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read_confirmed("t1", "id"), read_confirmed("t2", "id")],
+                writes: vec![write_unattributed("a", ResolutionKind::Ambiguous)],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn unqualified_set_with_no_owner_is_unresolved() {
+        // Both tables are registered and neither lists `a` — no candidate
+        // owner, mirroring the read side's `Unresolved`.
+        let catalog = TestCatalog::default()
+            .with("t1", vec!["id"])
+            .with("t2", vec!["id"]);
+        assert_column_ops_with_catalog(
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET a = 1",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read_confirmed("t1", "id"), read_confirmed("t2", "id")],
+                writes: vec![write_unattributed("a", ResolutionKind::Unresolved)],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn self_referencing_unqualified_set_reads_and_writes_the_same_table() {
+        // The point of mirroring the read rules: in `SET a = a + 1` the RHS
+        // read and the write target resolve to the same table (t2, the sole
+        // owner) — no more "read t2.a, write t1.a" self-contradiction.
+        let catalog = TestCatalog::default()
+            .with("t1", vec!["id", "x"])
+            .with("t2", vec!["id", "a"]);
+        assert_column_ops_with_catalog(
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET a = a + 1",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![
+                    read_confirmed("t1", "id"),
+                    read_confirmed("t2", "id"),
+                    read_confirmed("t2", "a"),
+                ],
+                writes: vec![write("t2", "a")],
+                lineage: vec![transformation(
+                    col_confirmed("t2", "a"),
+                    ColumnTarget::Relation(write("t2", "a")),
+                )],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn from_relations_are_not_attribution_candidates() {
+        // PostgreSQL / T-SQL `UPDATE t SET … FROM u` never writes `u`: the
+        // FROM relations join the scope for reads, but the writable set stays
+        // the target alone — so `a` pins t1 even though only t2 lists it.
+        let catalog = TestCatalog::default()
+            .with("t1", vec!["id", "x"])
+            .with("t2", vec!["id", "a"]);
+        assert_column_ops_with_catalog(
+            "UPDATE t1 SET a = 1 FROM t2",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![write_inferred("t1", "a")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn merge_set_always_targets_the_merge_target() {
+        // A MERGE source is read-only — the unqualified SET pins the merge
+        // target even when only the source lists the column.
+        let catalog = TestCatalog::default()
+            .with("t1", vec!["id", "x"])
+            .with("t2", vec!["id", "a"]);
+        assert_column_ops_with_catalog(
+            "MERGE INTO t1 USING t2 ON t1.id = t2.id WHEN MATCHED THEN UPDATE SET a = 1",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![read_confirmed("t1", "id"), read_confirmed("t2", "id")],
+                writes: vec![write_inferred("t1", "a")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
 }
 
 /// Pins one row per case from the [`ResolutionKind`] rustdoc's behavior

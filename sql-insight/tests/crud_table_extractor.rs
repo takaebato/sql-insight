@@ -108,6 +108,25 @@ mod basic {
     }
 
     #[test]
+    fn unattributed_multi_table_set_contributes_no_update_table() {
+        // `UPDATE t1 JOIN t2 SET a = 1` catalog-free: the unqualified SET
+        // can't be attributed to a single table (MySQL itself rejects the
+        // statement when both own `a`), so no update target surfaces — the
+        // joined tables stay reads, and the unattributed write is visible at
+        // column granularity (`table: None`, `Ambiguous`).
+        use sql_insight::sqlparser::dialect::MySqlDialect;
+        let sql = "UPDATE t1 JOIN t2 ON t1.id = t2.id SET a = 1";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![],
+            read_tables: vec![cread(table("t1")), cread(table("t2"))],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(MySqlDialect {})]);
+    }
+
+    #[test]
     fn update_array_join_operand_is_not_a_read_table() {
         // The UPDATE target's join clause takes the same ARRAY JOIN special
         // case as SELECT: the operand is `t`'s array column, not a table — so

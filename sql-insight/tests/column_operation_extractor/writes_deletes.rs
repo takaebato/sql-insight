@@ -163,6 +163,65 @@ mod writes {
             },
         );
     }
+
+    #[test]
+    fn multi_table_unqualified_set_is_ambiguous_without_a_catalog() {
+        // Catalog-free, both joined tables are Unknown suspects, so the
+        // unqualified SET target can't be attributed — real MySQL rejects the
+        // statement outright (error 1052) when both tables own the column, so
+        // no side is fabricated. The write surfaces unattributed (`table:
+        // None`, `Ambiguous`), mirroring the read side, and contributes no
+        // table-level write. (Previously it silently pinned the root t1.)
+        use sql_insight::sqlparser::dialect::MySqlDialect;
+        assert_column_ops_with_dialect(
+            &MySqlDialect {},
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET a = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1", "id"), read("t2", "id")],
+                writes: vec![ColumnWrite {
+                    reference: ColumnReference {
+                        table: None,
+                        name: "a".into(),
+                    },
+                    resolution: ResolutionKind::Ambiguous,
+                }],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn lineage_still_targets_an_unattributed_set_column() {
+        // A value RHS still traces to the unattributed write — the edge's
+        // target carries `table: None` + `Ambiguous`, symmetric with an
+        // ambiguous *source* read appearing in lineage. The value dependency
+        // (`t2.c` flows somewhere) is real even when the sink table isn't
+        // determinable.
+        use sql_insight::sqlparser::dialect::MySqlDialect;
+        let unattributed = ColumnWrite {
+            reference: ColumnReference {
+                table: None,
+                name: "a".into(),
+            },
+            resolution: ResolutionKind::Ambiguous,
+        };
+        assert_column_ops_with_dialect(
+            &MySqlDialect {},
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET a = t2.c",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1", "id"), read("t2", "id"), read("t2", "c")],
+                writes: vec![unattributed.clone()],
+                lineage: vec![passthrough(
+                    col("t2", "c"),
+                    ColumnTarget::Relation(unattributed),
+                )],
+                diagnostics: vec![],
+            },
+        );
+    }
 }
 
 mod delete {
