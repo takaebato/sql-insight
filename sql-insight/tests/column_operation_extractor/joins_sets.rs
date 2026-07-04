@@ -900,15 +900,16 @@ mod join_arm_coverage {
     }
 
     // ClickHouse `ARRAY JOIN` (and its `LEFT` / `INNER` forms) unnest an array
-    // expression inline and carry no `ON` predicate (join_constraint → None,
-    // like CROSS APPLY). The array expression is not itself a scanned relation,
-    // so only the projection's `t.a` surfaces. `GenericDialect` parses all
-    // three forms.
+    // *column* inline and carry no `ON` predicate (join_constraint → None, like
+    // CROSS APPLY). The operand is not a scanned table (so it is NOT a table
+    // read) but a column of the left relation — so `t.arr` surfaces as a column
+    // read alongside the projection's `t.a`. `GenericDialect` parses all three
+    // forms.
     #[test]
     fn array_join() {
         assert_unordered_eq!(
             join_reads("SELECT t.a FROM t ARRAY JOIN t.arr", &GenericDialect {}),
-            vec![read("t", "a")]
+            vec![read("t", "a"), read("t", "arr")]
         );
     }
 
@@ -919,7 +920,7 @@ mod join_arm_coverage {
                 "SELECT t.a FROM t LEFT ARRAY JOIN t.arr",
                 &GenericDialect {}
             ),
-            vec![read("t", "a")]
+            vec![read("t", "a"), read("t", "arr")]
         );
     }
 
@@ -930,7 +931,35 @@ mod join_arm_coverage {
                 "SELECT t.a FROM t INNER ARRAY JOIN t.arr",
                 &GenericDialect {}
             ),
-            vec![read("t", "a")]
+            vec![read("t", "a"), read("t", "arr")]
+        );
+    }
+
+    #[test]
+    fn array_join_alias_does_not_leak_as_a_phantom_column() {
+        // `AS x` names the unnested element (a synthetic column), not a column
+        // of `t` — so `x` in the projection is not a phantom `t.x` read; only
+        // the real `t.c` and the unnested source `t.arr` surface.
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT x, t.c FROM t ARRAY JOIN t.arr AS x",
+                &GenericDialect {}
+            ),
+            vec![read("t", "c"), read("t", "arr")]
+        );
+    }
+
+    #[test]
+    fn array_join_expression_operand_reads_its_arguments() {
+        // `ARRAY JOIN f(args)` is an array-producing *expression*: its argument
+        // columns are the reads. The function name is neither a table nor a
+        // column, so only `t.a` / `t.b` surface — not a phantom `t.arrayConcat`.
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT m FROM t ARRAY JOIN arrayConcat(t.a, t.b) AS m",
+                &GenericDialect {}
+            ),
+            vec![read("t", "a"), read("t", "b")]
         );
     }
 }

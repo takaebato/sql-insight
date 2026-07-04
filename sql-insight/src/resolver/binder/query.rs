@@ -544,7 +544,14 @@ impl<'a> Binder<'a> {
             // A joined LATERAL factor sees the left siblings plus the join
             // inputs accumulated so far.
             let visible: Vec<Relation> = left.iter().chain(&scope.relations).cloned().collect();
-            let (right, right_scope) = self.bind_table_factor(&j.relation, &visible);
+            // ClickHouse `ARRAY JOIN`'s operand is an array column being
+            // unnested, not a scanned table — bind it against the visible
+            // relations so it reads a column, not a table.
+            let (right, right_scope) = if is_array_join(&j.join_operator) {
+                self.bind_array_join(&j.relation, &visible)
+            } else {
+                self.bind_table_factor(&j.relation, &visible)
+            };
             // Merge columns — an unqualified reference to one fans in to both
             // sides. An explicit `USING (col)` names them; a NATURAL join takes
             // the two sides' schema-common columns (so it needs a catalog —
@@ -563,6 +570,78 @@ impl<'a> Binder<'a> {
                 .collect();
             node = join(node, right, on);
         }
+        (node, scope)
+    }
+
+    /// Bind a ClickHouse `ARRAY JOIN <operand> [AS alias]` right side. sqlparser
+    /// parses the operand as a `TableFactor::Table`, but it is an array
+    /// *expression* (typically a column of a visible relation) being unnested —
+    /// not a scanned table. Resolve its name as a column read against `visible`
+    /// and bind it as an opaque unnest (a [`TableFunction`], so no table read),
+    /// exposing the unnested output under its alias / column name.
+    pub(super) fn bind_array_join(
+        &mut self,
+        factor: &TableFactor,
+        visible: &[Relation],
+    ) -> (LogicalPlan, Scope) {
+        let (args, alias_name) = match factor {
+            // `ARRAY JOIN f(args) [AS m]`: an array-producing *expression* (e.g.
+            // `arrayMap(…)`). Its argument expressions carry the reads — the
+            // function name is not a column — and the unnested output is the
+            // alias, if any.
+            TableFactor::Table {
+                alias,
+                args: Some(fn_args),
+                ..
+            } => {
+                let bound =
+                    self.bind_function_arg_list(&fn_args.args, &Scope::from_relations(visible));
+                (bound, alias.as_ref().map(|a| a.name.clone()))
+            }
+            // `ARRAY JOIN arr [AS x]` / `ARRAY JOIN t.arr`: a plain array
+            // *column*. Read its name as a column of the visible relations.
+            TableFactor::Table { name, alias, .. } => {
+                let parts: Vec<Ident> = name
+                    .0
+                    .iter()
+                    .filter_map(|p| p.as_ident().cloned())
+                    .collect();
+                // The unnested output takes the explicit alias, else the
+                // operand's own (last) name — so a later `arr` reference resolves
+                // to the unnested element, not the source array.
+                let alias_name = alias
+                    .as_ref()
+                    .map(|a| a.name.clone())
+                    .or_else(|| parts.last().cloned());
+                let args = if parts.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![self.resolve_expr(&parts, &Scope::from_relations(visible))]
+                };
+                (args, alias_name)
+            }
+            // Any other factor shape (a derived subquery, nested join, …) is not
+            // valid ClickHouse ARRAY JOIN syntax, but sqlparser accepts it — bind
+            // it through the normal factor path (best-effort: keep its reads and
+            // alias) rather than silently dropping it.
+            _ => return self.bind_table_factor(factor, visible),
+        };
+        let node = LogicalPlan::TableFunction(TableFunction {
+            alias: alias_name.clone(),
+            input: Box::new(LogicalPlan::Empty),
+            args,
+        });
+        // Expose the unnested output as a synthetic (Derived) column so a
+        // reference to it (`x` / `arr`) binds to the unnest — not falling through
+        // to a real table as a phantom column — and traces to a synthetic source
+        // (dropped from reads), never to the source array as a second read.
+        let scope = match alias_name {
+            Some(name) => Scope::single(Relation::Derived {
+                alias: None,
+                columns: vec![name],
+            }),
+            None => Scope::default(),
+        };
         (node, scope)
     }
 
