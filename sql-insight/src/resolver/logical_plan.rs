@@ -217,12 +217,17 @@ pub(crate) struct Values {
 pub(crate) struct Insert {
     pub(crate) target: TableWrite,
     /// Written target columns, each catalog-resolved against the target
-    /// (explicit list, or catalog-filled for a column-less INSERT).
+    /// (explicit list — from an `(a, b)` list or an Oracle inline-view target's
+    /// projection — or catalog-filled for a column-less INSERT).
     pub(crate) columns: Vec<ColumnWrite>,
     pub(crate) input: Box<LogicalPlan>,
     pub(crate) returning: Vec<NamedExpr>,
     pub(crate) on_conflict: Vec<Assignment>,
     pub(crate) conflict_predicate: Vec<Expr>,
+    /// An Oracle inline-view target's WHERE predicate
+    /// (`INSERT INTO (SELECT … FROM t WHERE …) …`): filter reads against the
+    /// target — its columns read, but never originate a value.
+    pub(crate) target_predicate: Vec<Expr>,
     pub(crate) source_wildcard: bool,
 }
 
@@ -590,6 +595,7 @@ pub(super) fn own_exprs(op: &LogicalPlan) -> Vec<&Expr> {
             .map(|ne| &ne.expr)
             .chain(i.on_conflict.iter().map(|a| &a.value))
             .chain(i.conflict_predicate.iter())
+            .chain(i.target_predicate.iter())
             .collect(),
         LogicalPlan::Update(u) => u
             .assignments

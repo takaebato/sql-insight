@@ -104,15 +104,22 @@ impl<'a> Binder<'a> {
     /// expression is dropped (not flagged: it isn't an analyzable-info loss the
     /// common, constant case would false-alarm on).
     pub(super) fn bind_insert(&mut self, insert: &SqlInsert) -> LogicalPlan {
-        let name = match &insert.table {
-            TableObject::TableName(name) => name,
-            TableObject::TableFunction(function) => &function.name,
-            // Oracle `INSERT INTO (SELECT …) …`: the target is a subquery, not a
-            // writable base table — drop + flag (like a CTE / derived target).
-            TableObject::TableQuery(query) => {
-                self.record_unsupported_dml_target("INSERT", query.as_ref());
-                return LogicalPlan::Empty;
-            }
+        let (name, view) = match &insert.table {
+            TableObject::TableName(name) => (name, None),
+            TableObject::TableFunction(function) => (&function.name, None),
+            // Oracle `INSERT INTO (SELECT …) …`: an inline-view target — the
+            // row lands in the view's single base table, so resolve through to
+            // it (the projection names the target columns, the WHERE is filter
+            // reads). A view over no single base table (a join — key-preserved
+            // rules need a catalog — or a set operation) is dropped + flagged
+            // like a CTE / derived target.
+            TableObject::TableQuery(query) => match crate::reference::insert_target_view(query) {
+                Some((name, select)) => (name, Some(select)),
+                None => {
+                    self.record_unsupported_dml_target("INSERT", query.as_ref());
+                    return LogicalPlan::Empty;
+                }
+            },
         };
         let Some(written) = self.table_ref(name) else {
             return LogicalPlan::Empty;
@@ -146,7 +153,8 @@ impl<'a> Binder<'a> {
             .source
             .as_ref()
             .is_some_and(|q| source_has_wildcard(q));
-        // The written column list: an explicit `(a, b)` wins; otherwise a
+        // The written column list: an explicit list wins — an `(a, b)` list, or
+        // an inline-view target's plain-column projection — otherwise a
         // column-less INSERT fills from the target's catalog columns (reusing
         // the `table_match` list above), truncated to the source's projected
         // arity. The catalog columns are kept in their canonical form (quoted as
@@ -158,7 +166,7 @@ impl<'a> Binder<'a> {
         // catalog columns can't be positionally paired: leave the list empty so
         // the drop + flag guard below fires rather than mis-truncating to the
         // undercounted outputs.
-        let columns = if !insert.columns.is_empty() {
+        let explicit: Vec<Ident> = if !insert.columns.is_empty() {
             // `Insert::columns` is `Vec<ObjectName>`; a target column is named
             // by its final identifier part (mirrors the MERGE-insert path).
             insert
@@ -166,6 +174,12 @@ impl<'a> Binder<'a> {
                 .iter()
                 .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
                 .collect()
+        } else {
+            view.map(view_target_columns).unwrap_or_default()
+        };
+        let has_explicit = !explicit.is_empty();
+        let columns = if has_explicit {
+            explicit
         } else if source_wildcard {
             Vec::new()
         } else {
@@ -198,7 +212,7 @@ impl<'a> Binder<'a> {
             }
         };
         if let Some(source_count) = source_count {
-            if !insert.columns.is_empty() {
+            if has_explicit {
                 // An explicit list must match the source exactly — either
                 // direction silently zips to the shorter side.
                 self.diagnose_insert_arity(&target, true, columns.len(), source_count);
@@ -214,6 +228,23 @@ impl<'a> Binder<'a> {
         let (on_conflict, conflict_predicate) = match &insert.on {
             Some(on) => self.bind_conflict(on, &target, &columns),
             None => (Vec::new(), Vec::new()),
+        };
+        // An inline-view target's WHERE resolves against the target alone
+        // (filter reads — e.g. the predicate a `WITH CHECK OPTION` enforces).
+        // The base table may be aliased (`FROM emp e`); the predicate then
+        // qualifies through the alias (`e.dept`), so carry it on the scope.
+        let target_predicate = match view.and_then(|v| v.selection.as_ref()) {
+            Some(predicate) => {
+                let alias = view
+                    .and_then(|v| v.from.first())
+                    .and_then(|f| match &f.relation {
+                        TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.clone()),
+                        _ => None,
+                    });
+                let scope = self.target_scope_with_alias(&target, alias);
+                vec![self.bind_expr(predicate, &scope)]
+            }
+            None => Vec::new(),
         };
         // RETURNING resolves against the target alone (the source query's
         // scope is already popped).
@@ -232,6 +263,7 @@ impl<'a> Binder<'a> {
             returning,
             on_conflict,
             conflict_predicate,
+            target_predicate,
             source_wildcard,
         })
     }
@@ -304,7 +336,9 @@ impl<'a> Binder<'a> {
             returning,
             on_conflict,
             conflict_predicate,
-            // The MySQL SET form has no source query, so no wildcard.
+            // The MySQL SET form has no inline-view target and no source
+            // query, so no target predicate / wildcard.
+            target_predicate: Vec::new(),
             source_wildcard: false,
         })
     }
@@ -851,6 +885,18 @@ impl<'a> Binder<'a> {
     /// whose references resolve against the target alone — the source query's
     /// scope is already popped).
     pub(super) fn target_scope(&self, target: &TableReference) -> Scope {
+        self.target_scope_with_alias(target, None)
+    }
+
+    /// Like [`target_scope`](Self::target_scope), but exposing the target under
+    /// `alias` — an Oracle inline-view target's base table may be aliased
+    /// (`FROM emp e`), and its WHERE predicate qualifies through that alias
+    /// (`e.dept`), which then shadows the bare table name as usual.
+    pub(super) fn target_scope_with_alias(
+        &self,
+        target: &TableReference,
+        alias: Option<Ident>,
+    ) -> Scope {
         let m = self.table_match(target);
         let columns = if m.columns.is_empty() {
             Columns::Unknown
@@ -858,7 +904,7 @@ impl<'a> Binder<'a> {
             Columns::Cataloged(m.columns)
         };
         Scope::single(Relation::Table {
-            alias: None,
+            alias,
             table: m.table,
             columns,
         })
@@ -1233,6 +1279,31 @@ fn is_join_factor(factor: &TableFactor) -> bool {
         } => !table_with_joins.joins.is_empty() || is_join_factor(&table_with_joins.relation),
         _ => false,
     }
+}
+
+/// The insertable target columns an Oracle inline-view INSERT target's
+/// projection names: each item's underlying plain column (`a` / `t.a` /
+/// `a AS x` all name base column `a` — an alias renames the view column, the
+/// row still lands in the base one). Empty when *any* item is not a plain
+/// column (a wildcard / expression): the positional pairing is then
+/// indeterminate as a whole, so the caller falls back to the column-less
+/// (catalog-fill / diagnostic) path. The `SelectItem` match is exhaustive so a
+/// new variant forces a decision here.
+fn view_target_columns(select: &sqlparser::ast::Select) -> Vec<Ident> {
+    let mut columns = Vec::new();
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+            SelectItem::ExprWithAliases { .. }
+            | SelectItem::QualifiedWildcard(..)
+            | SelectItem::Wildcard(_) => return Vec::new(),
+        };
+        match inferred_name(expr) {
+            Some(column) => columns.push(column),
+            None => return Vec::new(),
+        }
+    }
+    columns
 }
 
 /// Whether a query's output projection contains an (unexpanded) wildcard

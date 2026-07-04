@@ -415,6 +415,23 @@ mod insert_statement {
     }
 
     #[test]
+    fn test_insert_into_inline_view_writes_the_base_table() {
+        // Oracle `INSERT INTO (SELECT … FROM emp WHERE …) …`: the row lands in
+        // the view's single base table, so `emp` is the create target; the
+        // WHERE reads the target's own data, so `emp` also surfaces as a read.
+        use sql_insight::sqlparser::dialect::OracleDialect;
+        let sql = "INSERT INTO (SELECT a FROM emp WHERE dept = 10) VALUES (100)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![cwrite(table("emp"))],
+            read_tables: vec![cread(table("emp"))],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(OracleDialect {})]);
+    }
+
+    #[test]
     fn test_parenthesized_insert_keeps_the_insert_verb() {
         // `(INSERT … SELECT …)` keeps its verb → target buckets as Create,
         // source as Read (the misclassification dropped both into a Select).

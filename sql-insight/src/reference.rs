@@ -9,7 +9,10 @@ use core::fmt;
 
 use crate::casing::IdentifierCasing;
 use crate::error::Error;
-use sqlparser::ast::{Ident, Insert, ObjectName, TableFactor, TableObject};
+use sqlparser::ast::{
+    GroupByExpr, Ident, Insert, ObjectName, Query, Select, SelectFlavor, SetExpr, TableFactor,
+    TableObject,
+};
 
 /// Physical table identity — the `catalog.schema.name` triplet.
 ///
@@ -327,18 +330,22 @@ impl TableReference {
         }
     }
 
-    /// Parse an INSERT statement's target into (identity, alias) pair.
+    /// Parse an INSERT statement's target into (identity, alias) pair. An
+    /// Oracle inline-view target (`INSERT INTO (SELECT … FROM t) …`) resolves
+    /// through to its single base table; a view over no single base table (a
+    /// join, a set operation) surfaces as an `AnalysisError`.
     pub(crate) fn from_insert_with_alias(value: &Insert) -> Result<(Self, Option<Ident>), Error> {
         let name = match &value.table {
             TableObject::TableName(object_name) => object_name,
             TableObject::TableFunction(function) => &function.name,
-            // Oracle `INSERT INTO (SELECT …) …`: a subquery target names no
-            // stored table, so it can't become a `TableReference`.
-            TableObject::TableQuery(_) => {
-                return Err(Error::AnalysisError(
-                    "INSERT target is a subquery, not a named table".to_string(),
-                ))
-            }
+            TableObject::TableQuery(query) => match insert_target_view(query) {
+                Some((name, _)) => name,
+                None => {
+                    return Err(Error::AnalysisError(
+                        "INSERT target is a subquery over no single base table".to_string(),
+                    ))
+                }
+            },
         };
         // `Insert::table_alias` is now a `TableAliasWithoutColumns`; the public
         // pair still exposes just the alias identifier.
@@ -563,6 +570,94 @@ impl TryFrom<&ObjectName> for TableReference {
     }
 }
 
+/// See through an Oracle inline-view INSERT target
+/// (`INSERT INTO (SELECT … FROM t [WHERE …]) …`) to its single base table:
+/// the `SELECT`'s one plain-table FROM item. Only the minimal insertable-view
+/// shape passes — a projection, the single FROM table, and an optional WHERE.
+/// `None` for everything else: a join / set operation / non-table factor
+/// names no single base table SQL text can determine (Oracle's key-preserved
+/// rules need a catalog), and any other clause (GROUP BY / HAVING / DISTINCT /
+/// ORDER BY / FETCH / CONNECT BY / …) makes the view non-insertable — and
+/// could carry column references that would otherwise drop silently. The
+/// returned [`Select`] carries the projection (the insertable target columns)
+/// and the WHERE predicate for the caller. Both destructures are exhaustive,
+/// so a new `Query` / `Select` clause forces a keep-or-reject decision here.
+pub(crate) fn insert_target_view(query: &Query) -> Option<(&ObjectName, &Select)> {
+    let Query {
+        with: None,
+        body,
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks,
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators,
+    } = query
+    else {
+        return None;
+    };
+    if !locks.is_empty() || !pipe_operators.is_empty() {
+        return None;
+    }
+    let SetExpr::Select(select) = body.as_ref() else {
+        return None;
+    };
+    let Select {
+        select_token: _,
+        optimizer_hints: _,
+        distinct: None,
+        select_modifiers: None,
+        top: None,
+        top_before_distinct: _,
+        projection: _,
+        exclude: None,
+        into: None,
+        from,
+        lateral_views,
+        prewhere: None,
+        selection: _,
+        connect_by,
+        group_by: GroupByExpr::Expressions(group_by, group_by_modifiers),
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having: None,
+        named_window,
+        qualify: None,
+        window_before_qualify: _,
+        value_table_mode: None,
+        flavor: SelectFlavor::Standard,
+    } = select.as_ref()
+    else {
+        return None;
+    };
+    if !group_by.is_empty()
+        || !group_by_modifiers.is_empty()
+        || !cluster_by.is_empty()
+        || !distribute_by.is_empty()
+        || !sort_by.is_empty()
+        || !lateral_views.is_empty()
+        || !connect_by.is_empty()
+        || !named_window.is_empty()
+    {
+        return None;
+    }
+    let [from] = from.as_slice() else {
+        return None;
+    };
+    if !from.joins.is_empty() {
+        return None;
+    }
+    match &from.relation {
+        TableFactor::Table {
+            name, args: None, ..
+        } => Some((name, select)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +736,28 @@ mod tests {
         let (reference, alias) = TableReference::from_insert_with_alias(&insert).unwrap();
         assert_eq!(reference.name.value, "t");
         assert_eq!(alias.unwrap().value, "foo");
+    }
+
+    #[test]
+    fn try_from_insert_sees_through_an_inline_view_target() {
+        // Oracle `INSERT INTO (SELECT … FROM s.t) …` resolves to the view's
+        // single base table; a join view has no single base table → error.
+        use sqlparser::dialect::OracleDialect;
+        let parse = |sql: &str| {
+            let mut stmts = Parser::parse_sql(&OracleDialect {}, sql).unwrap();
+            let Statement::Insert(insert) = stmts.remove(0) else {
+                panic!("expected an insert");
+            };
+            insert
+        };
+        let insert = parse("INSERT INTO (SELECT a FROM s.t WHERE a > 0) VALUES (1)");
+        let reference = TableReference::try_from(&insert).unwrap();
+        assert_eq!(reference.schema.as_ref().unwrap().value, "s");
+        assert_eq!(reference.name.value, "t");
+        let join = parse("INSERT INTO (SELECT a.id FROM a JOIN b ON a.id = b.id) VALUES (1)");
+        assert!(matches!(
+            TableReference::try_from(&join),
+            Err(Error::AnalysisError(_))
+        ));
     }
 }
