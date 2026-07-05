@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/takaebato/sql-insight/compare/sql-insight-v0.3.0...sql-insight-v0.4.0) - 2026-07-05
+
+### ⚠️ Breaking Changes
+
+#### attribute unqualified SET targets with the read-side rules ([#59](https://github.com/takaebato/sql-insight/pull/59)) by @takaebato
+
+#### upgrade sqlparser to 0.62 ([#55](https://github.com/takaebato/sql-insight/pull/55)) by @takaebato
+
+### Added
+
+- resolve Oracle join-view INSERT targets by column attribution ([#61](https://github.com/takaebato/sql-insight/pull/61)) by @takaebato
+- fan out multi-column-alias lineage to every alias ([#60](https://github.com/takaebato/sql-insight/pull/60)) by @takaebato
+- resolve Oracle inline-view INSERT targets to their base table ([#58](https://github.com/takaebato/sql-insight/pull/58)) by @takaebato
+
+### Fixed
+
+- don't surface a ClickHouse ARRAY JOIN operand as a table read ([#57](https://github.com/takaebato/sql-insight/pull/57)) by @takaebato
+
+### Other Changes
+
+- changelog breaking-change workflow, version-bump docs, and keywords ([#51](https://github.com/takaebato/sql-insight/pull/51)) by @takaebato
+- tidy keywords, README versions, and add a version-sync check ([#46](https://github.com/takaebato/sql-insight/pull/46)) by @takaebato
+
 ## [0.3.0](https://github.com/takaebato/sql-insight/compare/v0.2.0...v0.3.0) - 2026-06-28
 
 ### Added
