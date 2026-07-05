@@ -409,6 +409,258 @@ mod insert_inline_view_target {
     }
 
     #[test]
+    fn join_view_qualified_projection_resolves_the_common_relation() {
+        // A join view: every projected column is qualified to `e` — the row
+        // lands in `emp` (text-only attribution, like a multi-table UPDATE's
+        // `SET t2.col`). The companion `dept` is scanned context; the ON and
+        // WHERE are filter reads over both relations.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT e.id, e.name FROM emp e JOIN dept d \
+             ON e.dept_id = d.id WHERE d.active = 1) VALUES (100, 'x')",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![
+                    read("emp", "dept_id"),
+                    read("dept", "id"),
+                    read("dept", "active"),
+                ],
+                writes: vec![write("emp", "id"), write("emp", "name")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_view_comma_form_resolves_too() {
+        // The classic Oracle comma-join spelling of the same view.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT e.id FROM emp e, dept d WHERE e.dept_id = d.id) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("emp", "dept_id"), read("dept", "id")],
+                writes: vec![write("emp", "id")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_view_select_source_traces_to_the_base_column() {
+        // Relation lineage pairs the source outputs with the resolved base
+        // columns — through the join view.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT e.id FROM emp e JOIN dept d ON e.dept_id = d.id) \
+             SELECT x FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("emp", "dept_id"), read("dept", "id"), read("s", "x")],
+                writes: vec![write("emp", "id")],
+                lineage: vec![passthrough(col("s", "x"), relation("emp", "id"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_view_using_clause_adds_no_reads() {
+        // `USING (dept_id)` names merge columns, not reads — consistent with
+        // the SELECT path, where reads come from *reference* sites (a fan-in),
+        // never the USING clause itself. The view still resolves to `emp`.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT e.id FROM emp e JOIN dept d USING (dept_id)) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![write("emp", "id")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_view_self_join_resolves_to_the_one_table() {
+        // A self-join view: both instances are the same table, so columns
+        // qualified through either alias agree on `emp` — the identity is
+        // right even though key-preservedness is per-instance (unverifiable
+        // without key metadata). The second instance stays a scanned
+        // companion, so `emp` reads through it too.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT e1.id, e2.name FROM emp e1 JOIN emp e2 \
+             ON e1.id = e2.id) VALUES (1, 'x')",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("emp", "id"), read("emp", "id")],
+                writes: vec![write("emp", "id"), write("emp", "name")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_view_wildcard_projection_is_flagged() {
+        // A wildcard projection names no attributable columns — the target
+        // (and the positional pairing) is indeterminate: flag + drop.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT * FROM emp e JOIN dept d ON e.id = d.id) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
+    fn from_less_view_is_flagged() {
+        // `(SELECT 1)` has no FROM — no base table exists: flag + drop.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT 1) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
+    fn derived_factor_in_view_is_flagged() {
+        // A derived table as the view's FROM factor (single or joined) is not
+        // a plain base table — the gate rejects both shapes.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT x.a FROM (SELECT a FROM t) x) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT e.id FROM emp e JOIN (SELECT 1 AS id) d ON e.id = d.id) \
+             VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
+    fn single_table_view_over_a_cte_is_flagged() {
+        // The single-table view path takes the same CTE-target check as a
+        // plain-name INSERT — a CTE is read-only.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "WITH c AS (SELECT 1 AS a FROM x) INSERT INTO (SELECT a FROM c) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
+    fn join_view_expression_projection_is_flagged() {
+        // A non-column projection item (`e.id + 1`) leaves the join view's
+        // target indeterminate — unlike the single-table view (whose base is
+        // shape-determined and falls to the column-less path), a join view
+        // needs every column attributable: flag + drop.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT e.id + 1 FROM emp e JOIN dept d ON e.id = d.id) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
+    fn join_view_cte_target_is_flagged_not_written() {
+        // The attributed target names a declared CTE — a read-only relation,
+        // never a write target (the single-table view and plain-name INSERT
+        // paths flag the same shape): flag + drop rather than fabricate a
+        // write to `c`.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "WITH c AS (SELECT 1 AS id FROM x) \
+             INSERT INTO (SELECT c2.id FROM c c2 JOIN emp e ON c2.id = e.id) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
+    fn join_view_straddling_columns_are_flagged() {
+        // The projected columns attribute to *different* relations — no single
+        // table receives the row (real Oracle rejects this shape: the INTO
+        // columns must belong to one key-preserved table) — flag + drop.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT e.id, d.active FROM emp e JOIN dept d \
+             ON e.dept_id = d.id) VALUES (1, 1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
+    fn join_view_unqualified_without_catalog_is_flagged() {
+        // Catalog-free, an unqualified projected column has no determinable
+        // owner among the joined relations — flag + drop (the catalog-owner
+        // rule resolves it when a catalog lists it in exactly one relation).
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT id FROM emp JOIN dept ON emp.dept_id = dept.id) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
     fn view_with_other_clauses_is_flagged_not_resolved() {
         // Only the minimal insertable-view shape (projection + FROM + WHERE)
         // resolves through. Any other clause — GROUP BY here, likewise

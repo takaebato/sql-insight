@@ -52,16 +52,17 @@ mod reported {
     }
 
     #[test]
-    fn insert_into_join_view_target_reports_diagnostic() {
-        // Oracle `INSERT INTO (SELECT … JOIN …) …`: a join view names no single
-        // base table SQL text can determine (key-preserved rules need a
-        // catalog) — flagged (like the non-table UPDATE / MERGE target above),
-        // not dropped silently. The statement_kind stays Insert; nothing is
-        // written. (A *single-table* inline view resolves through to its base
-        // table instead — see `writes_deletes::insert_inline_view_target`.)
+    fn insert_into_undetermined_join_view_target_reports_diagnostic() {
+        // Oracle `INSERT INTO (SELECT … JOIN …) …` resolves when every
+        // projected column attributes to one relation (see
+        // `writes_deletes::insert_inline_view_target`); a view whose target
+        // can't be determined — here an unqualified column with no catalog —
+        // is flagged (like the non-table UPDATE / MERGE target above), not
+        // dropped silently. The statement_kind stays Insert; nothing is
+        // written.
         assert_column_ops_with_dialect(
             &OracleDialect {},
-            "INSERT INTO (SELECT e.id FROM emp e JOIN dept d ON e.dept = d.id) VALUES (1)",
+            "INSERT INTO (SELECT id FROM emp e JOIN dept d ON e.dept = d.id) VALUES (1)",
             ColumnOperation {
                 statement_kind: StatementKind::Insert,
                 reads: vec![],

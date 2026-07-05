@@ -10,8 +10,8 @@ use core::fmt;
 use crate::casing::IdentifierCasing;
 use crate::error::Error;
 use sqlparser::ast::{
-    GroupByExpr, Ident, Insert, ObjectName, Query, Select, SelectFlavor, SetExpr, TableFactor,
-    TableObject,
+    GroupByExpr, Ident, Insert, JoinOperator, ObjectName, Query, Select, SelectFlavor, SetExpr,
+    TableFactor, TableObject,
 };
 
 /// Physical table identity — the `catalog.schema.name` triplet.
@@ -344,14 +344,22 @@ impl TableReference {
         let name = match &value.table {
             TableObject::TableName(object_name) => object_name,
             TableObject::TableFunction(function) => &function.name,
-            TableObject::TableQuery(query) => match insert_target_view(query) {
-                Some((name, _)) => name,
-                None => {
-                    return Err(Error::AnalysisError(
-                        "INSERT target is a subquery over no single base table".to_string(),
-                    ))
+            // Only a single-table view is shape-determined; a join view's base
+            // table needs binder resolution (column attribution), out of reach
+            // of a plain identity parse.
+            TableObject::TableQuery(query) => {
+                match insert_target_view(query)
+                    .as_ref()
+                    .and_then(insert_target_base)
+                {
+                    Some(name) => name,
+                    None => {
+                        return Err(Error::AnalysisError(
+                            "INSERT target is a subquery over no single base table".to_string(),
+                        ))
+                    }
                 }
-            },
+            }
         };
         // `Insert::table_alias` is now a `TableAliasWithoutColumns`; the public
         // pair still exposes just the alias identifier.
@@ -576,19 +584,29 @@ impl TryFrom<&ObjectName> for TableReference {
     }
 }
 
-/// See through an Oracle inline-view INSERT target
-/// (`INSERT INTO (SELECT … FROM t [WHERE …]) …`) to its single base table:
-/// the `SELECT`'s one plain-table FROM item. Only the minimal insertable-view
-/// shape passes — a projection, the single FROM table, and an optional WHERE.
-/// `None` for everything else: a join / set operation / non-table factor
-/// names no single base table SQL text can determine (Oracle's key-preserved
-/// rules need a catalog), and any other clause (GROUP BY / HAVING / DISTINCT /
-/// ORDER BY / FETCH / CONNECT BY / …) makes the view non-insertable — and
-/// could carry column references that would otherwise drop silently. The
-/// returned [`Select`] carries the projection (the insertable target columns)
-/// and the WHERE predicate for the caller. Both destructures are exhaustive,
-/// so a new `Query` / `Select` clause forces a keep-or-reject decision here.
-pub(crate) fn insert_target_view(query: &Query) -> Option<(&ObjectName, &Select)> {
+/// A shape-gated Oracle inline-view INSERT target: the view\'s [`Select`]
+/// plus its FROM factors **pre-extracted** as `(name, alias)` pairs — the
+/// gate proves every factor is a plain table, and handing the proof over as
+/// data means no downstream re-match (and no unreachable fallback arm).
+pub(crate) struct InsertTargetView<'a> {
+    pub(crate) select: &'a Select,
+    /// Every FROM factor (each `TableWithJoins`\' relation and joins, in
+    /// source order): its table name and optional alias.
+    pub(crate) factors: Vec<(&'a ObjectName, Option<&'a Ident>)>,
+}
+
+/// Shape-gate an Oracle inline-view INSERT target
+/// (`INSERT INTO (SELECT … FROM …) …`): only the minimal insertable-view shape
+/// passes — a projection, a FROM of **plain tables** (a single table, or a
+/// join / comma list of them; `ARRAY JOIN` operands are not tables), and an
+/// optional WHERE. `None` for everything else: a non-table factor, or any
+/// other clause (GROUP BY / HAVING / DISTINCT / ORDER BY / FETCH / CONNECT BY
+/// / …) makes the view non-insertable — and could carry column references
+/// that would otherwise drop silently. Which table the row lands in is
+/// [`insert_target_base`] for the single-table shape, and binder-side column
+/// attribution for a join view. Both destructures are exhaustive, so a new
+/// `Query` / `Select` clause forces a keep-or-reject decision here.
+pub(crate) fn insert_target_view(query: &Query) -> Option<InsertTargetView<'_>> {
     let Query {
         with: None,
         body,
@@ -650,16 +668,49 @@ pub(crate) fn insert_target_view(query: &Query) -> Option<(&ObjectName, &Select)
     {
         return None;
     }
-    let [from] = from.as_slice() else {
-        return None;
-    };
-    if !from.joins.is_empty() {
+    if from.is_empty() {
         return None;
     }
-    match &from.relation {
-        TableFactor::Table {
-            name, args: None, ..
-        } => Some((name, select)),
+    fn plain_table(factor: &TableFactor) -> Option<(&ObjectName, Option<&Ident>)> {
+        match factor {
+            TableFactor::Table {
+                name,
+                alias,
+                args: None,
+                ..
+            } => Some((name, alias.as_ref().map(|a| &a.name))),
+            _ => None,
+        }
+    }
+    let mut factors = Vec::new();
+    for twj in from {
+        factors.push(plain_table(&twj.relation)?);
+        for join in &twj.joins {
+            // An ARRAY JOIN operand parses as a table factor but is an array
+            // column, not a relation — never a view over base tables.
+            if matches!(
+                join.join_operator,
+                JoinOperator::ArrayJoin
+                    | JoinOperator::LeftArrayJoin
+                    | JoinOperator::InnerArrayJoin
+            ) {
+                return None;
+            }
+            factors.push(plain_table(&join.relation)?);
+        }
+    }
+    Some(InsertTargetView { select, factors })
+}
+
+/// The single base table of a shape-gated inline view
+/// ([`insert_target_view`]), when the FROM is exactly one plain table — the
+/// shape-determined case a plain identity parse can resolve. A join view
+/// returns `None`: its base table is whichever relation the projection's
+/// columns attribute to, which needs the binder (qualifier / catalog
+/// resolution).
+pub(crate) fn insert_target_base<'a>(view: &InsertTargetView<'a>) -> Option<&'a ObjectName> {
+    match view.factors.as_slice() {
+        [(name, _)] => Some(name),
         _ => None,
     }
 }
@@ -765,5 +816,26 @@ mod tests {
             TableReference::try_from(&join),
             Err(Error::AnalysisError(_))
         ));
+    }
+
+    #[test]
+    fn insert_target_view_rejects_an_array_join_operand() {
+        // An ARRAY JOIN operand parses as a table factor but is an array
+        // column, not a relation — the gate must reject it so it can't
+        // masquerade as a companion table. No current dialect parses both an
+        // inline-view INSERT target *and* ARRAY JOIN, so this exercises the
+        // gate directly on a ClickHouse-parsed SELECT.
+        use sqlparser::dialect::ClickHouseDialect;
+        let parse = |sql: &str| {
+            let mut stmts = Parser::parse_sql(&ClickHouseDialect {}, sql).unwrap();
+            let Statement::Query(query) = stmts.remove(0) else {
+                panic!("expected a query");
+            };
+            query
+        };
+        let plain = parse("SELECT e.id FROM emp e JOIN dept d ON e.id = d.id");
+        assert!(insert_target_view(&plain).is_some());
+        let array_join = parse("SELECT e.id FROM emp e ARRAY JOIN arr");
+        assert!(insert_target_view(&array_join).is_none());
     }
 }

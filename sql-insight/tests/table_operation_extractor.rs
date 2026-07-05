@@ -585,6 +585,27 @@ mod ddl {
     }
 
     #[test]
+    fn join_view_insert_companion_reads_but_does_not_feed() {
+        // An Oracle join-view INSERT: the companion `dept` gates which rows
+        // are visible, so it *reads* — but it feeds no data (the value path is
+        // the source), so table lineage carries `s → emp` only, never
+        // `dept → emp`.
+        use sql_insight::sqlparser::dialect::OracleDialect;
+        assert_ops_with(
+            "INSERT INTO (SELECT e.id FROM emp e JOIN dept d ON e.dept_id = d.id) \
+             SELECT x FROM s",
+            &OracleDialect {},
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("emp"), read("dept"), read("s")],
+                writes: vec![twrite("emp")],
+                lineage: vec![edge("s", "emp")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn alter_table_emits_write_only() {
         assert_ops(
             "ALTER TABLE t1 ADD COLUMN a INT",
