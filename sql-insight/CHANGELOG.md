@@ -13,12 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### attribute unqualified SET targets with the read-side rules ([#59](https://github.com/takaebato/sql-insight/pull/59)) by @takaebato
 
-An unqualified SET column in a multi-table UPDATE (`UPDATE t1 JOIN t2 SET a = 1`)
-no longer pins to the statement's root table. It now resolves like a read over
-the writable relations: a sole catalog owner pins it; otherwise the column write
-surfaces unattributed (`table: None`, `Ambiguous` / `Unresolved`) and contributes
-no table-level write. Qualify the SET column or supply a catalog to keep a
-pinned table.
+Previously, `UPDATE t1 JOIN t2 SET a = 1` always attributed the write to the
+first table (`t1.a`) — even when `a` actually belongs to `t2`. The unqualified
+SET column now resolves like a column read: if exactly one joined relation can
+own it (e.g. per the catalog), that relation gets the write; when the owner
+can't be determined, the write surfaces unattributed (`table: None`,
+`Ambiguous` / `Unresolved`) and emits no table-level write, instead of a
+possibly-wrong `t1.a` — mirroring the engines, which reject the ambiguous
+form. To keep attributed writes, qualify the column (`SET t2.a = 1`) or supply
+a catalog.
 
 #### upgrade sqlparser to 0.62 ([#55](https://github.com/takaebato/sql-insight/pull/55)) by @takaebato
 
