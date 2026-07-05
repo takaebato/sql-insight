@@ -13,7 +13,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### attribute unqualified SET targets with the read-side rules ([#59](https://github.com/takaebato/sql-insight/pull/59)) by @takaebato
 
+An unqualified SET column in a multi-table UPDATE (`UPDATE t1 JOIN t2 SET a = 1`)
+no longer pins to the statement's root table. It now resolves like a read over
+the writable relations: a sole catalog owner pins it; otherwise the column write
+surfaces unattributed (`table: None`, `Ambiguous` / `Unresolved`) and contributes
+no table-level write. Qualify the SET column or supply a catalog to keep a
+pinned table.
+
 #### upgrade sqlparser to 0.62 ([#55](https://github.com/takaebato/sql-insight/pull/55)) by @takaebato
+
+The re-exported `sql_insight::sqlparser` moves 0.61 → 0.62; code matching on its
+AST must adapt (notably `Insert::columns` is now `Vec<ObjectName>`, `VALUES` rows
+carry `Parens`, visitors see `ValueWithSpan`, and there are new variants such as
+`SelectItem::ExprWithAliases` / `TableObject::TableQuery`). See the
+[sqlparser 0.62.0 changelog](https://github.com/apache/datafusion-sqlparser-rs/blob/main/changelog/0.62.0.md).
 
 ### Added
 

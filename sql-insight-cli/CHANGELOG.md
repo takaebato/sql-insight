@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.2](https://github.com/takaebato/sql-insight/compare/sql-insight-cli-v0.2.1...sql-insight-cli-v0.2.2) - 2026-07-05
+## [0.3.0](https://github.com/takaebato/sql-insight/compare/sql-insight-cli-v0.2.1...sql-insight-cli-v0.3.0) - 2026-07-05
 
 ### Added
 

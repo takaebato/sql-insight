@@ -13,7 +13,7 @@ readme = "README.md"
 # Bump the MINOR by hand (pre-1.0 breaking) when the CLI's output *format* changes
 # — stdout shape or `--format json` structure — vs a value-only change (patch).
 # Manual: tooling sees the API surface, not output/behaviour.
-version = "0.2.2"
+version = "0.3.0"
 edition = { workspace = true }
 homepage = { workspace = true }
 repository = { workspace = true }
