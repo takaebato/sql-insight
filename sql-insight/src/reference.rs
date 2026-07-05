@@ -10,8 +10,8 @@ use core::fmt;
 use crate::casing::IdentifierCasing;
 use crate::error::Error;
 use sqlparser::ast::{
-    GroupByExpr, Ident, Insert, JoinOperator, ObjectName, Query, Select, SelectFlavor, SetExpr,
-    TableFactor, TableObject,
+    Expr, GroupByExpr, Ident, Insert, JoinOperator, ObjectName, Query, Select, SelectFlavor,
+    SelectItem, SetExpr, TableFactor, TableObject,
 };
 
 /// Physical table identity — the `catalog.schema.name` triplet.
@@ -584,15 +584,23 @@ impl TryFrom<&ObjectName> for TableReference {
     }
 }
 
-/// A shape-gated Oracle inline-view INSERT target: the view\'s [`Select`]
-/// plus its FROM factors **pre-extracted** as `(name, alias)` pairs — the
-/// gate proves every factor is a plain table, and handing the proof over as
-/// data means no downstream re-match (and no unreachable fallback arm).
+/// A shape-gated Oracle inline-view INSERT target, handed over entirely as
+/// **gate-extracted data** — the FROM factors as `(name, alias)` pairs, the
+/// projection, the join operators, and the WHERE. The gate proves every
+/// factor is a plain table; carrying the proof as data means no downstream
+/// re-match (no unreachable fallback arm), and nothing re-reads the `Query`,
+/// so no consumer can pair `factors` with a clause it wasn\'t derived from.
 pub(crate) struct InsertTargetView<'a> {
-    pub(crate) select: &'a Select,
-    /// Every FROM factor (each `TableWithJoins`\' relation and joins, in
+    /// Every FROM factor (each `TableWithJoins`' relation and joins, in
     /// source order): its table name and optional alias.
     pub(crate) factors: Vec<(&'a ObjectName, Option<&'a Ident>)>,
+    /// The projection items — the insertable target columns' material.
+    pub(crate) projection: &'a [SelectItem],
+    /// Every join's operator, the constraint carrier (no relation data — that
+    /// lives in `factors`): the binder binds each `ON` as filter reads.
+    pub(crate) join_operators: Vec<&'a JoinOperator>,
+    /// The WHERE predicate — filter reads over the view's relations.
+    pub(crate) selection: Option<&'a Expr>,
 }
 
 /// Shape-gate an Oracle inline-view INSERT target
@@ -635,13 +643,13 @@ pub(crate) fn insert_target_view(query: &Query) -> Option<InsertTargetView<'_>> 
         select_modifiers: None,
         top: None,
         top_before_distinct: _,
-        projection: _,
+        projection,
         exclude: None,
         into: None,
         from,
         lateral_views,
         prewhere: None,
-        selection: _,
+        selection,
         connect_by,
         group_by: GroupByExpr::Expressions(group_by, group_by_modifiers),
         cluster_by,
@@ -683,6 +691,7 @@ pub(crate) fn insert_target_view(query: &Query) -> Option<InsertTargetView<'_>> 
         }
     }
     let mut factors = Vec::new();
+    let mut join_operators = Vec::new();
     for twj in from {
         factors.push(plain_table(&twj.relation)?);
         for join in &twj.joins {
@@ -697,9 +706,15 @@ pub(crate) fn insert_target_view(query: &Query) -> Option<InsertTargetView<'_>> 
                 return None;
             }
             factors.push(plain_table(&join.relation)?);
+            join_operators.push(&join.join_operator);
         }
     }
-    Some(InsertTargetView { select, factors })
+    Some(InsertTargetView {
+        factors,
+        projection,
+        join_operators,
+        selection: selection.as_ref(),
+    })
 }
 
 /// The single base table of a shape-gated inline view
@@ -834,7 +849,14 @@ mod tests {
             query
         };
         let plain = parse("SELECT e.id FROM emp e JOIN dept d ON e.id = d.id");
-        assert!(insert_target_view(&plain).is_some());
+        let view = insert_target_view(&plain).unwrap();
+        // The gate hands everything over as extracted data: both factors
+        // (with aliases), the join's operator, and the projection.
+        assert_eq!(view.factors.len(), 2);
+        assert_eq!(view.factors[1].1.unwrap().value, "d");
+        assert_eq!(view.join_operators.len(), 1);
+        assert_eq!(view.projection.len(), 1);
+        assert!(view.selection.is_none());
         let array_join = parse("SELECT e.id FROM emp e ARRAY JOIN arr");
         assert!(insert_target_view(&array_join).is_none());
     }

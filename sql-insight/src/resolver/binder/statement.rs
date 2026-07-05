@@ -142,7 +142,7 @@ impl<'a> Binder<'a> {
                         // enforces). The base table may be aliased
                         // (`FROM emp e`); the predicate then qualifies through
                         // the alias (`e.dept`), so carry it on the scope.
-                        let predicate = match view.select.selection.as_ref() {
+                        let predicate = match view.selection {
                             Some(predicate) => {
                                 let alias = view.factors[0].1.cloned();
                                 let scope = self.target_scope_with_alias(&m.table, alias);
@@ -152,7 +152,7 @@ impl<'a> Binder<'a> {
                         };
                         (
                             m,
-                            view_target_columns(view.select),
+                            view_target_columns(view.projection),
                             predicate,
                             LogicalPlan::Empty,
                         )
@@ -331,7 +331,6 @@ impl<'a> Binder<'a> {
         &mut self,
         view: &crate::reference::InsertTargetView<'_>,
     ) -> Option<(TableMatch, Vec<Ident>, Vec<Expr>, LogicalPlan)> {
-        let select = view.select;
         // The view's relations — the shape gate already extracted every
         // factor's (name, alias). Each match keeps its written (pre-canonical)
         // reference for the CTE-target check below. A *companion* factor
@@ -358,7 +357,7 @@ impl<'a> Binder<'a> {
         // Each projected column, split as (qualifier, column name) — plain
         // columns only; anything else leaves the target (and the positional
         // pairing) indeterminate.
-        let parts_list: Vec<(Vec<Ident>, Ident)> = select
+        let parts_list: Vec<(Vec<Ident>, Ident)> = view
             .projection
             .iter()
             .map(|item| match item {
@@ -423,12 +422,11 @@ impl<'a> Binder<'a> {
         // ON + WHERE are filter reads over the full view scope (all relations,
         // aliases included).
         let scope = Scope::from_relations(&relations);
-        let predicate = select
-            .from
+        let predicate = view
+            .join_operators
             .iter()
-            .flat_map(|twj| &twj.joins)
-            .filter_map(|j| join_on(&j.join_operator))
-            .chain(select.selection.as_ref())
+            .filter_map(|op| join_on(op))
+            .chain(view.selection)
             .map(|on| self.bind_expr(on, &scope))
             .collect();
         let columns = parts_list
@@ -1535,9 +1533,9 @@ fn is_join_factor(factor: &TableFactor) -> bool {
 /// indeterminate as a whole, so the caller falls back to the column-less
 /// (catalog-fill / diagnostic) path. The `SelectItem` match is exhaustive so a
 /// new variant forces a decision here.
-fn view_target_columns(select: &sqlparser::ast::Select) -> Vec<Ident> {
+fn view_target_columns(projection: &[SelectItem]) -> Vec<Ident> {
     let mut columns = Vec::new();
-    for item in &select.projection {
+    for item in projection {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
             SelectItem::ExprWithAliases { .. }
