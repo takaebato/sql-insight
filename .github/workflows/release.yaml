@@ -63,10 +63,9 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-          # x86_64 pins macos-13 (the last Intel runner; macos-latest is arm64
-          # now); aarch64 tracks macos-latest (arm64, native).
+          # x86_64 is cross-compiled on the arm64 image.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
