@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/takaebato/sql-insight/compare/sql-insight-v0.3.0...sql-insight-v0.4.0) - 2026-07-05
+
+### ⚠️ Breaking Changes
+
+#### attribute unqualified SET targets with the read-side rules ([#59](https://github.com/takaebato/sql-insight/pull/59)) by @takaebato
+
+Previously, `UPDATE t1 JOIN t2 SET a = 1` always attributed the write to the
+first table (`t1.a`) — even when `a` actually belongs to `t2`. The unqualified
+SET column now resolves like a column read: if exactly one joined relation can
+own it (e.g. per the catalog), that relation gets the write; when the owner
+can't be determined, the write surfaces unattributed (`table: None`,
+`Ambiguous` / `Unresolved`) and emits no table-level write, instead of a
+possibly-wrong `t1.a` — mirroring the engines, which reject the ambiguous
+form. To keep attributed writes, qualify the column (`SET t2.a = 1`) or supply
+a catalog.
+
+#### upgrade sqlparser to 0.62 ([#55](https://github.com/takaebato/sql-insight/pull/55)) by @takaebato
+
+The re-exported `sql_insight::sqlparser` moves 0.61 → 0.62; code matching on its
+AST must adapt (notably `Insert::columns` is now `Vec<ObjectName>`, `VALUES` rows
+carry `Parens`, visitors see `ValueWithSpan`, and there are new variants such as
+`SelectItem::ExprWithAliases` / `TableObject::TableQuery`). See the
+[sqlparser 0.62.0 changelog](https://github.com/apache/datafusion-sqlparser-rs/blob/main/changelog/0.62.0.md).
+
+### Added
+
+- resolve Oracle join-view INSERT targets by column attribution ([#61](https://github.com/takaebato/sql-insight/pull/61)) by @takaebato
+- fan out multi-column-alias lineage to every alias ([#60](https://github.com/takaebato/sql-insight/pull/60)) by @takaebato
+- resolve Oracle inline-view INSERT targets to their base table ([#58](https://github.com/takaebato/sql-insight/pull/58)) by @takaebato
+
+### Fixed
+
+- don't surface a ClickHouse ARRAY JOIN operand as a table read ([#57](https://github.com/takaebato/sql-insight/pull/57)) by @takaebato
+
+### Other Changes
+
+- changelog breaking-change workflow, version-bump docs, and keywords ([#51](https://github.com/takaebato/sql-insight/pull/51)) by @takaebato
+- tidy keywords, README versions, and add a version-sync check ([#46](https://github.com/takaebato/sql-insight/pull/46)) by @takaebato
+
 ## [0.3.0](https://github.com/takaebato/sql-insight/compare/v0.2.0...v0.3.0) - 2026-06-28
 
 ### Added

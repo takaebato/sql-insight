@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/takaebato/sql-insight/compare/sql-insight-cli-v0.2.1...sql-insight-cli-v0.3.0) - 2026-07-05
+
+### ⚠️ Breaking Changes
+
+#### analysis results change with sql-insight 0.4
+
+The same input SQL can produce different results — see the
+[sql-insight 0.4.0 changelog](https://github.com/takaebato/sql-insight/blob/master/sql-insight/CHANGELOG.md#040---2026-07-05)
+for what changed.
+
+### Added
+
+- *(cli)* prebuilt binary distribution — cargo binstall, completions, man, and provenance ([#53](https://github.com/takaebato/sql-insight/pull/53)) by @takaebato
+
+### Fixed
+
+- *(deps)* update rust crate clap_mangen to 0.3 ([#54](https://github.com/takaebato/sql-insight/pull/54)) by @renovate[bot]
+
+### Other Changes
+
+- changelog breaking-change workflow, version-bump docs, and keywords ([#51](https://github.com/takaebato/sql-insight/pull/51)) by @takaebato
+- tidy keywords, README versions, and add a version-sync check ([#46](https://github.com/takaebato/sql-insight/pull/46)) by @takaebato
+
 ## [0.2.1](https://github.com/takaebato/sql-insight/compare/sql-insight-cli-v0.2.0...sql-insight-cli-v0.2.1) - 2026-06-28
 
 ### Added
