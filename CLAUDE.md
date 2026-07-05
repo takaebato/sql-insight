@@ -96,8 +96,3 @@ Rules that bite if forgotten (the why is in `ARCHITECTURE.md`):
   as the commit subject, which release-plz reads to compute per-crate version
   bumps and changelogs — so `fix:` / `feat:` / `feat!:` (breaking) on the title
   is what ships. Allowed types live in that workflow.
-- **Breaking changes**: `!` on the title is the whole per-PR mechanism (#56
-  dropped the PR-description changelog block). release-plz renders each breaking
-  commit's subject as a heading in the CHANGELOG's "Breaking Changes" section,
-  credited `by @author`; migration notes, if needed, are written by hand when
-  reviewing the release PR's CHANGELOG.md.
