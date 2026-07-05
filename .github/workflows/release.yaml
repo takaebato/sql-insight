@@ -63,8 +63,7 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-          # x86_64 is cross-compiled on the arm64 image (macos-13, the last
-          # Intel image, was retired).
+          # x86_64 is cross-compiled on the arm64 image.
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
