@@ -63,9 +63,10 @@ commit_parsers = [
 # `commit.breaking`, via `!` or a BREAKING CHANGE footer), then the normal groups
 # with breaking commits excluded and empty groups skipped — so a breaking change
 # is listed once, at the top. `striptags` honors the `<!-- N -->` sort prefixes;
-# ` by @user` credits the author. The PR link comes from the subject's `(#N)`,
-# which release-plz's default commit_preprocessor turns into a markdown link, so
-# it is not repeated here (squash merges put `(#N)` in the subject).
+# ` by @user` credits the author (on breaking headings and normal entries alike).
+# The PR link comes from the subject's `(#N)`, which release-plz's default
+# commit_preprocessor turns into a markdown link, so it is not repeated here
+# (squash merges put `(#N)` in the subject).
 #
 # Each breaking change is a `####` heading (its subject) only; migration notes,
 # if any, are written by hand when reviewing the release PR's CHANGELOG.md.
@@ -76,7 +77,7 @@ body = '''
 {% if breaking | length > 0 %}
 ### ⚠️ Breaking Changes
 {% for commit in breaking %}
-#### {% if commit.scope %}*({{ commit.scope }})* {% endif %}{{ commit.message }}
+#### {% if commit.scope %}*({{ commit.scope }})* {% endif %}{{ commit.message }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}
 {% endfor -%}
 {% endif -%}
 {% for group, group_commits in commits | group_by(attribute="group") %}
