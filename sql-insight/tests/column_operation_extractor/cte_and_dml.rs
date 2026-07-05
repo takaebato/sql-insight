@@ -324,6 +324,45 @@ mod ctas_view {
     use super::*;
 
     #[test]
+    fn ctas_multi_column_alias_feeds_every_created_column() {
+        // A multi-alias projection (`explode(arr) AS (k, v)`) fans out: each
+        // created column pairs with its like-positioned output, and a tail
+        // alias resolves to the head expression — both `x.k` and `x.v`
+        // receive `t.arr` (the tail edge used to be silently missing).
+        assert_column_ops(
+            "CREATE TABLE x AS SELECT explode(arr) AS (k, v) FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("t", "arr")],
+                writes: vec![write("x", "k"), write("x", "v")],
+                lineage: vec![
+                    transformation(col("t", "arr"), relation("x", "k")),
+                    transformation(col("t", "arr"), relation("x", "v")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn create_view_multi_column_alias_feeds_every_view_column() {
+        // Same fan-out through CREATE VIEW (the other created-relation path).
+        assert_column_ops(
+            "CREATE VIEW w AS SELECT explode(arr) AS (k, v) FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateView,
+                reads: vec![read("t", "arr")],
+                writes: vec![write("w", "k"), write("w", "v")],
+                lineage: vec![
+                    transformation(col("t", "arr"), relation("w", "k")),
+                    transformation(col("t", "arr"), relation("w", "v")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn ctas_pairs_source_projection_with_inferred_column_names() {
         // CREATE TABLE AS SELECT — no explicit column list, so target
         // columns follow the source projection's inferred names

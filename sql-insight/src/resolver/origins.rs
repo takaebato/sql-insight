@@ -9,7 +9,9 @@
 
 use sqlparser::ast::Ident;
 
-use super::logical_plan::{Binding, BoundColumn, Cte, Expr, LogicalPlan, NamedExpr};
+use super::logical_plan::{
+    output_slots, resolved_output_expr, Binding, BoundColumn, Cte, Expr, LogicalPlan, NamedExpr,
+};
 use super::reads::column_read;
 use crate::casing::{CaseRule, IdentifierCasing};
 use crate::extractor::ColumnLineageKind;
@@ -225,10 +227,17 @@ fn origins_into<'a>(
     context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match op {
-        LogicalPlan::Projection(p) => match find_named(&p.exprs, name, context.casing.column) {
-            Some(ne) => origins_of_expr(&ne.expr, &p.input, context),
-            None => Vec::new(),
-        },
+        LogicalPlan::Projection(p) => {
+            // Resolve by name to a position, then through any multi-alias
+            // back-reference — `d.v` over `explode(arr) AS (k, v)` traces the
+            // head expression, reaching `arr`.
+            match named_position(&p.exprs, name, context.casing.column)
+                .and_then(|i| resolved_output_expr(&p.exprs, i))
+            {
+                Some(expr) => origins_of_expr(expr, &p.input, context),
+                None => Vec::new(),
+            }
+        }
         // The projection resolves against the FROM scope, so a column is a
         // base ref that returns directly, not a named `Aggregate` output —
         // a `Derived` ref tracing down just passes through to the input.
@@ -279,9 +288,8 @@ fn origins_into<'a>(
         LogicalPlan::SetOp(_) => {
             let operands = output_operands(op);
             let Some(i) = operands.first().and_then(|o| {
-                o.outputs
-                    .iter()
-                    .position(|ne| ne.name.as_ref().is_some_and(|n| context.eq_column(n, name)))
+                output_slots(o.outputs)
+                    .position(|(n, _)| n.is_some_and(|n| context.eq_column(n, name)))
             }) else {
                 return Vec::new();
             };
@@ -369,8 +377,10 @@ fn trace_nth_output<'a>(
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     let mut out = Vec::new();
     for operand in operands {
-        if let Some(ne) = operand.outputs.get(i) {
-            out.extend(operand.trace(context, |input, cx| origins_of_expr(&ne.expr, input, cx)));
+        // A multi-alias tail output resolves to its head expression, so a
+        // positional trace of `v` in `explode(arr) AS (k, v)` reaches `arr`.
+        if let Some(expr) = resolved_output_expr(operand.outputs, i) {
+            out.extend(operand.trace(context, |input, cx| origins_of_expr(expr, input, cx)));
         }
     }
     out
@@ -584,11 +594,9 @@ fn transform(
         .collect()
 }
 
-fn find_named<'a>(exprs: &'a [NamedExpr], name: &Ident, fold: CaseRule) -> Option<&'a NamedExpr> {
+/// The output **position** named `name` (case-folded), over the slot view —
+/// so a fan's aliases each occupy their own position.
+fn named_position(exprs: &[NamedExpr], name: &Ident, fold: CaseRule) -> Option<usize> {
     let target = fold.normalize(name);
-    exprs.iter().find(|ne| {
-        ne.name
-            .as_ref()
-            .is_some_and(|n| fold.normalize(n) == target)
-    })
+    output_slots(exprs).position(|(n, _)| n.is_some_and(|n| fold.normalize(n) == target))
 }

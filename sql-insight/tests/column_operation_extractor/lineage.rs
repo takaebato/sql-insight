@@ -53,18 +53,108 @@ mod projections {
     fn expr_with_multi_column_aliases_binds_the_expression_once() {
         // Spark `expr AS (a, b, …)`: one expression projected under several
         // output names. `reads` is occurrence-based, so `t.arr` is read exactly
-        // once; the expression's lineage attaches to the first alias (`k`), and
-        // the tail alias (`v`) is an extra output that traces to nothing —
-        // splitting one expression's lineage across N outputs isn't
-        // representable without re-reading it. (`GenericDialect` parses the
-        // multi-column alias.)
+        // once (the first alias carries the bound expression; each tail alias
+        // is a `Fanout` back-reference to it) — while lineage fans out: every
+        // alias gets its own edge from the expression's sources.
+        // (`GenericDialect` parses the multi-column alias.)
         assert_column_ops(
             "SELECT explode(t.arr) AS (k, v) FROM t",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t", "arr")],
                 writes: vec![],
-                lineage: vec![transformation(col("t", "arr"), out("k", 0))],
+                lineage: vec![
+                    transformation(col("t", "arr"), out("k", 0)),
+                    transformation(col("t", "arr"), out("v", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn multi_column_alias_of_a_bare_column_fans_out_passthroughs() {
+        // The fan-out edges take the *head expression's* kind: a bare column
+        // under several aliases is a `Passthrough` to each (a function like
+        // `explode` is a `Transformation` to each — previous test).
+        assert_column_ops(
+            "SELECT t.a AS (x, y) FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("x", 0)),
+                    passthrough(col("t", "a"), out("y", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn multi_column_alias_tail_traces_through_a_derived_table() {
+        // Selecting the *tail* alias through a derived table resolves its
+        // `Fanout` back to the head expression — `d.v` reaches `t.arr`.
+        assert_column_ops(
+            "SELECT v FROM (SELECT explode(arr) AS (k, v) FROM t) d",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "arr")],
+                writes: vec![],
+                lineage: vec![transformation(col("t", "arr"), out("v", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn derived_alias_list_renames_fan_names_positionally() {
+        // An explicit derived-table column list (`AS d(x, y)`) renames output
+        // *positions*: a fan consumes one name per alias (k→x, v→y), so the
+        // renamed tail (`y`) still traces to the fan's shared expression.
+        assert_column_ops(
+            "SELECT y FROM (SELECT explode(arr) AS (k, v) FROM t) AS d(x, y)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "arr")],
+                writes: vec![],
+                lineage: vec![transformation(col("t", "arr"), out("y", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn cte_column_list_renames_fan_names_positionally() {
+        // The same positional rename through a CTE's explicit column list.
+        assert_column_ops(
+            "WITH c (x, y) AS (SELECT explode(arr) AS (k, v) FROM t) SELECT y FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "arr")],
+                writes: vec![],
+                lineage: vec![transformation(col("t", "arr"), out("y", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn multi_column_alias_feeds_every_insert_target_column() {
+        // INSERT pairing is positional: each target column pairs with its
+        // like-positioned output, and a tail alias resolves to the head
+        // expression — both `tgt.c1` and `tgt.c2` receive `t.arr`.
+        assert_column_ops(
+            "INSERT INTO tgt (c1, c2) SELECT explode(arr) AS (k, v) FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("t", "arr")],
+                writes: vec![write("tgt", "c1"), write("tgt", "c2")],
+                lineage: vec![
+                    transformation(col("t", "arr"), relation("tgt", "c1")),
+                    transformation(col("t", "arr"), relation("tgt", "c2")),
+                ],
                 diagnostics: vec![],
             },
         );

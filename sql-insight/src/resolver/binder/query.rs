@@ -184,7 +184,9 @@ impl<'a> Binder<'a> {
                     .iter()
                     .chain(group_by_expr)
                     .map(|e| NamedExpr {
-                        name: e.expr.alias.clone().or_else(|| inferred_name(&e.expr.expr)),
+                        names: OutputNames::Single(
+                            e.expr.alias.clone().or_else(|| inferred_name(&e.expr.expr)),
+                        ),
                         expr: self.bind_expr(&e.expr.expr, scope),
                     })
                     .collect();
@@ -311,7 +313,7 @@ impl<'a> Binder<'a> {
                 expr: Expr::Column(Box::new(
                     self.resolve(std::slice::from_ref(&name), &pass_scope),
                 )),
-                name: Some(name),
+                names: OutputNames::Single(Some(name)),
             })
             .collect()
     }
@@ -329,13 +331,13 @@ impl<'a> Binder<'a> {
         for a in assignments {
             for column in assignment_target_columns(&a.target) {
                 let ne = NamedExpr {
-                    name: Some(column.clone()),
+                    names: OutputNames::Single(Some(column.clone())),
                     expr: self.bind_expr(&a.value, scope),
                 };
+                // Pipe outputs are always single-named passthroughs.
                 match exprs.iter_mut().find(|e| {
-                    e.name
-                        .as_ref()
-                        .is_some_and(|n| self.eq(self.style.casing.column, n, &column))
+                    matches!(&e.names, OutputNames::Single(Some(n))
+                        if self.eq(self.style.casing.column, n, &column))
                 }) {
                     Some(slot) => *slot = ne,
                     None => exprs.push(ne),

@@ -12,7 +12,8 @@
 use sqlparser::ast::Ident;
 
 use super::logical_plan::{
-    dml_roots, is_dml_root, peel_with, Expr, LogicalPlan, MergeClause, NamedExpr, Update,
+    dml_roots, is_dml_root, output_slots, peel_with, Expr, LogicalPlan, MergeClause, NamedExpr,
+    Update,
 };
 use super::origins::{
     conflict_value_origins, enter_withs, origins_of_expr, output_operands, TraceContext,
@@ -197,18 +198,21 @@ fn query_output_lineage<'a>(
     // column). Position already restarts per branch, aligning them; a plain
     // query has a single operand, so this is a no-op there.
     let result_names: Vec<Option<Ident>> = match operands.first() {
-        Some(o) => o.outputs.iter().map(|ne| ne.name.clone()).collect(),
+        Some(o) => output_slots(o.outputs).map(|(n, _)| n.cloned()).collect(),
         None => Vec::new(),
     };
     for operand in &operands {
         let outputs = operand.outputs;
         operand.trace(context, |input, cx| {
-            for (position, ne) in outputs.iter().enumerate() {
+            // Position-by-position over the slot view: a fan yields its
+            // shared expression once per alias, so every alias of
+            // `explode(arr) AS (k, v)` gets its own `arr` edge.
+            for (position, (_, expr)) in output_slots(outputs).enumerate() {
                 let target = ColumnTarget::QueryOutput {
                     name: result_names.get(position).cloned().flatten(),
                     position,
                 };
-                emit_edges(origins_of_expr(&ne.expr, input, cx), target, out);
+                emit_edges(origins_of_expr(expr, input, cx), target, out);
             }
         });
     }
@@ -263,9 +267,12 @@ fn relation_lineage<'a>(
     for operand in output_operands(input) {
         let outputs = operand.outputs;
         operand.trace(context, |src_input, cx| {
-            for (target_column, ne) in columns.iter().zip(outputs) {
+            // Pair positionally with the slot view: a fan feeds one target
+            // column per alias (`INSERT … SELECT explode(arr) AS (k, v)`
+            // feeds both).
+            for (target_column, (_, expr)) in columns.iter().zip(output_slots(outputs)) {
                 let tgt = ColumnTarget::Relation(target_column.clone());
-                emit_edges(origins_of_expr(&ne.expr, src_input, cx), tgt, out);
+                emit_edges(origins_of_expr(expr, src_input, cx), tgt, out);
             }
         });
     }
@@ -300,7 +307,7 @@ fn created_relation_lineage<'a>(
     let operands = output_operands(input);
     let result_names: Vec<Option<Ident>> = if explicit.is_empty() {
         match operands.first() {
-            Some(o) => o.outputs.iter().map(|ne| ne.name.clone()).collect(),
+            Some(o) => output_slots(o.outputs).map(|(n, _)| n.cloned()).collect(),
             None => Vec::new(),
         }
     } else {
@@ -309,7 +316,9 @@ fn created_relation_lineage<'a>(
     for operand in &operands {
         let outputs = operand.outputs;
         operand.trace(context, |src_input, cx| {
-            for (position, ne) in outputs.iter().enumerate() {
+            // Position-by-position over the slot view, so a CTAS / CREATE
+            // VIEW over `explode(arr) AS (k, v)` feeds both created columns.
+            for (position, (_, expr)) in output_slots(outputs).enumerate() {
                 let Some(name) = result_names.get(position).cloned().flatten() else {
                     continue;
                 };
@@ -321,7 +330,7 @@ fn created_relation_lineage<'a>(
                     },
                     resolution: ResolutionKind::Inferred,
                 });
-                emit_edges(origins_of_expr(&ne.expr, src_input, cx), tgt, out);
+                emit_edges(origins_of_expr(expr, src_input, cx), tgt, out);
             }
         });
     }
@@ -336,12 +345,12 @@ fn returning_lineage<'a>(
     context: &mut TraceContext<'a>,
     out: &mut Vec<ColumnLineageEdge>,
 ) {
-    for (position, ne) in returning.iter().enumerate() {
+    for (position, (name, expr)) in output_slots(returning).enumerate() {
         let target = ColumnTarget::QueryOutput {
-            name: ne.name.clone(),
+            name: name.cloned(),
             position,
         };
-        emit_edges(origins_of_expr(&ne.expr, input, context), target, out);
+        emit_edges(origins_of_expr(expr, input, context), target, out);
     }
 }
 
