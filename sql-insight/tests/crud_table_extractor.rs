@@ -451,6 +451,55 @@ mod insert_statement {
     }
 
     #[test]
+    fn test_insert_into_join_view_reads_the_companion_table() {
+        // A resolved join-view INSERT: the row lands in `emp` (create), and
+        // both view relations are reads — `emp` via its referenced columns
+        // (the sink rule), `dept` as scanned companion context.
+        use sql_insight::sqlparser::dialect::OracleDialect;
+        let sql = "INSERT INTO (SELECT e.id FROM emp e JOIN dept d \
+                   ON e.dept_id = d.id WHERE d.active = 1) VALUES (100)";
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![cwrite(table("emp"))],
+            read_tables: vec![cread(table("emp")), cread(table("dept"))],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(sql, expected, vec![Box::new(OracleDialect {})]);
+    }
+
+    #[test]
+    fn test_insert_into_table_function_targets_the_function_name() {
+        // ClickHouse `INSERT INTO TABLE FUNCTION remote(…)`: the function's
+        // name stands in as the write target (best-effort — the real remote
+        // table isn't inspectable from SQL text).
+        use sql_insight::sqlparser::dialect::ClickHouseDialect;
+        let sql = "INSERT INTO TABLE FUNCTION remote('addr', db.tbl) VALUES (1)";
+        let result = CrudTableExtractor::extract(&ClickHouseDialect {}, sql).unwrap();
+        let crud = result.into_iter().next().unwrap().unwrap();
+        assert_eq!(crud.create_tables, vec![cwrite(table("remote"))]);
+        assert_eq!(crud.read_tables, vec![]);
+    }
+
+    #[test]
+    fn test_insert_into_table_function_with_unrepresentable_name_drops() {
+        // A TABLE FUNCTION whose name exceeds `catalog.schema.name` can't be
+        // represented — dropped with the usual TooManyTableQualifiers flag.
+        use sql_insight::diagnostic::TableLevelDiagnosticKind;
+        use sql_insight::sqlparser::dialect::ClickHouseDialect;
+        let sql = "INSERT INTO TABLE FUNCTION a.b.c.d('x') VALUES (1)";
+        let result = CrudTableExtractor::extract(&ClickHouseDialect {}, sql).unwrap();
+        let crud = result.into_iter().next().unwrap().unwrap();
+        assert_eq!(crud.create_tables, vec![]);
+        assert_eq!(crud.read_tables, vec![]);
+        assert_eq!(crud.diagnostics.len(), 1);
+        assert_eq!(
+            crud.diagnostics[0].kind,
+            TableLevelDiagnosticKind::TooManyTableQualifiers
+        );
+    }
+
+    #[test]
     fn test_parenthesized_insert_keeps_the_insert_verb() {
         // `(INSERT … SELECT …)` keeps its verb → target buckets as Create,
         // source as Read (the misclassification dropped both into a Select).

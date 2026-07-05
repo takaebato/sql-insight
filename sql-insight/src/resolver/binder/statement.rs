@@ -3,6 +3,7 @@
 //! [`LogicalPlan`] root, plus the write-target resolution helpers (DELETE
 //! multi-target identity, RETURNING projection, ON CONFLICT).
 
+use super::resolve::TableMatch;
 use super::*;
 
 impl<'a> Binder<'a> {
@@ -104,34 +105,75 @@ impl<'a> Binder<'a> {
     /// expression is dropped (not flagged: it isn't an analyzable-info loss the
     /// common, constant case would false-alarm on).
     pub(super) fn bind_insert(&mut self, insert: &SqlInsert) -> LogicalPlan {
-        let (name, view) = match &insert.table {
-            TableObject::TableName(name) => (name, None),
-            TableObject::TableFunction(function) => (&function.name, None),
+        // Resolve the target into its catalog match plus, for an Oracle
+        // inline-view target, the view's pieces: its projected column names
+        // (the explicit target columns), its bound ON / WHERE predicates
+        // (filter reads), and — for a join view — the companion relations.
+        let (m, view_columns, target_predicate, target_context) = match &insert.table {
+            TableObject::TableName(name) => match self.named_insert_target(name) {
+                Some(m) => (m, Vec::new(), Vec::new(), LogicalPlan::Empty),
+                None => return LogicalPlan::Empty,
+            },
+            TableObject::TableFunction(function) => {
+                match self.named_insert_target(&function.name) {
+                    Some(m) => (m, Vec::new(), Vec::new(), LogicalPlan::Empty),
+                    None => return LogicalPlan::Empty,
+                }
+            }
             // Oracle `INSERT INTO (SELECT …) …`: an inline-view target — the
-            // row lands in the view's single base table, so resolve through to
-            // it (the projection names the target columns, the WHERE is filter
-            // reads). A view over no single base table (a join — key-preserved
-            // rules need a catalog — or a set operation) is dropped + flagged
-            // like a CTE / derived target.
-            TableObject::TableQuery(query) => match crate::reference::insert_target_view(query) {
-                Some((name, select)) => (name, Some(select)),
-                None => {
+            // row lands in the view's base table. A single-table view is
+            // shape-determined; a join view's base table is whichever relation
+            // every projected column attributes to. A view the gate rejects
+            // (a non-table factor, a set operation, any other clause) — or a
+            // join view with no single determined target — is dropped +
+            // flagged like a CTE / derived target.
+            TableObject::TableQuery(query) => {
+                let Some(view) = crate::reference::insert_target_view(query) else {
                     self.record_unsupported_dml_target("INSERT", query.as_ref());
                     return LogicalPlan::Empty;
+                };
+                match crate::reference::insert_target_base(&view) {
+                    Some(name) => {
+                        let Some(m) = self.named_insert_target(name) else {
+                            return LogicalPlan::Empty;
+                        };
+                        // The WHERE resolves against the target alone (filter
+                        // reads — e.g. the predicate a `WITH CHECK OPTION`
+                        // enforces). The base table may be aliased
+                        // (`FROM emp e`); the predicate then qualifies through
+                        // the alias (`e.dept`), so carry it on the scope.
+                        let predicate = match view.selection {
+                            Some(predicate) => {
+                                let alias = view.factors[0].1.cloned();
+                                let scope = self.target_scope_with_alias(&m.table, alias);
+                                vec![self.bind_expr(predicate, &scope)]
+                            }
+                            None => Vec::new(),
+                        };
+                        (
+                            m,
+                            view_target_columns(view.projection),
+                            predicate,
+                            LogicalPlan::Empty,
+                        )
+                    }
+                    None => {
+                        let diagnostics_before = self.diagnostics.len();
+                        match self.bind_join_view_target(&view) {
+                            Some(resolved) => resolved,
+                            None => {
+                                // A factor that failed to resolve already
+                                // flagged itself; flag only when nothing was.
+                                if self.diagnostics.len() == diagnostics_before {
+                                    self.record_unsupported_dml_target("INSERT", query.as_ref());
+                                }
+                                return LogicalPlan::Empty;
+                            }
+                        }
+                    }
                 }
-            },
+            }
         };
-        let Some(written) = self.table_ref(name) else {
-            return LogicalPlan::Empty;
-        };
-        let m = self.table_match(&written);
-        // The target is a real table, never a CTE (you can't INSERT into a
-        // read-only CTE): a name that matches a declared CTE and isn't a catalog
-        // table is the CTE — flag and drop rather than fabricate a write.
-        if m.resolution != ResolutionKind::Cataloged && self.is_declared_cte(&written) {
-            self.record_unsupported_dml_target("INSERT", &written);
-            return LogicalPlan::Empty;
-        }
         let target = m.table;
         // MySQL `INSERT INTO t SET col = expr, …`: the assignment form (no
         // VALUES / SELECT source) — each assignment is a value column named by
@@ -175,7 +217,7 @@ impl<'a> Binder<'a> {
                 .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
                 .collect()
         } else {
-            view.map(view_target_columns).unwrap_or_default()
+            view_columns
         };
         let has_explicit = !explicit.is_empty();
         let columns = if has_explicit {
@@ -229,23 +271,6 @@ impl<'a> Binder<'a> {
             Some(on) => self.bind_conflict(on, &target, &columns),
             None => (Vec::new(), Vec::new()),
         };
-        // An inline-view target's WHERE resolves against the target alone
-        // (filter reads — e.g. the predicate a `WITH CHECK OPTION` enforces).
-        // The base table may be aliased (`FROM emp e`); the predicate then
-        // qualifies through the alias (`e.dept`), so carry it on the scope.
-        let target_predicate = match view.and_then(|v| v.selection.as_ref()) {
-            Some(predicate) => {
-                let alias = view
-                    .and_then(|v| v.from.first())
-                    .and_then(|f| match &f.relation {
-                        TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.clone()),
-                        _ => None,
-                    });
-                let scope = self.target_scope_with_alias(&target, alias);
-                vec![self.bind_expr(predicate, &scope)]
-            }
-            None => Vec::new(),
-        };
         // RETURNING resolves against the target alone (the source query's
         // scope is already popped).
         let returning = self.bind_returning(&insert.returning, &self.target_scope(&target));
@@ -264,8 +289,149 @@ impl<'a> Binder<'a> {
             on_conflict,
             conflict_predicate,
             target_predicate,
+            target_context: Box::new(target_context),
             source_wildcard,
         })
+    }
+
+    /// Resolve a plain named INSERT target: `table_ref` + catalog match. The
+    /// target is a real table, never a CTE (you can't INSERT into a read-only
+    /// CTE): a name that matches a declared CTE and isn't a catalog table is
+    /// the CTE — flag and drop rather than fabricate a write.
+    fn named_insert_target(&mut self, name: &ObjectName) -> Option<TableMatch> {
+        let written = self.table_ref(name)?;
+        let m = self.table_match(&written);
+        if m.resolution != ResolutionKind::Cataloged && self.is_declared_cte(&written) {
+            self.record_unsupported_dml_target("INSERT", &written);
+            return None;
+        }
+        Some(m)
+    }
+
+    /// Resolve an Oracle **join-view** INSERT target: bind every FROM factor
+    /// as a relation, then attribute each projected column — a qualifier
+    /// resolves it text-only (like a multi-table UPDATE's `SET t2.col`), an
+    /// unqualified column by the catalog-owner rule
+    /// ([`unqualified_write_binding`](Self::unqualified_write_binding)) — and
+    /// the row lands in the one relation **every** column agrees on. Returns
+    /// that target's match, the projected column names (the explicit target
+    /// columns), the bound ON + WHERE predicates (filter reads over the view's
+    /// relations), and the companion relations as scanned context
+    /// ([`Insert::target_context`]).
+    ///
+    /// `None` — the caller flags and drops — when no single target is
+    /// determined: a non-column projection item (a wildcard / expression), a
+    /// column that is ambiguous / unresolved / owned by a different relation
+    /// than its siblings, or any factor naming a declared CTE (not a base
+    /// table). Real Oracle rejects those shapes too (the INTO columns must
+    /// all belong to one key-preserved table), so no side is fabricated. Key-preservedness itself isn't *verified* (that needs
+    /// unique-key metadata the catalog doesn't carry) — attribution assumes a
+    /// valid statement.
+    fn bind_join_view_target(
+        &mut self,
+        view: &crate::reference::InsertTargetView<'_>,
+    ) -> Option<(TableMatch, Vec<Ident>, Vec<Expr>, LogicalPlan)> {
+        // The view's relations — the shape gate already extracted every
+        // factor's (name, alias). A factor naming a declared CTE — target or
+        // companion — makes the view not-a-view-over-base-tables: flag and
+        // drop the whole statement rather than surface the CTE name as a
+        // phantom base-table read (binding it as a real `CteRef` is possible,
+        // but no engine executes a WITH + inline-view-target INSERT, so the
+        // machinery isn't worth it until one does).
+        let mut matches: Vec<TableMatch> = Vec::new();
+        for (name, _) in &view.factors {
+            // An unrepresentable name flags itself inside `table_ref`.
+            let written = self.table_ref(name)?;
+            let m = self.table_match(&written);
+            if m.resolution != ResolutionKind::Cataloged && self.is_declared_cte(&written) {
+                self.record_unsupported_dml_target("INSERT", &written);
+                return None;
+            }
+            matches.push(m);
+        }
+        let relations: Vec<Relation> = view
+            .factors
+            .iter()
+            .zip(&matches)
+            .map(|((_, alias), m)| Relation::Table {
+                alias: alias.cloned(),
+                table: m.table.clone(),
+                columns: Columns::from_catalog(m.columns.clone()),
+            })
+            .collect();
+        // Each projected column, split as (qualifier, column name) — plain
+        // columns only; anything else leaves the target (and the positional
+        // pairing) indeterminate.
+        let parts_list: Vec<(Vec<Ident>, Ident)> = view
+            .projection
+            .iter()
+            .map(|item| match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    match expr {
+                        SqlExpr::Identifier(id) => Some((Vec::new(), id.clone())),
+                        SqlExpr::CompoundIdentifier(parts) => parts
+                            .split_last()
+                            .map(|(column, qualifier)| (qualifier.to_vec(), column.clone())),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        // Attribute every column — a qualified one text-only via its
+        // qualifier, an unqualified one by the catalog-owner rule — and
+        // require all to agree on the first column's relation. (An empty
+        // projection can't parse.)
+        let mut owners = parts_list.iter().map(|(qualifier, column)| {
+            if qualifier.is_empty() {
+                match self.unqualified_write_binding(column, &relations)? {
+                    Binding::Base { table, .. } => Some(table),
+                    _ => None,
+                }
+            } else {
+                relations
+                    .iter()
+                    .find_map(|rel| self.writable_qualifier_table(rel, qualifier))
+            }
+        });
+        let target = owners.next()??;
+        for owner in owners {
+            if !self.table_identity_eq(&target, &owner?) {
+                return None; // columns straddle two relations
+            }
+        }
+        // Split off the (first) target relation; the companions become
+        // scanned context (reads, but no data feed). The attributed target
+        // always names one of the view's relations.
+        let position = matches
+            .iter()
+            .position(|m| self.table_identity_eq(&m.table, &target))?;
+        let target_match = matches.remove(position);
+        let context = matches
+            .into_iter()
+            .map(|m| {
+                LogicalPlan::Scan(Scan {
+                    table: m.table,
+                    resolution: m.resolution,
+                })
+            })
+            .reduce(|left, right| join(left, right, Vec::new()))
+            .unwrap_or(LogicalPlan::Empty);
+        // ON + WHERE are filter reads over the full view scope (all relations,
+        // aliases included).
+        let scope = Scope::from_relations(&relations);
+        let predicate = view
+            .join_operators
+            .iter()
+            .filter_map(|op| join_on(op))
+            .chain(view.selection)
+            .map(|on| self.bind_expr(on, &scope))
+            .collect();
+        let columns = parts_list
+            .iter()
+            .map(|(_, column)| column.clone())
+            .collect();
+        Some((target_match, columns, predicate, context))
     }
 
     /// Wrap written column names as [`ColumnWrite`]s, each resolved against the
@@ -337,8 +503,9 @@ impl<'a> Binder<'a> {
             on_conflict,
             conflict_predicate,
             // The MySQL SET form has no inline-view target and no source
-            // query, so no target predicate / wildcard.
+            // query, so no target predicate / context / wildcard.
             target_predicate: Vec::new(),
+            target_context: Box::new(LogicalPlan::Empty),
             source_wildcard: false,
         })
     }
@@ -905,11 +1072,7 @@ impl<'a> Binder<'a> {
         alias: Option<Ident>,
     ) -> Scope {
         let m = self.table_match(target);
-        let columns = if m.columns.is_empty() {
-            Columns::Unknown
-        } else {
-            Columns::Cataloged(m.columns)
-        };
+        let columns = Columns::from_catalog(m.columns);
         Scope::single(Relation::Table {
             alias,
             table: m.table,
@@ -1368,9 +1531,9 @@ fn is_join_factor(factor: &TableFactor) -> bool {
 /// indeterminate as a whole, so the caller falls back to the column-less
 /// (catalog-fill / diagnostic) path. The `SelectItem` match is exhaustive so a
 /// new variant forces a decision here.
-fn view_target_columns(select: &sqlparser::ast::Select) -> Vec<Ident> {
+fn view_target_columns(projection: &[SelectItem]) -> Vec<Ident> {
     let mut columns = Vec::new();
-    for item in &select.projection {
+    for item in projection {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
             SelectItem::ExprWithAliases { .. }

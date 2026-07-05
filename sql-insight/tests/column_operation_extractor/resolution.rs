@@ -497,6 +497,35 @@ mod catalog_strict {
         );
     }
 
+    #[test]
+    fn join_view_insert_unqualified_projection_attributes_by_catalog_owner() {
+        // An Oracle join-view INSERT with an *unqualified* projection: the
+        // catalog-owner rule attributes each column — `name` / `dept_id` are
+        // listed only in EMP, so the row lands there; DEPT stays a scanned
+        // companion. (Oracle folds unquoted identifiers to upper case, so the
+        // catalog registers upper-cased names.)
+        use sql_insight::sqlparser::dialect::OracleDialect;
+        let catalog = TestCatalog::default()
+            .with("EMP", vec!["ID", "NAME", "DEPT_ID"])
+            .with("DEPT", vec!["ID", "ACTIVE"]);
+        assert_column_ops_with_catalog_dialect(
+            &OracleDialect {},
+            "INSERT INTO (SELECT name, dept_id FROM emp JOIN dept \
+             ON emp.dept_id = dept.id) VALUES ('x', 1)",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![
+                    read_confirmed("EMP", "dept_id"),
+                    read_confirmed("DEPT", "id"),
+                ],
+                writes: vec![write("EMP", "name"), write("EMP", "dept_id")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
     // ===== unqualified SET write attribution =============================
     //
     // An unqualified SET target in a *multi-table* UPDATE is attributed with

@@ -69,6 +69,19 @@ pub(crate) enum Columns {
     Unknown,
 }
 
+impl Columns {
+    /// A catalog match's column list as scope knowledge — `table_match`
+    /// returns an empty list for a miss (schema unknown), never a zero-column
+    /// table, so empty maps to [`Unknown`](Columns::Unknown).
+    pub(crate) fn from_catalog(columns: Vec<Ident>) -> Columns {
+        if columns.is_empty() {
+            Columns::Unknown
+        } else {
+            Columns::Cataloged(columns)
+        }
+    }
+}
+
 /// Selection (σ): rows passing `predicate` flow through unchanged. The
 /// predicate's columns are reads but never lineage origins — it is filter
 /// position, and `origins` never traces here.
@@ -224,10 +237,18 @@ pub(crate) struct Insert {
     pub(crate) returning: Vec<NamedExpr>,
     pub(crate) on_conflict: Vec<Assignment>,
     pub(crate) conflict_predicate: Vec<Expr>,
-    /// An Oracle inline-view target's WHERE predicate
-    /// (`INSERT INTO (SELECT … FROM t WHERE …) …`): filter reads against the
-    /// target — its columns read, but never originate a value.
+    /// An Oracle inline-view target's predicates — the WHERE
+    /// (`INSERT INTO (SELECT … FROM t WHERE …) …`) plus, for a join view, the
+    /// join `ON` conditions: filter reads against the view's relations — their
+    /// columns read, but never originate a value.
     pub(crate) target_predicate: Vec<Expr>,
+    /// An Oracle **join-view** target's companion relations — the joined
+    /// tables other than the write target (`INSERT INTO (SELECT e.id FROM
+    /// emp e JOIN dept d ON …) …` → `Scan(dept)`): scanned context that gates
+    /// which rows the view exposes, so they surface as table *reads* — but
+    /// they feed no data (the value path is `input`), so table lineage
+    /// ignores them. [`Empty`](LogicalPlan::Empty) for every other INSERT.
+    pub(crate) target_context: Box<LogicalPlan>,
     pub(crate) source_wildcard: bool,
 }
 
@@ -716,7 +737,7 @@ pub(super) fn children(op: &LogicalPlan) -> Vec<&LogicalPlan> {
         // args are own expressions.
         LogicalPlan::TableFunction(tf) => vec![&tf.input],
         LogicalPlan::With(w) => vec![&w.body],
-        LogicalPlan::Insert(i) => vec![&i.input],
+        LogicalPlan::Insert(i) => vec![&i.input, &i.target_context],
         LogicalPlan::Update(u) => vec![&u.input],
         LogicalPlan::Delete(d) => vec![&d.input],
         LogicalPlan::Merge(m) => vec![&m.source],

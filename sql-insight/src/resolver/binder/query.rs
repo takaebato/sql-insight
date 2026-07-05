@@ -683,11 +683,7 @@ impl<'a> Binder<'a> {
         alias: Option<Ident>,
     ) -> (LogicalPlan, Scope) {
         let m = self.table_match(written);
-        let columns = if m.columns.is_empty() {
-            Columns::Unknown
-        } else {
-            Columns::Cataloged(m.columns)
-        };
+        let columns = Columns::from_catalog(m.columns);
         let scan = LogicalPlan::Scan(Scan {
             table: m.table.clone(),
             resolution: m.resolution,
