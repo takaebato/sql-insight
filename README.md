@@ -7,6 +7,7 @@ across every SQL dialect sqlparser-rs supports.
 [![Crates.io](https://img.shields.io/crates/v/sql-insight.svg)](https://crates.io/crates/sql-insight)
 [![Docs.rs](https://docs.rs/sql-insight/badge.svg)](https://docs.rs/sql-insight)
 [![Rust](https://github.com/takaebato/sql-insight/actions/workflows/rust.yaml/badge.svg?branch=master)](https://github.com/takaebato/sql-insight/actions/workflows/rust.yaml)
+[![Security Audit](https://github.com/takaebato/sql-insight/actions/workflows/security-audit.yaml/badge.svg?branch=master)](https://github.com/takaebato/sql-insight/actions/workflows/security-audit.yaml)
 [![codecov](https://codecov.io/gh/takaebato/sql-insight/graph/badge.svg?token=Z1KYAWA3HY)](https://codecov.io/gh/takaebato/sql-insight)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
