@@ -10,15 +10,6 @@ name: Release
 on:
   push:
     branches: [ master ]
-  # Re-upload binaries to an existing CLI release — the rescue path when an
-  # upload job dies after the release was already published (e.g. the
-  # macos-13 runner retirement stranded x86_64-apple-darwin for v0.3.0).
-  workflow_dispatch:
-    inputs:
-      upload-tag:
-        description: "Existing CLI release tag to (re)upload binaries to (e.g. sql-insight-cli-v0.3.0)"
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -26,7 +17,6 @@ permissions:
 jobs:
   release-plz-release:
     name: Publish
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -60,10 +50,7 @@ jobs:
   upload-cli-binaries:
     name: Upload sql-insight binary (${{ matrix.target }})
     needs: release-plz-release
-    # Push: gated on sql-insight-cli actually being released this run.
-    # Dispatch: Publish is skipped, so `!cancelled()` keeps this job alive
-    # through the skipped dependency and the tag comes from the input.
-    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || contains(needs.release-plz-release.outputs.releases, 'sql-insight-cli')) }}
+    if: contains(needs.release-plz-release.outputs.releases, 'sql-insight-cli')
     permissions:
       contents: write
       id-token: write     # OIDC for keyless Sigstore signing
@@ -76,10 +63,8 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-          # Both apple targets build on macos-latest (arm64): x86_64 is
-          # cross-compiled — the Apple toolchain is multi-arch and the upload
-          # action installs the target — since macos-13, the last Intel
-          # image, was retired (github.blog/changelog/2025-09-19).
+          # x86_64 is cross-compiled on the arm64 image (macos-13, the last
+          # Intel image, was retired).
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
@@ -91,21 +76,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          # On dispatch, build the tagged source — master may have moved on.
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.upload-tag || '' }}
           persist-credentials: false
       - name: Resolve CLI release tag
         id: tag
         shell: bash
         env:
           RELEASES: ${{ needs.release-plz-release.outputs.releases }}
-          INPUT_TAG: ${{ inputs.upload-tag }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            tag="$INPUT_TAG"
-          else
-            tag=$(printf '%s' "$RELEASES" | jq -r '.[] | select(.package_name == "sql-insight-cli") | .tag')
-          fi
+          tag=$(printf '%s' "$RELEASES" | jq -r '.[] | select(.package_name == "sql-insight-cli") | .tag')
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Build and upload binary
         id: upload
@@ -124,7 +102,6 @@ jobs:
 
   release-plz-pr:
     name: Release PR
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
