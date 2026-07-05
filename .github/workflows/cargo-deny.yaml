@@ -1,4 +1,4 @@
-name: Security Audit
+name: cargo-deny
 
 # cargo-deny runs only when the dependency set or policy changes (paths filter),
 # on pull requests and master pushes, plus a daily schedule. On PRs it runs the
@@ -11,14 +11,14 @@ on:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'deny.toml'
-      - '.github/workflows/security-audit.yaml'
+      - '.github/workflows/cargo-deny.yaml'
   push:
     branches: [ "master" ]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'deny.toml'
-      - '.github/workflows/security-audit.yaml'
+      - '.github/workflows/cargo-deny.yaml'
   schedule:
     - cron: '0 22 * * *' # daily at 22:00 UTC
 
