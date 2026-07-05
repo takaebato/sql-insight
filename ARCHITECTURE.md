@@ -92,7 +92,12 @@ source (`INSERT INTO t SELECT * FROM t`) reads through that scan.
 `collect_table_reads` = every `Scan` ∪ any referenced relation not already
 scanned (the sink). A multi-table `UPDATE t1 JOIN t2 SET t2.col = …` writes
 (and lineage-targets) the relation each SET qualifier resolves to, carried on
-`Assignment.target`, not the root.
+`Assignment.target`, not the root; an *unqualified* SET target among several
+writable relations is attributed with the read side's candidate rules (a sole
+catalog owner pins; otherwise the write surfaces unattributed — `table: None`,
+`Ambiguous` / `Unresolved` — and contributes no table-level write, matching
+MySQL's own ambiguity error). The full matrix lives on
+`resolve_assignment_column`.
 
 ### Value vs filter is structural
 

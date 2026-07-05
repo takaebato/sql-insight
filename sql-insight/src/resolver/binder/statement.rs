@@ -378,10 +378,11 @@ impl<'a> Binder<'a> {
             // `OnInsert` is non-exhaustive; an unmodelled action is a no-op.
             _ => return (Vec::new(), Vec::new()),
         };
-        // A conflict-action SET always targets the insert target's own columns.
+        // A conflict-action SET always targets the insert target's own columns
+        // (no other writable relations, hence the empty candidate set).
         let bound = assignments
             .iter()
-            .flat_map(|a| self.bind_assignment(a, &scope, target))
+            .flat_map(|a| self.bind_assignment(a, &scope, target, &[]))
             .collect();
         let predicate = selection
             .map(|s| self.bind_expr(s, &scope))
@@ -446,6 +447,11 @@ impl<'a> Binder<'a> {
                 .collect();
             input = join(input, node, on);
         }
+        // The unqualified-SET attribution candidates: the target plus its
+        // clause joins (MySQL's writable set) — snapshotted *before* the FROM
+        // relations join the scope, which are readable but never writable
+        // (PostgreSQL / T-SQL `UPDATE t SET … FROM u` only ever writes `t`).
+        let writable = scope.relations.clone();
         // FROM relations are reads (resolved against the target + joins so far).
         if let Some(from) = &update.from {
             let tables = match from {
@@ -474,13 +480,13 @@ impl<'a> Binder<'a> {
             });
         }
         // SET assignments resolve against the target + FROM scope; each writes
-        // its resolved target table (the root, or the relation a qualifier names
-        // in a multi-table `UPDATE t1 JOIN t2 SET t2.col = …`). A tuple
-        // `SET (a, b) = …` expands to one assignment per target column.
+        // its resolved target table (see `resolve_assignment_column` for the
+        // attribution rules). A tuple `SET (a, b) = …` expands to one
+        // assignment per target column.
         let assignments = update
             .assignments
             .iter()
-            .flat_map(|a| self.bind_assignment(a, &scope, &target))
+            .flat_map(|a| self.bind_assignment(a, &scope, &target, &writable))
             .collect();
         // RETURNING resolves against the statement scope (target + FROM).
         let returning = self.bind_returning(&update.returning, &scope);
@@ -693,11 +699,12 @@ impl<'a> Binder<'a> {
                         on.push(self.bind_expr(predicate, &scope));
                     }
                     // A MERGE WHEN UPDATE always targets the merge target's
-                    // own columns (a tuple SET expands per target column).
+                    // own columns (a tuple SET expands per target column; the
+                    // source is read-only, hence the empty candidate set).
                     let assignments = update
                         .assignments
                         .iter()
-                        .flat_map(|a| self.bind_assignment(a, &scope, &target))
+                        .flat_map(|a| self.bind_assignment(a, &scope, &target, &[]))
                         .collect();
                     clauses.push(MergeClause::Update { assignments });
                 }
@@ -913,18 +920,21 @@ impl<'a> Binder<'a> {
     /// Bind one SET assignment into the per-column [`Assignment`]s it writes —
     /// one for a single `col = expr`, several for a tuple `(a, b) = …` (one per
     /// target column). See [`bind_tuple_assignment`](Self::bind_tuple_assignment)
-    /// for the tuple pairing. `root` is the DML target an unqualified column
-    /// writes; `scope` resolves a qualified `t2.col` and the RHS reads.
+    /// for the tuple pairing. `scope` resolves a qualified `t2.col` and the RHS
+    /// reads; `root` / `writable` drive the unqualified write attribution — see
+    /// [`resolve_assignment_column`](Self::resolve_assignment_column) for the
+    /// rules.
     pub(super) fn bind_assignment(
         &mut self,
         assignment: &SqlAssignment,
         scope: &Scope,
         root: &TableReference,
+        writable: &[Relation],
     ) -> Vec<Assignment> {
         match &assignment.target {
             AssignmentTarget::ColumnName(name) => {
                 let value = self.bind_expr(&assignment.value, scope);
-                self.resolve_assignment_column(name, scope, root)
+                self.resolve_assignment_column(name, scope, root, writable)
                     .map(|(target, target_resolution)| Assignment {
                         target,
                         target_resolution,
@@ -934,7 +944,7 @@ impl<'a> Binder<'a> {
                     .collect()
             }
             AssignmentTarget::Tuple(names) => {
-                self.bind_tuple_assignment(names, &assignment.value, scope, root)
+                self.bind_tuple_assignment(names, &assignment.value, scope, root, writable)
             }
         }
     }
@@ -954,6 +964,7 @@ impl<'a> Binder<'a> {
         rhs: &SqlExpr,
         scope: &Scope,
         root: &TableReference,
+        writable: &[Relation],
     ) -> Vec<Assignment> {
         let values: Vec<Expr> = match rhs {
             // `(a, b) = (e0, e1)` — a row value: each element is one value.
@@ -977,28 +988,61 @@ impl<'a> Binder<'a> {
             .iter()
             .zip(values)
             .filter_map(|(name, value)| {
-                self.resolve_assignment_column(name, scope, root).map(
-                    |(target, target_resolution)| Assignment {
+                self.resolve_assignment_column(name, scope, root, writable)
+                    .map(|(target, target_resolution)| Assignment {
                         target,
                         target_resolution,
                         value,
-                    },
-                )
+                    })
             })
             .collect()
     }
 
     /// Resolve a SET assignment's target column to the column it writes,
-    /// qualified by its **resolved table**: an unqualified column writes the DML
-    /// `root`; a qualified `t2.col` (a multi-table `UPDATE t1 JOIN t2 SET t2.col
-    /// = …`) writes whichever in-scope real table the qualifier names. Returns
-    /// `None` — dropped — for a qualifier that names no writable table (a
-    /// derived table / CTE / unknown alias can't be a write target).
+    /// qualified by its **resolved table**. Running example — a multi-table
+    /// MySQL UPDATE, whose target clause makes both tables writable:
+    ///
+    /// `UPDATE t1 JOIN t2 ON t1.id = t2.id SET t2.col = 1, other = 2`
+    ///
+    /// The **qualified** target (`t2.col`) writes whichever in-scope real
+    /// table its qualifier names — `t2` here; a qualifier naming no writable
+    /// table (a derived table / CTE / unknown alias) drops the assignment
+    /// (`None`). The **unqualified** target (`other`) is attributed with the
+    /// read side's candidate / pick rules over the `writable` relations
+    /// (`t1`, `t2`) — but only when there are several, as here (a genuine
+    /// inference); with zero or one the sink is named by the statement
+    /// itself, so the DML `root` pins unconditionally. `writable` is the
+    /// target-clause relations for a multi-table UPDATE (MySQL's writable
+    /// set — snapshotted before `FROM` joins the scope, since PostgreSQL /
+    /// T-SQL `UPDATE t SET … FROM u` never writes `u`), and **empty** for a
+    /// conflict / MERGE SET (always the statement's own target).
+    ///
+    /// The full attribution matrix, `t2.col` / `other` as in the example
+    /// (`✔` = the column-level catalog match: `Cataloged` iff the pinned
+    /// table lists the column, else `Inferred`):
+    ///
+    /// | SET target | writable relations            | written table       | resolution        |
+    /// |------------|-------------------------------|---------------------|-------------------|
+    /// | `t2.col`   | (any)                         | `t2` (the qualifier's) | ✔              |
+    /// | `other`    | none besides root (MERGE / ON CONFLICT) | root      | ✔                 |
+    /// | `other`    | one (single-table UPDATE)     | root                | ✔                 |
+    /// | `other`    | several — sole candidate      | the owner           | read-mirrored (`Cataloged` verbatim; witness over catalog-free suspects downgrades to `Inferred`) |
+    /// | `other`    | several — several candidates  | *none*              | `Ambiguous`       |
+    /// | `other`    | several — no candidate        | *none*              | `Unresolved`      |
+    ///
+    /// The read mirror keeps `SET a = a + 1` coherent: the write pins exactly
+    /// the table the RHS read resolves to (or honestly neither, as `Ambiguous`
+    /// / `Unresolved` with `table: None` — the write then contributes no
+    /// table-level write, like an unattributed read contributes no scan).
+    /// Real MySQL agrees with the unattributed rows: an unqualified column
+    /// owned by several joined tables is an error (1052), so no write target
+    /// ever exists to pin.
     fn resolve_assignment_column(
         &self,
         name: &ObjectName,
         scope: &Scope,
         root: &TableReference,
+        writable: &[Relation],
     ) -> Option<(ColumnWrite, ResolutionKind)> {
         let parts: Vec<Ident> = name
             .0
@@ -1007,7 +1051,42 @@ impl<'a> Binder<'a> {
             .collect();
         let column = parts.last()?.clone();
         let table = if parts.len() == 1 {
-            root.clone() // unqualified → the DML root target
+            match self.unqualified_write_binding(&column, writable) {
+                // A genuine multi-relation inference: mirror the read outcome.
+                Some(Binding::Base { table, resolution }) => {
+                    let table_resolution = self.table_match(&table).resolution;
+                    return Some((
+                        ColumnWrite {
+                            reference: crate::reference::ColumnReference {
+                                table: Some(table),
+                                name: column,
+                            },
+                            resolution,
+                        },
+                        table_resolution,
+                    ));
+                }
+                Some(kind @ (Binding::Ambiguous | Binding::Unresolved)) => {
+                    let resolution = match kind {
+                        Binding::Ambiguous => ResolutionKind::Ambiguous,
+                        _ => ResolutionKind::Unresolved,
+                    };
+                    return Some((
+                        ColumnWrite {
+                            reference: crate::reference::ColumnReference {
+                                table: None,
+                                name: column,
+                            },
+                            resolution,
+                        },
+                        resolution,
+                    ));
+                }
+                // `Derived` / `Local` can't arise (only real tables are
+                // candidates); a `writable` of zero / one relation means the
+                // statement names the sink — the root.
+                Some(Binding::Derived | Binding::Local) | None => root.clone(),
+            }
         } else {
             let qualifier = &parts[..parts.len() - 1];
             scope

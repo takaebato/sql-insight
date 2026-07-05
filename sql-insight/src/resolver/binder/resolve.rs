@@ -121,6 +121,37 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Resolve an unqualified *written* column (a `SET col = …` target) against
+    /// the statement's `writable` relations, with the **same candidate / pick
+    /// rules as a read** ([`resolve_in`](Self::resolve_in)) — but only when
+    /// there is a genuine choice. With zero or one writable relation the sink
+    /// is named by the statement itself (a single-table UPDATE / MERGE /
+    /// conflict SET), not inferred — `None`, and the caller pins the DML root
+    /// unconditionally. With several, the read-mirrored outcome comes back
+    /// verbatim: the sole candidate (witness downgrades and all) as
+    /// [`Binding::Base`], several candidates as [`Binding::Ambiguous`], none as
+    /// [`Binding::Unresolved`]. Only real tables participate — a derived /
+    /// table-function relation can't be written.
+    pub(super) fn unqualified_write_binding(
+        &self,
+        column: &Ident,
+        writable: &[Relation],
+    ) -> Option<Binding> {
+        let tables: Vec<Relation> = writable
+            .iter()
+            .filter(|rel| matches!(rel, Relation::Table { .. }))
+            .cloned()
+            .collect();
+        if tables.len() < 2 {
+            return None;
+        }
+        let parts = [column.clone()];
+        Some(
+            self.resolve_in(&parts, &tables)
+                .unwrap_or(Binding::Unresolved),
+        )
+    }
+
     /// A relation is a qualified candidate iff the qualifier matches it: a
     /// non-aliased real table by right-anchored path, anything else by its
     /// single exposed (alias) name. A `Cataloged` table that doesn't list the
