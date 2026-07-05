@@ -8,38 +8,24 @@ impl<'a> Binder<'a> {
     pub(super) fn bind_select_item(&mut self, item: &SelectItem, scope: &Scope) -> Vec<NamedExpr> {
         match item {
             SelectItem::UnnamedExpr(expr) => vec![NamedExpr {
-                name: inferred_name(expr),
+                names: OutputNames::Single(inferred_name(expr)),
                 expr: self.bind_expr(expr, scope),
             }],
             SelectItem::ExprWithAlias { expr, alias } => vec![NamedExpr {
-                name: Some(alias.clone()),
+                names: OutputNames::Single(Some(alias.clone())),
                 expr: self.bind_expr(expr, scope),
             }],
             // Spark `expr AS (a, b, …)`: one expression projected under several
-            // output names (e.g. `explode(arr) AS (key, value)`). Because
-            // `reads` is occurrence-based, the expression's columns must be
-            // counted exactly once — so only the first alias carries the bound
-            // expression (with its reads / lineage); the remaining aliases are
-            // extra output columns that trace to nothing, like a
-            // `(VALUES …) AS v(x)` derived column. Splitting one expression's
-            // lineage across N outputs isn't representable without re-reading
-            // it, so those tail outputs are best-effort.
-            SelectItem::ExprWithAliases { expr, aliases } => {
-                let bound = self.bind_expr(expr, scope);
-                let mut names = aliases.iter();
-                let head = NamedExpr {
-                    name: names.next().cloned(),
-                    expr: bound,
-                };
-                std::iter::once(head)
-                    .chain(names.map(|a| NamedExpr {
-                        name: Some(a.clone()),
-                        // An empty `Call` reads nothing and originates from
-                        // nothing (a `Derived` output).
-                        expr: Expr::Call { args: Vec::new() },
-                    }))
-                    .collect()
-            }
+            // output names (e.g. `explode(arr) AS (key, value)`) — one *fan*
+            // item occupying one output position per alias. The expression
+            // exists once, so `reads` count it once (occurrence-based); the
+            // slot view expands the names, so lineage fans out — every output
+            // column traces to the expression's sources (`arr → key` *and*
+            // `arr → value`).
+            SelectItem::ExprWithAliases { expr, aliases } => vec![NamedExpr {
+                names: OutputNames::Fan(aliases.clone()),
+                expr: self.bind_expr(expr, scope),
+            }],
             // A wildcard isn't expanded (the rigor cost is too high for a
             // SQL-text-only library); record it so consumers know this
             // projection's column lineage is incomplete. A `REPLACE (expr AS
@@ -67,7 +53,7 @@ impl<'a> Binder<'a> {
                 // explicit outputs follow.
                 let mut out = match kind {
                     SelectItemQualifiedWildcardKind::Expr(expr) => vec![NamedExpr {
-                        name: None,
+                        names: OutputNames::Single(None),
                         expr: Expr::Call {
                             args: vec![self.bind_expr(expr, scope)],
                         },
@@ -94,7 +80,7 @@ impl<'a> Binder<'a> {
             .iter()
             .flat_map(|replace| &replace.items)
             .map(|element| NamedExpr {
-                name: Some(element.column_name.clone()),
+                names: OutputNames::Single(Some(element.column_name.clone())),
                 expr: self.bind_expr(&element.expr, scope),
             })
             .collect()
@@ -767,28 +753,27 @@ impl<'a> Binder<'a> {
     pub(super) fn output_cols(&self, exprs: &[NamedExpr]) -> Vec<OutputCol> {
         exprs
             .iter()
-            .map(|ne| {
+            .flat_map(|ne| {
                 // An identity output re-reads a real base column (so a later
                 // clause-alias / pipe reference to it reads that column). Only a
                 // `Base` column qualifies: a `Derived` passthrough (a pipe-
                 // carried alias, a derived-table column) traces back through the
                 // projection chain, not to a base table — marking it identity
                 // would let a later stage fall through to the base relation and
-                // fabricate a phantom read.
-                let identity = match &ne.expr {
-                    Expr::Column(c) => {
+                // fabricate a phantom read. A fan's names are always introduced
+                // aliases (never the column itself), so never identity.
+                let identity = match (&ne.names, &ne.expr) {
+                    (OutputNames::Single(Some(name)), Expr::Column(c)) => {
                         matches!(c.binding, Binding::Base { .. })
-                            && ne
-                                .name
-                                .as_ref()
-                                .is_some_and(|n| self.eq(self.style.casing.column, n, &c.name))
+                            && self.eq(self.style.casing.column, name, &c.name)
                     }
                     _ => false,
                 };
-                OutputCol {
-                    name: ne.name.clone(),
+                // One `OutputCol` per output position (a fan expands).
+                (0..ne.names.count()).map(move |j| OutputCol {
+                    name: ne.names.get(j).flatten().cloned(),
                     identity,
-                }
+                })
             })
             .collect()
     }

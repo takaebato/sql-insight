@@ -501,13 +501,80 @@ impl Expr {
     }
 }
 
-/// A named output expression — a projection item, an aggregate, a group key,
-/// or a `RETURNING` item. `name` is the explicit alias, else the inferred
-/// name (a bare column's own name), else `None` (anonymous).
+/// A named output item — a projection item, an aggregate, or a `RETURNING`
+/// item: one expression under one or several output names. The expression is
+/// always a real [`Expr`] and always exists exactly once, so `reads` count it
+/// once by construction; a multi-name item (a *fan*) occupies several adjacent
+/// output **positions**, so a list's item index is **not** its output position
+/// — positional and named access go through the slot view ([`output_slots`] /
+/// [`slot_count`] / [`resolved_output_expr`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NamedExpr {
-    pub(crate) name: Option<Ident>,
+    pub(crate) names: OutputNames,
     pub(crate) expr: Expr,
+}
+
+/// The output name(s) of one [`NamedExpr`] item.
+///
+/// `Fan` is Spark's multi-column alias `expr AS (a, b, …)`: one expression
+/// producing several output columns (the one-source-many-outputs dual of
+/// [`Expr::Fanin`]). Keeping the fan **inside one item** — instead of
+/// splitting it into per-name entries linked by references — makes the
+/// sharing structural: the names and the expression can never separate (no
+/// dangling reference under any reorder / filter), lineage fans out by
+/// expanding the names, and the expression is walked once wherever items are
+/// walked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OutputNames {
+    /// An ordinary item: the explicit alias, else the inferred name (a bare
+    /// column's own name), else `None` (anonymous).
+    Single(Option<Ident>),
+    /// A multi-column alias — always explicit identifiers, one output
+    /// position per name.
+    Fan(Vec<Ident>),
+}
+
+impl OutputNames {
+    /// How many output positions this item occupies.
+    pub(crate) fn count(&self) -> usize {
+        match self {
+            OutputNames::Single(_) => 1,
+            OutputNames::Fan(names) => names.len(),
+        }
+    }
+
+    /// The name at the item's `j`-th position (inner `None` = anonymous;
+    /// outer `None` = out of range).
+    pub(crate) fn get(&self, j: usize) -> Option<Option<&Ident>> {
+        match self {
+            OutputNames::Single(name) => (j == 0).then_some(name.as_ref()),
+            OutputNames::Fan(names) => names.get(j).map(Some),
+        }
+    }
+}
+
+/// The number of output **positions** an output list produces — the item
+/// count plus fan expansion (`SELECT id, explode(a) AS (k, v)` = 2 items,
+/// 3 positions).
+pub(super) fn slot_count(outputs: &[NamedExpr]) -> usize {
+    outputs.iter().map(|ne| ne.names.count()).sum()
+}
+
+/// Iterate an output list position by position as `(name, expr)` pairs — a
+/// fan yields its shared expression once per name. The single positional /
+/// named access path over outputs (query-output lineage, DML relation
+/// pairing, RETURNING, CTAS / CREATE VIEW, set-operation / subquery /
+/// EXCLUDED traces, derived-table name traces), so every position of a fan
+/// traces exactly like its siblings.
+pub(super) fn output_slots(outputs: &[NamedExpr]) -> impl Iterator<Item = (Option<&Ident>, &Expr)> {
+    outputs
+        .iter()
+        .flat_map(|ne| (0..ne.names.count()).map(|j| (ne.names.get(j).flatten(), &ne.expr)))
+}
+
+/// The value expression at output **position** `i` (`None` = out of range).
+pub(super) fn resolved_output_expr(outputs: &[NamedExpr], i: usize) -> Option<&Expr> {
+    output_slots(outputs).nth(i).map(|(_, e)| e)
 }
 
 /// A `col = expr` assignment (UPDATE SET, MySQL INSERT … SET, ON CONFLICT

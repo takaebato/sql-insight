@@ -56,10 +56,10 @@ use sqlparser::ast::{
 use sqlparser::tokenizer::Span;
 
 use super::logical_plan::{
-    Aggregate, AlterTable, Assignment, Binding, BoundColumn, Columns, CreateTableAs, CreateView,
-    Cte, CteRef, Delete, Drop, Expr, Filter, Insert, Join, LogicalPlan, Merge, MergeClause,
-    NamedExpr, Projection, Scan, SchemaSource, SetOp, Sort, SubqueryAlias, TableFunction, Update,
-    Values, With,
+    output_slots, slot_count, Aggregate, AlterTable, Assignment, Binding, BoundColumn, Columns,
+    CreateTableAs, CreateView, Cte, CteRef, Delete, Drop, Expr, Filter, Insert, Join, LogicalPlan,
+    Merge, MergeClause, NamedExpr, OutputNames, Projection, Scan, SchemaSource, SetOp, Sort,
+    SubqueryAlias, TableFunction, Update, Values, With,
 };
 use super::origins::output_operands;
 use crate::casing::{CaseRule, IdentifierStyle};
@@ -330,10 +330,8 @@ impl<'a> Binder<'a> {
         let Some(operand) = operands.first() else {
             return;
         };
-        let anonymous = operand
-            .outputs
-            .iter()
-            .filter(|ne| ne.name.is_none())
+        let anonymous = output_slots(operand.outputs)
+            .filter(|(name, _)| name.is_none())
             .count();
         if anonymous == 0 {
             return;
@@ -370,9 +368,9 @@ impl<'a> Binder<'a> {
             return;
         }
         if let Some(operand) = output_operands(input).first() {
-            let outputs = operand.outputs;
-            if !outputs.is_empty() && outputs.len() != explicit.len() {
-                self.record_created_columns_arity_mismatch(target, explicit.len(), outputs.len());
+            let outputs = slot_count(operand.outputs);
+            if outputs != 0 && outputs != explicit.len() {
+                self.record_created_columns_arity_mismatch(target, explicit.len(), outputs);
             }
         }
     }
@@ -679,8 +677,23 @@ fn rename_outputs(op: &mut LogicalPlan, names: &[Ident]) {
     }
     match op {
         LogicalPlan::Projection(p) => {
-            for (ne, n) in p.exprs.iter_mut().zip(names) {
-                ne.name = Some(n.clone());
+            let mut names = names.iter();
+            for ne in p.exprs.iter_mut() {
+                match &mut ne.names {
+                    OutputNames::Single(slot) => {
+                        if let Some(n) = names.next() {
+                            *slot = Some(n.clone());
+                        }
+                    }
+                    // A fan occupies one position per name — each renames.
+                    OutputNames::Fan(fan) => {
+                        for slot in fan.iter_mut() {
+                            if let Some(n) = names.next() {
+                                *slot = n.clone();
+                            }
+                        }
+                    }
+                }
             }
         }
         LogicalPlan::Sort(s) => rename_outputs(&mut s.input, names),

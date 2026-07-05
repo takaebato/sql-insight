@@ -9,7 +9,7 @@
 
 use sqlparser::ast::Ident;
 
-use super::logical_plan::{dml_roots, LogicalPlan, MergeClause};
+use super::logical_plan::{dml_roots, output_slots, LogicalPlan, MergeClause};
 use super::origins::output_operands;
 use crate::reference::{ColumnReference, ColumnWrite, ResolutionKind, TableReference, TableWrite};
 
@@ -183,10 +183,8 @@ fn created_relation_writes(
         return inferred_writes(explicit, target);
     }
     let names: Vec<Ident> = match output_operands(input).first() {
-        Some(operand) => operand
-            .outputs
-            .iter()
-            .filter_map(|ne| ne.name.clone())
+        Some(operand) => output_slots(operand.outputs)
+            .filter_map(|(n, _)| n.cloned())
             .collect(),
         None => Vec::new(),
     };

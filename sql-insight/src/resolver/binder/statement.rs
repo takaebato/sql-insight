@@ -207,7 +207,7 @@ impl<'a> Binder<'a> {
                 LogicalPlan::Values(v) => v.rows.first().map(Vec::len),
                 other => output_operands(other)
                     .first()
-                    .map(|operand| operand.outputs.len())
+                    .map(|operand| slot_count(operand.outputs))
                     .filter(|n| *n > 0),
             }
         };
@@ -311,7 +311,7 @@ impl<'a> Binder<'a> {
         for assignment in &insert.assignments {
             for column in assignment_target_columns(&assignment.target) {
                 exprs.push(NamedExpr {
-                    name: Some(column.clone()),
+                    names: OutputNames::Single(Some(column.clone())),
                     expr: self.bind_expr(&assignment.value, &scope),
                 });
                 columns.push(column);
