@@ -604,6 +604,69 @@ mod insert_inline_view_target {
     }
 
     #[test]
+    fn join_view_resolves_when_a_cte_is_only_a_companion() {
+        // A declared CTE in the view's FROM is fine as long as the *target*
+        // attributes to a real base table — the CTE-target check gates the
+        // write, not the whole view. The companion CTE stays a best-effort
+        // scan (its reference reads surface against the CTE's own name, not
+        // through its body like a `CteRef` would — documented compromise),
+        // and the CTE body's reads surface via the usual unreferenced-CTE
+        // rule.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "WITH c AS (SELECT 1 AS id FROM x) \
+             INSERT INTO (SELECT e.name FROM emp e JOIN c ON e.id = c.id) VALUES ('a')",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("emp", "id"), read("c", "id")],
+                writes: vec![write("emp", "name")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn join_view_with_a_top_level_cte_source_traces_through_it() {
+        // A top-level CTE consumed only by the *source* interacts with the
+        // join view exactly like any source: the CTE reference resolves
+        // through its body (`c.n → x.n`), and relation lineage lands on the
+        // attributed base table.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "WITH c AS (SELECT n FROM x) \
+             INSERT INTO (SELECT e.name FROM emp e JOIN dept d ON e.dept_id = d.id) \
+             SELECT n FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("x", "n"), read("emp", "dept_id"), read("dept", "id")],
+                writes: vec![write("emp", "name")],
+                lineage: vec![passthrough(col("x", "n"), relation("emp", "name"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn cte_inside_the_target_view_is_flagged() {
+        // A WITH *inside* the target view is rejected by the shape gate
+        // (`with: None`) — its CTE could shadow a FROM name, so resolving
+        // through it would need full CTE machinery: flag + drop.
+        assert_column_ops_with_dialect(
+            &OracleDialect {},
+            "INSERT INTO (WITH c AS (SELECT 1 AS id FROM x) \
+             SELECT e.id FROM emp e JOIN dept d ON e.id = d.id) VALUES (1)",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
+            },
+        );
+    }
+
+    #[test]
     fn join_view_cte_target_is_flagged_not_written() {
         // The attributed target names a declared CTE — a read-only relation,
         // never a write target (the single-table view and plain-name INSERT
