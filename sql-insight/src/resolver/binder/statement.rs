@@ -322,9 +322,9 @@ impl<'a> Binder<'a> {
     /// `None` — the caller flags and drops — when no single target is
     /// determined: a non-column projection item (a wildcard / expression), a
     /// column that is ambiguous / unresolved / owned by a different relation
-    /// than its siblings. Real Oracle rejects those shapes too (the INTO
-    /// columns must all belong to one key-preserved table), so no side is
-    /// fabricated. Key-preservedness itself isn't *verified* (that needs
+    /// than its siblings, or any factor naming a declared CTE (not a base
+    /// table). Real Oracle rejects those shapes too (the INTO columns must
+    /// all belong to one key-preserved table), so no side is fabricated. Key-preservedness itself isn't *verified* (that needs
     /// unique-key metadata the catalog doesn't carry) — attribution assumes a
     /// valid statement.
     fn bind_join_view_target(
@@ -332,23 +332,28 @@ impl<'a> Binder<'a> {
         view: &crate::reference::InsertTargetView<'_>,
     ) -> Option<(TableMatch, Vec<Ident>, Vec<Expr>, LogicalPlan)> {
         // The view's relations — the shape gate already extracted every
-        // factor's (name, alias). Each match keeps its written (pre-canonical)
-        // reference for the CTE-target check below. A *companion* factor
-        // naming a declared CTE is left as a best-effort scan (the normal FROM
-        // path would expand a `CteRef`; a CTE inside an insert-target view is
-        // beyond exotic).
-        let mut matches: Vec<(TableReference, TableMatch)> = Vec::new();
+        // factor's (name, alias). A factor naming a declared CTE — target or
+        // companion — makes the view not-a-view-over-base-tables: flag and
+        // drop the whole statement rather than surface the CTE name as a
+        // phantom base-table read (binding it as a real `CteRef` is possible,
+        // but no engine executes a WITH + inline-view-target INSERT, so the
+        // machinery isn't worth it until one does).
+        let mut matches: Vec<TableMatch> = Vec::new();
         for (name, _) in &view.factors {
             // An unrepresentable name flags itself inside `table_ref`.
             let written = self.table_ref(name)?;
             let m = self.table_match(&written);
-            matches.push((written, m));
+            if m.resolution != ResolutionKind::Cataloged && self.is_declared_cte(&written) {
+                self.record_unsupported_dml_target("INSERT", &written);
+                return None;
+            }
+            matches.push(m);
         }
         let relations: Vec<Relation> = view
             .factors
             .iter()
             .zip(&matches)
-            .map(|((_, alias), (_, m))| Relation::Table {
+            .map(|((_, alias), m)| Relation::Table {
                 alias: alias.cloned(),
                 table: m.table.clone(),
                 columns: Columns::from_catalog(m.columns.clone()),
@@ -400,18 +405,11 @@ impl<'a> Binder<'a> {
         // always names one of the view's relations.
         let position = matches
             .iter()
-            .position(|(_, m)| self.table_identity_eq(&m.table, &target))?;
-        let (written, target_match) = matches.remove(position);
-        // The target is a real table, never a CTE (like `named_insert_target`
-        // — you can't INSERT into a read-only CTE): flag and drop rather than
-        // fabricate a write.
-        if target_match.resolution != ResolutionKind::Cataloged && self.is_declared_cte(&written) {
-            self.record_unsupported_dml_target("INSERT", &written);
-            return None;
-        }
+            .position(|m| self.table_identity_eq(&m.table, &target))?;
+        let target_match = matches.remove(position);
         let context = matches
             .into_iter()
-            .map(|(_, m)| {
+            .map(|m| {
                 LogicalPlan::Scan(Scan {
                     table: m.table,
                     resolution: m.resolution,

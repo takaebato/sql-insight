@@ -604,24 +604,21 @@ mod insert_inline_view_target {
     }
 
     #[test]
-    fn join_view_resolves_when_a_cte_is_only_a_companion() {
-        // A declared CTE in the view's FROM is fine as long as the *target*
-        // attributes to a real base table — the CTE-target check gates the
-        // write, not the whole view. The companion CTE stays a best-effort
-        // scan (its reference reads surface against the CTE's own name, not
-        // through its body like a `CteRef` would — documented compromise),
-        // and the CTE body's reads surface via the usual unreferenced-CTE
-        // rule.
+    fn join_view_with_a_cte_factor_is_flagged() {
+        // A factor naming a declared CTE — even as a mere companion — makes
+        // the view not-a-view-over-base-tables: flag + drop the statement
+        // rather than surface the CTE name as a phantom base-table read.
+        // (No engine executes a WITH + inline-view-target INSERT anyway.)
         assert_column_ops_with_dialect(
             &OracleDialect {},
             "WITH c AS (SELECT 1 AS id FROM x) \
              INSERT INTO (SELECT e.name FROM emp e JOIN c ON e.id = c.id) VALUES ('a')",
             ColumnOperation {
                 statement_kind: StatementKind::Insert,
-                reads: vec![read("emp", "id"), read("c", "id")],
-                writes: vec![write("emp", "name")],
+                reads: vec![],
+                writes: vec![],
                 lineage: vec![],
-                diagnostics: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::UnsupportedStatement)],
             },
         );
     }
