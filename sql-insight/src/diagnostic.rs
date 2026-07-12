@@ -78,9 +78,15 @@ pub enum ColumnLevelDiagnosticKind {
     /// well enough to extract operations from. `message` names the
     /// statement.
     UnsupportedStatement,
-    /// `SELECT *` / `t.*` left unexpanded — the extractor does not
-    /// perform wildcard expansion (see crate docs), so column lineage
-    /// is incomplete for projections that include a wildcard.
+    /// A `SELECT *` / `t.*` that **couldn't be expanded** — its columns
+    /// aren't completely known (a catalog-free / unmatched table, an opaque
+    /// table function, a derived body with its own unexpanded wildcard), a
+    /// bare `*` sits over `USING` / `NATURAL` merge columns, or a wildcard
+    /// modifier (`EXCLUDE` / `REPLACE` / …) rides it. Expansion is
+    /// all-or-nothing per wildcard (see crate docs), so the flagged wildcard
+    /// contributes nothing and column lineage is incomplete for its
+    /// projection. An *expanded* wildcard raises no diagnostic — it is just
+    /// its columns.
     WildcardSuppressed,
     /// A table reference with more identifiers than `catalog.schema.name`
     /// (e.g. a SQL Server `server.db.schema.table`) that can't be

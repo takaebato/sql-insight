@@ -268,12 +268,14 @@ fn invalid_ddl_returns_error() {
 }
 
 #[test]
-fn columnless_insert_from_wildcard_source_drops_writes_and_flags() {
-    // A column-list-less INSERT whose source carries a wildcard can't pair the
-    // target's catalog columns positionally — the `*` count is indeterminate
-    // (wildcards aren't expanded), so the visible-output count is too low.
-    // Surface no writes and flag `InsertColumnsUnresolved` rather than
-    // mis-truncating the catalog list to the undercounted outputs.
+fn columnless_insert_wildcard_source_pairs_when_expanded_flags_when_not() {
+    // A column-list-less INSERT whose source carries a wildcard pairs the
+    // target's catalog columns positionally iff the wildcard *expands*: a
+    // cataloged source makes `SELECT *, now()` a determinate 4-column
+    // projection (p, q, r, now()), so the fill proceeds; a catalog-unknown
+    // source keeps the `*` unexpanded — indeterminate count — so surface no
+    // writes and flag `InsertColumnsUnresolved` rather than mis-truncating
+    // the catalog list to the undercounted outputs.
     use sql_insight::diagnostic::ColumnLevelDiagnosticKind;
     let ddl = "CREATE TABLE t (a INT, b INT, c INT, d INT); CREATE TABLE s (p INT, q INT, r INT)";
     let op = |q: &str| {
@@ -288,10 +290,26 @@ fn columnless_insert_from_wildcard_source_drops_writes_and_flags() {
         .unwrap()
     };
 
-    let wild = op("INSERT INTO t SELECT *, now() FROM s");
+    // Expanded: `*` → (p, q, r), plus now() — four slots fill a, b, c, d.
+    let expanded = op("INSERT INTO t SELECT *, now() FROM s");
+    let written: Vec<_> = expanded
+        .writes
+        .iter()
+        .map(|w| w.reference.name.value.as_str())
+        .collect();
+    assert_eq!(written, ["a", "b", "c", "d"]);
+    assert!(
+        expanded.diagnostics.is_empty(),
+        "expanded wildcard → determinate fill, no diagnostic, got {:?}",
+        expanded.diagnostics
+    );
+
+    // Unexpandable (source not in the catalog): indeterminate count → no
+    // writes, flagged.
+    let wild = op("INSERT INTO t SELECT *, now() FROM unknown_src");
     assert!(
         wild.writes.is_empty(),
-        "wildcard source → no determinate writes, got {:?}",
+        "unexpanded wildcard source → no determinate writes, got {:?}",
         wild.writes
     );
     assert!(

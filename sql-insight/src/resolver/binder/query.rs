@@ -58,11 +58,11 @@ impl<'a> Binder<'a> {
                     let columns = self
                         .in_ctes(env.to_vec(), |b| b.bind_set_expr(left))
                         .1
-                        .exposed_columns(Some(&cte.alias));
+                        .exposed(Some(&cte.alias));
                     self.diagnostics.truncate(saved);
                     columns
                 }
-                _ => Vec::new(),
+                _ => Exposed::default(),
             };
             let mut e = env.to_vec();
             e.push(CteDecl {
@@ -74,7 +74,7 @@ impl<'a> Binder<'a> {
             env.to_vec()
         };
         let (mut plan, scope) = self.in_ctes(inner_env, |b| b.bind_query(&cte.query));
-        let columns = scope.exposed_columns(Some(&cte.alias));
+        let columns = scope.exposed(Some(&cte.alias));
         // An explicit `c (x, y)` column list renames the body's output columns
         // so a reference through the CTE traces to them.
         rename_outputs(&mut plan, &alias_column_names(&cte.alias));
@@ -100,6 +100,7 @@ impl<'a> Binder<'a> {
                 LogicalPlan::SetOp(_) => Scope {
                     relations: Vec::new(),
                     query_outputs: std::mem::take(&mut scope.query_outputs),
+                    outputs_complete: scope.outputs_complete,
                     merge_columns: Vec::new(),
                 },
                 _ => scope,
@@ -157,17 +158,22 @@ impl<'a> Binder<'a> {
     ) -> LogicalPlan {
         match op {
             PipeOperator::Select { exprs } => {
-                let new = self.bind_output_items(exprs, scope);
+                let (new, complete) = self.bind_output_items(exprs, scope);
                 let (node, query_outputs) = self.pipe_project(input, &[], new, &scope.relations);
                 scope.query_outputs = query_outputs;
+                // A pipe SELECT replaces the outputs wholesale.
+                scope.outputs_complete = complete;
                 node
             }
             PipeOperator::Extend { exprs } => {
                 // The new columns see the running outputs; then they append.
-                let new = self.bind_output_items(exprs, scope);
+                let (new, complete) = self.bind_output_items(exprs, scope);
                 let base = std::mem::take(&mut scope.query_outputs);
                 let (node, query_outputs) = self.pipe_project(input, &base, new, &scope.relations);
                 scope.query_outputs = query_outputs;
+                // EXTEND appends to the running outputs, so both must be
+                // determinate.
+                scope.outputs_complete &= complete;
                 node
             }
             PipeOperator::Set { assignments } => {
@@ -192,6 +198,9 @@ impl<'a> Binder<'a> {
                     .collect();
                 let (node, query_outputs) = self.pipe_project(input, &[], new, &scope.relations);
                 scope.query_outputs = query_outputs;
+                // AGGREGATE replaces the outputs with its own (wildcard-free)
+                // items.
+                scope.outputs_complete = true;
                 node
             }
             PipeOperator::Where { expr } => {
@@ -259,16 +268,22 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Bind a list of output items (SELECT / EXTEND projection items).
+    /// Bind a list of output items (SELECT / RETURNING / pipe projection
+    /// items). The second return reports whether the list's slot count is
+    /// determinate — `false` when any wildcard stayed unexpanded.
     pub(super) fn bind_output_items(
         &mut self,
         items: &[SelectItem],
         scope: &Scope,
-    ) -> Vec<NamedExpr> {
-        items
-            .iter()
-            .flat_map(|i| self.bind_select_item(i, scope))
-            .collect()
+    ) -> (Vec<NamedExpr>, bool) {
+        let mut exprs = Vec::new();
+        let mut complete = true;
+        for item in items {
+            let (bound, determinate) = self.bind_select_item(item, scope);
+            complete &= determinate;
+            exprs.extend(bound);
+        }
+        (exprs, complete)
     }
 
     /// Build an output-producing pipe `Projection`: the passthrough of `base`
@@ -305,6 +320,7 @@ impl<'a> Binder<'a> {
         let pass_scope = Scope {
             relations: relations.to_vec(),
             query_outputs: base.to_vec(),
+            outputs_complete: false,
             merge_columns: Vec::new(),
         };
         base.iter()
@@ -386,10 +402,15 @@ impl<'a> Binder<'a> {
             | SetExpr::Delete(statement)
             | SetExpr::Merge(statement) => (self.bind_statement(statement), Scope::default()),
             // A set operation: result columns are the left operand's (names
-            // from the left, positional merge).
+            // from the left, positional merge). The result is positionally
+            // determinate only when *every* branch is — a right branch with an
+            // unexpanded wildcard shifts its positions, so a positional
+            // consumer (wildcard expansion over this as a derived table, DML
+            // pairing) must not trust the left count alone.
             SetExpr::SetOperation { left, right, .. } => {
-                let (l, scope) = self.bind_set_expr(left);
-                let (r, _) = self.bind_set_expr(right);
+                let (l, mut scope) = self.bind_set_expr(left);
+                let (r, right_scope) = self.bind_set_expr(right);
+                scope.outputs_complete &= right_scope.outputs_complete;
                 (
                     LogicalPlan::SetOp(SetOp {
                         left: Box::new(l),
@@ -432,6 +453,8 @@ impl<'a> Binder<'a> {
             Scope {
                 relations: Vec::new(),
                 query_outputs,
+                // A VALUES row set's width is determinate (no wildcards).
+                outputs_complete: true,
                 merge_columns: Vec::new(),
             },
         )
@@ -467,12 +490,8 @@ impl<'a> Binder<'a> {
             })
         };
         // The projection resolves against the FROM scope (base reads).
-        let exprs: Vec<NamedExpr> = select
-            .projection
-            .iter()
-            .flat_map(|item| self.bind_select_item(item, &scope))
-            .collect();
-        let clause_scope = scope.with_query_outputs(self.output_cols(&exprs));
+        let (exprs, outputs_complete) = self.bind_output_items(&select.projection, &scope);
+        let clause_scope = scope.with_query_outputs(self.output_cols(&exprs), outputs_complete);
         // GROUP BY → an `Aggregate` over the filtered rows; its keys are reads.
         let group_by = self.group_by_keys(&select.group_by, &clause_scope);
         if !group_by.is_empty() {
@@ -640,7 +659,13 @@ impl<'a> Binder<'a> {
         let scope = match alias_name {
             Some(name) => Scope::single(Relation::Derived {
                 alias: None,
-                columns: vec![name],
+                // The unnest exposes just the element column; the relation's
+                // real shape is dynamic, so the view is not `complete` (a bare
+                // `*` over an ARRAY JOIN scope stays unexpanded).
+                columns: Exposed {
+                    slots: vec![Some(name)],
+                    complete: false,
+                },
             }),
             None => Scope::default(),
         };
@@ -759,7 +784,7 @@ impl<'a> Binder<'a> {
                 } else {
                     self.bind_query(subquery)
                 };
-                let columns = sub_scope.exposed_columns(alias.as_ref());
+                let columns = sub_scope.exposed(alias.as_ref());
                 let relation = Relation::Derived {
                     alias: alias.as_ref().map(|a| a.name.clone()),
                     columns,

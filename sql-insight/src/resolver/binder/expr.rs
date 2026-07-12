@@ -5,16 +5,30 @@
 use super::*;
 
 impl<'a> Binder<'a> {
-    pub(super) fn bind_select_item(&mut self, item: &SelectItem, scope: &Scope) -> Vec<NamedExpr> {
+    /// Bind one SELECT / RETURNING item. The second return reports whether the
+    /// item's slot contribution is **determinate** — `false` only when a
+    /// wildcard stayed unexpanded (its column count / positions are then
+    /// unknown, so the surrounding projection can't be trusted positionally).
+    pub(super) fn bind_select_item(
+        &mut self,
+        item: &SelectItem,
+        scope: &Scope,
+    ) -> (Vec<NamedExpr>, bool) {
         match item {
-            SelectItem::UnnamedExpr(expr) => vec![NamedExpr {
-                names: OutputNames::Single(inferred_name(expr)),
-                expr: self.bind_expr(expr, scope),
-            }],
-            SelectItem::ExprWithAlias { expr, alias } => vec![NamedExpr {
-                names: OutputNames::Single(Some(alias.clone())),
-                expr: self.bind_expr(expr, scope),
-            }],
+            SelectItem::UnnamedExpr(expr) => (
+                vec![NamedExpr {
+                    names: OutputNames::Single(inferred_name(expr)),
+                    expr: self.bind_expr(expr, scope),
+                }],
+                true,
+            ),
+            SelectItem::ExprWithAlias { expr, alias } => (
+                vec![NamedExpr {
+                    names: OutputNames::Single(Some(alias.clone())),
+                    expr: self.bind_expr(expr, scope),
+                }],
+                true,
+            ),
             // Spark `expr AS (a, b, …)`: one expression projected under several
             // output names (e.g. `explode(arr) AS (key, value)`) — one *fan*
             // item occupying one output position per alias. The expression
@@ -22,22 +36,35 @@ impl<'a> Binder<'a> {
             // slot view expands the names, so lineage fans out — every output
             // column traces to the expression's sources (`arr → key` *and*
             // `arr → value`).
-            SelectItem::ExprWithAliases { expr, aliases } => vec![NamedExpr {
-                names: OutputNames::Fan(aliases.clone()),
-                expr: self.bind_expr(expr, scope),
-            }],
-            // A wildcard isn't expanded (the rigor cost is too high for a
-            // SQL-text-only library); record it so consumers know this
-            // projection's column lineage is incomplete. A `REPLACE (expr AS
-            // col)` clause is a real value-producing output, though — bind each
-            // replacement as a named output (its reads / lineage are exactly a
-            // standalone `expr AS col`; only the output position is best-effort,
-            // since the wildcard's own columns aren't enumerated).
+            SelectItem::ExprWithAliases { expr, aliases } => (
+                vec![NamedExpr {
+                    names: OutputNames::Fan(aliases.clone()),
+                    expr: self.bind_expr(expr, scope),
+                }],
+                true,
+            ),
+            // A wildcard expands into one output item per column of the
+            // relation(s) it covers — but only *completely* (all-or-nothing):
+            // if any covered relation's columns aren't fully known, the
+            // wildcard stays unexpanded and is flagged, so the surfaces never
+            // present a partial expansion as the whole set. A `REPLACE (expr
+            // AS col)` clause is a real value-producing output even then —
+            // bind each replacement as a named output (its reads / lineage are
+            // exactly a standalone `expr AS col`; only the output position is
+            // best-effort, since the wildcard's own columns aren't enumerated).
             SelectItem::Wildcard(options) => {
+                if let Some(items) = self.expand_wildcard(None, options, scope) {
+                    return (items, true);
+                }
                 self.record_wildcard_suppressed("wildcard `*`", options.wildcard_token.0.span);
-                self.replace_outputs(options, scope)
+                (self.replace_outputs(options, scope), false)
             }
             SelectItem::QualifiedWildcard(kind, options) => {
+                if let SelectItemQualifiedWildcardKind::ObjectName(name) = kind {
+                    if let Some(items) = self.expand_wildcard(Some(name), options, scope) {
+                        return (items, true);
+                    }
+                }
                 let description = match kind {
                     SelectItemQualifiedWildcardKind::Expr(_) => {
                         "qualified wildcard `(expr).*`".to_string()
@@ -61,8 +88,196 @@ impl<'a> Binder<'a> {
                     SelectItemQualifiedWildcardKind::ObjectName(_) => Vec::new(),
                 };
                 out.extend(self.replace_outputs(options, scope));
-                out
+                (out, false)
             }
+        }
+    }
+
+    /// Expand a projection wildcard (`*` / `t.*`) into its per-column output
+    /// items, or `None` when it can't be done **completely** — the caller then
+    /// keeps the wildcard unexpanded and flags it. All-or-nothing per
+    /// wildcard: a partial expansion would present an incomplete column set as
+    /// the whole one. Expansion fails when:
+    ///
+    /// - any dialect modifier rides the wildcard (`EXCLUDE` / `EXCEPT` /
+    ///   `ILIKE` filter the set, `RENAME` / `REPLACE` / Redshift `AS` rewrite
+    ///   it — expanding while ignoring one would misreport reads / lineage);
+    /// - a bare `*`'s scope carries `USING` / `NATURAL` merge columns (the
+    ///   standard coalesces them into join-structure-dependent positions the
+    ///   flat scope no longer encodes — `t.*` is unaffected: it never
+    ///   coalesces);
+    /// - a covered relation's columns aren't completely known (a catalog-free
+    ///   / miss table, an opaque table function, a derived relation whose body
+    ///   kept an unexpanded wildcard), or the qualifier doesn't pin exactly
+    ///   one relation.
+    ///
+    /// Only the **current scope** is consulted — never the enclosing
+    /// correlation stack (`context.outer`). For a bare `*` that is SQL's own
+    /// rule (a subquery's `*` covers its own FROM). A qualified `t.*` naming
+    /// an *enclosing* relation is dialect-split (PostgreSQL 17 resolves it,
+    /// SQLite rejects it) and lands here as "no relation matched" —
+    /// suppressed with a diagnostic, never mis-expanded. Supporting it would
+    /// be an outer fall-through limited to cataloged base tables (an outer
+    /// *derived* producer sits outside the subquery's plan subtree, out of
+    /// the slot trace's reach) — deferred until wanted.
+    fn expand_wildcard(
+        &self,
+        qualifier: Option<&ObjectName>,
+        options: &WildcardAdditionalOptions,
+        scope: &Scope,
+    ) -> Option<Vec<NamedExpr>> {
+        if options.opt_ilike.is_some()
+            || options.opt_exclude.is_some()
+            || options.opt_except.is_some()
+            || options.opt_replace.is_some()
+            || options.opt_rename.is_some()
+            || options.opt_alias.is_some()
+        {
+            return None;
+        }
+        let span = options.wildcard_token.0.span;
+        let relations: Vec<&Relation> = match qualifier {
+            Some(name) => vec![self.wildcard_relation(name, scope)?],
+            None => {
+                if !scope.merge_columns.is_empty()
+                    || scope.relations.is_empty()
+                    || self.derived_names_collide(scope)
+                {
+                    return None;
+                }
+                scope.relations.iter().collect()
+            }
+        };
+        let mut items = Vec::new();
+        for relation in relations {
+            items.extend(self.relation_wildcard_slots(relation, scope, span)?);
+        }
+        Some(items)
+    }
+
+    /// Whether two derived relations in scope expose the same name (illegal
+    /// SQL — engines reject a duplicate table alias, but the parser doesn't).
+    /// A derived slot finds its producer *by that exposed name* during the
+    /// origin trace, so a duplicate would collect the other relation's
+    /// origins too — a bare `*` refuses rather than mis-attribute. Only
+    /// derived boundaries claim a qualifier (a base table's expanded columns
+    /// bind directly, and an opaque table function already fails expansion),
+    /// so base-table name duplicates stay out of the check. The qualified
+    /// form needs no counterpart: [`wildcard_relation`](Self::wildcard_relation)
+    /// already demands a unique match.
+    fn derived_names_collide(&self, scope: &Scope) -> bool {
+        let derived_names: Vec<&Ident> = scope
+            .relations
+            .iter()
+            .filter(|rel| matches!(rel, Relation::Derived { .. }))
+            .filter_map(|rel| rel.exposed_name())
+            .collect();
+        derived_names.iter().enumerate().any(|(i, a)| {
+            derived_names[i + 1..]
+                .iter()
+                .any(|b| self.eq(self.style.casing.table_alias, a, b))
+        })
+    }
+
+    /// The single in-scope relation a wildcard qualifier (`t.*` / `s.t.*`)
+    /// names — matched like a column qualifier (an aliased / derived relation
+    /// by its exposed name, a non-aliased real table right-anchored). `None`
+    /// when no relation matches or several do.
+    fn wildcard_relation<'s>(&self, name: &ObjectName, scope: &'s Scope) -> Option<&'s Relation> {
+        let parts: Vec<Ident> = name
+            .0
+            .iter()
+            .map(|p| p.as_ident().cloned())
+            .collect::<Option<_>>()?;
+        let qualifier_ref = TableReference::try_from_parts(&parts);
+        let mut hits = scope.relations.iter().filter(|rel| match rel {
+            Relation::Table {
+                table, alias: None, ..
+            } => qualifier_ref
+                .as_ref()
+                .is_some_and(|q| self.qualifier_matches_table(q, table)),
+            _ => rel.exposed_name().is_some_and(|exposed| {
+                matches!(&parts[..], [only] if self.eq(self.style.casing.table_alias, only, exposed))
+            }),
+        });
+        let hit = hits.next()?;
+        hits.next().is_none().then_some(hit)
+    }
+
+    /// One relation's contribution to a wildcard expansion — an output item
+    /// per column, in schema order — or `None` when its columns aren't
+    /// completely known (which fails the whole wildcard, all-or-nothing).
+    ///
+    /// - A `Cataloged` table expands each catalog column as a pinned `Base`
+    ///   read (`Cataloged` — the column is listed by construction), in the
+    ///   canonical (quoted) form the write-side catalog fill also uses. Each
+    ///   synthesized identifier carries the **wildcard token's span**, so the
+    ///   source-ordered surfaces place every expanded column at the `*` (the
+    ///   facade's stable sort keeps them in schema order there).
+    /// - A derived / CTE relation with a complete slot view expands each slot
+    ///   as an [`Expr::DerivedSlot`] positional reference — position, not
+    ///   name, so a duplicate or anonymous output name can't misattribute the
+    ///   trace. Like every `Derived` reference it contributes no read (the
+    ///   physical read was counted inside the producer). An *unaliased*
+    ///   derived relation has no qualifier for the trace to match, so it
+    ///   expands only as the scope's sole relation (nothing to misattribute
+    ///   to).
+    /// - An `Unknown` table, an incomplete derived view, and an opaque table
+    ///   function refuse.
+    fn relation_wildcard_slots(
+        &self,
+        relation: &Relation,
+        scope: &Scope,
+        span: Span,
+    ) -> Option<Vec<NamedExpr>> {
+        match relation {
+            Relation::Table {
+                table,
+                columns: Columns::Cataloged(cols),
+                ..
+            } => Some(
+                cols.iter()
+                    .map(|col| {
+                        let name = Ident {
+                            span,
+                            ..col.clone()
+                        };
+                        NamedExpr {
+                            names: OutputNames::Single(Some(name.clone())),
+                            expr: Expr::Column(Box::new(BoundColumn {
+                                qualifier: None,
+                                name,
+                                binding: base(table, ResolutionKind::Cataloged),
+                            })),
+                        }
+                    })
+                    .collect(),
+            ),
+            Relation::Derived { alias, columns }
+                if columns.complete && (alias.is_some() || scope.relations.len() == 1) =>
+            {
+                Some(
+                    columns
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .map(|(index, slot)| NamedExpr {
+                            names: OutputNames::Single(slot.clone()),
+                            expr: Expr::DerivedSlot {
+                                qualifier: alias.clone(),
+                                index,
+                                name: slot.clone(),
+                            },
+                        })
+                        .collect(),
+                )
+            }
+            Relation::Table {
+                columns: Columns::Unknown,
+                ..
+            }
+            | Relation::Derived { .. }
+            | Relation::TableFunction { .. } => None,
         }
     }
 
@@ -388,7 +603,7 @@ impl<'a> Binder<'a> {
             } if self.list_has(cols, name) => base(table, ResolutionKind::Cataloged),
             // A derived / CTE side that exposes the column: a `Derived` ref the
             // trace resolves through its alias into the producing subquery.
-            Relation::Derived { alias, columns } if self.list_has(columns, name) => {
+            Relation::Derived { alias, columns } if self.exposed_has(columns, name) => {
                 return Some(BoundColumn {
                     qualifier: alias.clone(),
                     name: name.clone(),

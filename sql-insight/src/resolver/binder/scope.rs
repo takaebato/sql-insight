@@ -22,13 +22,37 @@ use sqlparser::ast::{Ident, TableAlias};
 use super::super::logical_plan::Columns;
 use crate::reference::TableReference;
 
-/// A declared CTE in scope: its name and the output column names it exposes
-/// (so a `FROM cte` reference resolves through them). The body lives once on
-/// the owning `With` node; a reference is a lightweight `CteRef`.
+/// A declared CTE in scope: its name and the output slots it exposes (so a
+/// `FROM cte` reference resolves through them). The body lives once on the
+/// owning `With` node; a reference is a lightweight `CteRef`.
 #[derive(Clone)]
 pub(super) struct CteDecl {
     pub(super) name: Ident,
-    pub(super) columns: Vec<Ident>,
+    pub(super) columns: Exposed,
+}
+
+/// The output-slot view a derived relation (a derived table / CTE) exposes:
+/// one entry per output position (`None` = an anonymous output — an unaliased
+/// expression, unnameable but still occupying its position).
+///
+/// `complete` says whether `slots` is the relation's *whole* output list. It
+/// is `false` when the producing body's own outputs are indeterminate (it
+/// holds an unexpanded wildcard, or it is an opaque body like a `TABLE foo` /
+/// unnest whose columns aren't enumerated): named references still resolve
+/// against the known slots, but anything positional — wildcard expansion,
+/// (`Complete`-gated) slot counting — must not trust an incomplete view.
+#[derive(Clone, Default)]
+pub(super) struct Exposed {
+    pub(super) slots: Vec<Option<Ident>>,
+    pub(super) complete: bool,
+}
+
+impl Exposed {
+    /// The named slots (resolution / NATURAL-merge candidates) — sparse when
+    /// anonymous outputs sit between them.
+    pub(super) fn names(&self) -> impl Iterator<Item = &Ident> {
+        self.slots.iter().flatten()
+    }
 }
 
 /// The relations and outputs visible at a point in the bind. Scratch — never
@@ -46,6 +70,13 @@ pub(super) struct Scope {
     ///
     /// [`ColumnTarget::QueryOutput`]: crate::extractor::ColumnTarget::QueryOutput
     pub(super) query_outputs: Vec<OutputCol>,
+    /// Whether `query_outputs` covers *every* output position — `false` when
+    /// the projection still holds an unexpanded wildcard (its slot count is
+    /// then indeterminate), or when the body's outputs aren't enumerated at
+    /// all (`TABLE foo`, a DML body). Feeds [`Exposed::complete`] and the DML
+    /// roots' `source_wildcard`. Deliberately `false` under `Default` so a
+    /// scope is only trusted positionally where a bind path vouches for it.
+    pub(super) outputs_complete: bool,
     /// `JOIN … USING (col)` merge-column names: an unqualified reference to one
     /// fans in to every joined relation that could own it.
     pub(super) merge_columns: Vec<Ident>,
@@ -76,13 +107,13 @@ pub(super) enum Relation {
         table: TableReference,
         columns: Columns,
     },
-    /// A derived table / CTE reference: a synthetic relation exposing the named
-    /// output columns of an inner query. A reference through it is
+    /// A derived table / CTE reference: a synthetic relation exposing the
+    /// output slots of an inner query. A reference through it is
     /// `Binding::Derived` — the origin traversal traces into the producing
     /// sub-plan (`SubqueryAlias` / `CteRef`).
     Derived {
         alias: Option<Ident>,
-        columns: Vec<Ident>,
+        columns: Exposed,
     },
     /// An opaque table function / PIVOT / … relation with dynamic columns. A
     /// bare name is **not** claimed by it (so it stays resolvable against real
@@ -127,19 +158,23 @@ impl Scope {
     /// Mint the clause scope: attach the bound projection's output columns to
     /// the FROM scope, so GROUP BY / HAVING / ORDER BY resolve against the FROM
     /// relations *plus* these outputs (clause-alias visibility), while WHERE and
-    /// the projection itself saw only the relations.
-    pub(super) fn with_query_outputs(self, query_outputs: Vec<OutputCol>) -> Scope {
+    /// the projection itself saw only the relations. `complete` records whether
+    /// the outputs cover every position (no unexpanded wildcard remained).
+    pub(super) fn with_query_outputs(self, query_outputs: Vec<OutputCol>, complete: bool) -> Scope {
         Scope {
             query_outputs,
+            outputs_complete: complete,
             ..self
         }
     }
 
-    /// The output column names this (sub)query exposes as a derived table / CTE:
+    /// The output-slot view this (sub)query exposes as a derived table / CTE:
     /// an explicit alias list (`AS d(x, y)`) renames positionally; otherwise
-    /// each output keeps its inferred name (anonymous outputs with no alias are
-    /// unnameable, so dropped — they can't be referenced).
-    pub(super) fn exposed_columns(&self, alias: Option<&TableAlias>) -> Vec<Ident> {
+    /// each output keeps its inferred name (`None` for an anonymous output —
+    /// it can't be referenced by name, but it still holds its position).
+    /// `complete` carries [`Scope::outputs_complete`] through, so a positional
+    /// consumer (wildcard expansion) knows whether the view can be trusted.
+    pub(super) fn exposed(&self, alias: Option<&TableAlias>) -> Exposed {
         let alias_columns: Vec<&Ident> = alias
             .map(|a| a.columns.iter().map(|c| &c.name).collect())
             .unwrap_or_default();
@@ -150,14 +185,18 @@ impl Scope {
         // otherwise a reference to an aliased column would dangle as a phantom
         // unresolved read instead of binding to this derived relation.
         let len = alias_columns.len().max(self.query_outputs.len());
-        (0..len)
-            .filter_map(|i| {
+        let slots = (0..len)
+            .map(|i| {
                 alias_columns
                     .get(i)
                     .map(|n| (*n).clone())
                     .or_else(|| self.query_outputs.get(i).and_then(|o| o.name.clone()))
             })
-            .collect()
+            .collect();
+        Exposed {
+            slots,
+            complete: self.outputs_complete,
+        }
     }
 }
 
@@ -172,21 +211,21 @@ impl Relation {
     }
 
     /// The column names this relation is *known* to expose — a `Cataloged`
-    /// table's columns, or a derived relation's exposed columns. An `Unknown`
+    /// table's columns, or a derived relation's named slots. An `Unknown`
     /// (catalog-free) table or an opaque table function has no known list, so it
     /// contributes nothing to a NATURAL join's schema-common columns.
-    pub(super) fn known_columns(&self) -> &[Ident] {
+    pub(super) fn known_columns(&self) -> Vec<&Ident> {
         match self {
             Relation::Table {
                 columns: Columns::Cataloged(cols),
                 ..
-            } => cols,
-            Relation::Derived { columns, .. } => columns,
+            } => cols.iter().collect(),
+            Relation::Derived { columns, .. } => columns.names().collect(),
             Relation::Table {
                 columns: Columns::Unknown,
                 ..
             }
-            | Relation::TableFunction { .. } => &[],
+            | Relation::TableFunction { .. } => Vec::new(),
         }
     }
 }
