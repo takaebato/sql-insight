@@ -44,6 +44,13 @@ fn corpus() -> &'static [&'static str] {
         "MERGE INTO t1 USING t2 ON t1.id = t2.id \
          WHEN MATCHED THEN UPDATE SET a = t2.a \
          WHEN NOT MATCHED THEN INSERT (id, a) VALUES (t2.id, t2.a)",
+        // Statement-materialized relations: references through them trace
+        // into their inputs (a table function's arguments, a VALUES row
+        // set's cells, EXCLUDED's proposed row) — never a fabricated
+        // alias-named source.
+        "SELECT u.col FROM t1, UNNEST(t1.arr) AS u",
+        "SELECT v.a FROM (VALUES (1, 'x'), ((SELECT max(y) FROM s), 'z')) AS v(a, b)",
+        "INSERT INTO t1 (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = EXCLUDED.a",
     ]
 }
 
@@ -222,6 +229,38 @@ fn writing_statements_emit_writes() {
                     "writing statement has empty table_op writes \
                      for statement {idx} of SQL: {sql}"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn column_lineage_source_tables_appear_in_table_op_reads_or_writes() {
+    // A column lineage source is always a *written* reference: the resolver
+    // never fabricates a source named after a statement-local relation (a
+    // table function's output traces to the function's arguments, a VALUES
+    // column to its row cells, EXCLUDED to the proposed row's source). So
+    // every source that names a table must name one the table-level
+    // surfaces know — the same containment the reads invariant pins.
+    for sql in corpus() {
+        for (idx, pair) in extract_paired(sql).into_iter().enumerate() {
+            let table_op_reads: HashSet<_> =
+                table_set(pair.tab.reads.clone(), |r: &sql_insight::TableRead| {
+                    Some(r.reference.clone())
+                });
+            let table_op_writes: HashSet<_> =
+                table_set(pair.tab.writes.clone(), |w| Some(w.reference.clone()));
+            let known: HashSet<_> = table_op_reads.union(&table_op_writes).cloned().collect();
+            for e in &pair.col.lineage {
+                if let Some(t) = &e.source.reference.table {
+                    assert!(
+                        known.contains(t),
+                        "column lineage source table {t:?} missing from table_op \
+                         reads ∪ writes for statement {idx} of SQL: {sql}\n\
+                         table_op reads: {table_op_reads:?}\n\
+                         table_op writes: {table_op_writes:?}"
+                    );
+                }
             }
         }
     }

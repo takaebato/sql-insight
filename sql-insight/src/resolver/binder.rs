@@ -704,6 +704,10 @@ fn rename_outputs(op: &mut LogicalPlan, names: &[Ident]) {
             rename_outputs(&mut so.left, names);
             rename_outputs(&mut so.right, names);
         }
+        // A `VALUES` row set has no named outputs of its own — the alias list
+        // *is* its column naming (`(VALUES …) AS v(a, b)`), recorded so a
+        // named reference through the relation maps to a cell position.
+        LogicalPlan::Values(v) => v.columns = names.to_vec(),
         _ => {}
     }
 }

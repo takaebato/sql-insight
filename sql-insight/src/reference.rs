@@ -227,7 +227,12 @@ pub struct ColumnWrite {
 ///   [`Cataloged`](Self::Cataloged) and [`Inferred`](Self::Inferred)
 ///   interchangeably as "resolved" (use the `(table, name)` pair);
 ///   treat [`Ambiguous`](Self::Ambiguous) and
-///   [`Unresolved`](Self::Unresolved) as "incomplete".
+///   [`Unresolved`](Self::Unresolved) as "incomplete". A lineage source
+///   is always a *written* reference (a base column, or an
+///   `Ambiguous` / `Unresolved` one with `table: None`) — the resolver
+///   never fabricates a source named after a statement-local relation
+///   (a table function's output traces to the function's arguments, a
+///   `VALUES` column to its row cells).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum ResolutionKind {

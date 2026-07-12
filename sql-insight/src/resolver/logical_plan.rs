@@ -154,10 +154,12 @@ pub(crate) struct SubqueryAlias {
 /// An opaque table-producing factor: a table function (`f(args)` / `UNNEST` /
 /// `JSON_TABLE` / …), or a `PIVOT` / `UNPIVOT` / `MATCH_RECOGNIZE` wrapping an
 /// inner table. Its produced columns are dynamic, so a reference through its
-/// `alias` is a synthetic lineage source (the alias as table, dropped from
-/// reads). `args` are the clause / argument expressions (reads). `input` is the
-/// wrapped inner table (feeds data, e.g. a PIVOT source) or [`LogicalPlan::Empty`]
-/// for a bare function.
+/// `alias` is dropped from reads and traces to the origins of `args` — the
+/// function's data inputs — at function granularity (see the `TableFunction`
+/// arm of the origin trace). `args` are the clause / argument expressions
+/// (reads, and the outputs' lineage sources). `input` is the wrapped inner
+/// table (feeds data, e.g. a PIVOT source) or [`LogicalPlan::Empty`] for a
+/// bare function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TableFunction {
     pub(crate) alias: Option<Ident>,
@@ -202,11 +204,18 @@ pub(crate) struct CteRef {
     pub(crate) alias: Option<Ident>,
 }
 
-/// A `VALUES` row set: synthesised rows with no base columns. The row
-/// expressions are reads (and feed positionally when this is a write source).
+/// A `VALUES` row set: synthesised rows with no base columns of their own —
+/// but not opaque: a column of the row set *is* the like-positioned cell of
+/// every row, so positional consumers (an INSERT pairing, a reference through
+/// an aliased `VALUES` relation, an `EXCLUDED` mapping) trace into the cell
+/// expressions rather than stopping here. `columns` carries the declared
+/// column names when the row set is exposed as a relation
+/// (`(VALUES …) AS v(a, b)` / `WITH v (a, b) AS (VALUES …)`; empty otherwise)
+/// so a *named* reference maps to its position first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Values {
     pub(crate) rows: Vec<Vec<Expr>>,
+    pub(crate) columns: Vec<Ident>,
 }
 
 /// `INSERT INTO target (columns) <input>`: the source `input`'s output
@@ -435,10 +444,6 @@ pub(crate) enum Expr {
     DerivedSlot {
         qualifier: Option<Ident>,
         index: usize,
-        /// The slot's exposed output name, if any — used only for the
-        /// synthetic source at an untraceable boundary (a VALUES-backed
-        /// relation), never for resolution.
-        name: Option<Ident>,
     },
 }
 

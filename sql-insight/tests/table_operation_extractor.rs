@@ -774,6 +774,24 @@ mod lineage {
     }
 
     #[test]
+    fn table_function_subquery_argument_feeds_lineage() {
+        // A table function's arguments are its data inputs: a scalar-subquery
+        // argument's scan feeds the DML target (`s`'s data moves through the
+        // UNNEST into `dst`), matching the column-level trace of the
+        // function's outputs into its arguments.
+        assert_ops(
+            "INSERT INTO dst (a) SELECT u.x FROM UNNEST((SELECT arr FROM s)) AS u",
+            TableOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s")],
+                writes: vec![twrite("dst")],
+                lineage: vec![edge("s", "dst")],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn predicate_subquery_does_not_feed_lineage() {
         // t3 is referenced only inside `WHERE id IN (SELECT id FROM t3)`,
         // so it must not appear as a lineage source even though it does

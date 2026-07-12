@@ -1002,6 +1002,58 @@ mod relation_arm_coverage {
     }
 
     #[test]
+    fn table_function_output_traces_to_its_arguments() {
+        // A column projected through a table function's alias traces to the
+        // origins of the function's *arguments* — its data inputs
+        // (`UNNEST(t.arr)` emits `t.arr`'s elements) — as a Transformation,
+        // at function granularity. No pseudo-source named after the alias
+        // `u` surfaces; `t.arr` is both the ordinary read and the source.
+        assert_column_ops(
+            "SELECT u.x FROM t, UNNEST(t.arr) AS u",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "arr")],
+                writes: vec![],
+                lineage: vec![transformation(col("t", "arr"), out("x", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn derived_ref_walks_past_a_non_matching_table_function() {
+        // The named trace of `d.a` descends both join sides: the table
+        // function's alias (`u`) doesn't match the qualifier, so it claims
+        // nothing — only `d`'s producer answers.
+        assert_column_ops(
+            "SELECT d.a FROM UNNEST(x) AS u, (SELECT a FROM t) AS d",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![unresolved("x"), col("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn table_function_with_constant_arguments_has_no_lineage() {
+        // Constant arguments contribute no origin, so the output column has
+        // no lineage source — exactly like `SELECT 1 AS v`.
+        assert_column_ops(
+            "SELECT g.v FROM generate_series(1, 10) AS g(v)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn parameterized_table_function_is_opaque() {
         // `generate_series(1, 10) AS g` is a table-valued function, not a base
         // table: a reference through its alias (`g.value`) is a synthetic
