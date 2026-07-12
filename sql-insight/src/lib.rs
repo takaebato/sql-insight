@@ -137,15 +137,21 @@
 //!   contributes reads and a `col` lineage edge, exactly like a standalone
 //!   `expr AS col` — but its **output position** is best-effort, since the
 //!   suppressed wildcard's columns aren't enumerated to place it among them.
-//! - **Table functions are opaque**: `UNNEST` / `generate_series` /
-//!   `JSON_TABLE` / `PIVOT` etc. produce dynamic columns that aren't
-//!   enumerated. Their argument expressions surface as reads, but a
-//!   reference *through* such a relation (`u.col`) is a synthetic
-//!   lineage source named by the alias, not a cataloged real-table read —
-//!   marked [`ResolutionKind::Synthetic`] so it can't be mistaken for a
-//!   persisted-table dependency. (A `VALUES` relation is different: its
-//!   cells are visible, so a reference through it traces into them —
-//!   real columns surface, literals contribute nothing.)
+//! - **Table-function lineage is function-grained**: `UNNEST` /
+//!   `generate_series` / `JSON_TABLE` / `PIVOT` etc. produce dynamic
+//!   columns that aren't enumerated, so a reference *through* such a
+//!   relation (`u.col`) traces to the origins of the function's
+//!   **arguments** (its data inputs), as a `Transformation` — every output
+//!   column derives from every argument, the same coarseness as a scalar
+//!   `f(a, b)`. Which argument feeds which output column is per-function
+//!   semantics the SQL text doesn't carry (a multi-array `UNNEST(a, b)`
+//!   zips column i from array i), so the fan may over-attribute there.
+//!   Constant arguments contribute nothing — a `generate_series(1, 10)`
+//!   output has no lineage source, exactly like `SELECT 1`. The same
+//!   into-the-inputs rule covers `VALUES` relations (a reference traces to
+//!   the like-positioned row cells), so a lineage source is always a
+//!   *written* reference — never a name fabricated from a statement-local
+//!   alias.
 //! - **Recursive CTEs aren't unrolled**: the recursive self-reference
 //!   terminates against the anchor branch's columns (via an active-set),
 //!   so lineage traces through to the anchor's real tables — it doesn't

@@ -659,8 +659,10 @@ impl<'a> Binder<'a> {
         });
         // Expose the unnested output as a synthetic (Derived) column so a
         // reference to it (`x` / `arr`) binds to the unnest — not falling through
-        // to a real table as a phantom column — and traces to a synthetic source
-        // (dropped from reads), never to the source array as a second read.
+        // to a real table as a phantom column. It is dropped from reads (the
+        // operand read is counted once at the argument) and traces to the
+        // operand's origins: the unnested element's lineage reaches the
+        // source array column.
         let scope = match alias_name {
             Some(name) => Scope::single(Relation::Derived {
                 alias: None,

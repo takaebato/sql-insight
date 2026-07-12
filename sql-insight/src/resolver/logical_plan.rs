@@ -154,10 +154,12 @@ pub(crate) struct SubqueryAlias {
 /// An opaque table-producing factor: a table function (`f(args)` / `UNNEST` /
 /// `JSON_TABLE` / …), or a `PIVOT` / `UNPIVOT` / `MATCH_RECOGNIZE` wrapping an
 /// inner table. Its produced columns are dynamic, so a reference through its
-/// `alias` is a synthetic lineage source (the alias as table, dropped from
-/// reads). `args` are the clause / argument expressions (reads). `input` is the
-/// wrapped inner table (feeds data, e.g. a PIVOT source) or [`LogicalPlan::Empty`]
-/// for a bare function.
+/// `alias` is dropped from reads and traces to the origins of `args` — the
+/// function's data inputs — at function granularity (see the `TableFunction`
+/// arm of the origin trace). `args` are the clause / argument expressions
+/// (reads, and the outputs' lineage sources). `input` is the wrapped inner
+/// table (feeds data, e.g. a PIVOT source) or [`LogicalPlan::Empty`] for a
+/// bare function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TableFunction {
     pub(crate) alias: Option<Ident>,

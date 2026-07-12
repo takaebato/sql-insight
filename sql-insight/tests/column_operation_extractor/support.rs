@@ -104,14 +104,6 @@ pub fn col(table_name: &str, name: &str) -> ColumnRead {
     read_with(table_name, name, ResolutionKind::Inferred)
 }
 
-/// A synthetic lineage source — an irreducible statement-materialized
-/// relation's column (a table function's output, an untraceable
-/// `EXCLUDED`), whose "table" is the relation's exposed name, not a
-/// persisted table. Appears only on lineage sources, never in `reads`.
-pub fn synthetic(table_name: &str, name: &str) -> ColumnRead {
-    read_with(table_name, name, ResolutionKind::Synthetic)
-}
-
 pub fn col_confirmed(table_name: &str, name: &str) -> ColumnRead {
     read_with_ref(cataloged_table(table_name), name, ResolutionKind::Cataloged)
 }

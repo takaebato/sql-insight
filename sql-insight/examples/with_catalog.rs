@@ -113,9 +113,6 @@ fn print_reads(label: &str, reads: &[sql_insight::ColumnRead]) {
             ResolutionKind::Inferred => "~",
             ResolutionKind::Ambiguous => "?",
             ResolutionKind::Unresolved => "✗",
-            // A statement-local relation's column (a table function's
-            // output, a VALUES row set, EXCLUDED) — not a persisted table.
-            ResolutionKind::Synthetic => "◌",
         };
         println!(
             "    {confidence_marker} {table}.{name} ({resolution:?})",

@@ -119,8 +119,8 @@ pub(super) enum Relation {
     /// bare name is **not** claimed by it (so it stays resolvable against real
     /// tables); a qualified ref through its alias is `Binding::Derived` — the
     /// origin traversal reaches the [`LogicalPlan::TableFunction`](super::LogicalPlan::TableFunction)
-    /// node and emits the synthetic `alias.col` source (a lineage source,
-    /// dropped from reads).
+    /// node and traces to the function arguments' origins (dropped from
+    /// reads either way).
     TableFunction { alias: Option<Ident> },
 }
 

@@ -1002,19 +1002,35 @@ mod relation_arm_coverage {
     }
 
     #[test]
-    fn table_function_output_is_a_synthetic_lineage_source() {
-        // A column projected through a table function's alias flows out as a
-        // lineage source, but the "table" is the alias of a relation the
-        // statement itself materializes — `Synthetic`, so it can't be
-        // mistaken for an (`Inferred`) read of a real table named `u`. The
-        // function argument (`t.arr`) is the ordinary base read.
+    fn table_function_output_traces_to_its_arguments() {
+        // A column projected through a table function's alias traces to the
+        // origins of the function's *arguments* — its data inputs
+        // (`UNNEST(t.arr)` emits `t.arr`'s elements) — as a Transformation,
+        // at function granularity. No pseudo-source named after the alias
+        // `u` surfaces; `t.arr` is both the ordinary read and the source.
         assert_column_ops(
             "SELECT u.x FROM t, UNNEST(t.arr) AS u",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t", "arr")],
                 writes: vec![],
-                lineage: vec![passthrough(synthetic("u", "x"), out("x", 0))],
+                lineage: vec![transformation(col("t", "arr"), out("x", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn table_function_with_constant_arguments_has_no_lineage() {
+        // Constant arguments contribute no origin, so the output column has
+        // no lineage source — exactly like `SELECT 1 AS v`.
+        assert_column_ops(
+            "SELECT g.v FROM generate_series(1, 10) AS g(v)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
                 diagnostics: vec![],
             },
         );

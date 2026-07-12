@@ -217,7 +217,6 @@ pub struct ColumnWrite {
 /// | catalog-aware, two or more known schemas confirm | [`Ambiguous`](Self::Ambiguous) |
 /// | qualified `t.col` where `t` is unknown | [`Inferred`](Self::Inferred) |
 /// | qualified `t.col` where `t` is known and lists `col` | [`Cataloged`](Self::Cataloged) |
-/// | lineage source behind a table function / untraceable `EXCLUDED` | [`Synthetic`](Self::Synthetic) |
 ///
 /// # Consumer guidance
 ///
@@ -228,11 +227,12 @@ pub struct ColumnWrite {
 ///   [`Cataloged`](Self::Cataloged) and [`Inferred`](Self::Inferred)
 ///   interchangeably as "resolved" (use the `(table, name)` pair);
 ///   treat [`Ambiguous`](Self::Ambiguous) and
-///   [`Unresolved`](Self::Unresolved) as "incomplete"; treat
-///   [`Synthetic`](Self::Synthetic) as **not a persisted dependency** —
-///   the `(table, name)` pair names a statement-local relation (a table
-///   function's output, an untraceable `EXCLUDED`), so skip it or render
-///   it as an ephemeral node rather than a table.
+///   [`Unresolved`](Self::Unresolved) as "incomplete". A lineage source
+///   is always a *written* reference (a base column, or an
+///   `Ambiguous` / `Unresolved` one with `table: None`) — the resolver
+///   never fabricates a source named after a statement-local relation
+///   (a table function's output traces to the function's arguments, a
+///   `VALUES` column to its row cells).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum ResolutionKind {
@@ -261,26 +261,6 @@ pub enum ResolutionKind {
     /// scope chain held no bindings at all. `ColumnReference.table`
     /// is `None`. Columns only.
     Unresolved,
-    /// Resolved — exactly — to a relation the statement itself
-    /// materializes whose values are **irreducible** from the SQL text: a
-    /// table function's output column (`SELECT u.col FROM UNNEST(x) AS u` —
-    /// the output only exists at run time), or the `EXCLUDED` pseudo-row of
-    /// an upsert with nothing to trace the proposed values into. (A `VALUES`
-    /// relation is *reducible* — a reference through it traces into the row
-    /// cells, reaching real columns or, for literals, nothing — so it never
-    /// surfaces here.) The `table` segment is the relation's exposed name
-    /// (alias / `excluded`), **not** a real table — without this marker it
-    /// would be indistinguishable from an [`Inferred`](Self::Inferred) read
-    /// of an unregistered base table.
-    ///
-    /// Appears **only on lineage sources**
-    /// ([`ColumnLineageEdge::source`](crate::extractor::ColumnLineageEdge::source)):
-    /// a synthetic relation's columns are never physical reads (`reads`
-    /// counts the producer's own reads instead), never write targets, and
-    /// never table-level references — which is also why a synthetic
-    /// column source has no counterpart edge in `table_lineage` (only
-    /// real scans feed there).
-    Synthetic,
 }
 
 impl TableReference {

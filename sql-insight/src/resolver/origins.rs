@@ -16,7 +16,7 @@ use super::logical_plan::{
 use super::reads::column_read;
 use crate::casing::{CaseRule, IdentifierCasing};
 use crate::extractor::ColumnLineageKind;
-use crate::reference::{ColumnRead, ColumnReference, ColumnWrite, ResolutionKind, TableReference};
+use crate::reference::{ColumnRead, ColumnWrite};
 
 /// CTE environment for expanding `CteRef`s during a trace, plus the
 /// active-set that terminates a recursive self-reference and the dialect
@@ -398,15 +398,21 @@ fn origins_into<'a>(
                 origins_into(&sa.input, None, name, context)
             }
         }
-        // An opaque table function: its produced columns are dynamic, so a ref
-        // through its alias is a synthetic lineage source (the alias as table)
-        // — not collapsible to a base column.
+        // A table function's output data comes from its inputs — the argument
+        // expressions (`UNNEST(t.arr)` emits `t.arr`'s elements; a PIVOT's
+        // aggregate expressions carry the inner columns) — so a ref through
+        // its alias traces to the arguments' origins, at **function
+        // granularity**: every output column derives from every argument
+        // (`Transformation`), the same coarseness as a scalar call
+        // `f(a, b) AS x`. Which argument feeds which output column is
+        // function semantics the SQL text doesn't carry (a multi-array
+        // `UNNEST(a, b)` zips: column i ← array i) — a per-function
+        // refinement can narrow this later. Constant arguments contribute
+        // nothing, so a `generate_series(1, 10)` output has no source,
+        // exactly like `SELECT 1`.
         LogicalPlan::TableFunction(tf) => match &tf.alias {
             Some(alias) if qualifier.is_none_or(|q| context.eq_alias(q, alias)) => {
-                vec![(
-                    synthetic_source(alias, name),
-                    ColumnLineageKind::Passthrough,
-                )]
+                table_function_output_origins(tf, context)
             }
             _ => Vec::new(),
         },
@@ -521,9 +527,9 @@ fn trace_nth_output<'a>(
 /// The origins of an ON CONFLICT DO UPDATE value. Like [`origins_of_expr`],
 /// but an `EXCLUDED.col` reference (a `Derived` ref, qualified `excluded`) maps
 /// to the INSERT source's like-positioned output column — a `VALUES` source
-/// maps into its cells the same way. Only a source with nothing to inspect at
-/// all (`DEFAULT VALUES`) keeps the `EXCLUDED.col` pseudo-column itself (a
-/// synthetic lineage source, not a read).
+/// maps into its cells the same way. A source with nothing to inspect at all
+/// (`DEFAULT VALUES`) yields no edge: the proposed value is untraceable,
+/// like any constant.
 pub(super) fn conflict_value_origins<'a>(
     value: &'a Expr,
     columns: &[ColumnWrite],
@@ -545,11 +551,10 @@ pub(super) fn conflict_value_origins<'a>(
             if let Some(values) = values_node(source) {
                 return values_cell_origins(values, i, source, context);
             }
-            let operands = output_operands(source);
-            if operands.is_empty() {
-                return vec![(excluded_source(c), ColumnLineageKind::Passthrough)];
-            }
-            trace_nth_output(&operands, i, context)
+            // A source with nothing to inspect at all (`DEFAULT VALUES`):
+            // the proposed value is untraceable, so the target column gets
+            // no edge — like any constant.
+            trace_nth_output(&output_operands(source), i, context)
         }
         // A non-EXCLUDED ref (a target column, MySQL `VALUES(col)` inner, …)
         // and the structural variants trace like any value.
@@ -593,38 +598,22 @@ pub(super) fn conflict_value_origins<'a>(
     }
 }
 
-/// The `EXCLUDED.col` pseudo-table lineage source (when the source can't be
-/// collapsed through): the qualifier (`EXCLUDED`, original text) as the
-/// table, [`Synthetic`](ResolutionKind::Synthetic) like every other
-/// statement-materialized relation. A conflict-scope `EXCLUDED` binding is
-/// always qualified (an unqualified reference demotes to `Ambiguous` at
-/// bind — engine parity), but fall back to the pseudo-table's own name
-/// rather than ever surfacing a `table: None` `Synthetic`.
-fn excluded_source(c: &BoundColumn) -> ColumnRead {
-    let table = c
-        .qualifier
-        .clone()
-        .unwrap_or_else(|| Ident::new("excluded"));
-    synthetic_source(&table, &c.name)
-}
-
-/// A synthetic single-segment lineage source `table.name` — a column of a
-/// relation the statement itself materializes (a table function's output, a
-/// `VALUES` row set, `EXCLUDED`): its value flows out but there is no base
-/// column to collapse to and no persisted table behind the name, which
-/// [`Synthetic`](ResolutionKind::Synthetic) marks for the consumer.
-fn synthetic_source(table: &Ident, name: &Ident) -> ColumnRead {
-    ColumnRead {
-        reference: ColumnReference {
-            table: Some(TableReference {
-                catalog: None,
-                schema: None,
-                name: table.clone(),
-            }),
-            name: name.clone(),
-        },
-        resolution: ResolutionKind::Synthetic,
+/// The origins of a table function's output — the arguments' origins,
+/// composed as a [`Transformation`](ColumnLineageKind::Transformation)
+/// (function granularity: see the `TableFunction` arm of [`origins_into`]).
+/// The arguments were bound against the LATERAL-visible scope, so a base
+/// reference (`UNNEST(t.arr)`) traces directly; a `Derived` reference to a
+/// sibling derived table is out of this subtree's reach and drops (an
+/// omission, not a misattribution — its physical read is still counted).
+fn table_function_output_origins<'a>(
+    tf: &'a super::logical_plan::TableFunction,
+    context: &mut TraceContext<'a>,
+) -> Vec<(ColumnRead, ColumnLineageKind)> {
+    let mut sources = Vec::new();
+    for arg in &tf.args {
+        sources.extend(origins_of_expr(arg, &tf.input, context));
     }
+    transform(sources)
 }
 
 /// One output operand of a query: the projected columns and the input that

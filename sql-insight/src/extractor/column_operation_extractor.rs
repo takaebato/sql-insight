@@ -163,7 +163,7 @@ pub struct ColumnLineageEdge {
     /// resolver's [`ResolutionKind`](crate::ResolutionKind) in that placement.
     /// `source.reference` is the inner (post-collapse) real-table
     /// reference; `source.resolution` follows that inner reference's
-    /// classification rather than the outer synthetic step's.
+    /// classification rather than any intermediate derived step's.
     pub source: ColumnRead,
     pub target: ColumnTarget,
     pub kind: ColumnLineageKind,

@@ -587,9 +587,16 @@ fn feeding_scans<'a>(
         LogicalPlan::Aggregate(a) => feeding_scans(&a.input, context, fed_ctes, out),
         LogicalPlan::Sort(s) => feeding_scans(&s.input, context, fed_ctes, out),
         LogicalPlan::SubqueryAlias(sa) => feeding_scans(&sa.input, context, fed_ctes, out),
-        // A PIVOT / … feeds from its wrapped inner table; the function args
-        // are filter-position reads and do not feed.
-        LogicalPlan::TableFunction(tf) => feeding_scans(&tf.input, context, fed_ctes, out),
+        // A table function feeds from its wrapped inner table (PIVOT / …)
+        // *and* its argument expressions — the args are the function's data
+        // inputs (`UNNEST((SELECT arr FROM s))` moves s's data), matching
+        // the column-level trace of the outputs into the arguments.
+        LogicalPlan::TableFunction(tf) => {
+            feeding_scans(&tf.input, context, fed_ctes, out);
+            for arg in &tf.args {
+                expr_feeding(arg, context, fed_ctes, out);
+            }
+        }
         LogicalPlan::SetOp(so) => {
             feeding_scans(&so.left, context, fed_ctes, out);
             feeding_scans(&so.right, context, fed_ctes, out);

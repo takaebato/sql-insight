@@ -198,8 +198,8 @@ impl<'a> Binder<'a> {
                 self.exposed_has(columns, name).then_some(Binding::Derived)
             }
             // A ref qualified by a table function's alias resolves to it: a
-            // `Derived` binding the traversal turns into the synthetic
-            // `alias.col` lineage source (dropped from reads).
+            // `Derived` binding the origin traversal collapses to the
+            // function arguments' origins (dropped from reads).
             Relation::TableFunction { .. } => Some(Binding::Derived),
         }
     }
