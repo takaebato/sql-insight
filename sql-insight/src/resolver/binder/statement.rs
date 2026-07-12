@@ -62,7 +62,7 @@ impl<'a> Binder<'a> {
     /// it's ignored rather than leaking a mid-tree `CreateTableAs` that the
     /// write walkers (which peel only a leading `WITH`) would miss.
     fn bind_query_into(&mut self, query: &Query) -> LogicalPlan {
-        let plan = self.bind_query(query).0;
+        let (plan, scope) = self.bind_query(query);
         let Some(name) = leading_select_into(&query.body) else {
             return plan;
         };
@@ -74,7 +74,7 @@ impl<'a> Binder<'a> {
         // unaliased source expression (`SELECT a + 1 INTO t`) is an unnameable
         // column dropped from `writes` / `lineage` — flag it, like the
         // `CREATE TABLE … AS` path. (No explicit list, so no arity check.)
-        let source_wildcard = source_has_wildcard(query);
+        let source_wildcard = !scope.outputs_complete;
         self.diagnose_created_columns(&target.reference, &[], &plan, source_wildcard);
         LogicalPlan::CreateTableAs(CreateTableAs {
             target,
@@ -185,16 +185,15 @@ impl<'a> Binder<'a> {
             Some(source) => self.bind_query(source),
             None => (LogicalPlan::Empty, Scope::default()),
         };
-        // A wildcard in the source projection (`SELECT *, y`) leaves the column
-        // count / positions indeterminate (wildcards aren't expanded), so
-        // neither the arity check nor positional relation-lineage can trust the
-        // visible outputs. Carried on `source_wildcard`; the arity check and the
-        // lineage walker both skip when set, it words the diagnostic below, and
-        // a column-list-less INSERT can't fill from the catalog under it (next).
-        let source_wildcard = insert
-            .source
-            .as_ref()
-            .is_some_and(|q| source_has_wildcard(q));
+        // An *unexpanded* wildcard in the source projection (`SELECT *, y`
+        // whose `*` couldn't expand) leaves the column count / positions
+        // indeterminate, so neither the arity check nor positional
+        // relation-lineage can trust the visible outputs. Carried on
+        // `source_wildcard`; the arity check and the lineage walker both skip
+        // when set, it words the diagnostic below, and a column-list-less
+        // INSERT can't fill from the catalog under it (next). An expanded
+        // wildcard is just columns — the pairing proceeds.
+        let source_wildcard = insert.source.is_some() && !scope.outputs_complete;
         // The written column list: an explicit list wins — an `(a, b)` list, or
         // an inline-view target's plain-column projection — otherwise a
         // column-less INSERT fills from the target's catalog columns (reusing
@@ -203,11 +202,11 @@ impl<'a> Binder<'a> {
         // `canonical_quote` dictates), not re-wrapped as plain identifiers — so a
         // case-exact column like `"MyCol"` surfaces quoted and matches both the
         // catalog (→ `Cataloged`, not `Inferred`) and a user's own quoted
-        // reference. But a wildcard source has indeterminate arity — the `*`
-        // isn't in `query_outputs`, so the visible count is too low — and the
-        // catalog columns can't be positionally paired: leave the list empty so
-        // the drop + flag guard below fires rather than mis-truncating to the
-        // undercounted outputs.
+        // reference. But a source with an *unexpanded* wildcard has
+        // indeterminate arity — the suppressed `*` isn't in `query_outputs`,
+        // so the visible count is too low — and the catalog columns can't be
+        // positionally paired: leave the list empty so the drop + flag guard
+        // below fires rather than mis-truncating to the undercounted outputs.
         let explicit: Vec<Ident> = if !insert.columns.is_empty() {
             // `Insert::columns` is `Vec<ObjectName>`; a target column is named
             // by its final identifier part (mirrors the MERGE-insert path).
@@ -532,7 +531,13 @@ impl<'a> Binder<'a> {
                     let mut scope = self.target_scope(target);
                     scope.relations.push(Relation::Derived {
                         alias: Some(Ident::new("excluded")),
-                        columns: columns.to_vec(),
+                        // A synthetic pseudo-relation, not a positional
+                        // producer — never `complete` (nothing expands over
+                        // the conflict scope anyway).
+                        columns: Exposed {
+                            slots: columns.iter().cloned().map(Some).collect(),
+                            complete: false,
+                        },
                     });
                     (
                         scope,
@@ -688,6 +693,7 @@ impl<'a> Binder<'a> {
             scope.relations.extend(uscope.relations);
             input = combine(input, node);
         }
+        let using_relations = scope.relations.len();
         for twj in from_tables {
             if from_is_target {
                 // The FROM relations are the deletion targets, in scope for the
@@ -717,6 +723,17 @@ impl<'a> Binder<'a> {
             if let Some(target) = self.resolve_delete_target(name, &scope) {
                 targets.push(target);
             }
+        }
+        // The clauses see the target relations *first*: PostgreSQL's
+        // `DELETE FROM t USING s RETURNING *` yields t's columns then s's
+        // (verified on PostgreSQL 17), and the UPDATE scope is already
+        // target-first — only the *binding* above had to run USING-first (so
+        // a target alias can resolve). Rotating the freshly-bound target
+        // block ahead changes nothing for name resolution (candidates are
+        // gathered scope-wide, not first-match); only positional consumers —
+        // a `RETURNING *` expansion — see the order.
+        if from_is_target {
+            scope.relations.rotate_left(using_relations);
         }
         // WHERE + the MySQL `ORDER BY` / `LIMIT` tail are filter-position reads
         // (row selection / positioning / count), none feeding lineage. ORDER BY
@@ -1307,18 +1324,20 @@ impl<'a> Binder<'a> {
 
     /// Bind a `RETURNING` clause's projected columns against `scope` — a value
     /// projection over the written relation, like a SELECT list, so each item
-    /// contributes target reads and a `QueryOutput` lineage edge. A wildcard is
-    /// suppressed (its diagnostic is a later brick).
+    /// contributes target reads and a `QueryOutput` lineage edge. A
+    /// `RETURNING *` expands like a projection wildcard (a cataloged target
+    /// yields one item — a target read — per column); an unexpandable one
+    /// stays suppressed. Positional completeness isn't consumed here — a
+    /// RETURNING list pairs with nothing — so the flag is dropped.
     pub(super) fn bind_returning(
         &mut self,
         returning: &Option<Vec<SelectItem>>,
         scope: &Scope,
     ) -> Vec<NamedExpr> {
-        returning
-            .iter()
-            .flatten()
-            .flat_map(|item| self.bind_select_item(item, scope))
-            .collect()
+        match returning {
+            Some(items) => self.bind_output_items(items, scope).0,
+            None => Vec::new(),
+        }
     }
 
     /// `CREATE TABLE dst AS <query>` (CTAS): the source query's reads, paired
@@ -1377,9 +1396,9 @@ impl<'a> Binder<'a> {
                 source_wildcard: false,
             });
         };
-        let (input, _) = self.bind_query(query);
+        let (input, scope) = self.bind_query(query);
         let columns: Vec<Ident> = create.columns.iter().map(|c| c.name.clone()).collect();
-        let source_wildcard = source_has_wildcard(query);
+        let source_wildcard = !scope.outputs_complete;
         self.diagnose_created_columns(&target, &columns, &input, source_wildcard);
         LogicalPlan::CreateTableAs(CreateTableAs {
             target: TableWrite {
@@ -1402,9 +1421,9 @@ impl<'a> Binder<'a> {
         };
         let m = self.table_match(&written);
         let target = m.table;
-        let (input, _) = self.bind_query(&create.query);
+        let (input, scope) = self.bind_query(&create.query);
         let columns: Vec<Ident> = create.columns.iter().map(|c| c.name.clone()).collect();
-        let source_wildcard = source_has_wildcard(&create.query);
+        let source_wildcard = !scope.outputs_complete;
         self.diagnose_created_columns(&target, &columns, &input, source_wildcard);
         LogicalPlan::CreateView(CreateView {
             target: TableWrite {
@@ -1431,8 +1450,8 @@ impl<'a> Binder<'a> {
         };
         let m = self.table_match(&written);
         let target = m.table;
-        let (input, _) = self.bind_query(query);
-        let source_wildcard = source_has_wildcard(query);
+        let (input, scope) = self.bind_query(query);
+        let source_wildcard = !scope.outputs_complete;
         self.diagnose_created_columns(&target, columns, &input, source_wildcard);
         LogicalPlan::CreateView(CreateView {
             target: TableWrite {
@@ -1546,37 +1565,6 @@ fn view_target_columns(projection: &[SelectItem]) -> Vec<Ident> {
         }
     }
     columns
-}
-
-/// Whether a query's output projection contains an (unexpanded) wildcard
-/// (`*` / `t.*`), anywhere a set operation's branches or a parenthesised
-/// subquery reach. An INSERT source with one has an indeterminate column count
-/// / positions, so positional pairing with the target columns can't be trusted
-/// (see [`Insert::source_wildcard`](super::super::logical_plan::Insert)). The
-/// `SetExpr` / `SelectItem` matches are exhaustive so a new variant forces a
-/// decision here.
-fn source_has_wildcard(query: &Query) -> bool {
-    fn body_has_wildcard(body: &SetExpr) -> bool {
-        match body {
-            SetExpr::Select(select) => select.projection.iter().any(|item| match item {
-                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => true,
-                SelectItem::UnnamedExpr(_)
-                | SelectItem::ExprWithAlias { .. }
-                | SelectItem::ExprWithAliases { .. } => false,
-            }),
-            SetExpr::Query(q) => body_has_wildcard(&q.body),
-            SetExpr::SetOperation { left, right, .. } => {
-                body_has_wildcard(left) || body_has_wildcard(right)
-            }
-            SetExpr::Values(_)
-            | SetExpr::Insert(_)
-            | SetExpr::Update(_)
-            | SetExpr::Delete(_)
-            | SetExpr::Merge(_)
-            | SetExpr::Table(_) => false,
-        }
-    }
-    body_has_wildcard(&query.body)
 }
 
 /// The target table of a query's leading `SELECT … INTO t`, if any. `INTO`

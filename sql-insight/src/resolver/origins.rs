@@ -159,6 +159,14 @@ pub(super) fn origins_of_expr<'a>(
         // boolean transformation of it, like `a IN (list)`. The subquery's
         // columns are a membership test (filter), contributing no origin.
         Expr::InSubquery { expr, .. } => transform(origins_of_expr(expr, input, context)),
+        // A wildcard-expanded slot over a derived relation: trace the
+        // producer's `index`-th output — position, not name, so a duplicate /
+        // anonymous output name in the producer can't misattribute.
+        Expr::DerivedSlot {
+            qualifier,
+            index,
+            name,
+        } => origins_of_slot(input, qualifier.as_ref(), *index, name.as_ref(), context),
         // Tests / suppressed operands contribute no value origin (reads only).
         Expr::Exists(_) | Expr::Filter(_) => Vec::new(),
     }
@@ -181,6 +189,107 @@ fn origins_of_ref<'a>(
         // A lambda parameter is a local with no base column — no origin.
         Binding::Local => Vec::new(),
     }
+}
+
+/// The origins of a wildcard-expanded slot ([`Expr::DerivedSlot`]): find the
+/// derived relation the slot was minted against — walking the producing
+/// operator tree exactly like [`origins_into`], with the same qualifier
+/// guards at the relation boundaries — then trace its `index`-th output
+/// positionally ([`trace_nth_output`], fanning across set-operation
+/// branches). A VALUES-backed relation has no base columns to collapse to, so
+/// a *named* slot becomes the synthetic `alias.name` source (mirroring the
+/// named trace) and an anonymous one contributes nothing (no name to
+/// fabricate).
+///
+/// A slot with no qualifier was minted against an *unaliased* derived table —
+/// expansion only allows that as the scope's sole relation, so the inline
+/// `Projection` / `SetOp` reached here is unambiguously the producer.
+fn origins_of_slot<'a>(
+    op: &'a LogicalPlan,
+    qualifier: Option<&Ident>,
+    index: usize,
+    name: Option<&Ident>,
+    context: &mut TraceContext<'a>,
+) -> Vec<(ColumnRead, ColumnLineageKind)> {
+    match op {
+        // The unaliased producer reached inline (no relation boundary to match
+        // a qualifier against). A qualified slot never claims here — its
+        // producer sits behind a `SubqueryAlias` / `CteRef` boundary below.
+        LogicalPlan::Projection(_) | LogicalPlan::SetOp(_) => {
+            if qualifier.is_some() {
+                return Vec::new();
+            }
+            trace_nth_output(&output_operands(op), index, context)
+        }
+        LogicalPlan::Aggregate(a) => origins_of_slot(&a.input, qualifier, index, name, context),
+        LogicalPlan::Filter(f) => origins_of_slot(&f.input, qualifier, index, name, context),
+        LogicalPlan::Sort(s) => origins_of_slot(&s.input, qualifier, index, name, context),
+        LogicalPlan::Join(j) => {
+            let mut o = origins_of_slot(&j.left, qualifier, index, name, context);
+            o.extend(origins_of_slot(&j.right, qualifier, index, name, context));
+            o
+        }
+        LogicalPlan::SubqueryAlias(sa) => {
+            if !qualifier.is_none_or(|q| context.eq_alias(q, &sa.alias)) {
+                Vec::new()
+            } else if values_backed(&sa.input) {
+                slot_synthetic_source(&sa.alias, name)
+            } else {
+                trace_nth_output(&output_operands(&sa.input), index, context)
+            }
+        }
+        LogicalPlan::With(w) => context.with_decls(&w.ctes, |context| {
+            origins_of_slot(&w.body, qualifier, index, name, context)
+        }),
+        // A `CteRef` boundary: only the reference whose exposed name the
+        // qualifier matches descends (same guard as the named trace, so a
+        // self-join of one CTE doesn't duplicate the edge). `output_operands`
+        // + `Operand::trace` register the body's own `WITH` declarations.
+        LogicalPlan::CteRef(r) => {
+            let exposed = r.alias.as_ref().unwrap_or(&r.name);
+            if !qualifier.is_none_or(|q| context.eq_alias(q, exposed)) {
+                return Vec::new();
+            }
+            context
+                .enter_cte(&r.name, |context, body| {
+                    if values_backed(body) {
+                        slot_synthetic_source(&r.name, name)
+                    } else {
+                        trace_nth_output(&output_operands(body), index, context)
+                    }
+                })
+                .unwrap_or_default()
+        }
+        // A table function reached here is always a walked-past join side:
+        // expansion never mints a slot over one (its shape is unknown), and a
+        // qualifier naming both it and the slot's own derived relation would
+        // have failed the unique-match guard at expansion. Nothing to claim.
+        // Not positional producers otherwise: a raw scan / row set on a
+        // walked-past join side, and DML / DDL roots.
+        LogicalPlan::TableFunction(_)
+        | LogicalPlan::Scan(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty => Vec::new(),
+        LogicalPlan::Insert(_)
+        | LogicalPlan::Update(_)
+        | LogicalPlan::Delete(_)
+        | LogicalPlan::Merge(_)
+        | LogicalPlan::CreateTableAs(_)
+        | LogicalPlan::CreateView(_)
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => Vec::new(),
+    }
+}
+
+/// The synthetic `table.name` source of a slot at an untraceable boundary
+/// (VALUES-backed / opaque) — nothing for an anonymous slot: there is no name
+/// to surface and fabricating one would misreport.
+fn slot_synthetic_source(
+    table: &Ident,
+    name: Option<&Ident>,
+) -> Vec<(ColumnRead, ColumnLineageKind)> {
+    name.map(|n| vec![(synthetic_source(table, n), ColumnLineageKind::Passthrough)])
+        .unwrap_or_default()
 }
 
 /// Whether a (sub)plan's rows are synthesised by `VALUES` (peeling the clause
@@ -449,6 +558,10 @@ pub(super) fn conflict_value_origins<'a>(
         Expr::InSubquery { expr, .. } => {
             transform(conflict_value_origins(expr, columns, source, context))
         }
+        // A conflict scope holds no derived relations besides `EXCLUDED`
+        // (handled as a named `Derived` ref above), so an expanded slot can't
+        // occur here — trace it like any value for completeness.
+        Expr::DerivedSlot { .. } => origins_of_expr(value, source, context),
         Expr::Exists(_) | Expr::Filter(_) => Vec::new(),
     }
 }

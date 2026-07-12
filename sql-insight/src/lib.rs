@@ -117,17 +117,26 @@
 //! Intentional non-support and known gaps — set expectations before
 //! relying on a given output:
 //!
-//! - **Wildcards not expanded**: the `*` / `t.*` itself contributes
-//!   nothing to `reads` / `lineage` (expanding it safely would require
-//!   modelling USING / NATURAL JOIN merge, EXCLUDE / EXCEPT / RENAME, and
-//!   multi-level aliases — too much rigor for a SQL-text-only library).
-//!   Surfaced as
+//! - **Wildcards expand only when complete**: a `*` / `t.*` whose columns
+//!   are *fully* known — a cataloged table, or a derived table / CTE whose
+//!   output slots the SQL text itself determines — expands into per-column
+//!   outputs, exactly as if the list were written at the `*` (one read per
+//!   expanded column per occurrence, lineage, determinate positions).
+//!   Anything less than fully known keeps the wildcard unexpanded
+//!   (all-or-nothing per wildcard — never a partial expansion posing as the
+//!   whole set): a catalog-free / unmatched table, an opaque table
+//!   function, a derived body whose own wildcard didn't expand, a bare `*`
+//!   over `USING` / `NATURAL` merge columns (their coalesced positions
+//!   depend on join structure), or any wildcard modifier (`EXCLUDE` /
+//!   `EXCEPT` / `RENAME` / `REPLACE` / `ILIKE` — expanding while ignoring
+//!   one would misreport). An unexpanded wildcard contributes nothing to
+//!   `reads` / `lineage` and is surfaced as
 //!   [`WildcardSuppressed`](diagnostic::ColumnLevelDiagnosticKind::WildcardSuppressed)
-//!   so consumers can detect incomplete projections. A `REPLACE (expr AS
-//!   col)` clause *is* extracted — each replacement's `expr` contributes
-//!   reads and a `col` lineage edge, exactly like a standalone `expr AS col`
-//!   — but its **output position** is best-effort, since the wildcard's own
-//!   columns aren't enumerated to place it among them.
+//!   so consumers can detect the incomplete projection. A `REPLACE (expr AS
+//!   col)` clause *is* extracted even then — each replacement's `expr`
+//!   contributes reads and a `col` lineage edge, exactly like a standalone
+//!   `expr AS col` — but its **output position** is best-effort, since the
+//!   suppressed wildcard's columns aren't enumerated to place it among them.
 //! - **Table functions are opaque**: `UNNEST` / `generate_series` /
 //!   `JSON_TABLE` / `PIVOT` etc. produce dynamic columns that aren't
 //!   enumerated. Their argument expressions surface as reads, but a

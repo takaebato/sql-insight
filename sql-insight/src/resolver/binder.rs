@@ -208,8 +208,9 @@ impl<'a> Binder<'a> {
     /// INSERT / MERGE-INSERT whose target columns couldn't be determined, so
     /// its column-level `writes` / `lineage` are dropped (the table still
     /// surfaces in `table_writes`). The message names the actual cause: a
-    /// `SELECT *` source can't be paired even *with* a catalog (its arity is
-    /// unknown), so blaming a missing catalog there would mislead — that's
+    /// source whose `SELECT *` **couldn't be expanded** has an unknown arity,
+    /// so it can't be paired regardless of the target's catalog entry —
+    /// blaming a missing catalog there would mislead; that wording is
     /// reserved for a determinate source with no catalog to fill the target.
     pub(super) fn record_insert_columns_unresolved(
         &mut self,
@@ -218,7 +219,7 @@ impl<'a> Binder<'a> {
     ) {
         let message = if source_wildcard {
             format!(
-                "column-list-less INSERT into `{target}`: the `SELECT *` source isn't expanded, so its columns can't be paired with the target — column writes / lineage dropped"
+                "column-list-less INSERT into `{target}`: the source's `SELECT *` couldn't be expanded, so its columns can't be paired with the target — column writes / lineage dropped"
             )
         } else {
             format!(
@@ -253,8 +254,8 @@ impl<'a> Binder<'a> {
 
     /// Record an `InsertColumnsUnresolved` diagnostic for a BigQuery
     /// `MERGE … WHEN NOT MATCHED THEN INSERT ROW`: it inserts the full source
-    /// row, whose column pairing isn't recoverable from SQL text (and a catalog
-    /// wouldn't help — the source columns aren't expanded), so its column-level
+    /// row — there is no projection wildcard to expand, and the row's column
+    /// pairing isn't recoverable from SQL text — so its column-level
     /// `writes` / `lineage` are dropped. The target still surfaces in
     /// `table_writes` and feeds `table_lineage`.
     pub(super) fn record_merge_insert_row_unresolved(&mut self, target: &TableReference) {

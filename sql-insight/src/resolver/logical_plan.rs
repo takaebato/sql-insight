@@ -219,13 +219,14 @@ pub(crate) struct Values {
 /// `Derived` ref qualified `excluded`, traced to the source's like-positioned
 /// output column.
 ///
-/// `source_wildcard` flags that the source projection contains an (unexpanded)
-/// wildcard (`SELECT *, y`): its column count and positions are then
-/// indeterminate, so positional pairing with `columns` would mis-attribute and
-/// the arity check would mis-fire. The relation-lineage walker and the arity
-/// check skip when it is set — the target columns still surface as `writes`,
-/// the `WildcardSuppressed` diagnostic signals the gap, matching a pure
-/// `SELECT *` source (which yields no operands to pair at all).
+/// `source_wildcard` flags that the source projection **kept an unexpanded
+/// wildcard** (`SELECT *, y` whose `*` couldn't expand): its column count and
+/// positions are then indeterminate, so positional pairing with `columns`
+/// would mis-attribute and the arity check would mis-fire. The
+/// relation-lineage walker and the arity check skip when it is set — the
+/// target columns still surface as `writes`, the `WildcardSuppressed`
+/// diagnostic signals the gap. An *expanded* wildcard is just columns
+/// (determinate positions), so it does not set this.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Insert {
     pub(crate) target: TableWrite,
@@ -422,6 +423,23 @@ pub(crate) enum Expr {
     /// — each a `Passthrough` read / origin (one per side, not an ambiguous
     /// `table: None`).
     Fanin(Vec<BoundColumn>),
+    /// A wildcard-expansion-synthesized reference to the `index`-th output
+    /// slot of the derived relation exposed as `qualifier` — **positional by
+    /// construction** (the expansion enumerates the producer's slots), so a
+    /// duplicate output name (`SELECT o.id, c.id` in the producer) or an
+    /// anonymous one can't misattribute the trace the way a name-keyed
+    /// `Derived` lookup would. Never minted for written SQL: a *written*
+    /// reference resolves by name (`Expr::Column`). Like any `Derived` ref it
+    /// is not a read (the physical read is counted at the inner producer);
+    /// `origins` traces it to the producer's `index`-th output.
+    DerivedSlot {
+        qualifier: Option<Ident>,
+        index: usize,
+        /// The slot's exposed output name, if any — used only for the
+        /// synthetic source at an untraceable boundary (a VALUES-backed
+        /// relation), never for resolution.
+        name: Option<Ident>,
+    },
 }
 
 /// Structural accessors over an [`Expr`]: which sub-expressions and sub-plans
@@ -459,7 +477,8 @@ impl Expr {
             | Expr::Subquery { .. }
             | Expr::Exists(_)
             | Expr::Filter(_)
-            | Expr::Fanin(_) => Vec::new(),
+            | Expr::Fanin(_)
+            | Expr::DerivedSlot { .. } => Vec::new(),
         }
     }
 
@@ -476,7 +495,8 @@ impl Expr {
             | Expr::Subquery { .. }
             | Expr::Exists(_)
             | Expr::InSubquery { .. }
-            | Expr::Fanin(_) => Vec::new(),
+            | Expr::Fanin(_)
+            | Expr::DerivedSlot { .. } => Vec::new(),
         }
     }
 
@@ -500,7 +520,8 @@ impl Expr {
             | Expr::Exists(_)
             | Expr::InSubquery { .. }
             | Expr::Filter(_)
-            | Expr::Fanin(_) => Vec::new(),
+            | Expr::Fanin(_)
+            | Expr::DerivedSlot { .. } => Vec::new(),
         }
     }
 
@@ -517,7 +538,8 @@ impl Expr {
             | Expr::Window { .. }
             | Expr::Subquery { .. }
             | Expr::Filter(_)
-            | Expr::Fanin(_) => Vec::new(),
+            | Expr::Fanin(_)
+            | Expr::DerivedSlot { .. } => Vec::new(),
         }
     }
 }

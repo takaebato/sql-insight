@@ -4,6 +4,27 @@ mod set_operations {
     use super::*;
 
     #[test]
+    fn pipe_operator_over_a_set_operation_body() {
+        // A pipe chain over a set-operation body runs in an outputs-only
+        // scope (no single relation to resolve against); a `|> LIMIT` is a
+        // constant filter, so the union's reads / lineage pass through
+        // unchanged.
+        assert_column_ops(
+            "SELECT t1.a FROM t1 UNION ALL SELECT t2.b FROM t2 |> LIMIT 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a"), read("t2", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t1", "a"), out("a", 0)),
+                    passthrough(col("t2", "b"), out("a", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn union_two_branches_target_left_branch_name() {
         // A set operation has one result schema whose column names come from
         // the LEFT branch (SQL's conventional rule). Both branches' projections
@@ -590,6 +611,27 @@ mod join_using_and_natural {
                 lineage: vec![
                     passthrough(col("s", "a"), out("id", 0)),
                     passthrough(col("t", "id"), out("id", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn natural_join_derived_sides_merge_on_exposed_columns() {
+        // NATURAL's merge set is the intersection of both sides' *known*
+        // columns — a derived table's exposed slot view supplies them
+        // catalog-free, so the schema-common `k` fans in to both producers
+        // (traced through each subquery to its base column).
+        assert_column_ops(
+            "SELECT k FROM (SELECT k, a FROM t) d NATURAL JOIN (SELECT k, b FROM u) e",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![col("t", "k"), col("t", "a"), col("u", "k"), col("u", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "k"), out("k", 0)),
+                    passthrough(col("u", "k"), out("k", 0)),
                 ],
                 diagnostics: vec![],
             },

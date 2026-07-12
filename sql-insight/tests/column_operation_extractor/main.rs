@@ -15,4 +15,5 @@ mod joins_sets;
 mod lineage;
 mod reads_semantics;
 mod resolution;
+mod wildcard_expansion;
 mod writes_deletes;

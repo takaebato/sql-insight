@@ -113,7 +113,7 @@ impl<'a> Binder<'a> {
             // A derived relation owns the column iff it exposes it (confirmed
             // witness, like a Cataloged table); the origin traversal collapses it.
             Relation::Derived { columns, .. } => {
-                self.list_has(columns, name).then_some(Binding::Derived)
+                self.exposed_has(columns, name).then_some(Binding::Derived)
             }
             // A table function's columns are opaque — a bare name is not
             // claimed by it (stays resolvable against real tables).
@@ -195,7 +195,7 @@ impl<'a> Binder<'a> {
                 ..
             } => Some(base(table, ResolutionKind::Inferred)),
             Relation::Derived { columns, .. } => {
-                self.list_has(columns, name).then_some(Binding::Derived)
+                self.exposed_has(columns, name).then_some(Binding::Derived)
             }
             // A ref qualified by a table function's alias resolves to it: a
             // `Derived` binding the traversal turns into the synthetic
@@ -303,6 +303,14 @@ impl<'a> Binder<'a> {
     pub(super) fn list_has(&self, columns: &[Ident], name: &Ident) -> bool {
         columns
             .iter()
+            .any(|c| self.eq(self.style.casing.column, c, name))
+    }
+
+    /// Whether a derived relation's exposed slot view names `name`
+    /// (case-folded) — the [`Exposed`] counterpart of [`list_has`](Self::list_has).
+    pub(super) fn exposed_has(&self, columns: &Exposed, name: &Ident) -> bool {
+        columns
+            .names()
             .any(|c| self.eq(self.style.casing.column, c, name))
     }
 

@@ -142,6 +142,55 @@ fold-equivalent spellings (`users` vs `USERS`), `identity_key` /
 `same_table` / `same_column` fold by a dialect's casing; the key is opaque
 so the folded text never surfaces.
 
+### Wildcard expansion
+
+A projection wildcard (`*` / `t.*`) expands at bind time into per-column
+output items — exactly as if the column list were written at the `*` — but
+only **completely** (all-or-nothing per wildcard): a partial expansion would
+present an incomplete set as the whole one, so anything not fully known keeps
+the wildcard unexpanded, contributing nothing and flagged
+`WildcardSuppressed` (whose meaning is precisely "this wildcard could not be
+expanded"). Two knowledge sources qualify:
+
+- **A cataloged table** expands each catalog column as a pinned
+  `Base { Cataloged }` read in canonical (quoted) form — the same form the
+  write-side catalog fill uses, since the column has no written token. Each
+  synthesized identifier carries the *wildcard token's span*, so the
+  source-ordered surfaces place the whole block at the `*`, in schema order
+  (the facade's sort is stable).
+- **A derived table / CTE** whose slot view is complete. `Scope` tracks
+  `outputs_complete` (false while an unexpanded wildcard remains) and
+  `exposed()` hands a parent the slot view (`Exposed { slots, complete }`,
+  one `Option<Ident>` per position — an anonymous output holds its position
+  namelessly rather than being dropped). Expanded slots bind as
+  `Expr::DerivedSlot { qualifier, index }` — **positional by construction**,
+  so a duplicate output name (`SELECT o.id, c.id` inside) or an anonymous
+  one can't misattribute the trace the way a name-keyed `Derived` lookup
+  would; `origins` traces the producer's `index`-th output
+  (`trace_nth_output`, fanning across set-operation branches). Written
+  references keep name-keyed resolution — position is knowledge only the
+  expansion has.
+
+The `reads` consequence is occurrence-based, as always: one read per
+expanded column *per wildcard occurrence*; a derived-relation slot is no
+read at all (`Derived` drop — the physical read was counted inside the
+producer), so expansion can never fabricate reads. Expansion feeding a DML
+source also makes `source_wildcard` mean "an *unexpanded* wildcard remains":
+an expanded source has determinate positions, so column-less INSERT
+catalog-fill, the arity checks, and positional relation lineage all proceed.
+
+What still refuses (the guards, each honest-by-construction): an `Unknown`
+table, an opaque table function, an incomplete derived view, a bare `*` over
+`USING` / `NATURAL` merge columns (the standard coalesces them into
+join-structure-dependent positions the flat `Scope` no longer encodes —
+`t.*` never coalesces, so it expands), any wildcard modifier (`EXCLUDE` /
+`EXCEPT` / `RENAME` / `REPLACE` / `ILIKE` / Redshift `AS` — expanding while
+ignoring one would misreport), a qualifier matching zero or several
+relations, and an *unaliased* derived relation that isn't the scope's sole
+relation (its slots would have no qualifier to trace by). Anonymous outputs
+never get fabricated names — engine auto-names are dialect-specific — they
+surface as `QueryOutput { name: None, position }`.
+
 ### Casing
 
 Identifier matching is dialect-aware (`crate::casing`), two orthogonal
@@ -179,14 +228,16 @@ and the flat list. All fall out of a pure walk of a clean tree.
 
 ## Deliberate non-goals
 
-- **Wildcards (`SELECT *`, `t.*`) are not expanded** — even with a catalog.
-  The rigor cost (USING / NATURAL merge, EXCLUDE / REPLACE / RENAME, CTE
-  column rename, multi-segment qualifiers) is too high for a SQL-text-only
-  library to get right. Wildcards contribute nothing to `reads` / `lineage`;
-  consumers needing per-column lineage supply resolved plans or expand
-  themselves.
-- **NATURAL JOIN is not expanded** (its merge set needs both schemas — same
-  reason as wildcards). `JOIN … USING (col)`, however, **fans in**: an
+- **No partial wildcard expansion, no fabricated names.** Expansion (see
+  "Wildcard expansion" above) is all-or-nothing per wildcard, never invents
+  an engine auto-name for an anonymous output, and refuses the cases whose
+  correct shape a SQL-text-only view can't reconstruct — a bare `*` over
+  merge columns (the standard's coalesced ordering needs the join tree) and
+  the wildcard modifiers. An unexpanded wildcard contributes nothing to
+  `reads` / `lineage` and is flagged; consumers needing more supply a
+  catalog or expand themselves.
+- **NATURAL JOIN's merge set needs both schemas** — a side with unknown
+  columns contributes no merge columns. `JOIN … USING (col)` **fans in**: an
   unqualified ref to a merge column resolves to *every* joined relation that
   could own it (one read / lineage source per side, not an ambiguous
   `table: None`). A catalog narrows the fan-in to declaring relations.

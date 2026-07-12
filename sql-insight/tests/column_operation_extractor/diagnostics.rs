@@ -335,12 +335,14 @@ mod reported {
 
     #[test]
     fn insert_with_wildcard_source_drops_lineage_and_skips_arity_diagnostic() {
-        // A wildcard in the source projection (`SELECT *, y`) makes the column
-        // count / positions indeterminate (wildcards aren't expanded), so the
-        // positional pairing can't be trusted: relation lineage is dropped and
-        // the arity check is skipped (no false `InsertColumnsArityMismatch`).
-        // The target columns still surface as `writes`, with `WildcardSuppressed`
-        // flagging the gap — matching a pure `SELECT *` source.
+        // An *unexpanded* wildcard in the source projection (`SELECT *, y`,
+        // catalog-free so the `*` can't expand) makes the column count /
+        // positions indeterminate, so the positional pairing can't be
+        // trusted: relation lineage is dropped and the arity check is skipped
+        // (no false `InsertColumnsArityMismatch`). The target columns still
+        // surface as `writes`, with `WildcardSuppressed` flagging the gap —
+        // matching a pure `SELECT *` source. (The expanded counterpart is
+        // pinned in `wildcard_expansion::dml_pairing`.)
         assert_column_ops(
             "INSERT INTO t (a, b) SELECT *, y FROM s",
             ColumnOperation {
