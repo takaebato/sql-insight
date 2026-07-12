@@ -656,6 +656,47 @@ mod on_conflict {
     }
 
     #[test]
+    fn pg_on_conflict_unqualified_reference_is_ambiguous() {
+        // An *unqualified* reference in the conflict action is contested
+        // between the existing target row and EXCLUDED — PostgreSQL 17 / 18
+        // reject it (`column reference "b" is ambiguous`), SQLite reads the
+        // target — so it surfaces `Ambiguous` (`table: None`), in both the
+        // SET RHS and the `DO UPDATE … WHERE` predicate. Qualify (`t.b` /
+        // `EXCLUDED.b`) to pin a side, as the neighbouring tests do.
+        assert_column_ops_with_dialect(
+            "INSERT INTO t (a, b) VALUES (1, 2) \
+             ON CONFLICT (a) DO UPDATE SET b = b + 1 WHERE b < 10",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![ambiguous("b"), ambiguous("b")],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
+                lineage: vec![transformation(ambiguous("b"), relation("t", "b"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn pg_on_conflict_target_qualified_reference_reads_the_target() {
+        // The target-qualified counterpart of the ambiguity test: `t.b` pins
+        // the existing row, so it is a plain target read (source/sink: the
+        // sink's own data is referenced) and a self-lineage edge.
+        assert_column_ops_with_dialect(
+            "INSERT INTO t (a, b) VALUES (1, 2) \
+             ON CONFLICT (a) DO UPDATE SET b = t.b + 1",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("t", "b")],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
+                lineage: vec![transformation(col("t", "b"), relation("t", "b"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn pg_on_conflict_do_update_set_subquery_value() {
         // DO UPDATE SET x = (SELECT max(y) FROM s): the conflict-action value is
         // a subquery — its column flows to the SET target (Transformation, via
