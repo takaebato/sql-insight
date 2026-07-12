@@ -260,18 +260,16 @@ fn origins_of_slot<'a>(
                 })
                 .unwrap_or_default()
         }
-        // Expansion never mints a slot over an opaque table function (its
-        // shape is unknown), so nothing to claim; listed for completeness with
-        // the same synthetic shape the named trace would give a named slot.
-        LogicalPlan::TableFunction(tf) => match &tf.alias {
-            Some(alias) if qualifier.is_none_or(|q| context.eq_alias(q, alias)) => {
-                slot_synthetic_source(alias, name)
-            }
-            _ => Vec::new(),
-        },
-        // Not positional producers: a raw scan / row set on a walked-past join
-        // side, and DML / DDL roots.
-        LogicalPlan::Scan(_) | LogicalPlan::Values(_) | LogicalPlan::Empty => Vec::new(),
+        // A table function reached here is always a walked-past join side:
+        // expansion never mints a slot over one (its shape is unknown), and a
+        // qualifier naming both it and the slot's own derived relation would
+        // have failed the unique-match guard at expansion. Nothing to claim.
+        // Not positional producers otherwise: a raw scan / row set on a
+        // walked-past join side, and DML / DDL roots.
+        LogicalPlan::TableFunction(_)
+        | LogicalPlan::Scan(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Empty => Vec::new(),
         LogicalPlan::Insert(_)
         | LogicalPlan::Update(_)
         | LogicalPlan::Delete(_)

@@ -489,6 +489,122 @@ mod derived_relations {
     }
 
     #[test]
+    fn slot_trace_walks_filter_join_and_scan_dead_ends() {
+        // The slot trace shares the named trace's walk: it passes the WHERE
+        // `Filter`, descends both `Join` sides, dead-ends on the base-table
+        // `Scan` (a scan claims no positional slot), and only the matching
+        // `CteRef` descends into the producer.
+        assert_column_ops(
+            "WITH d AS (SELECT a, b FROM s) \
+             SELECT d.* FROM u0 JOIN d ON u0.k = d.a WHERE u0.f > 0",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![col("s", "a"), col("s", "b"), col("u0", "k"), col("u0", "f")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("s", "a"), out("a", 0)),
+                    passthrough(col("s", "b"), out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn slot_trace_passes_the_outer_group_by_aggregate() {
+        // An outer GROUP BY layers an `Aggregate` between the projection and
+        // the derived boundary — the slot trace passes through it (the
+        // grouping key names an expanded output, a `Derived` clause ref, so
+        // it adds no read).
+        assert_column_ops(
+            "SELECT * FROM (SELECT a FROM t) d GROUP BY a",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![col("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn sibling_derived_tables_expand_without_cross_claims() {
+        // Each relation's slots descend only through the alias-matching
+        // boundary — the walk visits the sibling `SubqueryAlias` and rejects
+        // it on the qualifier, so no crossed edges.
+        assert_column_ops(
+            "SELECT * FROM (SELECT a FROM t) x, (SELECT b FROM u) y",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![col("t", "a"), col("u", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("u", "b"), out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn qualified_slots_skip_an_unaliased_sibling_producer() {
+        // `y.*` expands even though an *unaliased* derived sibling sits in
+        // scope (the sole-relation rule restricts only the unaliased
+        // relation's own expansion). Its inline `Projection` is reached on
+        // the walk and rejected — a qualified slot never claims a bare
+        // producer — so `y`'s slots reach only `u`.
+        assert_column_ops(
+            "SELECT y.* FROM (SELECT a FROM t), (SELECT b FROM u) AS y",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![col("t", "a"), col("u", "b")],
+                writes: vec![],
+                lineage: vec![passthrough(col("u", "b"), out("b", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn unaliased_derived_with_leading_with_expands() {
+        // An unaliased derived table binds its body inline — a leading WITH
+        // included. The slot trace registers the `With`'s declarations on
+        // the way down, so the body's CTE reference resolves.
+        assert_column_ops(
+            "SELECT * FROM (WITH w AS (SELECT a FROM t) SELECT a FROM w)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![col("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn values_backed_cte_slots_surface_synthetic_sources() {
+        // A VALUES-backed CTE has no base columns — an expanded slot's
+        // origin is the synthetic `v.<col>`, exactly like the derived-table
+        // form (`(VALUES …) AS v(a, b)`), through the `CteRef` boundary.
+        assert_column_ops(
+            "WITH v (a, b) AS (VALUES (1, 2)) SELECT * FROM v",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("v", "a"), out("a", 0)),
+                    passthrough(col("v", "b"), out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn one_cte_expands_under_each_alias() {
         // Two references to one CTE: each alias's `*` expands its own slots
         // and the trace descends only through the matching `CteRef` (no
@@ -967,6 +1083,35 @@ mod guards {
                 lineage: vec![],
                 diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
             },
+        );
+    }
+
+    #[test]
+    fn an_ilike_modifier_suppresses_expansion() {
+        // Snowflake `* ILIKE 'pattern'` filters the expanded set by name —
+        // unmodelled, so the wildcard stays unexpanded (same guard family as
+        // EXCLUDE).
+        use sql_insight::sqlparser::dialect::SnowflakeDialect;
+        let catalog = Catalog::new().table(CatalogTable::unqualified("T").columns(["A", "B"]));
+        let ops = extract_column_operations_with_options(
+            &SnowflakeDialect {},
+            "SELECT * ILIKE 'a%' FROM t",
+            ExtractorOptions::new().with_catalog(&catalog),
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        assert!(
+            ops.reads.is_empty(),
+            "suppressed → no reads: {:?}",
+            ops.reads
+        );
+        assert_eq!(
+            ops.diagnostics
+                .iter()
+                .map(|d| d.kind.clone())
+                .collect::<Vec<_>>(),
+            vec![ColumnLevelDiagnosticKind::WildcardSuppressed]
         );
     }
 
