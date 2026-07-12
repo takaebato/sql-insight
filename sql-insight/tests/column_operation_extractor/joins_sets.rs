@@ -798,6 +798,23 @@ mod values_as_relation {
     }
 
     #[test]
+    fn values_under_a_trailing_order_by_still_traces_cells() {
+        // A trailing ORDER BY / LIMIT layers clause nodes over the row set;
+        // the cell trace peels them to the `Values` underneath (the ordinal
+        // key is a constant, no read).
+        assert_column_ops(
+            "SELECT v.a FROM (VALUES ((SELECT max(y) FROM s)), (2) ORDER BY 1 LIMIT 1) AS v(a)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "y")],
+                writes: vec![],
+                lineage: vec![transformation(col("s", "y"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn values_subquery_cell_traces_to_its_real_columns() {
         // A non-literal cell is a real value path: `t.x` maps to position 0,
         // whose cell in the (sole) row is a scalar subquery — the edge

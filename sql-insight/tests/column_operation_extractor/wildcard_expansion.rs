@@ -584,6 +584,24 @@ mod derived_relations {
     }
 
     #[test]
+    fn unaliased_values_slots_trace_into_cells() {
+        // An unaliased `(VALUES …)` binds its row set inline (no
+        // `SubqueryAlias` boundary), so the slot trace claims the `Values`
+        // node directly — the subquery cell reaches its real column, the
+        // literal cell contributes nothing, and both slots stay anonymous.
+        assert_column_ops(
+            "SELECT * FROM (VALUES ((SELECT max(y) FROM s), 2))",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "y")],
+                writes: vec![],
+                lineage: vec![transformation(col("s", "y"), out_anon(0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn values_backed_cte_slots_trace_into_cells() {
         // Same through the `CteRef` boundary: the expansion succeeds (the
         // slot view is complete — no diagnostic), and the constant cells

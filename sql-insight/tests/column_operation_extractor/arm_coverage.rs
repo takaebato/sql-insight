@@ -1021,6 +1021,23 @@ mod relation_arm_coverage {
     }
 
     #[test]
+    fn derived_ref_walks_past_a_non_matching_table_function() {
+        // The named trace of `d.a` descends both join sides: the table
+        // function's alias (`u`) doesn't match the qualifier, so it claims
+        // nothing — only `d`'s producer answers.
+        assert_column_ops(
+            "SELECT d.a FROM UNNEST(x) AS u, (SELECT a FROM t) AS d",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![unresolved("x"), col("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn table_function_with_constant_arguments_has_no_lineage() {
         // Constant arguments contribute no origin, so the output column has
         // no lineage source — exactly like `SELECT 1 AS v`.
