@@ -613,13 +613,10 @@ mod on_conflict {
         assert_column_ops_inner(sql, 0, actual, expected);
     }
 
-    /// Construct a `ColumnRead` for the synthetic EXCLUDED
-    /// pseudo-table — used only as a Source in lineage edges, not
-    /// as a real table. The EXCLUDED binding inherits its
-    /// `output_columns` from the INSERT source's per-operand
-    /// projections; for VALUES sources (no projection captured) the
-    /// binding ends up with `output_columns: None`, so refs against
-    /// it can't be `Cataloged` and surface as `Inferred`.
+    /// Construct a `ColumnRead` for the EXCLUDED pseudo-table — a lineage
+    /// source only, never a read. It arises when the proposed row can't be
+    /// traced further (a `VALUES` source has no projection to map into), and
+    /// like every statement-materialized relation it is `Synthetic`.
     fn excluded(name: &str) -> ColumnRead {
         ColumnRead {
             reference: ColumnReference {
@@ -630,7 +627,7 @@ mod on_conflict {
                 }),
                 name: name.into(),
             },
-            resolution: ResolutionKind::Inferred,
+            resolution: ResolutionKind::Synthetic,
         }
     }
 

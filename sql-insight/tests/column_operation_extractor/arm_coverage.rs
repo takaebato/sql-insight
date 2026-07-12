@@ -1002,6 +1002,25 @@ mod relation_arm_coverage {
     }
 
     #[test]
+    fn table_function_output_is_a_synthetic_lineage_source() {
+        // A column projected through a table function's alias flows out as a
+        // lineage source, but the "table" is the alias of a relation the
+        // statement itself materializes — `Synthetic`, so it can't be
+        // mistaken for an (`Inferred`) read of a real table named `u`. The
+        // function argument (`t.arr`) is the ordinary base read.
+        assert_column_ops(
+            "SELECT u.x FROM t, UNNEST(t.arr) AS u",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "arr")],
+                writes: vec![],
+                lineage: vec![passthrough(synthetic("u", "x"), out("x", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn parameterized_table_function_is_opaque() {
         // `generate_series(1, 10) AS g` is a table-valued function, not a base
         // table: a reference through its alias (`g.value`) is a synthetic

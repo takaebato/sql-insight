@@ -567,24 +567,25 @@ pub(super) fn conflict_value_origins<'a>(
 }
 
 /// The `EXCLUDED.col` pseudo-table lineage source (when the source can't be
-/// collapsed through): the qualifier (`EXCLUDED`, original text) as the table.
+/// collapsed through): the qualifier (`EXCLUDED`, original text) as the
+/// table, [`Synthetic`](ResolutionKind::Synthetic) like every other
+/// statement-materialized relation. A conflict-scope `EXCLUDED` binding is
+/// always qualified (an unqualified reference demotes to `Ambiguous` at
+/// bind — engine parity), but fall back to the pseudo-table's own name
+/// rather than ever surfacing a `table: None` `Synthetic`.
 fn excluded_source(c: &BoundColumn) -> ColumnRead {
-    ColumnRead {
-        reference: ColumnReference {
-            table: c.qualifier.clone().map(|q| TableReference {
-                catalog: None,
-                schema: None,
-                name: q,
-            }),
-            name: c.name.clone(),
-        },
-        resolution: ResolutionKind::Inferred,
-    }
+    let table = c
+        .qualifier
+        .clone()
+        .unwrap_or_else(|| Ident::new("excluded"));
+    synthetic_source(&table, &c.name)
 }
 
-/// A synthetic single-segment lineage source `table.name` (`Inferred`) — for a
-/// table-function column, whose produced value flows out but has no base
-/// column to collapse to.
+/// A synthetic single-segment lineage source `table.name` — a column of a
+/// relation the statement itself materializes (a table function's output, a
+/// `VALUES` row set, `EXCLUDED`): its value flows out but there is no base
+/// column to collapse to and no persisted table behind the name, which
+/// [`Synthetic`](ResolutionKind::Synthetic) marks for the consumer.
 fn synthetic_source(table: &Ident, name: &Ident) -> ColumnRead {
     ColumnRead {
         reference: ColumnReference {
@@ -595,7 +596,7 @@ fn synthetic_source(table: &Ident, name: &Ident) -> ColumnRead {
             }),
             name: name.clone(),
         },
-        resolution: ResolutionKind::Inferred,
+        resolution: ResolutionKind::Synthetic,
     }
 }
 

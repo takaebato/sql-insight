@@ -794,8 +794,8 @@ mod values_as_relation {
                 reads: vec![],
                 writes: vec![],
                 lineage: vec![
-                    passthrough(read("t", "x"), out("x", 0)),
-                    passthrough(read("t", "y"), out("y", 1)),
+                    passthrough(synthetic("t", "x"), out("x", 0)),
+                    passthrough(synthetic("t", "y"), out("y", 1)),
                 ],
                 diagnostics: vec![],
             },
@@ -810,7 +810,7 @@ mod values_as_relation {
                 statement_kind: StatementKind::Select,
                 reads: vec![],
                 writes: vec![],
-                lineage: vec![passthrough(read("cte", "id"), out("id", 0))],
+                lineage: vec![passthrough(synthetic("cte", "id"), out("id", 0))],
                 diagnostics: vec![],
             },
         );
@@ -828,7 +828,7 @@ mod values_as_relation {
                 statement_kind: StatementKind::Select,
                 reads: vec![unresolved("a")],
                 writes: vec![],
-                lineage: vec![passthrough(read("v", "x"), out("x", 0))],
+                lineage: vec![passthrough(synthetic("v", "x"), out("x", 0))],
                 diagnostics: vec![],
             },
         );

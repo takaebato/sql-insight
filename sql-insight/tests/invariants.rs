@@ -9,7 +9,7 @@ use sql_insight::extractor::{
     ColumnTarget, StatementKind, TableOperation,
 };
 use sql_insight::sqlparser::dialect::GenericDialect;
-use sql_insight::{ColumnWrite, TableReference};
+use sql_insight::{ColumnWrite, ResolutionKind, TableReference};
 use std::collections::HashSet;
 
 /// Curated corpus chosen to stress the major shapes the resolver
@@ -44,6 +44,10 @@ fn corpus() -> &'static [&'static str] {
         "MERGE INTO t1 USING t2 ON t1.id = t2.id \
          WHEN MATCHED THEN UPDATE SET a = t2.a \
          WHEN NOT MATCHED THEN INSERT (id, a) VALUES (t2.id, t2.a)",
+        // Statement-materialized relations (synthetic lineage sources)
+        "SELECT u.col FROM t1, UNNEST(t1.arr) AS u",
+        "SELECT v.a FROM (VALUES (1, 'x')) AS v(a, b)",
+        "INSERT INTO t1 (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = EXCLUDED.a",
     ]
 }
 
@@ -225,4 +229,69 @@ fn writing_statements_emit_writes() {
             }
         }
     }
+}
+
+#[test]
+fn synthetic_resolution_is_confined_to_column_lineage_sources() {
+    // `Synthetic` marks a statement-materialized relation's column (a table
+    // function's output, a `VALUES` row set, `EXCLUDED`). Such a column is
+    // never a physical read, a write target, a lineage-target column, or a
+    // table-level reference — the *only* place it may appear is a column
+    // lineage source, and there it always names its relation (`table: Some`).
+    let mut synthetic_sources = 0;
+    for sql in corpus() {
+        for pair in extract_paired(sql) {
+            for r in &pair.col.reads {
+                assert_ne!(
+                    r.resolution,
+                    ResolutionKind::Synthetic,
+                    "synthetic read in SQL: {sql}"
+                );
+            }
+            for w in &pair.col.writes {
+                assert_ne!(
+                    w.resolution,
+                    ResolutionKind::Synthetic,
+                    "synthetic write in SQL: {sql}"
+                );
+            }
+            for e in &pair.col.lineage {
+                if let ColumnTarget::Relation(c) = &e.target {
+                    assert_ne!(
+                        c.resolution,
+                        ResolutionKind::Synthetic,
+                        "synthetic lineage target in SQL: {sql}"
+                    );
+                }
+                if e.source.resolution == ResolutionKind::Synthetic {
+                    synthetic_sources += 1;
+                    assert!(
+                        e.source.reference.table.is_some(),
+                        "a synthetic source names its relation, SQL: {sql}"
+                    );
+                }
+            }
+            for r in &pair.tab.reads {
+                assert_ne!(
+                    r.resolution,
+                    ResolutionKind::Synthetic,
+                    "synthetic table read in SQL: {sql}"
+                );
+            }
+            for w in &pair.tab.writes {
+                assert_ne!(
+                    w.resolution,
+                    ResolutionKind::Synthetic,
+                    "synthetic table write in SQL: {sql}"
+                );
+            }
+        }
+    }
+    // The corpus carries synthetic producers (UNNEST / VALUES / EXCLUDED),
+    // so the invariant must have been exercised, not vacuously true.
+    assert!(
+        synthetic_sources >= 3,
+        "expected the synthetic-producer corpus entries to emit synthetic \
+         sources, saw {synthetic_sources}"
+    );
 }

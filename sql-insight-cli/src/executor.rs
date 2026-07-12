@@ -337,6 +337,7 @@ fn resolution_marker(resolution: ResolutionKind) -> &'static str {
         ResolutionKind::Cataloged => " (cataloged)",
         ResolutionKind::Ambiguous => " (ambiguous)",
         ResolutionKind::Unresolved => " (unresolved)",
+        ResolutionKind::Synthetic => " (synthetic)",
     }
 }
 

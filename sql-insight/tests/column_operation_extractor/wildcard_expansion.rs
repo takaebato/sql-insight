@@ -440,8 +440,8 @@ mod derived_relations {
                 reads: vec![],
                 writes: vec![],
                 lineage: vec![
-                    passthrough(col("v", "a"), out("a", 0)),
-                    passthrough(col("v", "b"), out("b", 1)),
+                    passthrough(synthetic("v", "a"), out("a", 0)),
+                    passthrough(synthetic("v", "b"), out("b", 1)),
                 ],
                 diagnostics: vec![],
             },
@@ -596,8 +596,8 @@ mod derived_relations {
                 reads: vec![],
                 writes: vec![],
                 lineage: vec![
-                    passthrough(col("v", "a"), out("a", 0)),
-                    passthrough(col("v", "b"), out("b", 1)),
+                    passthrough(synthetic("v", "a"), out("a", 0)),
+                    passthrough(synthetic("v", "b"), out("b", 1)),
                 ],
                 diagnostics: vec![],
             },
