@@ -552,14 +552,31 @@ impl<'a> Binder<'a> {
         };
         // A conflict-action SET always targets the insert target's own columns
         // (no other writable relations, hence the empty candidate set).
-        let bound = assignments
+        let mut bound: Vec<Assignment> = assignments
             .iter()
             .flat_map(|a| self.bind_assignment(a, &scope, target, &[]))
             .collect();
-        let predicate = selection
+        let mut predicate: Vec<Expr> = selection
             .map(|s| self.bind_expr(s, &scope))
             .into_iter()
             .collect();
+        // PostgreSQL parity: an *unqualified* reference in the conflict action
+        // is contested between the existing target row and `EXCLUDED` — PG 17 / 18
+        // reject it (`column reference "b" is ambiguous`; SQLite instead reads
+        // the target), so no single attribution is right and it surfaces
+        // `Ambiguous`, matching what the catalog-aware bind already produces
+        // (target + EXCLUDED are then two confirming witnesses). The generic
+        // scope resolution instead lets the `EXCLUDED` exposure win as the sole
+        // witness over a catalog-free (`Unknown`) target — demote exactly those
+        // bindings: in this scope an unqualified `Derived` can only be
+        // `EXCLUDED` (the sole derived relation). Qualified references
+        // (`EXCLUDED.b` / `t.b`) keep their binding.
+        for a in &mut bound {
+            demote_unqualified_excluded(&mut a.value);
+        }
+        for p in &mut predicate {
+            demote_unqualified_excluded(p);
+        }
         (bound, predicate)
     }
 
@@ -1565,6 +1582,53 @@ fn view_target_columns(projection: &[SelectItem]) -> Vec<Ident> {
         }
     }
     columns
+}
+
+/// Demote an unqualified conflict-scope reference that resolved to `EXCLUDED`
+/// (an unqualified `Binding::Derived` — `EXCLUDED` is the scope's sole derived
+/// relation) to [`Binding::Ambiguous`] — see the call in
+/// [`Binder::bind_conflict`] for the engine-verified rationale. The walk stays
+/// on the expression's **own** operands: a nested subquery owns its own scope,
+/// so its bindings are left alone. The `Expr` match is exhaustive so a new
+/// variant forces a decision here.
+fn demote_unqualified_excluded(expr: &mut Expr) {
+    match expr {
+        Expr::Column(c) => {
+            if c.qualifier.is_none() && matches!(c.binding, Binding::Derived) {
+                c.binding = Binding::Ambiguous;
+            }
+        }
+        Expr::Call { args } => args.iter_mut().for_each(demote_unqualified_excluded),
+        Expr::Case {
+            when,
+            then,
+            else_result,
+        } => {
+            when.iter_mut()
+                .chain(then.iter_mut())
+                .for_each(demote_unqualified_excluded);
+            if let Some(e) = else_result {
+                demote_unqualified_excluded(e);
+            }
+        }
+        Expr::Window {
+            arg,
+            partition,
+            order,
+        } => {
+            demote_unqualified_excluded(arg);
+            partition
+                .iter_mut()
+                .chain(order.iter_mut())
+                .for_each(demote_unqualified_excluded);
+        }
+        Expr::InSubquery { expr, .. } => demote_unqualified_excluded(expr),
+        Expr::Filter(exprs) => exprs.iter_mut().for_each(demote_unqualified_excluded),
+        // A merge fan-in can't arise (no USING join in a conflict scope) and
+        // neither can an expanded slot (no projection); a subquery's plan owns
+        // its own scope.
+        Expr::Fanin(_) | Expr::DerivedSlot { .. } | Expr::Subquery { .. } | Expr::Exists(_) => {}
+    }
 }
 
 /// The target table of a query's leading `SELECT … INTO t`, if any. `INTO`
