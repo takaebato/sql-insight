@@ -678,6 +678,37 @@ mod on_conflict {
     }
 
     #[test]
+    fn pg_on_conflict_demotion_reaches_nested_operand_positions() {
+        // The demotion walk must reach every operand position an expression
+        // can nest — a window's argument / partition / order keys, an IN
+        // probe, an ANY right operand — even shapes real engines reject in a
+        // conflict action (a window function is illegal here in PG; the
+        // analyzer stays best-effort over what parses). Every unqualified `b`
+        // below is contested (target row vs EXCLUDED) and surfaces
+        // `Ambiguous`; the subquery keeps its own scope (`s.x` unaffected).
+        assert_column_ops_with_dialect(
+            "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE \
+             SET b = rank() OVER (PARTITION BY b ORDER BY b) \
+             WHERE b IN (SELECT x FROM s) AND b = ANY(b)",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![
+                    ambiguous("b"),
+                    ambiguous("b"),
+                    ambiguous("b"),
+                    read("s", "x"),
+                    ambiguous("b"),
+                    ambiguous("b"),
+                ],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn pg_on_conflict_target_qualified_reference_reads_the_target() {
         // The target-qualified counterpart of the ambiguity test: `t.b` pins
         // the existing row, so it is a plain target read (source/sink: the
