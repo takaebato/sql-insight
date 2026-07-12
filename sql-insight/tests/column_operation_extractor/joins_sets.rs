@@ -780,37 +780,49 @@ mod values_as_relation {
     use super::*;
 
     #[test]
-    fn values_as_derived_table_with_aliases_emits_synthetic_refs_only() {
-        // The derived table `t` carries schema [x, y] from the
-        // alias rename, but its output_columns is None (VALUES
-        // contributes no OutputColumns). So `t.x` is recorded as
-        // a synthetic ref pointing at the derived binding; reads
-        // filter it out, and lineage keeps `t.x` as the source
-        // (collapse can't collapse further).
+    fn values_as_derived_table_constant_cells_yield_no_lineage() {
+        // A reference through a `VALUES` relation traces into the
+        // like-positioned cell of every row. Literal cells have no source —
+        // a constant column has no data dependency, exactly like
+        // `SELECT 1 AS x` — so no lineage edge and no read surfaces.
         assert_column_ops(
             "SELECT x, y FROM (VALUES (1, 'a'), (2, 'b')) AS t(x, y)",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![],
                 writes: vec![],
-                lineage: vec![
-                    passthrough(synthetic("t", "x"), out("x", 0)),
-                    passthrough(synthetic("t", "y"), out("y", 1)),
-                ],
+                lineage: vec![],
                 diagnostics: vec![],
             },
         );
     }
 
     #[test]
-    fn values_as_cte_body_with_aliases_emits_synthetic_refs_only() {
+    fn values_subquery_cell_traces_to_its_real_columns() {
+        // A non-literal cell is a real value path: `t.x` maps to position 0,
+        // whose cell in the (sole) row is a scalar subquery — the edge
+        // reaches `s.y`, not a pseudo-column of `t`.
+        assert_column_ops(
+            "SELECT t.x FROM (VALUES ((SELECT max(y) FROM s))) AS t(x)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "y")],
+                writes: vec![],
+                lineage: vec![transformation(col("s", "y"), out("x", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn values_as_cte_body_constant_cells_yield_no_lineage() {
         assert_column_ops(
             "WITH cte(id, val) AS (VALUES (1, 'a'), (2, 'b')) SELECT id FROM cte",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![],
                 writes: vec![],
-                lineage: vec![passthrough(synthetic("cte", "id"), out("id", 0))],
+                lineage: vec![],
                 diagnostics: vec![],
             },
         );
@@ -820,15 +832,15 @@ mod values_as_relation {
     fn values_with_column_ref_in_row_does_not_resolve_a_sibling() {
         // A column ref inside a non-LATERAL `VALUES` row is walked (it surfaces
         // in reads) but, with LATERAL enforced, can't see the FROM sibling
-        // `t1`, so `t1.a` is `Unresolved`. The derived column `v.x` is a
-        // synthetic source (VALUES rows have no base columns).
+        // `t1`, so `t1.a` is `Unresolved`. The cell trace carries that same
+        // unresolved ref out as the lineage source of `v.x`.
         assert_column_ops(
             "SELECT v.x FROM t1, (VALUES (t1.a)) AS v(x)",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![unresolved("a")],
                 writes: vec![],
-                lineage: vec![passthrough(synthetic("v", "x"), out("x", 0))],
+                lineage: vec![passthrough(unresolved("a"), out("x", 0))],
                 diagnostics: vec![],
             },
         );

@@ -449,7 +449,12 @@ impl<'a> Binder<'a> {
             })
             .collect();
         (
-            LogicalPlan::Values(Values { rows }),
+            LogicalPlan::Values(Values {
+                rows,
+                // Declared column names arrive later, via `rename_outputs`,
+                // when an alias list exposes the row set as a relation.
+                columns: Vec::new(),
+            }),
             Scope {
                 relations: Vec::new(),
                 query_outputs,

@@ -266,7 +266,6 @@ impl<'a> Binder<'a> {
                             expr: Expr::DerivedSlot {
                                 qualifier: alias.clone(),
                                 index,
-                                name: slot.clone(),
                             },
                         })
                         .collect(),

@@ -44,9 +44,12 @@ fn corpus() -> &'static [&'static str] {
         "MERGE INTO t1 USING t2 ON t1.id = t2.id \
          WHEN MATCHED THEN UPDATE SET a = t2.a \
          WHEN NOT MATCHED THEN INSERT (id, a) VALUES (t2.id, t2.a)",
-        // Statement-materialized relations (synthetic lineage sources)
+        // Statement-materialized relations: the table function's output is a
+        // synthetic lineage source; the VALUES / EXCLUDED shapes are
+        // *reducible* (references trace into the row cells) so they must
+        // stay synthetic-free.
         "SELECT u.col FROM t1, UNNEST(t1.arr) AS u",
-        "SELECT v.a FROM (VALUES (1, 'x')) AS v(a, b)",
+        "SELECT v.a FROM (VALUES (1, 'x'), ((SELECT max(y) FROM s), 'z')) AS v(a, b)",
         "INSERT INTO t1 (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = EXCLUDED.a",
     ]
 }
@@ -287,11 +290,11 @@ fn synthetic_resolution_is_confined_to_column_lineage_sources() {
             }
         }
     }
-    // The corpus carries synthetic producers (UNNEST / VALUES / EXCLUDED),
-    // so the invariant must have been exercised, not vacuously true.
+    // The corpus carries a synthetic producer (the UNNEST output), so the
+    // invariant must have been exercised, not vacuously true.
     assert!(
-        synthetic_sources >= 3,
-        "expected the synthetic-producer corpus entries to emit synthetic \
-         sources, saw {synthetic_sources}"
+        synthetic_sources >= 1,
+        "expected the table-function corpus entry to emit a synthetic \
+         source, saw {synthetic_sources}"
     );
 }

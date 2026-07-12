@@ -430,19 +430,18 @@ mod derived_relations {
     }
 
     #[test]
-    fn values_backed_slots_surface_synthetic_sources() {
-        // A `(VALUES …) AS v(a, b)` relation synthesises rows — an expanded
-        // slot's origin is the synthetic `v.<col>`, like a written `v.a`.
+    fn values_backed_slots_trace_into_cells() {
+        // An expanded slot over a `VALUES` relation traces into the
+        // like-positioned cell of every row: the literal cell contributes no
+        // source (a constant column has no data dependency), the subquery
+        // cell reaches its real column — no pseudo-column of `v` surfaces.
         assert_column_ops(
-            "SELECT * FROM (VALUES (1, 2)) AS v(a, b)",
+            "SELECT * FROM (VALUES (1, (SELECT max(y) FROM s))) AS v(a, b)",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
-                reads: vec![],
+                reads: vec![read("s", "y")],
                 writes: vec![],
-                lineage: vec![
-                    passthrough(synthetic("v", "a"), out("a", 0)),
-                    passthrough(synthetic("v", "b"), out("b", 1)),
-                ],
+                lineage: vec![transformation(col("s", "y"), out("b", 1))],
                 diagnostics: vec![],
             },
         );
@@ -585,20 +584,17 @@ mod derived_relations {
     }
 
     #[test]
-    fn values_backed_cte_slots_surface_synthetic_sources() {
-        // A VALUES-backed CTE has no base columns — an expanded slot's
-        // origin is the synthetic `v.<col>`, exactly like the derived-table
-        // form (`(VALUES …) AS v(a, b)`), through the `CteRef` boundary.
+    fn values_backed_cte_slots_trace_into_cells() {
+        // Same through the `CteRef` boundary: the expansion succeeds (the
+        // slot view is complete — no diagnostic), and the constant cells
+        // simply contribute no lineage, exactly like `SELECT 1 AS a`.
         assert_column_ops(
             "WITH v (a, b) AS (VALUES (1, 2)) SELECT * FROM v",
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![],
                 writes: vec![],
-                lineage: vec![
-                    passthrough(synthetic("v", "a"), out("a", 0)),
-                    passthrough(synthetic("v", "b"), out("b", 1)),
-                ],
+                lineage: vec![],
                 diagnostics: vec![],
             },
         );

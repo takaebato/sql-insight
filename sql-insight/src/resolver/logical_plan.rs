@@ -202,11 +202,18 @@ pub(crate) struct CteRef {
     pub(crate) alias: Option<Ident>,
 }
 
-/// A `VALUES` row set: synthesised rows with no base columns. The row
-/// expressions are reads (and feed positionally when this is a write source).
+/// A `VALUES` row set: synthesised rows with no base columns of their own —
+/// but not opaque: a column of the row set *is* the like-positioned cell of
+/// every row, so positional consumers (an INSERT pairing, a reference through
+/// an aliased `VALUES` relation, an `EXCLUDED` mapping) trace into the cell
+/// expressions rather than stopping here. `columns` carries the declared
+/// column names when the row set is exposed as a relation
+/// (`(VALUES …) AS v(a, b)` / `WITH v (a, b) AS (VALUES …)`; empty otherwise)
+/// so a *named* reference maps to its position first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Values {
     pub(crate) rows: Vec<Vec<Expr>>,
+    pub(crate) columns: Vec<Ident>,
 }
 
 /// `INSERT INTO target (columns) <input>`: the source `input`'s output
@@ -435,10 +442,6 @@ pub(crate) enum Expr {
     DerivedSlot {
         qualifier: Option<Ident>,
         index: usize,
-        /// The slot's exposed output name, if any — used only for the
-        /// synthetic source at an untraceable boundary (a VALUES-backed
-        /// relation), never for resolution.
-        name: Option<Ident>,
     },
 }
 

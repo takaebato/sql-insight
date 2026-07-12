@@ -11,6 +11,7 @@ use sqlparser::ast::Ident;
 
 use super::logical_plan::{
     output_slots, resolved_output_expr, Binding, BoundColumn, Cte, Expr, LogicalPlan, NamedExpr,
+    Values,
 };
 use super::reads::column_read;
 use crate::casing::{CaseRule, IdentifierCasing};
@@ -162,11 +163,9 @@ pub(super) fn origins_of_expr<'a>(
         // A wildcard-expanded slot over a derived relation: trace the
         // producer's `index`-th output — position, not name, so a duplicate /
         // anonymous output name in the producer can't misattribute.
-        Expr::DerivedSlot {
-            qualifier,
-            index,
-            name,
-        } => origins_of_slot(input, qualifier.as_ref(), *index, name.as_ref(), context),
+        Expr::DerivedSlot { qualifier, index } => {
+            origins_of_slot(input, qualifier.as_ref(), *index, context)
+        }
         // Tests / suppressed operands contribute no value origin (reads only).
         Expr::Exists(_) | Expr::Filter(_) => Vec::new(),
     }
@@ -196,19 +195,17 @@ fn origins_of_ref<'a>(
 /// operator tree exactly like [`origins_into`], with the same qualifier
 /// guards at the relation boundaries — then trace its `index`-th output
 /// positionally ([`trace_nth_output`], fanning across set-operation
-/// branches). A VALUES-backed relation has no base columns to collapse to, so
-/// a *named* slot becomes the synthetic `alias.name` source (mirroring the
-/// named trace) and an anonymous one contributes nothing (no name to
-/// fabricate).
+/// branches). A VALUES-backed relation traces straight into its cells
+/// ([`values_cell_origins`]).
 ///
 /// A slot with no qualifier was minted against an *unaliased* derived table —
 /// expansion only allows that as the scope's sole relation, so the inline
-/// `Projection` / `SetOp` reached here is unambiguously the producer.
+/// `Projection` / `SetOp` / `Values` reached here is unambiguously the
+/// producer.
 fn origins_of_slot<'a>(
     op: &'a LogicalPlan,
     qualifier: Option<&Ident>,
     index: usize,
-    name: Option<&Ident>,
     context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match op {
@@ -221,25 +218,31 @@ fn origins_of_slot<'a>(
             }
             trace_nth_output(&output_operands(op), index, context)
         }
-        LogicalPlan::Aggregate(a) => origins_of_slot(&a.input, qualifier, index, name, context),
-        LogicalPlan::Filter(f) => origins_of_slot(&f.input, qualifier, index, name, context),
-        LogicalPlan::Sort(s) => origins_of_slot(&s.input, qualifier, index, name, context),
+        LogicalPlan::Values(v) => {
+            if qualifier.is_some() {
+                return Vec::new();
+            }
+            values_cell_origins(v, index, op, context)
+        }
+        LogicalPlan::Aggregate(a) => origins_of_slot(&a.input, qualifier, index, context),
+        LogicalPlan::Filter(f) => origins_of_slot(&f.input, qualifier, index, context),
+        LogicalPlan::Sort(s) => origins_of_slot(&s.input, qualifier, index, context),
         LogicalPlan::Join(j) => {
-            let mut o = origins_of_slot(&j.left, qualifier, index, name, context);
-            o.extend(origins_of_slot(&j.right, qualifier, index, name, context));
+            let mut o = origins_of_slot(&j.left, qualifier, index, context);
+            o.extend(origins_of_slot(&j.right, qualifier, index, context));
             o
         }
         LogicalPlan::SubqueryAlias(sa) => {
             if !qualifier.is_none_or(|q| context.eq_alias(q, &sa.alias)) {
                 Vec::new()
-            } else if values_backed(&sa.input) {
-                slot_synthetic_source(&sa.alias, name)
+            } else if let Some(values) = values_node(&sa.input) {
+                values_cell_origins(values, index, &sa.input, context)
             } else {
                 trace_nth_output(&output_operands(&sa.input), index, context)
             }
         }
         LogicalPlan::With(w) => context.with_decls(&w.ctes, |context| {
-            origins_of_slot(&w.body, qualifier, index, name, context)
+            origins_of_slot(&w.body, qualifier, index, context)
         }),
         // A `CteRef` boundary: only the reference whose exposed name the
         // qualifier matches descends (same guard as the named trace, so a
@@ -252,8 +255,8 @@ fn origins_of_slot<'a>(
             }
             context
                 .enter_cte(&r.name, |context, body| {
-                    if values_backed(body) {
-                        slot_synthetic_source(&r.name, name)
+                    if let Some(values) = values_node(body) {
+                        values_cell_origins(values, index, body, context)
                     } else {
                         trace_nth_output(&output_operands(body), index, context)
                     }
@@ -264,12 +267,9 @@ fn origins_of_slot<'a>(
         // expansion never mints a slot over one (its shape is unknown), and a
         // qualifier naming both it and the slot's own derived relation would
         // have failed the unique-match guard at expansion. Nothing to claim.
-        // Not positional producers otherwise: a raw scan / row set on a
-        // walked-past join side, and DML / DDL roots.
-        LogicalPlan::TableFunction(_)
-        | LogicalPlan::Scan(_)
-        | LogicalPlan::Values(_)
-        | LogicalPlan::Empty => Vec::new(),
+        // Not positional producers otherwise: a raw scan on a walked-past
+        // join side, and DML / DDL roots.
+        LogicalPlan::TableFunction(_) | LogicalPlan::Scan(_) | LogicalPlan::Empty => Vec::new(),
         LogicalPlan::Insert(_)
         | LogicalPlan::Update(_)
         | LogicalPlan::Delete(_)
@@ -281,32 +281,61 @@ fn origins_of_slot<'a>(
     }
 }
 
-/// The synthetic `table.name` source of a slot at an untraceable boundary
-/// (VALUES-backed / opaque) — nothing for an anonymous slot: there is no name
-/// to surface and fabricating one would misreport.
-fn slot_synthetic_source(
-    table: &Ident,
-    name: Option<&Ident>,
+/// The origins of a `VALUES`-backed relation's column at `position`: the
+/// like-positioned cell of **every** row, each traced like any value. A
+/// literal cell contributes nothing — a constant column has no source,
+/// exactly like `SELECT 1 AS a` — while a subquery / correlated cell reaches
+/// its real columns. So a `VALUES` relation is *reducible*, unlike a table
+/// function (whose output only exists at run time): no synthetic source.
+fn values_cell_origins<'a>(
+    values: &'a Values,
+    position: usize,
+    input: &'a LogicalPlan,
+    context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
-    name.map(|n| vec![(synthetic_source(table, n), ColumnLineageKind::Passthrough)])
-        .unwrap_or_default()
+    let mut out = Vec::new();
+    for row in &values.rows {
+        if let Some(cell) = row.get(position) {
+            out.extend(origins_of_expr(cell, input, context));
+        }
+    }
+    out
 }
 
-/// Whether a (sub)plan's rows are synthesised by `VALUES` (peeling the clause
-/// layers / a leading `With`): a column of such a relation has no base column
-/// to collapse to, so a reference to it is a synthetic source.
-fn values_backed(op: &LogicalPlan) -> bool {
+/// The origins of a *named* reference through a `VALUES`-backed relation:
+/// map the name to its declared-column position (`(VALUES …) AS v(a, b)` —
+/// the only way such a column is nameable), then trace the cells.
+fn values_named_origins<'a>(
+    values: &'a Values,
+    name: &Ident,
+    input: &'a LogicalPlan,
+    context: &mut TraceContext<'a>,
+) -> Vec<(ColumnRead, ColumnLineageKind)> {
+    match values
+        .columns
+        .iter()
+        .position(|c| context.eq_column(c, name))
+    {
+        Some(position) => values_cell_origins(values, position, input, context),
+        None => Vec::new(),
+    }
+}
+
+/// The `Values` row set a (sub)plan's rows come from (peeling the clause
+/// layers / a leading `With`), `None` for any real relation — consumers trace
+/// into its cells ([`values_cell_origins`] / [`values_named_origins`]).
+fn values_node(op: &LogicalPlan) -> Option<&Values> {
     match op {
-        LogicalPlan::Values(_) => true,
+        LogicalPlan::Values(v) => Some(v),
         // Only the clause-layer wrappers `Values` can sit beneath are peeled —
         // an ORDER BY / WHERE on a VALUES, and a leading WITH. Anything else
         // is a real relation (a Scan, a Projection rewriting the row shape, a
         // derived alias on top), and its columns *do* have a base to collapse
         // to. Listed explicitly so a new operator added between `Values` and
         // its clause layers needs an explicit decision here.
-        LogicalPlan::Sort(s) => values_backed(&s.input),
-        LogicalPlan::Filter(f) => values_backed(&f.input),
-        LogicalPlan::With(w) => values_backed(&w.body),
+        LogicalPlan::Sort(s) => values_node(&s.input),
+        LogicalPlan::Filter(f) => values_node(&f.input),
+        LogicalPlan::With(w) => values_node(&w.body),
         LogicalPlan::Scan(_)
         | LogicalPlan::Join(_)
         | LogicalPlan::Aggregate(_)
@@ -323,7 +352,7 @@ fn values_backed(op: &LogicalPlan) -> bool {
         | LogicalPlan::CreateTableAs(_)
         | LogicalPlan::CreateView(_)
         | LogicalPlan::AlterTable(_)
-        | LogicalPlan::Drop(_) => false,
+        | LogicalPlan::Drop(_) => None,
     }
 }
 
@@ -361,13 +390,10 @@ fn origins_into<'a>(
         LogicalPlan::SubqueryAlias(sa) => {
             if !qualifier.is_none_or(|q| context.eq_alias(q, &sa.alias)) {
                 Vec::new()
-            } else if values_backed(&sa.input) {
-                // A `(VALUES …) AS t(x)` relation synthesises rows with no base
-                // columns, so the exposed column is a synthetic source (t.x).
-                vec![(
-                    synthetic_source(&sa.alias, name),
-                    ColumnLineageKind::Passthrough,
-                )]
+            } else if let Some(values) = values_node(&sa.input) {
+                // A `(VALUES …) AS t(x)` column is the like-positioned cell of
+                // every row — trace into the cells, not a synthetic stop.
+                values_named_origins(values, name, &sa.input, context)
             } else {
                 origins_into(&sa.input, None, name, context)
             }
@@ -425,13 +451,10 @@ fn origins_into<'a>(
             // becomes an empty `Vec` via `unwrap_or_default`.
             context
                 .enter_cte(&r.name, |context, body| {
-                    // A VALUES-backed CTE has no traceable base columns — the
-                    // exposed column is a synthetic source (cte.col).
-                    if values_backed(body) {
-                        vec![(
-                            synthetic_source(&r.name, name),
-                            ColumnLineageKind::Passthrough,
-                        )]
+                    // A VALUES-backed CTE (`WITH v (a, b) AS (VALUES …)`)
+                    // traces into its cells like the derived-table form.
+                    if let Some(values) = values_node(body) {
+                        values_named_origins(values, name, body, context)
                     } else {
                         origins_into(body, None, name, context)
                     }
@@ -497,9 +520,10 @@ fn trace_nth_output<'a>(
 
 /// The origins of an ON CONFLICT DO UPDATE value. Like [`origins_of_expr`],
 /// but an `EXCLUDED.col` reference (a `Derived` ref, qualified `excluded`) maps
-/// to the INSERT source's like-positioned output column — or, when the source
-/// has no inspectable projection (a `VALUES` source), to the `EXCLUDED.col`
-/// pseudo-column itself (a synthetic lineage source, not a read).
+/// to the INSERT source's like-positioned output column — a `VALUES` source
+/// maps into its cells the same way. Only a source with nothing to inspect at
+/// all (`DEFAULT VALUES`) keeps the `EXCLUDED.col` pseudo-column itself (a
+/// synthetic lineage source, not a read).
 pub(super) fn conflict_value_origins<'a>(
     value: &'a Expr,
     columns: &[ColumnWrite],
@@ -509,8 +533,8 @@ pub(super) fn conflict_value_origins<'a>(
     match value {
         // A `Derived` ref here is `EXCLUDED.col` (the only synthetic relation in
         // a conflict scope). Map it to the source's `col`-positioned output —
-        // fanning out to every set-operation branch. A source with no
-        // inspectable projection (VALUES) keeps the `EXCLUDED.col` pseudo-source.
+        // fanning out to every set-operation branch, or into a `VALUES`
+        // source's like-positioned cells (its rows *are* the proposed rows).
         Expr::Column(c) if matches!(c.binding, Binding::Derived) => {
             let Some(i) = columns
                 .iter()
@@ -518,6 +542,9 @@ pub(super) fn conflict_value_origins<'a>(
             else {
                 return Vec::new();
             };
+            if let Some(values) = values_node(source) {
+                return values_cell_origins(values, i, source, context);
+            }
             let operands = output_operands(source);
             if operands.is_empty() {
                 return vec![(excluded_source(c), ColumnLineageKind::Passthrough)];

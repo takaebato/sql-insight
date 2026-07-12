@@ -613,32 +613,12 @@ mod on_conflict {
         assert_column_ops_inner(sql, 0, actual, expected);
     }
 
-    /// Construct a `ColumnRead` for the EXCLUDED pseudo-table — a lineage
-    /// source only, never a read. It arises when the proposed row can't be
-    /// traced further (a `VALUES` source has no projection to map into), and
-    /// like every statement-materialized relation it is `Synthetic`.
-    fn excluded(name: &str) -> ColumnRead {
-        ColumnRead {
-            reference: ColumnReference {
-                table: Some(TableReference {
-                    catalog: None,
-                    schema: None,
-                    name: "EXCLUDED".into(),
-                }),
-                name: name.into(),
-            },
-            resolution: ResolutionKind::Synthetic,
-        }
-    }
-
     #[test]
-    fn pg_on_conflict_do_update_set_excluded_emits_lineage_and_write() {
-        // DO UPDATE SET b = EXCLUDED.b
-        //   - writes: t.a, t.b from INSERT columns plus another
-        //     t.b for the SET target.
-        //   - reads: empty (EXCLUDED is synthetic-filtered;
-        //     VALUES (1, 2) are literals).
-        //   - lineage: EXCLUDED.b → Relation(t.b), Passthrough.
+    fn pg_on_conflict_set_excluded_traces_the_proposed_cell() {
+        // `SET b = EXCLUDED.b` names the proposed row, which for a VALUES
+        // source *is* the like-positioned cell of each row. A literal cell
+        // contributes no source — the SET writes a constant, exactly like
+        // `SET b = 2` — so writes surface without a lineage edge.
         assert_column_ops_with_dialect(
             "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
             &PostgreSqlDialect {},
@@ -646,7 +626,24 @@ mod on_conflict {
                 statement_kind: StatementKind::Insert,
                 reads: vec![],
                 writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
-                lineage: vec![passthrough(excluded("b"), relation("t", "b"))],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+        // A subquery cell is a real value path: EXCLUDED.b → the position-1
+        // cell → `s.y`, so the conflict SET carries genuine lineage.
+        assert_column_ops_with_dialect(
+            "INSERT INTO t (a, b) VALUES (1, (SELECT max(y) FROM s)) \
+             ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "y")],
+                writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
+                lineage: vec![
+                    transformation(col("s", "y"), relation("t", "b")),
+                    transformation(col("s", "y"), relation("t", "b")),
+                ],
                 diagnostics: vec![],
             },
         );
@@ -856,7 +853,8 @@ mod on_conflict {
     #[test]
     fn pg_on_conflict_do_update_with_where_clause_emits_read() {
         // DO UPDATE ... WHERE walks in filter context: `t.a` in the
-        // WHERE expression surfaces as a read but not a lineage source.
+        // WHERE expression surfaces as a read but not a lineage source (and
+        // `EXCLUDED.b` traces to a literal cell — no edge).
         assert_column_ops_with_dialect(
             "INSERT INTO t (a, b) VALUES (1, 2) \
              ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b WHERE t.a > 0",
@@ -865,7 +863,7 @@ mod on_conflict {
                 statement_kind: StatementKind::Insert,
                 reads: vec![read("t", "a")],
                 writes: vec![write("t", "a"), write("t", "b"), write("t", "b")],
-                lineage: vec![passthrough(excluded("b"), relation("t", "b"))],
+                lineage: vec![],
                 diagnostics: vec![],
             },
         );

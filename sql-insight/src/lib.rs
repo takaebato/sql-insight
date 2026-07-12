@@ -142,9 +142,10 @@
 //!   enumerated. Their argument expressions surface as reads, but a
 //!   reference *through* such a relation (`u.col`) is a synthetic
 //!   lineage source named by the alias, not a cataloged real-table read —
-//!   marked [`ResolutionKind::Synthetic`], like every column of a relation
-//!   the statement itself materializes (a `VALUES` row set, `EXCLUDED`),
-//!   so it can't be mistaken for a persisted-table dependency.
+//!   marked [`ResolutionKind::Synthetic`] so it can't be mistaken for a
+//!   persisted-table dependency. (A `VALUES` relation is different: its
+//!   cells are visible, so a reference through it traces into them —
+//!   real columns surface, literals contribute nothing.)
 //! - **Recursive CTEs aren't unrolled**: the recursive self-reference
 //!   terminates against the anchor branch's columns (via an active-set),
 //!   so lineage traces through to the anchor's real tables — it doesn't

@@ -217,7 +217,7 @@ pub struct ColumnWrite {
 /// | catalog-aware, two or more known schemas confirm | [`Ambiguous`](Self::Ambiguous) |
 /// | qualified `t.col` where `t` is unknown | [`Inferred`](Self::Inferred) |
 /// | qualified `t.col` where `t` is known and lists `col` | [`Cataloged`](Self::Cataloged) |
-/// | lineage source behind a table function / `VALUES` / untraceable `EXCLUDED` | [`Synthetic`](Self::Synthetic) |
+/// | lineage source behind a table function / untraceable `EXCLUDED` | [`Synthetic`](Self::Synthetic) |
 ///
 /// # Consumer guidance
 ///
@@ -231,8 +231,8 @@ pub struct ColumnWrite {
 ///   [`Unresolved`](Self::Unresolved) as "incomplete"; treat
 ///   [`Synthetic`](Self::Synthetic) as **not a persisted dependency** —
 ///   the `(table, name)` pair names a statement-local relation (a table
-///   function's output, a `VALUES` row set, `EXCLUDED`), so skip it or
-///   render it as an ephemeral node rather than a table.
+///   function's output, an untraceable `EXCLUDED`), so skip it or render
+///   it as an ephemeral node rather than a table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum ResolutionKind {
@@ -262,14 +262,16 @@ pub enum ResolutionKind {
     /// is `None`. Columns only.
     Unresolved,
     /// Resolved — exactly — to a relation the statement itself
-    /// materializes, with no persisted schema object behind it: a table
-    /// function's output column (`SELECT u.col FROM UNNEST(x) AS u`), a
-    /// `VALUES` row set's column (`(VALUES (1, 2)) AS v(a, b)` → `v.a`),
-    /// or the `EXCLUDED` pseudo-row of an upsert whose proposed values
-    /// aren't traceable further. The `table` segment is the relation's
-    /// exposed name (alias / `excluded`), **not** a real table — without
-    /// this marker it would be indistinguishable from an
-    /// [`Inferred`](Self::Inferred) read of an unregistered base table.
+    /// materializes whose values are **irreducible** from the SQL text: a
+    /// table function's output column (`SELECT u.col FROM UNNEST(x) AS u` —
+    /// the output only exists at run time), or the `EXCLUDED` pseudo-row of
+    /// an upsert with nothing to trace the proposed values into. (A `VALUES`
+    /// relation is *reducible* — a reference through it traces into the row
+    /// cells, reaching real columns or, for literals, nothing — so it never
+    /// surfaces here.) The `table` segment is the relation's exposed name
+    /// (alias / `excluded`), **not** a real table — without this marker it
+    /// would be indistinguishable from an [`Inferred`](Self::Inferred) read
+    /// of an unregistered base table.
     ///
     /// Appears **only on lineage sources**
     /// ([`ColumnLineageEdge::source`](crate::extractor::ColumnLineageEdge::source)):
