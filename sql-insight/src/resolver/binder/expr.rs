@@ -136,23 +136,86 @@ impl<'a> Binder<'a> {
             return None;
         }
         let span = options.wildcard_token.0.span;
-        let relations: Vec<&Relation> = match qualifier {
-            Some(name) => vec![self.wildcard_relation(name, scope)?],
-            None => {
-                if !scope.merge_columns.is_empty()
-                    || scope.relations.is_empty()
-                    || self.derived_names_collide(scope)
-                {
-                    return None;
-                }
-                scope.relations.iter().collect()
+        match qualifier {
+            Some(name) => {
+                let relation = self.wildcard_relation(name, scope)?;
+                self.relation_wildcard_slots(relation, scope, span)
             }
-        };
+            // A bare `*` in a **pipe output stage** (`|> SELECT *`) projects
+            // the *running outputs*, not the original FROM relations — an
+            // earlier `|> AGGREGATE` / `|> SELECT` replaced them. Query
+            // outputs are attached to the scope only at those stages (a
+            // plain projection binds against a FROM-level scope with none),
+            // so their presence is the discriminator.
+            None if !scope.query_outputs.is_empty() => self.pipe_star_slots(scope),
+            None => self.scope_star_slots(scope, |_| span),
+        }
+    }
+
+    /// A bare `*` over the scope's FROM relations: every relation's columns,
+    /// in FROM order — or `None` when any is incompletely known
+    /// (all-or-nothing). `span_of` picks the source-order anchor for each
+    /// relation's block: a written `*` anchors every block at its own token;
+    /// the implicit FROM-first form (no token) anchors each block at its
+    /// relation's written name.
+    fn scope_star_slots(
+        &self,
+        scope: &Scope,
+        span_of: impl Fn(&Relation) -> Span,
+    ) -> Option<Vec<NamedExpr>> {
+        if !scope.merge_columns.is_empty()
+            || scope.relations.is_empty()
+            || self.derived_names_collide(scope)
+        {
+            return None;
+        }
         let mut items = Vec::new();
-        for relation in relations {
-            items.extend(self.relation_wildcard_slots(relation, scope, span)?);
+        for relation in &scope.relations {
+            items.extend(self.relation_wildcard_slots(relation, scope, span_of(relation))?);
         }
         Some(items)
+    }
+
+    /// A FROM-first / projection-less SELECT (`FROM t` — DuckDB / ClickHouse
+    /// FROM-first, or a pipe base) is an **implicit** `SELECT *`: expand it
+    /// like a written bare `*`, each relation's block anchored at the
+    /// relation's own written name (there is no `*` token to anchor at).
+    /// `None` when the scope isn't completely known — the caller marks the
+    /// outputs incomplete and flags, exactly like a suppressed wildcard,
+    /// rather than presenting zero outputs as the complete set.
+    pub(super) fn expand_implicit_star(&self, scope: &Scope) -> Option<Vec<NamedExpr>> {
+        self.scope_star_slots(scope, |relation| {
+            relation
+                .exposed_name()
+                .map_or_else(Span::empty, |name| name.span)
+        })
+    }
+
+    /// A pipe-stage bare `*`: one positional slot per **running output** —
+    /// each an [`Expr::DerivedSlot`] into the pipe's input projection (inline,
+    /// so no qualifier), keeping names (anonymous outputs stay anonymous) and
+    /// adding no reads (the physical reads were counted where the outputs
+    /// were computed, exactly like a wildcard over a derived table). `None`
+    /// when the running outputs are incomplete (an unexpanded wildcard
+    /// upstream) — the slot count can't be trusted.
+    fn pipe_star_slots(&self, scope: &Scope) -> Option<Vec<NamedExpr>> {
+        if !scope.outputs_complete {
+            return None;
+        }
+        Some(
+            scope
+                .query_outputs
+                .iter()
+                .enumerate()
+                .map(|(index, output)| NamedExpr {
+                    names: OutputNames::Single(output.name.clone()),
+                    expr: Expr::DerivedSlot {
+                        qualifier: None,
+                        index,
+                    },
+                })
+                .collect(),
+        )
     }
 
     /// Whether two derived relations in scope expose the same name (illegal

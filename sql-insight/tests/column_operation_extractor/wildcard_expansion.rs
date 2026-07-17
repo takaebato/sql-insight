@@ -1166,3 +1166,139 @@ mod guards {
         );
     }
 }
+
+mod implicit_star {
+    //! A FROM-first / projection-less SELECT (DuckDB / ClickHouse `FROM t`,
+    //! a pipe base) is an implicit `SELECT *` — expanded by the same
+    //! machinery, or flagged when the scope isn't fully known. Previously
+    //! the empty projection passed as a *complete* zero-column output,
+    //! silently claiming the query projects nothing.
+    use super::*;
+
+    #[test]
+    fn from_first_select_expands_like_a_bare_wildcard() {
+        let catalog = TestCatalog::default().with("t", vec!["a", "b"]);
+        assert_column_ops_with_catalog(
+            "FROM t",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![expanded_read("t", "a"), expanded_read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(expanded_read("t", "a"), expanded_out("a", 0)),
+                    passthrough(expanded_read("t", "b"), expanded_out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn ctas_over_a_from_first_select_pairs_the_expanded_columns() {
+        // `CREATE TABLE u AS FROM t` used to bind a complete zero-column
+        // projection: no column writes, no lineage, no diagnostic. Expanded,
+        // it pairs like `CREATE TABLE u AS SELECT * FROM t`.
+        let catalog = TestCatalog::default().with("t", vec!["a", "b"]);
+        let quoted_write = |col: &str| ColumnWrite {
+            reference: ColumnReference {
+                table: Some(table("u")),
+                name: qident(col),
+            },
+            resolution: ResolutionKind::Inferred,
+        };
+        assert_column_ops_with_catalog(
+            "CREATE TABLE u AS FROM t",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![expanded_read("t", "a"), expanded_read("t", "b")],
+                writes: vec![quoted_write("a"), quoted_write("b")],
+                lineage: vec![
+                    passthrough(
+                        expanded_read("t", "a"),
+                        ColumnTarget::Relation(quoted_write("a")),
+                    ),
+                    passthrough(
+                        expanded_read("t", "b"),
+                        ColumnTarget::Relation(quoted_write("b")),
+                    ),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn unexpandable_from_first_select_is_flagged_not_silently_empty() {
+        // Catalog-free the implicit `*` can't be enumerated: the outputs are
+        // incomplete and flagged — a downstream CTAS drops its column pairing
+        // (`source_wildcard`) instead of writing zero columns silently.
+        assert_column_ops(
+            "CREATE TABLE u AS FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn pipe_select_star_projects_the_running_outputs() {
+        // `|> SELECT *` covers the *running* pipe outputs, not the original
+        // FROM relations: after `|> AGGREGATE SUM(a) AS s GROUP BY b` the
+        // output is (s, b), so the star's slots trace to the aggregate's
+        // expressions (t.a transformed into s) — previously it re-expanded
+        // the base table and fabricated passthrough edges for every column
+        // of `t`.
+        let catalog = TestCatalog::default().with("t", vec!["a", "b"]);
+        assert_column_ops_with_catalog(
+            "FROM t |> AGGREGATE SUM(a) AS s GROUP BY b |> SELECT *",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    expanded_read("t", "a"),
+                    expanded_read("t", "b"),
+                    read_with_ref(cataloged_table("t"), "a", ResolutionKind::Cataloged),
+                    read_with_ref(cataloged_table("t"), "b", ResolutionKind::Cataloged),
+                ],
+                writes: vec![],
+                lineage: vec![
+                    transformation(
+                        read_with_ref(cataloged_table("t"), "a", ResolutionKind::Cataloged),
+                        out("s", 0),
+                    ),
+                    passthrough(
+                        read_with_ref(cataloged_table("t"), "b", ResolutionKind::Cataloged),
+                        out("b", 1),
+                    ),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn pipe_select_star_over_incomplete_outputs_stays_suppressed() {
+        // Catalog-free the base implicit `*` is unexpanded, so the running
+        // outputs are incomplete — the pipe star must not pretend to know
+        // the slot count (two flags: the base and the pipe star).
+        assert_column_ops(
+            "FROM t |> SELECT *",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![
+                    diag(ColumnLevelDiagnosticKind::WildcardSuppressed),
+                    diag(ColumnLevelDiagnosticKind::WildcardSuppressed),
+                ],
+            },
+        );
+    }
+}

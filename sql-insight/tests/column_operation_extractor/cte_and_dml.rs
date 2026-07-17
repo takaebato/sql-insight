@@ -672,6 +672,27 @@ mod on_conflict {
     }
 
     #[test]
+    fn pg_on_conflict_excluded_mapping_is_gated_by_an_unexpanded_wildcard() {
+        // The source projection kept an unexpanded `*`, so its positions are
+        // indeterminate — the `EXCLUDED.a` positional mapping must yield no
+        // edge (previously it mapped target position 0 onto the shifted
+        // source outputs and fabricated `s.y -> t2.b`), matching the skip
+        // the INSERT relation pairing already applies.
+        assert_column_ops_with_dialect(
+            "INSERT INTO t2 (a, b) SELECT *, y FROM s \
+             ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.a",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "y")],
+                writes: vec![write("t2", "a"), write("t2", "b"), write("t2", "b")],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
     fn pg_on_conflict_demotion_reaches_nested_operand_positions() {
         // The demotion walk must reach every operand position an expression
         // can nest — a window's argument / partition / order keys, an IN

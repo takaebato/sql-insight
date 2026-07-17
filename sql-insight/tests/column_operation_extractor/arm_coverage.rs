@@ -377,7 +377,10 @@ mod expr_arm_coverage {
                     transformation(col("t", "a"), out("s", 0)),
                     transformation(col("t", "b"), out("s", 0)),
                 ],
-                diagnostics: vec![],
+                // The FROM-first pipe base (`FROM t`) is an implicit
+                // `SELECT *`; catalog-free it stays unexpanded and is
+                // flagged, like any suppressed wildcard.
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
             },
         );
     }
@@ -395,7 +398,10 @@ mod expr_arm_coverage {
                 reads: vec![read("t", "a")],
                 writes: vec![],
                 lineage: vec![passthrough(col("t", "a"), out("x", 0))],
-                diagnostics: vec![],
+                // The FROM-first pipe base (`FROM t`) is an implicit
+                // `SELECT *`; catalog-free it stays unexpanded and is
+                // flagged, like any suppressed wildcard.
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
             },
         );
     }

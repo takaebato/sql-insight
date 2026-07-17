@@ -529,11 +529,16 @@ fn trace_nth_output<'a>(
 /// to the INSERT source's like-positioned output column — a `VALUES` source
 /// maps into its cells the same way. A source with nothing to inspect at all
 /// (`DEFAULT VALUES`) yields no edge: the proposed value is untraceable,
-/// like any constant.
+/// like any constant. `positional` gates that mapping: the caller passes
+/// `false` when the source projection kept an unexpanded wildcard — its
+/// positions are then indeterminate, so an `EXCLUDED.col` yields no edge
+/// rather than a mis-paired one (the same skip the INSERT relation pairing
+/// applies).
 pub(super) fn conflict_value_origins<'a>(
     value: &'a Expr,
     columns: &[ColumnWrite],
     source: &'a LogicalPlan,
+    positional: bool,
     context: &mut TraceContext<'a>,
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match value {
@@ -542,6 +547,9 @@ pub(super) fn conflict_value_origins<'a>(
         // fanning out to every set-operation branch, or into a `VALUES`
         // source's like-positioned cells (its rows *are* the proposed rows).
         Expr::Column(c) if matches!(c.binding, Binding::Derived) => {
+            if !positional {
+                return Vec::new();
+            }
             let Some(i) = columns
                 .iter()
                 .position(|t| context.eq_column(&t.reference.name, &c.name))
@@ -561,23 +569,25 @@ pub(super) fn conflict_value_origins<'a>(
         Expr::Column(_) => origins_of_expr(value, source, context),
         Expr::Call { args } => transform(
             args.iter()
-                .flat_map(|e| conflict_value_origins(e, columns, source, context)),
+                .flat_map(|e| conflict_value_origins(e, columns, source, positional, context)),
         ),
         Expr::Case {
             then, else_result, ..
         } => {
             let mut sources: Vec<_> = then
                 .iter()
-                .flat_map(|e| conflict_value_origins(e, columns, source, context))
+                .flat_map(|e| conflict_value_origins(e, columns, source, positional, context))
                 .collect();
             if let Some(e) = else_result {
-                sources.extend(conflict_value_origins(e, columns, source, context));
+                sources.extend(conflict_value_origins(
+                    e, columns, source, positional, context,
+                ));
             }
             transform(sources)
         }
-        Expr::Window { arg, .. } => {
-            transform(conflict_value_origins(arg, columns, source, context))
-        }
+        Expr::Window { arg, .. } => transform(conflict_value_origins(
+            arg, columns, source, positional, context,
+        )),
         Expr::Subquery { plan, output } => {
             transform(subquery_output_origins(plan, *output, context))
         }
@@ -587,9 +597,9 @@ pub(super) fn conflict_value_origins<'a>(
             .collect(),
         // `a IN (subquery)`: the LHS flows as a value operand (see
         // `origins_of_expr`); the subquery side is a filter.
-        Expr::InSubquery { expr, .. } => {
-            transform(conflict_value_origins(expr, columns, source, context))
-        }
+        Expr::InSubquery { expr, .. } => transform(conflict_value_origins(
+            expr, columns, source, positional, context,
+        )),
         // A conflict scope holds no derived relations besides `EXCLUDED`
         // (handled as a named `Derived` ref above), so an expanded slot can't
         // occur here — trace it like any value for completeness.
