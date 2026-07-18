@@ -24,7 +24,7 @@ impl Binder<'_> {
     /// and the permissive side keeps a sole-assignment UPDATE visible in
     /// the write / CRUD surfaces (the unattributed alternative surfaces no
     /// table-level write).
-    pub(super) fn struct_set_targets(&self) -> bool {
+    pub(super) fn supports_struct_set_targets(&self) -> bool {
         !(self.dialect.is::<MySqlDialect>()
             || self.dialect.is::<MsSqlDialect>()
             || self.dialect.is::<SQLiteDialect>()
