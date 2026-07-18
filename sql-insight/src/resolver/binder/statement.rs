@@ -76,13 +76,31 @@ impl<'a> Binder<'a> {
         // `CREATE TABLE … AS` path. (No explicit list, so no arity check.)
         let source_wildcard = !scope.outputs_complete;
         self.diagnose_created_columns(&target.reference, &[], &plan, source_wildcard);
-        LogicalPlan::CreateTableAs(CreateTableAs {
+        // A `WITH` on a SELECT INTO is the *statement's* WITH (PostgreSQL
+        // requires data-modifying CTEs at the top level), so it must stay the
+        // outermost node: wrapping the CreateTableAs *around* it would bury a
+        // data-modifying CTE body inside the root's input, where
+        // `dml_roots` — which descends declarations, not inputs — never
+        // finds it, silently dropping the CTE's own write.
+        let (ctes, input) = match plan {
+            LogicalPlan::With(w) => (w.ctes, *w.body),
+            other => (Vec::new(), other),
+        };
+        let create = LogicalPlan::CreateTableAs(CreateTableAs {
             target,
             columns: Vec::new(),
-            input: Box::new(plan),
+            input: Box::new(input),
             schema_source: None,
             source_wildcard,
-        })
+        });
+        if ctes.is_empty() {
+            create
+        } else {
+            LogicalPlan::With(With {
+                ctes,
+                body: Box::new(create),
+            })
+        }
     }
 
     /// `INSERT INTO target (columns) <source>`: the source query's plan is the
@@ -265,14 +283,20 @@ impl<'a> Binder<'a> {
         }
         // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: extra writes + their
         // `value → target.col` lineage, plus the optional `DO UPDATE … WHERE`
-        // (filter reads).
+        // (filter reads). A PG `INSERT INTO t AS c` alias is how the conflict
+        // action names the existing row (`SET n = c.n + 1`), so it rides the
+        // target scope — without it those references fell to `Unresolved`.
+        let target_alias = insert.table_alias.as_ref().map(|a| a.alias.clone());
         let (on_conflict, conflict_predicate) = match &insert.on {
-            Some(on) => self.bind_conflict(on, &target, &columns),
+            Some(on) => self.bind_conflict(on, &target, target_alias.clone(), &columns),
             None => (Vec::new(), Vec::new()),
         };
         // RETURNING resolves against the target alone (the source query's
-        // scope is already popped).
-        let returning = self.bind_returning(&insert.returning, &self.target_scope(&target));
+        // scope is already popped), under the same alias.
+        let returning = self.bind_returning(
+            &insert.returning,
+            &self.target_scope_with_alias(&target, target_alias),
+        );
         // Each written column carries its catalog match against the target
         // (`Cataloged` if listed, else `Inferred` — a catalog-filled column is
         // by definition listed).
@@ -483,7 +507,7 @@ impl<'a> Binder<'a> {
             }
         }
         let (on_conflict, conflict_predicate) = match &insert.on {
-            Some(on) => self.bind_conflict(on, &target, &columns),
+            Some(on) => self.bind_conflict(on, &target, None, &columns),
             None => (Vec::new(), Vec::new()),
         };
         let returning = self.bind_returning(&insert.returning, &scope);
@@ -520,15 +544,18 @@ impl<'a> Binder<'a> {
         &mut self,
         on: &OnInsert,
         target: &TableReference,
+        target_alias: Option<Ident>,
         columns: &[Ident],
     ) -> (Vec<Assignment>, Vec<Expr>) {
         let (scope, assignments, selection) = match on {
-            OnInsert::DuplicateKeyUpdate(assignments) => {
-                (self.target_scope(target), assignments.as_slice(), None)
-            }
+            OnInsert::DuplicateKeyUpdate(assignments) => (
+                self.target_scope_with_alias(target, target_alias),
+                assignments.as_slice(),
+                None,
+            ),
             OnInsert::OnConflict(on_conflict) => match &on_conflict.action {
                 OnConflictAction::DoUpdate(do_update) => {
-                    let mut scope = self.target_scope(target);
+                    let mut scope = self.target_scope_with_alias(target, target_alias);
                     scope.relations.push(Relation::Derived {
                         alias: Some(Ident::new("excluded")),
                         // A synthetic pseudo-relation, not a positional
@@ -593,6 +620,18 @@ impl<'a> Binder<'a> {
         // — so the parenthesized form behaves like the non-paren MySQL
         // `UPDATE t1 JOIN t2 …` form (whose joins live on `update.table.joins`).
         let (target_factor, joins) = flatten_dml_target(&update.table);
+        // T-SQL aliases the target *in the FROM clause*:
+        // `UPDATE a SET x = 1 FROM t AS a` writes `t`, the relation the alias
+        // names. Resolving the bare target name directly would fabricate a
+        // phantom table `a` (and leave the real relation as a second
+        // candidate, turning its own references ambiguous) — so, mirroring
+        // DELETE's USING-first order, bind the FROM relations first and
+        // resolve the target through them when the shape matches.
+        if joins.is_empty() {
+            if let Some(op) = self.bind_update_via_from_alias(update, target_factor) {
+                return op;
+            }
+        }
         // The root's own resolution isn't needed here — each SET assignment
         // carries its write-target table's resolution (`assignment_target`).
         let diagnostics_before = self.diagnostics.len();
@@ -641,26 +680,46 @@ impl<'a> Binder<'a> {
         // relations join the scope, which are readable but never writable
         // (PostgreSQL / T-SQL `UPDATE t SET … FROM u` only ever writes `t`).
         let writable = scope.relations.clone();
-        // FROM relations are reads (resolved against the target + joins so far).
+        // FROM relations are reads (resolved against the target + joins so
+        // far). `absorb` carries their `USING` / NATURAL merge columns too, so
+        // an unqualified SET RHS / WHERE reference to a merge column fans in
+        // to both sides like it does in a SELECT (previously only the
+        // relations were kept and such a reference fell to `Ambiguous`).
         if let Some(from) = &update.from {
             let tables = match from {
                 UpdateTableFromKind::BeforeSet(t) | UpdateTableFromKind::AfterSet(t) => t,
             };
             for twj in tables {
                 let (node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
-                scope.relations.extend(fscope.relations);
+                scope.absorb(fscope);
                 input = combine(input, node);
             }
         }
-        // WHERE + the MySQL `LIMIT` tail are filter-position reads (they pick /
-        // bound which rows update; their reads / subqueries never feed the new
-        // value). A `LIMIT` is normally a constant, so it adds no read, but it's
-        // bound for parity with SELECT / DELETE rather than silently dropped.
+        self.bind_update_clauses(update, scope, input, target, &writable)
+    }
+
+    /// The clause tail every UPDATE form shares once its scope is assembled:
+    /// WHERE / ORDER BY / LIMIT as filter reads, the SET assignments, and
+    /// RETURNING.
+    fn bind_update_clauses(
+        &mut self,
+        update: &SqlUpdate,
+        scope: Scope,
+        mut input: LogicalPlan,
+        target: TableReference,
+        writable: &[Relation],
+    ) -> LogicalPlan {
+        // WHERE + the MySQL `ORDER BY` / `LIMIT` tail are filter-position
+        // reads (they pick / order / bound which rows update; their reads /
+        // subqueries never feed the new value). ORDER BY keys reference the
+        // target's columns, so they read it — mirroring DELETE; a constant
+        // LIMIT adds no read but is bound for parity, not dropped.
         let mut filter_reads: Vec<Expr> = update
             .selection
             .iter()
             .map(|predicate| self.bind_expr(predicate, &scope))
             .collect();
+        filter_reads.extend(self.order_by_expr_keys(&update.order_by, &scope));
         filter_reads.extend(update.limit.iter().map(|e| self.bind_expr(e, &scope)));
         if !filter_reads.is_empty() {
             input = LogicalPlan::Filter(Filter {
@@ -675,7 +734,7 @@ impl<'a> Binder<'a> {
         let assignments = update
             .assignments
             .iter()
-            .flat_map(|a| self.bind_assignment(a, &scope, &target, &writable))
+            .flat_map(|a| self.bind_assignment(a, &scope, &target, writable))
             .collect();
         // RETURNING resolves against the statement scope (target + FROM).
         let returning = self.bind_returning(&update.returning, &scope);
@@ -685,6 +744,59 @@ impl<'a> Binder<'a> {
             input: Box::new(input),
             returning,
         })
+    }
+
+    /// The T-SQL `UPDATE <alias> SET … FROM t AS <alias>` form: the join-less,
+    /// unaliased, single-part target names a FROM-clause alias. Binds the FROM
+    /// relations first and resolves the target through them
+    /// ([`scope_target`](Self::scope_target), like DELETE's USING-alias form) —
+    /// `None` when the shape doesn't match (no FROM, a non-bare target, or no
+    /// relation answering to the name), falling back to the ordinary
+    /// target-first bind.
+    fn bind_update_via_from_alias(
+        &mut self,
+        update: &SqlUpdate,
+        target_factor: &TableFactor,
+    ) -> Option<LogicalPlan> {
+        let tables = match update.from.as_ref()? {
+            UpdateTableFromKind::BeforeSet(t) | UpdateTableFromKind::AfterSet(t) => t,
+        };
+        let written = match target_factor {
+            TableFactor::Table {
+                name,
+                alias: None,
+                args: None,
+                ..
+            } => TableReference::try_from_name(name).ok()?,
+            _ => return None,
+        };
+        if written.schema.is_some() || written.catalog.is_some() {
+            return None;
+        }
+        // Cheap syntactic pre-check before committing to the reordered bind:
+        // some FROM factor must alias the target's name.
+        let alias_fold = self.style.casing.table_alias;
+        let aliases_target = |factor: &TableFactor| {
+            matches!(factor, TableFactor::Table { alias: Some(a), .. }
+                if alias_fold.normalize(&a.name) == alias_fold.normalize(&written.name))
+        };
+        if !tables.iter().any(|twj| {
+            aliases_target(&twj.relation) || twj.joins.iter().any(|j| aliases_target(&j.relation))
+        }) {
+            return None;
+        }
+        let mut scope = Scope::default();
+        let mut input = LogicalPlan::Empty;
+        for twj in tables {
+            let (node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
+            scope.absorb(fscope);
+            input = combine(input, node);
+        }
+        let target = self.scope_target(&written, &scope)?.reference;
+        // The aliased relation is the sole writable sink (T-SQL writes only
+        // the target); the root pin covers unqualified SET targets, and a
+        // qualified `<alias>.col` resolves through the relation's alias.
+        Some(self.bind_update_clauses(update, scope, input, target, &[]))
     }
 
     /// `DELETE`: the deletion targets, plus the consulted read relations and
@@ -707,7 +819,9 @@ impl<'a> Binder<'a> {
         // alias can resolve against them.
         for twj in delete.using.iter().flatten() {
             let (node, uscope) = self.bind_table_with_joins(twj, &scope.relations);
-            scope.relations.extend(uscope.relations);
+            // `absorb` keeps the joins' USING / NATURAL merge columns, so an
+            // unqualified predicate reference to one fans in like in a SELECT.
+            scope.absorb(uscope);
             input = combine(input, node);
         }
         let using_relations = scope.relations.len();
@@ -726,11 +840,11 @@ impl<'a> Binder<'a> {
                 } else {
                     let (_node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
                     targets.extend(self.twj_table_targets(twj));
-                    scope.relations.extend(fscope.relations);
+                    scope.absorb(fscope);
                 }
             } else {
                 let (node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
-                scope.relations.extend(fscope.relations);
+                scope.absorb(fscope);
                 input = combine(input, node);
             }
         }
@@ -1202,9 +1316,16 @@ impl<'a> Binder<'a> {
     /// `UPDATE t1 JOIN t2 ON t1.id = t2.id SET t2.col = 1, other = 2`
     ///
     /// The **qualified** target (`t2.col`) writes whichever in-scope real
-    /// table its qualifier names — `t2` here; a qualifier naming no writable
-    /// table (a derived table / CTE / unknown alias) drops the assignment
-    /// (`None`). The **unqualified** target (`other`) is attributed with the
+    /// table its qualifier names — `t2` here. A qualifier naming no writable
+    /// relation is **not** dropped (that silently erased the assignment, its
+    /// RHS reads, and — for a sole assignment — the whole UPDATE from the
+    /// write surfaces): with a single writable sink it reads as a composite
+    /// subfield path on the root (PostgreSQL `SET address.city = …` updates
+    /// column `address` of the target; `SET t.address.city = …` likewise
+    /// with the root named first), and among several writable relations
+    /// (MySQL multi-table, where no composite syntax exists) it surfaces
+    /// unattributed (`table: None`, `Unresolved`) like an unqualified miss.
+    /// The **unqualified** target (`other`) is attributed with the
     /// read side's candidate / pick rules over the `writable` relations
     /// (`t1`, `t2`) — but only when there are several, as here (a genuine
     /// inference); with zero or one the sink is named by the statement
@@ -1286,10 +1407,14 @@ impl<'a> Binder<'a> {
             }
         } else {
             let qualifier = &parts[..parts.len() - 1];
-            scope
+            match scope
                 .relations
                 .iter()
-                .find_map(|rel| self.writable_qualifier_table(rel, qualifier))?
+                .find_map(|rel| self.writable_qualifier_table(rel, qualifier))
+            {
+                Some(table) => table,
+                None => return Some(self.unmatched_qualifier_write(&parts, root, writable)),
+            }
         };
         // Re-match the resolved write-target table (`table` is canonical, so
         // this reproduces the root scan's / joined relation's catalog match):
@@ -1312,6 +1437,63 @@ impl<'a> Binder<'a> {
             },
             m.resolution,
         ))
+    }
+
+    /// A SET target whose qualifier names no writable relation. With a
+    /// **single** writable sink the dotted path reads as a composite subfield
+    /// on the root (PostgreSQL: `SET address.city = …` updates column
+    /// `address` of the target; `SET t.address.city = …` the same with the
+    /// root named first) — the write pins the root, its column the first
+    /// non-root segment. Among **several** writable relations no composite
+    /// syntax exists (MySQL multi-table), and a ≥3-segment path with no root
+    /// prefix looks like a mistyped table path rather than a subfield — both
+    /// surface unattributed (`table: None`, `Unresolved`), keeping the
+    /// assignment (and its RHS reads / lineage) alive either way.
+    fn unmatched_qualifier_write(
+        &self,
+        parts: &[Ident],
+        root: &TableReference,
+        writable: &[Relation],
+    ) -> (ColumnWrite, ResolutionKind) {
+        let fold = self.style.casing.table;
+        let root_prefixed = self.eq(fold, &parts[0], &root.name);
+        let column = if writable.len() < 2 && root_prefixed && parts.len() >= 3 {
+            Some(parts[1].clone())
+        } else if writable.len() < 2 && !root_prefixed && parts.len() == 2 {
+            Some(parts[0].clone())
+        } else {
+            None
+        };
+        match column {
+            Some(column) => {
+                let m = self.table_match(root);
+                let resolution = if self.list_has(&m.columns, &column) {
+                    ResolutionKind::Cataloged
+                } else {
+                    ResolutionKind::Inferred
+                };
+                (
+                    ColumnWrite {
+                        reference: crate::reference::ColumnReference {
+                            table: Some(m.table),
+                            name: column,
+                        },
+                        resolution,
+                    },
+                    m.resolution,
+                )
+            }
+            None => (
+                ColumnWrite {
+                    reference: crate::reference::ColumnReference {
+                        table: None,
+                        name: parts[parts.len() - 1].clone(),
+                    },
+                    resolution: ResolutionKind::Unresolved,
+                },
+                ResolutionKind::Unresolved,
+            ),
+        }
     }
 
     /// The table a SET qualifier names, iff it's a *writable* relation — a real

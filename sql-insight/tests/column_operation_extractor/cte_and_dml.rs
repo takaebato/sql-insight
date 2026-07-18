@@ -66,6 +66,27 @@ mod with_in_dml {
     }
 
     #[test]
+    fn select_into_keeps_a_data_modifying_cte_write() {
+        // `SELECT … INTO` lowers to a CreateTableAs; its `WITH` is the
+        // *statement's* WITH, so it must stay outermost — wrapping the create
+        // around it buried the CTE's INSERT inside the root's input, where
+        // the write-root collection never descends, and `t1`'s write vanished
+        // from every surface. (The unresolved outer `a` is a separate known
+        // gap: a DML CTE's RETURNING columns aren't exposed to references.)
+        assert_column_ops(
+            "WITH c AS (INSERT INTO t1 (a) VALUES (1) RETURNING a) \
+             SELECT a INTO t2 FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::CreateTable,
+                reads: vec![read("t1", "a"), unresolved("a")],
+                writes: vec![write("t1", "a"), write("t2", "a")],
+                lineage: vec![passthrough(unresolved("a"), relation("t2", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn with_multiple_ctes_chained_into_insert() {
         // Two CTEs where `b` references `a`. INSERT then pulls
         // from `b`. Composition walks back through both layers
@@ -644,6 +665,33 @@ mod on_conflict {
                     transformation(col("s", "y"), relation("t", "b")),
                     transformation(col("s", "y"), relation("t", "b")),
                 ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn pg_insert_target_alias_resolves_conflict_references() {
+        // PG's upsert idiom aliases the target (`INSERT INTO counters AS c`)
+        // so the conflict action can name the *existing* row (`c.n`). The
+        // alias used to be ignored, leaving `c.n` unresolved — no sink read,
+        // no lineage source.
+        assert_column_ops_with_dialect(
+            "INSERT INTO counters AS c (id, n) VALUES (1, 1) \
+             ON CONFLICT (id) DO UPDATE SET n = c.n + 1",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("counters", "n")],
+                writes: vec![
+                    write("counters", "id"),
+                    write("counters", "n"),
+                    write("counters", "n"),
+                ],
+                lineage: vec![transformation(
+                    col("counters", "n"),
+                    relation("counters", "n"),
+                )],
                 diagnostics: vec![],
             },
         );

@@ -1575,12 +1575,22 @@ mod relation_arm_coverage {
     }
 
     #[test]
-    fn update_5part_assignment_target_skipped() {
-        // UPDATE SET with a 5-segment qualified target lands in the
-        // catch-all `_ => None` arm of `column_ref_from_assignment_target`
-        // (the resolver's target decoder caps at 4 parts =
-        // catalog.schema.table.column).
+    fn update_5part_assignment_target_is_unattributed() {
+        // A 5-segment qualified target exceeds every representable shape
+        // (max catalog.schema.table.column, and no composite reading
+        // applies). The assignment is kept — column named, unattributed
+        // (`table: None`, `Unresolved`) — rather than silently dropped,
+        // so the UPDATE's write surface doesn't vanish.
         let result = op("UPDATE t SET a.b.c.d.e = 1");
-        assert_eq!(result.writes, vec![]);
+        assert_eq!(
+            result.writes,
+            vec![ColumnWrite {
+                reference: ColumnReference {
+                    table: None,
+                    name: "e".into(),
+                },
+                resolution: ResolutionKind::Unresolved,
+            }]
+        );
     }
 }
