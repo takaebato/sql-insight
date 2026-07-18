@@ -187,8 +187,9 @@ impl TableOperationExtractor {
         statement: &Statement,
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
+        capabilities: crate::resolver::DialectCapabilities,
     ) -> Result<TableOperation, Error> {
-        Self::extract_inner(statement, catalog, style).map(|(op, ..)| op)
+        Self::extract_inner(statement, catalog, style, capabilities).map(|(op, ..)| op)
     }
 
     /// Bind the statement and walk the plan for `reads` / `writes` / (for
@@ -203,6 +204,7 @@ impl TableOperationExtractor {
         statement: &Statement,
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
+        capabilities: crate::resolver::DialectCapabilities,
     ) -> Result<
         (
             TableOperation,
@@ -221,7 +223,8 @@ impl TableOperationExtractor {
                 None,
             ));
         }
-        let (plan, column_diagnostics) = crate::resolver::build(statement, catalog, style);
+        let (plan, column_diagnostics) =
+            crate::resolver::build(statement, catalog, style, capabilities);
         let merge_actions = crate::resolver::merge_actions(&plan);
         // An upsert (`INSERT … ON CONFLICT DO UPDATE`) both inserts and updates
         // its target, so the CRUD extractor places it in both buckets.

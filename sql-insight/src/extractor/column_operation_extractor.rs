@@ -257,12 +257,13 @@ impl ColumnOperationExtractor {
         statement: &Statement,
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
+        capabilities: crate::resolver::DialectCapabilities,
     ) -> Result<ColumnOperation, Error> {
         let statement_kind = classify_statement(statement);
         if statement_kind == StatementKind::Unsupported {
             return Ok(unsupported_column_operation(statement_kind, statement));
         }
-        let (plan, diagnostics) = crate::resolver::build(statement, catalog, style);
+        let (plan, diagnostics) = crate::resolver::build(statement, catalog, style, capabilities);
         Ok(ColumnOperation {
             statement_kind,
             reads: crate::resolver::reads(&plan),

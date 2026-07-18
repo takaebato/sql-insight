@@ -34,6 +34,7 @@
 //! - [`tables`] — the `writes` / `table_writes` walkers.
 
 mod binder;
+mod capabilities;
 mod lineage;
 mod logical_plan;
 mod origins;
@@ -41,6 +42,8 @@ mod reads;
 mod tables;
 
 use logical_plan::LogicalPlan;
+
+pub(crate) use capabilities::DialectCapabilities;
 
 use crate::extractor::{ColumnLineageEdge, TableLineageEdge};
 use crate::reference::{ColumnRead, ColumnWrite, TableRead, TableWrite};

@@ -1439,16 +1439,20 @@ impl<'a> Binder<'a> {
         ))
     }
 
-    /// A SET target whose qualifier names no writable relation. With a
-    /// **single** writable sink the dotted path reads as a composite subfield
-    /// on the root (PostgreSQL: `SET address.city = …` updates column
-    /// `address` of the target; `SET t.address.city = …` the same with the
-    /// root named first) — the write pins the root, its column the first
-    /// non-root segment. Among **several** writable relations no composite
-    /// syntax exists (MySQL multi-table), and a ≥3-segment path with no root
-    /// prefix looks like a mistyped table path rather than a subfield — both
-    /// surface unattributed (`table: None`, `Unresolved`), keeping the
-    /// assignment (and its RHS reads / lineage) alive either way.
+    /// A SET target whose qualifier names no writable relation. In a
+    /// struct-capable dialect ([`struct_set_targets`]) with a **single**
+    /// writable sink, the dotted path reads as a struct subfield on the root
+    /// (PostgreSQL: `SET address.city = …` updates column `address` of the
+    /// target — its SET grammar forbids relation qualifiers outright, so the
+    /// leading segment is always a column; `SET t.address.city = …` the same
+    /// with the root named first). Everywhere else — a table-qualifier-only
+    /// dialect (MySQL / MSSQL, where the qualifier can only be a mistyped
+    /// table), several writable relations, or a ≥3-segment path with no root
+    /// prefix — the write surfaces unattributed (`table: None`,
+    /// `Unresolved`). Either way the assignment (and its RHS reads /
+    /// lineage) stays alive.
+    ///
+    /// [`struct_set_targets`]: crate::resolver::DialectCapabilities::struct_set_targets
     fn unmatched_qualifier_write(
         &self,
         parts: &[Ident],
@@ -1457,9 +1461,10 @@ impl<'a> Binder<'a> {
     ) -> (ColumnWrite, ResolutionKind) {
         let fold = self.style.casing.table;
         let root_prefixed = self.eq(fold, &parts[0], &root.name);
-        let column = if writable.len() < 2 && root_prefixed && parts.len() >= 3 {
+        let struct_reading = self.capabilities.struct_set_targets && writable.len() < 2;
+        let column = if struct_reading && root_prefixed && parts.len() >= 3 {
             Some(parts[1].clone())
-        } else if writable.len() < 2 && !root_prefixed && parts.len() == 2 {
+        } else if struct_reading && !root_prefixed && parts.len() == 2 {
             Some(parts[0].clone())
         } else {
             None

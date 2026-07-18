@@ -84,6 +84,40 @@ mod writes {
     }
 
     #[test]
+    fn mysql_unknown_set_qualifier_is_unattributed_not_a_struct_field() {
+        // MySQL has no struct columns: a SET qualifier is always a table
+        // path, so one matching no relation is a mistake — the dialect
+        // capability gates the struct reading off, and the write surfaces
+        // unattributed instead of fabricating a `t.address` column write.
+        assert_column_ops_with_dialect(
+            &MySqlDialect {},
+            "UPDATE t SET address.city = old_city",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t", "old_city")],
+                writes: vec![ColumnWrite {
+                    reference: ColumnReference {
+                        table: None,
+                        name: "city".into(),
+                    },
+                    resolution: ResolutionKind::Unresolved,
+                }],
+                lineage: vec![passthrough(
+                    col("t", "old_city"),
+                    ColumnTarget::Relation(ColumnWrite {
+                        reference: ColumnReference {
+                            table: None,
+                            name: "city".into(),
+                        },
+                        resolution: ResolutionKind::Unresolved,
+                    }),
+                )],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn update_unknown_qualifier_among_several_writables_is_unattributed() {
         // With several writable relations (MySQL multi-table) no composite
         // syntax exists, so an unknown qualifier is a mistyped table path:

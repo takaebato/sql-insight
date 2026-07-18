@@ -359,6 +359,9 @@ mod tests {
         Binder {
             catalog,
             style: IdentifierStyle { casing, quote: '"' },
+            capabilities: crate::resolver::DialectCapabilities::for_dialect(
+                &sqlparser::dialect::GenericDialect {},
+            ),
             diagnostics: Vec::new(),
             context: Context::default(),
         }

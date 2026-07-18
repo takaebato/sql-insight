@@ -88,10 +88,12 @@ pub(crate) fn build_with_diagnostics(
     statement: &Statement,
     catalog: Option<&Catalog>,
     style: IdentifierStyle,
+    capabilities: super::DialectCapabilities,
 ) -> (LogicalPlan, Vec<ColumnLevelDiagnostic>) {
     let mut binder = Binder {
         catalog,
         style,
+        capabilities,
         diagnostics: Vec::new(),
         context: Context::default(),
     };
@@ -102,6 +104,9 @@ pub(crate) fn build_with_diagnostics(
 struct Binder<'a> {
     catalog: Option<&'a Catalog>,
     style: IdentifierStyle,
+    /// Dialect-derived resolution-rule switches (see
+    /// [`super::DialectCapabilities`]), threaded like `style`.
+    capabilities: super::DialectCapabilities,
     /// The accumulated diagnostics (a write-only sink, appended as binding
     /// proceeds). The binder is a single `&mut` entity, so this is a plain
     /// `Vec` — no interior mutability needed.
@@ -833,7 +838,13 @@ mod tests {
             casing: crate::casing::IdentifierCasing::for_dialect(&GenericDialect {}),
             quote: crate::casing::canonical_quote(&GenericDialect {}),
         };
-        build_with_diagnostics(&statements[0], catalog, style).0
+        build_with_diagnostics(
+            &statements[0],
+            catalog,
+            style,
+            crate::resolver::DialectCapabilities::for_dialect(&GenericDialect {}),
+        )
+        .0
     }
 
     fn only_binding(plan: &LogicalPlan) -> &Binding {
