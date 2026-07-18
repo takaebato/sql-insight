@@ -1283,6 +1283,62 @@ mod implicit_star {
     }
 
     #[test]
+    fn outer_wildcard_expands_through_a_from_first_derived_body() {
+        // The derived body's implicit `*` expands (catalog), completing the
+        // slot view — so the outer `*` expands through it. Previously the
+        // body bound as a *complete empty* output and the outer star
+        // "expanded" to zero columns with no diagnostic.
+        let catalog = TestCatalog::default().with("t", vec!["a", "b"]);
+        assert_column_ops_with_catalog(
+            "SELECT * FROM (FROM t) v",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![expanded_read("t", "a"), expanded_read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(expanded_read("t", "a"), expanded_out("a", 0)),
+                    passthrough(expanded_read("t", "b"), expanded_out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn pipe_select_star_over_a_set_operation_body() {
+        // Over a set-operation body the running outputs are the union's
+        // result columns; the star's slots fan across both branches
+        // positionally.
+        let catalog = TestCatalog::default()
+            .with("t", vec!["a", "b"])
+            .with("s", vec!["x", "y"]);
+        assert_column_ops_with_catalog(
+            "SELECT a FROM t UNION ALL SELECT x FROM s |> SELECT *",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read_with_ref(cataloged_table("t"), "a", ResolutionKind::Cataloged),
+                    read_with_ref(cataloged_table("s"), "x", ResolutionKind::Cataloged),
+                ],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(
+                        read_with_ref(cataloged_table("t"), "a", ResolutionKind::Cataloged),
+                        out("a", 0),
+                    ),
+                    passthrough(
+                        read_with_ref(cataloged_table("s"), "x", ResolutionKind::Cataloged),
+                        out("a", 0),
+                    ),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn pipe_select_star_over_incomplete_outputs_stays_suppressed() {
         // Catalog-free the base implicit `*` is unexpanded, so the running
         // outputs are incomplete — the pipe star must not pretend to know
