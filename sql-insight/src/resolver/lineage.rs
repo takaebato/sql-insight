@@ -83,10 +83,13 @@ fn dml_relation_lineage<'a>(
                 relation_lineage(&i.columns, src, context, edges);
             }
             // ON CONFLICT DO UPDATE SET col = value: each `value → target.col`,
-            // an `EXCLUDED.x` ref mapped to the source's like-positioned output.
+            // an `EXCLUDED.x` ref mapped to the source's like-positioned
+            // output. The positional mapping shares the wildcard gate above:
+            // an unexpanded `*` in the source shifts positions, so an
+            // `EXCLUDED.x` must yield no edge rather than a mis-paired one.
             for a in &i.on_conflict {
                 emit_edges(
-                    conflict_value_origins(&a.value, &i.columns, src, context),
+                    conflict_value_origins(&a.value, &i.columns, src, !i.source_wildcard, context),
                     ColumnTarget::Relation(a.target.clone()),
                     edges,
                 );

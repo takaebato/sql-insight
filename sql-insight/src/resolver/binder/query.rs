@@ -494,8 +494,27 @@ impl<'a> Binder<'a> {
                 predicate: where_reads,
             })
         };
-        // The projection resolves against the FROM scope (base reads).
-        let (exprs, outputs_complete) = self.bind_output_items(&select.projection, &scope);
+        // The projection resolves against the FROM scope (base reads). An
+        // *empty* projection is the FROM-first / projection-less form
+        // (DuckDB / ClickHouse `FROM t`, a pipe base) — an implicit
+        // `SELECT *`: expand it like a written bare `*`, and when the scope
+        // isn't completely known, mark the outputs incomplete and flag
+        // (previously the zero-item projection passed as a *complete* empty
+        // output list, silently claiming the query projects nothing).
+        let (exprs, outputs_complete) = if select.projection.is_empty() {
+            match self.expand_implicit_star(&scope) {
+                Some(items) => (items, true),
+                None => {
+                    self.record_wildcard_suppressed(
+                        "implicit `SELECT *` (FROM-first select)",
+                        Span::empty(),
+                    );
+                    (Vec::new(), false)
+                }
+            }
+        } else {
+            self.bind_output_items(&select.projection, &scope)
+        };
         let clause_scope = scope.with_query_outputs(self.output_cols(&exprs), outputs_complete);
         // GROUP BY → an `Aggregate` over the filtered rows; its keys are reads.
         let group_by = self.group_by_keys(&select.group_by, &clause_scope);

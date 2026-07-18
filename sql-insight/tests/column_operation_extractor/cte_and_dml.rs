@@ -672,6 +672,58 @@ mod on_conflict {
     }
 
     #[test]
+    fn pg_on_conflict_excluded_mapping_is_gated_by_an_unexpanded_wildcard() {
+        // The source projection kept an unexpanded `*`, so its positions are
+        // indeterminate — the `EXCLUDED.a` positional mapping must yield no
+        // edge (previously it mapped target position 0 onto the shifted
+        // source outputs and fabricated `s.y -> t2.b`), matching the skip
+        // the INSERT relation pairing already applies.
+        assert_column_ops_with_dialect(
+            "INSERT INTO t2 (a, b) SELECT *, y FROM s \
+             ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.a",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "y")],
+                writes: vec![write("t2", "a"), write("t2", "b"), write("t2", "b")],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn pg_on_conflict_excluded_maps_through_an_expanded_wildcard_source() {
+        // The positive counterpart of the gate: with a catalog the source's
+        // `*` expands, positions are determinate, and `EXCLUDED.a` correctly
+        // maps to the expanded slot 0 (`s.x`) — the gate only fires for an
+        // *unexpanded* wildcard.
+        use sql_insight::catalog::{Catalog, CatalogTable};
+        let catalog = Catalog::new().table(CatalogTable::new("public", "s").columns(["x", "y"]));
+        let options = ExtractorOptions::new().with_catalog(&catalog);
+        let actual = extract_column_operations_with_options(
+            &PostgreSqlDialect {},
+            "INSERT INTO t2 (a, b) SELECT * FROM s \
+             ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.a",
+            options,
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        let conflict_edges: Vec<String> = actual
+            .lineage
+            .iter()
+            .filter(
+                |e| matches!(&e.target, ColumnTarget::Relation(w) if w.reference.name.value == "b"),
+            )
+            .map(|e| e.source.reference.name.value.clone())
+            .collect();
+        // b receives the INSERT pairing (s.y) and the conflict SET (s.x).
+        assert_eq!(conflict_edges, vec!["y", "x"]);
+        assert!(actual.diagnostics.is_empty(), "{:?}", actual.diagnostics);
+    }
+
+    #[test]
     fn pg_on_conflict_demotion_reaches_nested_operand_positions() {
         // The demotion walk must reach every operand position an expression
         // can nest — a window's argument / partition / order keys, an IN
