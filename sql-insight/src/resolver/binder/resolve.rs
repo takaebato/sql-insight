@@ -356,12 +356,11 @@ mod tests {
     /// resolution helpers tested here). The surface quote defaults to the
     /// standard `"`; these helpers test matching, which is quote-char-agnostic.
     fn binder<'a>(catalog: Option<&'a Catalog>, casing: IdentifierCasing) -> Binder<'a> {
+        static GENERIC: sqlparser::dialect::GenericDialect = sqlparser::dialect::GenericDialect {};
         Binder {
             catalog,
             style: IdentifierStyle { casing, quote: '"' },
-            capabilities: crate::resolver::DialectCapabilities::for_dialect(
-                &sqlparser::dialect::GenericDialect {},
-            ),
+            dialect: &GENERIC,
             diagnostics: Vec::new(),
             context: Context::default(),
         }

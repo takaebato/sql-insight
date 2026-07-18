@@ -29,7 +29,6 @@ pub use table_operation_extractor::*;
 use crate::casing::{IdentifierCasing, IdentifierStyle};
 use crate::catalog::Catalog;
 use crate::error::Error;
-use crate::resolver::DialectCapabilities;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
@@ -180,14 +179,13 @@ pub(crate) fn extract_each<T, F>(
     extract_from: F,
 ) -> Result<Vec<Result<T, Error>>, Error>
 where
-    F: Fn(&Statement, Option<&Catalog>, IdentifierStyle, DialectCapabilities) -> Result<T, Error>,
+    F: Fn(&Statement, Option<&Catalog>, IdentifierStyle, &dyn Dialect) -> Result<T, Error>,
 {
     let statements = Parser::parse_sql(dialect, sql)?;
     let style = options.identifier_style(dialect);
-    let capabilities = DialectCapabilities::for_dialect(dialect);
     Ok(statements
         .iter()
-        .map(|s| extract_from(s, options.catalog, style, capabilities))
+        .map(|s| extract_from(s, options.catalog, style, dialect))
         .collect())
 }
 

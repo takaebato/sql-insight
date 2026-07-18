@@ -1452,7 +1452,7 @@ impl<'a> Binder<'a> {
     /// `Unresolved`). Either way the assignment (and its RHS reads /
     /// lineage) stays alive.
     ///
-    /// [`struct_set_targets`]: crate::resolver::DialectCapabilities::struct_set_targets
+    /// [`struct_set_targets`]: Binder::struct_set_targets
     fn unmatched_qualifier_write(
         &self,
         parts: &[Ident],
@@ -1461,7 +1461,7 @@ impl<'a> Binder<'a> {
     ) -> (ColumnWrite, ResolutionKind) {
         let fold = self.style.casing.table;
         let root_prefixed = self.eq(fold, &parts[0], &root.name);
-        let struct_reading = self.capabilities.struct_set_targets && writable.len() < 2;
+        let struct_reading = self.struct_set_targets() && writable.len() < 2;
         let column = if struct_reading && root_prefixed && parts.len() >= 3 {
             Some(parts[1].clone())
         } else if struct_reading && !root_prefixed && parts.len() == 2 {
