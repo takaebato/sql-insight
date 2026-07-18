@@ -1575,22 +1575,13 @@ mod relation_arm_coverage {
     }
 
     #[test]
-    fn update_5part_assignment_target_is_unattributed() {
-        // A 5-segment qualified target exceeds every representable shape
-        // (max catalog.schema.table.column, and no composite reading
-        // applies). The assignment is kept — column named, unattributed
-        // (`table: None`, `Unresolved`) — rather than silently dropped,
-        // so the UPDATE's write surface doesn't vanish.
+    fn update_5part_assignment_target_is_a_struct_path() {
+        // A 5-segment target exceeds every relation-qualified shape (max
+        // catalog.schema.table.column), so under the sole sink it reads as
+        // a composite subfield path at full depth — PostgreSQL puts no
+        // bound on nesting — writing the leading column, rather than
+        // being silently dropped or left unattributed.
         let result = op("UPDATE t SET a.b.c.d.e = 1");
-        assert_eq!(
-            result.writes,
-            vec![ColumnWrite {
-                reference: ColumnReference {
-                    table: None,
-                    name: "e".into(),
-                },
-                resolution: ResolutionKind::Unresolved,
-            }]
-        );
+        assert_eq!(result.writes, vec![w("t", "a")]);
     }
 }

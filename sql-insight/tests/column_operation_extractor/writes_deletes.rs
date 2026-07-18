@@ -81,6 +81,50 @@ mod writes {
                 diagnostics: vec![],
             },
         );
+        // Depth is unbounded: a nested composite path still writes the
+        // leading column (PostgreSQL: `SET address.city.zip` updates
+        // `address`).
+        assert_column_ops(
+            "UPDATE t SET address.city.zip = '9'",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![write("t", "address")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn update_aliased_target_shadowed_name_is_a_struct_column() {
+        // Root-prefix detection is scope addressability, not text: under
+        // `UPDATE t AS x` the alias shadows `t`, so `SET t.a` writes
+        // column `t` (PostgreSQL 18: assigns field `a` of column `t`) —
+        // it used to surface unattributed, erasing the sole assignment
+        // from the table-level write surface.
+        assert_column_ops(
+            "UPDATE t AS x SET t.a = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![write("t", "t")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+        // The alias itself is the addressable prefix and strips like the
+        // bare root name does.
+        assert_column_ops(
+            "UPDATE t AS x SET x.address.city = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![write("t", "address")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
     }
 
     #[test]

@@ -1415,7 +1415,7 @@ impl<'a> Binder<'a> {
                 .find_map(|rel| self.writable_qualifier_table(rel, qualifier))
             {
                 Some(table) => table,
-                None => return Some(self.unmatched_qualifier_write(&parts, root, writable)),
+                None => return Some(self.unmatched_qualifier_write(&parts, scope, root, writable)),
             }
         };
         // Re-match the resolved write-target table (`table` is canonical, so
@@ -1443,14 +1443,20 @@ impl<'a> Binder<'a> {
 
     /// A SET target whose qualifier names no writable relation. In a
     /// struct-capable dialect ([`supports_struct_set_targets`]) with a **single**
-    /// writable sink, the dotted path reads as a struct subfield on the root
-    /// (PostgreSQL: `SET address.city = …` updates column `address` of the
-    /// target — its SET grammar forbids relation qualifiers outright, so the
-    /// leading segment is always a column; `SET t.address.city = …` the same
-    /// with the root named first). Everywhere else — a table-qualifier-only
-    /// dialect (MySQL / MSSQL, where the qualifier can only be a mistyped
-    /// table), several writable relations, or a ≥3-segment path with no root
-    /// prefix — the write surfaces unattributed (`table: None`,
+    /// writable sink, the dotted path reads as a struct subfield path on the
+    /// root, at any depth (PostgreSQL: `SET address.city = …` — and the
+    /// deeper `SET address.city.zip = …` — update column `address` of the
+    /// target; its SET grammar has no relation qualifiers, so the leading
+    /// segment is a column). One exception: a leading segment that
+    /// *addresses the root in scope* — its alias when aliased, the bare
+    /// name otherwise — is a root prefix, stripped before the column
+    /// (`SET t.address.city = …` → column `address`). Addressability is the
+    /// scope's, not textual: under `UPDATE t AS x` the alias shadows `t`,
+    /// so `SET t.a = …` writes column `t` (PostgreSQL 18 reads it exactly
+    /// so) while `SET x.address.city = …` strips the alias prefix.
+    /// Everywhere else — a table-qualifier-only dialect (MySQL / MSSQL,
+    /// where the qualifier can only be a mistyped table) or several
+    /// writable relations — the write surfaces unattributed (`table: None`,
     /// `Unresolved`). Either way the assignment (and its RHS reads /
     /// lineage) stays alive.
     ///
@@ -1458,15 +1464,22 @@ impl<'a> Binder<'a> {
     fn unmatched_qualifier_write(
         &self,
         parts: &[Ident],
+        scope: &Scope,
         root: &TableReference,
         writable: &[Relation],
     ) -> (ColumnWrite, ResolutionKind) {
-        let fold = self.style.casing.table;
-        let root_prefixed = self.eq(fold, &parts[0], &root.name);
+        let head_is_root = scope
+            .relations
+            .iter()
+            .filter_map(|rel| self.writable_qualifier_table(rel, &parts[..1]))
+            .any(|table| self.table_identity_eq(&table, root));
         let struct_reading = self.supports_struct_set_targets() && writable.len() < 2;
-        let column = if struct_reading && root_prefixed && parts.len() >= 3 {
+        // `head_is_root` with only 2 segments can't reach here (that
+        // qualifier matched the root), so the prefix strip always leaves
+        // a column.
+        let column = if struct_reading && head_is_root && parts.len() >= 3 {
             Some(parts[1].clone())
-        } else if struct_reading && !root_prefixed && parts.len() == 2 {
+        } else if struct_reading && !head_is_root {
             Some(parts[0].clone())
         } else {
             None
