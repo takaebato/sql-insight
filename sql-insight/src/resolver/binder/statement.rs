@@ -923,7 +923,9 @@ impl<'a> Binder<'a> {
         };
         let mut scope = Scope::single(target_relation);
         let (source, source_scope) = self.bind_table_factor(&merge.source, &scope.relations);
-        scope.relations.extend(source_scope.relations);
+        // `absorb` keeps a parenthesized-join source's USING / NATURAL merge
+        // columns, so an unqualified reference to one fans in like in a SELECT.
+        scope.absorb(source_scope);
 
         let mut on = vec![self.bind_expr(&merge.on, &scope)];
         let mut clauses = Vec::new();

@@ -146,6 +146,38 @@ mod merge {
     }
 
     #[test]
+    fn merge_join_source_fans_in_the_merge_column() {
+        // The source-scope merge used to keep only the relations and drop a
+        // parenthesized join's USING merge columns, leaving an unqualified
+        // `k` ambiguous. It now fans in like the same join in a SELECT.
+        // (Known limit, as elsewhere: a catalog-free fan-in includes every
+        // relation that could own the name — the target `t` too.)
+        assert_column_ops(
+            "MERGE INTO t USING (a JOIN b USING (k)) ON t.id = k \
+             WHEN MATCHED THEN UPDATE SET x = k",
+            ColumnOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![
+                    read("t", "id"),
+                    read("t", "k"),
+                    read("a", "k"),
+                    read("b", "k"),
+                    read("t", "k"),
+                    read("a", "k"),
+                    read("b", "k"),
+                ],
+                writes: vec![write("t", "x")],
+                lineage: vec![
+                    passthrough(col("t", "k"), relation("t", "x")),
+                    passthrough(col("a", "k"), relation("t", "x")),
+                    passthrough(col("b", "k"), relation("t", "x")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn merge_returning_projects_affected_rows() {
         // RETURNING (Snowflake) / OUTPUT (MSSQL) projects the affected rows over
         // the target + source — its columns surface as reads with `QueryOutput`
