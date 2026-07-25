@@ -389,9 +389,14 @@ impl<'a> Binder<'a> {
             SetExpr::Query(query) => self.bind_query(query),
             SetExpr::Values(values) => self.bind_values(values),
             // `TABLE foo`: a whole-table query body (e.g. the source of
-            // `CREATE TABLE t AS TABLE foo`). Bind it as a read scan.
+            // `CREATE TABLE t AS TABLE foo`). A bare name checks the CTE
+            // environment first, like a FROM factor (`WITH c AS (…) TABLE c`
+            // reads the CTE, not a phantom table `c`); else a read scan.
             SetExpr::Table(table) => match table_set_expr_ref(table) {
-                Some(written) => self.bind_named_table(&written, None),
+                Some(written) => match self.bind_cte_by_name(&written, None) {
+                    Some(bound) => bound,
+                    None => self.bind_named_table(&written, None),
+                },
                 None => (LogicalPlan::Empty, Scope::default()),
             },
             // `WITH … INSERT/UPDATE/DELETE/MERGE …`: the DML statement is the
@@ -594,6 +599,15 @@ impl<'a> Binder<'a> {
             // relations so it reads a column, not a table.
             let (right, right_scope) = if is_array_join(&j.join_operator) {
                 self.bind_array_join(&j.relation, &visible)
+            } else if is_apply(&j.join_operator) {
+                // A T-SQL `CROSS / OUTER APPLY` factor is lateral by
+                // construction, but sqlparser parses it with `lateral: false`
+                // — so push the visible relations as an enclosing level for
+                // the whole factor (a derived body and a table function's
+                // arguments both correlate to the left rows).
+                self.in_outer(visible.clone(), scope.merge_columns.clone(), |b| {
+                    b.bind_table_factor(&j.relation, &visible)
+                })
             } else {
                 self.bind_table_factor(&j.relation, &visible)
             };
@@ -747,6 +761,38 @@ impl<'a> Binder<'a> {
         (scan, Scope::single(relation))
     }
 
+    /// A bare name matching an in-scope CTE resolves to a `CteRef` (the body
+    /// lives once on the owning `With`) exposing the CTE's output columns as
+    /// a synthetic relation — so the CTE name never surfaces as a table read.
+    /// `None` when the name is qualified or matches no CTE (a base table).
+    /// Shared by the table factor and a `TABLE foo` query body.
+    fn bind_cte_by_name(
+        &mut self,
+        written: &TableReference,
+        alias_name: Option<Ident>,
+    ) -> Option<(LogicalPlan, Scope)> {
+        if written.schema.is_some() || written.catalog.is_some() {
+            return None;
+        }
+        let cte = self
+            .context
+            .ctes
+            .iter()
+            .rev()
+            .find(|c| self.eq(self.style.casing.table_alias, &c.name, &written.name))?;
+        let relation = Relation::Derived {
+            alias: alias_name.clone().or_else(|| Some(cte.name.clone())),
+            columns: cte.columns.clone(),
+        };
+        Some((
+            LogicalPlan::CteRef(CteRef {
+                name: cte.name.clone(),
+                alias: alias_name,
+            }),
+            Scope::single(relation),
+        ))
+    }
+
     pub(super) fn bind_table_factor(
         &mut self,
         factor: &TableFactor,
@@ -771,27 +817,8 @@ impl<'a> Binder<'a> {
                     return (LogicalPlan::Empty, Scope::default());
                 };
                 let alias_name = alias.as_ref().map(|a| a.name.clone());
-                // A bare name matching an in-scope CTE resolves to a `CteRef`
-                // (the body lives once on the owning `With`) exposing the CTE's
-                // output columns as a synthetic relation.
-                if written.schema.is_none() && written.catalog.is_none() {
-                    if let Some(cte) =
-                        self.context.ctes.iter().rev().find(|c| {
-                            self.eq(self.style.casing.table_alias, &c.name, &written.name)
-                        })
-                    {
-                        let relation = Relation::Derived {
-                            alias: alias_name.clone().or_else(|| Some(cte.name.clone())),
-                            columns: cte.columns.clone(),
-                        };
-                        return (
-                            LogicalPlan::CteRef(CteRef {
-                                name: cte.name.clone(),
-                                alias: alias_name,
-                            }),
-                            Scope::single(relation),
-                        );
-                    }
+                if let Some(bound) = self.bind_cte_by_name(&written, alias_name.clone()) {
+                    return bound;
                 }
                 self.bind_named_table(&written, alias_name)
             }
@@ -806,7 +833,11 @@ impl<'a> Binder<'a> {
                 ..
             } => {
                 let (mut op, sub_scope) = if *lateral {
-                    self.in_outer(left.to_vec(), |b| b.bind_query(subquery))
+                    // Only the sibling relations are in hand here (the
+                    // enclosing scope's merge columns don't thread through
+                    // `bind_table_factor`), so a LATERAL body sees them
+                    // without any fan-in — a pre-existing limit.
+                    self.in_outer(left.to_vec(), Vec::new(), |b| b.bind_query(subquery))
                 } else {
                     self.bind_query(subquery)
                 };

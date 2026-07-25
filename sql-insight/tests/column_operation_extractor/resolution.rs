@@ -315,6 +315,36 @@ mod catalog_strict {
     }
 
     #[test]
+    fn correlated_reference_falls_through_to_the_outer_merge_column() {
+        // The catalog rules the inner relation out (`c` doesn't list `k`),
+        // so the correlated reference falls through to the enclosing level
+        // and fans in to the outer USING owners — catalog-free the sole
+        // inner suspect `c` would pin it instead (the catalog-free pin is
+        // in `joins_sets`).
+        let catalog = TestCatalog::default()
+            .with("a", vec!["id", "k"])
+            .with("b", vec!["k", "y"])
+            .with("c", vec!["x"]);
+        assert_column_ops_with_catalog(
+            "SELECT a.id FROM a JOIN b USING (k) \
+             WHERE EXISTS (SELECT 1 FROM c WHERE c.x = k)",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read_confirmed("a", "id"),
+                    read_confirmed("c", "x"),
+                    read_confirmed("a", "k"),
+                    read_confirmed("b", "k"),
+                ],
+                writes: vec![],
+                lineage: vec![passthrough(col_confirmed("a", "id"), out("id", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn multi_table_update_natural_join_fans_in_the_schema_common_column() {
         // A NATURAL join in the UPDATE target clause takes its merge columns
         // from the catalog's schema-common columns (`id`), so the

@@ -658,6 +658,53 @@ mod collapse {
     }
 
     #[test]
+    fn qualified_ref_does_not_trace_into_an_unaliased_sibling_derived() {
+        // `x.a` names the aliased derived table only; the *unaliased*
+        // sibling producer — which exposes an `a` too — has no relation
+        // boundary a qualifier could match, so the named trace must not
+        // claim it (it used to, fabricating `s.a -> a`). Its scan still
+        // reads (reads are syntactic); only the lineage is pinned to `u`.
+        assert_column_ops(
+            "SELECT x.a FROM (SELECT a FROM s), (SELECT a FROM u) AS x",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "a"), read("u", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("u", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+        // The set-operation producer is inline the same way — same guard.
+        assert_column_ops(
+            "SELECT x.a FROM (SELECT a FROM s UNION SELECT a FROM s2), \
+             (SELECT a FROM u) AS x",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "a"), read("s2", "a"), read("u", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("u", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn unqualified_ref_still_traces_into_an_unaliased_derived() {
+        // Without a qualifier the inline producer is legitimately claimed
+        // (an unaliased derived is addressable only unqualified).
+        assert_column_ops(
+            "SELECT a FROM (SELECT a FROM s)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("s", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("s", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn cte_referenced_twice_collapses_each_use() {
         // Each cte reference in the projection collapses independently
         // back to t1.id.

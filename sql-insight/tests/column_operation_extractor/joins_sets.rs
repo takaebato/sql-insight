@@ -474,6 +474,45 @@ mod join_using_and_natural {
     }
 
     #[test]
+    fn correlated_subquery_reference_fans_in_the_outer_merge_column() {
+        // A correlated reference to the outer query's USING merge column
+        // fans in exactly as it would in the outer query itself — the
+        // correlation level carries the merge columns, not just the
+        // relations (it used to fall `Ambiguous`).
+        assert_column_ops(
+            "SELECT (SELECT k) FROM a JOIN b USING (k)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("a", "k"), read("b", "k")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("a", "k"), out_anon(0)),
+                    transformation(col("b", "k"), out_anon(0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn inner_scope_claims_the_name_before_the_outer_merge_column() {
+        // An inner relation that could own the name wins over the outer
+        // merge column (innermost-first, like all correlation): `k` inside
+        // the EXISTS pins its sole inner suspect `c`, no outer fan-in.
+        assert_column_ops(
+            "SELECT a.id FROM a JOIN b USING (k) \
+             WHERE EXISTS (SELECT 1 FROM c WHERE c.x = k)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("a", "id"), read("c", "x"), read("c", "k")],
+                writes: vec![],
+                lineage: vec![passthrough(col("a", "id"), out("id", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn join_using_id_fans_in_at_each_occurrence() {
         // The merge column fans in independently per occurrence: the
         // projection `id` and the WHERE `id` each expand to t1.id +
@@ -660,6 +699,7 @@ mod join_using_and_natural {
 
 mod lateral_and_correlation {
     use super::*;
+    use sql_insight::sqlparser::dialect::MsSqlDialect;
 
     #[test]
     fn lateral_subquery_resolves_inner_ref_to_inner_table() {
@@ -717,6 +757,43 @@ mod lateral_and_correlation {
                     transformation(unresolved("a"), out("x", 0)),
                     transformation(col("t2", "b"), out("x", 0)),
                 ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn cross_apply_derived_body_sees_the_left_side() {
+        // T-SQL `CROSS APPLY` is lateral by construction (sqlparser parses
+        // the factor with `lateral: false`, so the binder grants the
+        // visibility off the join operator): the applied body's `t.b`
+        // resolves to the left relation — it used to fall `Unresolved`.
+        assert_column_ops_with_dialect(
+            &MsSqlDialect {},
+            "SELECT v.b FROM t CROSS APPLY (SELECT t.b AS b) v",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "b")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "b"), out("b", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn outer_apply_function_arguments_see_the_left_side() {
+        // The other APPLY shape: a table-valued function whose arguments
+        // reference the left rows. The argument read resolves and feeds the
+        // function's output at function granularity (a Transformation).
+        assert_column_ops_with_dialect(
+            &MsSqlDialect {},
+            "SELECT v.x FROM t OUTER APPLY dbo.split(t.csv) v",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "csv")],
+                writes: vec![],
+                lineage: vec![transformation(col("t", "csv"), out("x", 0))],
                 diagnostics: vec![],
             },
         );

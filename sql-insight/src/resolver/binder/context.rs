@@ -18,8 +18,13 @@ use super::*;
 #[derive(Clone)]
 pub(super) enum Level {
     /// An enclosing query level's FROM relations (a subquery / the query the
-    /// current one is correlated into).
-    Relations(Vec<Relation>),
+    /// current one is correlated into), with the level's `USING` / NATURAL
+    /// merge columns — a correlated reference to one fans in to its owners
+    /// exactly as it would in the enclosing query itself.
+    Relations {
+        relations: Vec<Relation>,
+        merge_columns: Vec<Ident>,
+    },
     /// A lambda's parameters (`x` in `x -> …`): a bare reference resolves to
     /// [`Binding::Local`] — not a table column.
     Lambda(Vec<Ident>),
@@ -54,8 +59,15 @@ impl Context {
 
     /// A child context with one more enclosing relation level on the stack (used
     /// when descending into a subquery in an expression / a LATERAL factor).
-    pub(super) fn with_outer(&self, relations: Vec<Relation>) -> Context {
-        self.pushing(Level::Relations(relations))
+    pub(super) fn with_outer(
+        &self,
+        relations: Vec<Relation>,
+        merge_columns: Vec<Ident>,
+    ) -> Context {
+        self.pushing(Level::Relations {
+            relations,
+            merge_columns,
+        })
     }
 
     /// A child context with the lambda `params` pushed as a level (used to bind
