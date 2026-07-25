@@ -71,6 +71,7 @@ use crate::reference::{ColumnWrite, ResolutionKind, TableRead, TableReference, T
 // block over the shared types — the `Binder` context and free helpers here,
 // the `Scope` relation / output model in `scope`.
 mod context;
+mod dialect;
 mod expr;
 mod query;
 mod resolve;
@@ -84,14 +85,16 @@ use scope::*;
 /// diagnostics it raised (unsupported statement, suppressed wildcard,
 /// over-qualified table name). An unmodelled statement yields
 /// [`LogicalPlan::Empty`] and an `UnsupportedStatement` diagnostic.
-pub(crate) fn build_with_diagnostics(
+pub(crate) fn build_with_diagnostics<'a>(
     statement: &Statement,
-    catalog: Option<&Catalog>,
+    catalog: Option<&'a Catalog>,
     style: IdentifierStyle,
+    dialect: &'a dyn sqlparser::dialect::Dialect,
 ) -> (LogicalPlan, Vec<ColumnLevelDiagnostic>) {
     let mut binder = Binder {
         catalog,
         style,
+        dialect,
         diagnostics: Vec::new(),
         context: Context::default(),
     };
@@ -102,6 +105,12 @@ pub(crate) fn build_with_diagnostics(
 struct Binder<'a> {
     catalog: Option<&'a Catalog>,
     style: IdentifierStyle,
+    /// The parsing dialect, for **semantic** questions — divergences in what
+    /// a construct *means* across dialects (`crate::casing` covers how
+    /// identifiers merely *match*). Consult it only through the question
+    /// methods in [`dialect`](self) (`binder/dialect.rs`); bind code never
+    /// downcasts it ad hoc.
+    dialect: &'a dyn sqlparser::dialect::Dialect,
     /// The accumulated diagnostics (a write-only sink, appended as binding
     /// proceeds). The binder is a single `&mut` entity, so this is a plain
     /// `Vec` — no interior mutability needed.
@@ -833,7 +842,7 @@ mod tests {
             casing: crate::casing::IdentifierCasing::for_dialect(&GenericDialect {}),
             quote: crate::casing::canonical_quote(&GenericDialect {}),
         };
-        build_with_diagnostics(&statements[0], catalog, style).0
+        build_with_diagnostics(&statements[0], catalog, style, &GenericDialect {}).0
     }
 
     fn only_binding(plan: &LogicalPlan) -> &Binding {

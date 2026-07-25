@@ -136,9 +136,10 @@ impl CrudTableExtractor {
         statement: &Statement,
         catalog: Option<&Catalog>,
         style: IdentifierStyle,
+        dialect: &dyn Dialect,
     ) -> Result<CrudTables, Error> {
         let (ops, merge_actions, insert_updates, cte_crud) =
-            TableOperationExtractor::extract_inner(statement, catalog, style)?;
+            TableOperationExtractor::extract_inner(statement, catalog, style, dialect)?;
         // CRUD buckets carry the same `ResolutionKind` as the table operation:
         // reads as `TableRead`, the create / update / delete buckets as
         // `TableWrite`.

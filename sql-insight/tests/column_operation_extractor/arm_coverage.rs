@@ -1575,12 +1575,13 @@ mod relation_arm_coverage {
     }
 
     #[test]
-    fn update_5part_assignment_target_skipped() {
-        // UPDATE SET with a 5-segment qualified target lands in the
-        // catch-all `_ => None` arm of `column_ref_from_assignment_target`
-        // (the resolver's target decoder caps at 4 parts =
-        // catalog.schema.table.column).
+    fn update_5part_assignment_target_is_a_struct_path() {
+        // A 5-segment target exceeds every relation-qualified shape (max
+        // catalog.schema.table.column), so under the sole sink it reads as
+        // a composite subfield path at full depth — PostgreSQL puts no
+        // bound on nesting — writing the leading column, rather than
+        // being silently dropped or left unattributed.
         let result = op("UPDATE t SET a.b.c.d.e = 1");
-        assert_eq!(result.writes, vec![]);
+        assert_eq!(result.writes, vec![w("t", "a")]);
     }
 }

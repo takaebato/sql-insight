@@ -2,6 +2,7 @@ use crate::support::*;
 
 mod writes {
     use super::*;
+    use sql_insight::sqlparser::dialect::{MsSqlDialect, MySqlDialect};
 
     #[test]
     fn insert_with_explicit_columns_writes_those_columns_on_target() {
@@ -44,6 +45,299 @@ mod writes {
                 writes: vec![],
                 lineage: vec![],
                 diagnostics: vec![diag(ColumnLevelDiagnosticKind::InsertColumnsUnresolved)],
+            },
+        );
+    }
+
+    #[test]
+    fn update_composite_subfield_target_writes_the_root_column() {
+        // A qualified SET target whose qualifier names no relation reads as a
+        // PostgreSQL composite subfield path on the (sole) sink:
+        // `SET address.city = …` updates column `address` of `t` — the
+        // assignment used to be silently dropped, erasing the RHS reads and,
+        // as the sole assignment, the whole UPDATE from the write surfaces.
+        assert_column_ops(
+            "UPDATE t SET address.city = old_city || '-x' WHERE id = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t", "old_city"), read("t", "id")],
+                writes: vec![write("t", "address")],
+                lineage: vec![transformation(
+                    col("t", "old_city"),
+                    relation("t", "address"),
+                )],
+                diagnostics: vec![],
+            },
+        );
+        // The root-prefixed spelling (`t.address.city`) strips the root and
+        // lands on the same column.
+        assert_column_ops(
+            "UPDATE t SET t.address.city = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![write("t", "address")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+        // Depth is unbounded: a nested composite path still writes the
+        // leading column (PostgreSQL: `SET address.city.zip` updates
+        // `address`).
+        assert_column_ops(
+            "UPDATE t SET address.city.zip = '9'",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![write("t", "address")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn update_aliased_target_shadowed_name_is_a_struct_column() {
+        // Root-prefix detection is scope addressability, not text: under
+        // `UPDATE t AS x` the alias shadows `t`, so `SET t.a` writes
+        // column `t` (PostgreSQL 18: assigns field `a` of column `t`) —
+        // it used to surface unattributed, erasing the sole assignment
+        // from the table-level write surface.
+        assert_column_ops(
+            "UPDATE t AS x SET t.a = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![write("t", "t")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+        // The alias itself is the addressable prefix and strips like the
+        // bare root name does.
+        assert_column_ops(
+            "UPDATE t AS x SET x.address.city = 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![write("t", "address")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn mysql_unknown_set_qualifier_is_unattributed_not_a_struct_field() {
+        // MySQL has no struct columns: a SET qualifier is always a table
+        // path, so one matching no relation is a mistake — the dialect
+        // capability gates the struct reading off, and the write surfaces
+        // unattributed instead of fabricating a `t.address` column write.
+        assert_column_ops_with_dialect(
+            &MySqlDialect {},
+            "UPDATE t SET address.city = old_city",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t", "old_city")],
+                writes: vec![ColumnWrite {
+                    reference: ColumnReference {
+                        table: None,
+                        name: "city".into(),
+                    },
+                    resolution: ResolutionKind::Unresolved,
+                }],
+                lineage: vec![passthrough(
+                    col("t", "old_city"),
+                    ColumnTarget::Relation(ColumnWrite {
+                        reference: ColumnReference {
+                            table: None,
+                            name: "city".into(),
+                        },
+                        resolution: ResolutionKind::Unresolved,
+                    }),
+                )],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn update_unknown_qualifier_among_several_writables_is_unattributed() {
+        // With several writable relations (MySQL multi-table) no composite
+        // syntax exists, so an unknown qualifier is a mistyped table path:
+        // the write surfaces unattributed (`table: None`, `Unresolved`) and
+        // the RHS reads survive, rather than the assignment vanishing.
+        assert_column_ops_with_dialect(
+            &MySqlDialect {},
+            "UPDATE t1 JOIN t2 ON t1.id = t2.id SET bogus.c = t1.a",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1", "id"), read("t2", "id"), read("t1", "a")],
+                writes: vec![ColumnWrite {
+                    reference: ColumnReference {
+                        table: None,
+                        name: "c".into(),
+                    },
+                    resolution: ResolutionKind::Unresolved,
+                }],
+                lineage: vec![passthrough(
+                    col("t1", "a"),
+                    ColumnTarget::Relation(ColumnWrite {
+                        reference: ColumnReference {
+                            table: None,
+                            name: "c".into(),
+                        },
+                        resolution: ResolutionKind::Unresolved,
+                    }),
+                )],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn tuple_set_with_composite_first_target_keeps_reads_and_pairing() {
+        // The first tuple target failing to resolve used to drop only the
+        // output-0 subquery clone — the one `reads` walks — leaving lineage
+        // without reads. Both targets now bind (the first as a composite
+        // write on the root), so reads and lineage stay symmetric.
+        assert_column_ops(
+            "UPDATE t SET (address.city, b) = (SELECT x, y FROM s)",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("s", "x"), read("s", "y")],
+                writes: vec![write("t", "address"), write("t", "b")],
+                lineage: vec![
+                    transformation(col("s", "x"), relation("t", "address")),
+                    transformation(col("s", "y"), relation("t", "b")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn tsql_update_alias_from_writes_the_aliased_table() {
+        // T-SQL aliases the target in the FROM clause: `UPDATE a … FROM t AS
+        // a` writes `t`. The bare target name used to bind as a phantom table
+        // `a` (a fabricated write target) while making `a.id` ambiguous
+        // between the phantom and the real relation.
+        assert_column_ops_with_dialect(
+            &MsSqlDialect {},
+            "UPDATE a SET x = 1 FROM t AS a WHERE a.id = 5",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t", "id")],
+                writes: vec![write("t", "x")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn update_target_clause_using_join_fans_in_the_merge_column() {
+        // The merge column of a *target-clause* join (MySQL multi-table
+        // form) fans in too — same rule as the FROM-clause join below, via
+        // the target-join loop's own merge computation.
+        assert_column_ops_with_dialect(
+            &MySqlDialect {},
+            "UPDATE t1 JOIN t2 USING (k) SET t1.x = k",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1", "k"), read("t2", "k")],
+                writes: vec![write("t1", "x")],
+                lineage: vec![
+                    passthrough(col("t1", "k"), relation("t1", "x")),
+                    passthrough(col("t2", "k"), relation("t1", "x")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn tsql_update_alias_on_a_joined_from_factor_matches() {
+        // The FROM-alias form also matches when the alias sits on a *joined*
+        // factor, not the first one.
+        assert_column_ops_with_dialect(
+            &MsSqlDialect {},
+            "UPDATE b SET x = 1 FROM t JOIN s AS b ON t.id = b.tid",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t", "id"), read("s", "tid")],
+                writes: vec![write("s", "x")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn tsql_schema_qualified_target_is_not_a_from_alias() {
+        // A schema-qualified target can never name a FROM alias (aliases are
+        // single-part), so it binds the ordinary target-first way even when
+        // a FROM factor happens to alias the same trailing name.
+        assert_column_ops_with_dialect(
+            &MsSqlDialect {},
+            "UPDATE dbo.a SET x = 1 FROM t AS a",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![ColumnWrite {
+                    reference: ColumnReference {
+                        table: Some(TableReference {
+                            catalog: None,
+                            schema: Some("dbo".into()),
+                            name: "a".into(),
+                        }),
+                        name: "x".into(),
+                    },
+                    resolution: ResolutionKind::Inferred,
+                }],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn update_from_join_using_fans_in_the_merge_column() {
+        // The FROM loop used to keep only the joined relations and drop
+        // their USING merge columns, leaving an unqualified `k` ambiguous.
+        // It now fans in like the same join in a SELECT. (Known limit,
+        // as elsewhere: a catalog-free fan-in includes every relation that
+        // could own the name — the target `t` too, not just the two USING
+        // operands.)
+        assert_column_ops(
+            "UPDATE t SET x = k FROM a JOIN b USING (k)",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t", "k"), read("a", "k"), read("b", "k")],
+                writes: vec![write("t", "x")],
+                lineage: vec![
+                    passthrough(col("t", "k"), relation("t", "x")),
+                    passthrough(col("a", "k"), relation("t", "x")),
+                    passthrough(col("b", "k"), relation("t", "x")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn update_order_by_keys_are_reads() {
+        // The MySQL `ORDER BY` tail picks row order for the LIMIT — filter
+        // reads of the target, mirroring DELETE (previously unbound).
+        assert_column_ops_with_dialect(
+            &MySqlDialect {},
+            "UPDATE t SET a = 1 ORDER BY b LIMIT 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t", "b")],
+                writes: vec![write("t", "a")],
+                lineage: vec![],
+                diagnostics: vec![],
             },
         );
     }
@@ -235,6 +529,30 @@ mod delete {
             ColumnOperation {
                 statement_kind: StatementKind::Delete,
                 reads: vec![read("t1", "id")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn delete_using_join_fans_in_the_merge_column() {
+        // The USING loop keeps the joins' merge columns (`absorb`, like the
+        // UPDATE FROM loop), so an unqualified predicate reference to one
+        // fans in like in a SELECT. (Known limit, as elsewhere: a
+        // catalog-free fan-in includes every relation that could own the
+        // name — the target `t` too, not just the two USING operands.)
+        assert_column_ops(
+            "DELETE FROM t USING a JOIN b USING (k) WHERE t.id = k",
+            ColumnOperation {
+                statement_kind: StatementKind::Delete,
+                reads: vec![
+                    read("t", "id"),
+                    read("t", "k"),
+                    read("a", "k"),
+                    read("b", "k"),
+                ],
                 writes: vec![],
                 lineage: vec![],
                 diagnostics: vec![],

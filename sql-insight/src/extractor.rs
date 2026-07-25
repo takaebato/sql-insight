@@ -179,13 +179,13 @@ pub(crate) fn extract_each<T, F>(
     extract_from: F,
 ) -> Result<Vec<Result<T, Error>>, Error>
 where
-    F: Fn(&Statement, Option<&Catalog>, IdentifierStyle) -> Result<T, Error>,
+    F: Fn(&Statement, Option<&Catalog>, IdentifierStyle, &dyn Dialect) -> Result<T, Error>,
 {
     let statements = Parser::parse_sql(dialect, sql)?;
     let style = options.identifier_style(dialect);
     Ok(statements
         .iter()
-        .map(|s| extract_from(s, options.catalog, style))
+        .map(|s| extract_from(s, options.catalog, style, dialect))
         .collect())
 }
 

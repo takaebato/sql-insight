@@ -296,6 +296,79 @@ mod catalog_strict {
     }
 
     #[test]
+    fn composite_subfield_write_resolution_cataloged_vs_inferred() {
+        // The struct-subfield fallback matches the written root column
+        // against the target's catalog list like any base write: `address`
+        // is listed → Cataloged; `bogus` isn't → Inferred.
+        let catalog = TestCatalog::default().with("t", vec!["id", "address"]);
+        assert_column_ops_with_catalog(
+            "UPDATE t SET address.city = 1, bogus.city = 2",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![write("t", "address"), write_inferred("t", "bogus")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn multi_table_update_natural_join_fans_in_the_schema_common_column() {
+        // A NATURAL join in the UPDATE target clause takes its merge columns
+        // from the catalog's schema-common columns (`id`), so the
+        // unqualified predicate reference fans in to both sides; the
+        // unqualified SET target `x` pins its sole owner `t1`. (Asserts
+        // names + resolutions directly, sidestepping MySQL's canonical
+        // backtick quoting of the surfaced identities.)
+        let catalog = TestCatalog::default()
+            .with("t1", vec!["id", "x"])
+            .with("t2", vec!["id", "y"]);
+        let options = ExtractorOptions::new().with_catalog(&catalog.catalog);
+        let op = extract_column_operations_with_options(
+            &MySqlDialect {},
+            "UPDATE t1 NATURAL JOIN t2 SET x = 1 WHERE id > 0",
+            options,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .unwrap();
+        let reads: Vec<_> = op
+            .reads
+            .iter()
+            .map(|r| {
+                (
+                    r.reference.table.as_ref().unwrap().name.value.as_str(),
+                    r.reference.name.value.as_str(),
+                    r.resolution,
+                )
+            })
+            .collect();
+        assert_eq!(
+            reads,
+            vec![
+                ("t1", "id", ResolutionKind::Cataloged),
+                ("t2", "id", ResolutionKind::Cataloged),
+            ]
+        );
+        let writes: Vec<_> = op
+            .writes
+            .iter()
+            .map(|w| {
+                (
+                    w.reference.table.as_ref().unwrap().name.value.as_str(),
+                    w.reference.name.value.as_str(),
+                    w.resolution,
+                )
+            })
+            .collect();
+        assert_eq!(writes, vec![("t1", "x", ResolutionKind::Cataloged)]);
+    }
+
+    #[test]
     fn multi_table_update_resolves_each_set_target_against_its_own_catalog() {
         // Each SET target resolves against *its own* table's catalog columns:
         // `t1.a` is listed (Cataloged), `t2.z` isn't (Inferred). (Asserts the

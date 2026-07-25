@@ -685,7 +685,7 @@ mod tests {
             casing: IdentifierCasing::for_dialect(&GenericDialect {}),
             quote: canonical_quote(&GenericDialect {}),
         };
-        build_with_diagnostics(&statements[0], None, style).0
+        build_with_diagnostics(&statements[0], None, style, &GenericDialect {}).0
     }
 
     fn read_names(plan: &LogicalPlan) -> Vec<String> {
