@@ -208,6 +208,44 @@ mod select {
     }
 
     #[test]
+    fn table_body_resolves_a_cte_not_a_phantom_table() {
+        // `TABLE c` is sugar for `SELECT * FROM c`, so a bare name checks
+        // the CTE environment like a FROM factor — the CTE binding `c`
+        // never surfaces as a table read. A qualified `TABLE public.c`
+        // names a real table as usual (the sibling assertion).
+        assert_ops(
+            "WITH c AS (SELECT a FROM t) TABLE c",
+            TableOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+        assert_ops(
+            "WITH c AS (SELECT a FROM t) TABLE public.c",
+            TableOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    TableRead {
+                        reference: TableReference {
+                            catalog: None,
+                            schema: Some("public".into()),
+                            name: "c".into(),
+                        },
+                        resolution: ResolutionKind::Inferred,
+                    },
+                    read("t"),
+                ],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn bare_values_emits_nothing() {
         // `VALUES (1, 2)` parses as a query whose body is a VALUES
         // clause — no table references, no writes, no lineage.
