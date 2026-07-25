@@ -236,6 +236,72 @@ mod writes {
     }
 
     #[test]
+    fn update_target_clause_using_join_fans_in_the_merge_column() {
+        // The merge column of a *target-clause* join (MySQL multi-table
+        // form) fans in too — same rule as the FROM-clause join below, via
+        // the target-join loop's own merge computation.
+        assert_column_ops_with_dialect(
+            &MySqlDialect {},
+            "UPDATE t1 JOIN t2 USING (k) SET t1.x = k",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t1", "k"), read("t2", "k")],
+                writes: vec![write("t1", "x")],
+                lineage: vec![
+                    passthrough(col("t1", "k"), relation("t1", "x")),
+                    passthrough(col("t2", "k"), relation("t1", "x")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn tsql_update_alias_on_a_joined_from_factor_matches() {
+        // The FROM-alias form also matches when the alias sits on a *joined*
+        // factor, not the first one.
+        assert_column_ops_with_dialect(
+            &MsSqlDialect {},
+            "UPDATE b SET x = 1 FROM t JOIN s AS b ON t.id = b.tid",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![read("t", "id"), read("s", "tid")],
+                writes: vec![write("s", "x")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn tsql_schema_qualified_target_is_not_a_from_alias() {
+        // A schema-qualified target can never name a FROM alias (aliases are
+        // single-part), so it binds the ordinary target-first way even when
+        // a FROM factor happens to alias the same trailing name.
+        assert_column_ops_with_dialect(
+            &MsSqlDialect {},
+            "UPDATE dbo.a SET x = 1 FROM t AS a",
+            ColumnOperation {
+                statement_kind: StatementKind::Update,
+                reads: vec![],
+                writes: vec![ColumnWrite {
+                    reference: ColumnReference {
+                        table: Some(TableReference {
+                            catalog: None,
+                            schema: Some("dbo".into()),
+                            name: "a".into(),
+                        }),
+                        name: "x".into(),
+                    },
+                    resolution: ResolutionKind::Inferred,
+                }],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn update_from_join_using_fans_in_the_merge_column() {
         // The FROM loop used to keep only the joined relations and drop
         // their USING merge columns, leaving an unqualified `k` ambiguous.
@@ -463,6 +529,30 @@ mod delete {
             ColumnOperation {
                 statement_kind: StatementKind::Delete,
                 reads: vec![read("t1", "id")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn delete_using_join_fans_in_the_merge_column() {
+        // The USING loop keeps the joins' merge columns (`absorb`, like the
+        // UPDATE FROM loop), so an unqualified predicate reference to one
+        // fans in like in a SELECT. (Known limit, as elsewhere: a
+        // catalog-free fan-in includes every relation that could own the
+        // name — the target `t` too, not just the two USING operands.)
+        assert_column_ops(
+            "DELETE FROM t USING a JOIN b USING (k) WHERE t.id = k",
+            ColumnOperation {
+                statement_kind: StatementKind::Delete,
+                reads: vec![
+                    read("t", "id"),
+                    read("t", "k"),
+                    read("a", "k"),
+                    read("b", "k"),
+                ],
                 writes: vec![],
                 lineage: vec![],
                 diagnostics: vec![],

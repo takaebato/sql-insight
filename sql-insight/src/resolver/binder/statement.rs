@@ -681,21 +681,30 @@ impl<'a> Binder<'a> {
         // (PostgreSQL / T-SQL `UPDATE t SET … FROM u` only ever writes `t`).
         let writable = scope.relations.clone();
         // FROM relations are reads (resolved against the target + joins so
-        // far). `absorb` carries their `USING` / NATURAL merge columns too, so
-        // an unqualified SET RHS / WHERE reference to a merge column fans in
-        // to both sides like it does in a SELECT (previously only the
-        // relations were kept and such a reference fell to `Ambiguous`).
+        // far).
         if let Some(from) = &update.from {
-            let tables = match from {
-                UpdateTableFromKind::BeforeSet(t) | UpdateTableFromKind::AfterSet(t) => t,
-            };
-            for twj in tables {
-                let (node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
-                scope.absorb(fscope);
-                input = combine(input, node);
-            }
+            input = self.bind_update_from(update_from_tables(from), &mut scope, input);
         }
         self.bind_update_clauses(update, scope, input, target, &writable)
+    }
+
+    /// Bind an `UPDATE … FROM` clause's read relations into `scope` / the
+    /// input. `absorb` carries their `USING` / NATURAL merge columns too, so
+    /// an unqualified SET RHS / WHERE reference to a merge column fans in to
+    /// the joined sides like it does in a SELECT (previously only the
+    /// relations were kept and such a reference fell to `Ambiguous`).
+    fn bind_update_from(
+        &mut self,
+        tables: &[TableWithJoins],
+        scope: &mut Scope,
+        mut input: LogicalPlan,
+    ) -> LogicalPlan {
+        for twj in tables {
+            let (node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
+            scope.absorb(fscope);
+            input = combine(input, node);
+        }
+        input
     }
 
     /// The clause tail every UPDATE form shares once its scope is assembled:
@@ -758,9 +767,7 @@ impl<'a> Binder<'a> {
         update: &SqlUpdate,
         target_factor: &TableFactor,
     ) -> Option<LogicalPlan> {
-        let tables = match update.from.as_ref()? {
-            UpdateTableFromKind::BeforeSet(t) | UpdateTableFromKind::AfterSet(t) => t,
-        };
+        let tables = update_from_tables(update.from.as_ref()?);
         let written = match target_factor {
             TableFactor::Table {
                 name,
@@ -786,12 +793,7 @@ impl<'a> Binder<'a> {
             return None;
         }
         let mut scope = Scope::default();
-        let mut input = LogicalPlan::Empty;
-        for twj in tables {
-            let (node, fscope) = self.bind_table_with_joins(twj, &scope.relations);
-            scope.absorb(fscope);
-            input = combine(input, node);
-        }
+        let input = self.bind_update_from(tables, &mut scope, LogicalPlan::Empty);
         let target = self.scope_target(&written, &scope)?.reference;
         // The aliased relation is the sole writable sink (T-SQL writes only
         // the target); the root pin covers unqualified SET targets, and a
@@ -1391,16 +1393,7 @@ impl<'a> Binder<'a> {
                         Binding::Ambiguous => ResolutionKind::Ambiguous,
                         _ => ResolutionKind::Unresolved,
                     };
-                    return Some((
-                        ColumnWrite {
-                            reference: crate::reference::ColumnReference {
-                                table: None,
-                                name: column,
-                            },
-                            resolution,
-                        },
-                        resolution,
-                    ));
+                    return Some(unattributed_write(column, resolution));
                 }
                 // `Derived` / `Local` can't arise (only real tables are
                 // candidates); a `writable` of zero / one relation means the
@@ -1418,27 +1411,36 @@ impl<'a> Binder<'a> {
                 None => return Some(self.unmatched_qualifier_write(&parts, scope, root, writable)),
             }
         };
-        // Re-match the resolved write-target table (`table` is canonical, so
-        // this reproduces the root scan's / joined relation's catalog match):
-        // its `resolution` is the table-level write resolution; whether the
-        // written `column` is in its catalog column list is the column-level
-        // one (`Cataloged` if listed, else `Inferred` — mirroring a base read).
-        let m = self.table_match(&table);
-        let column_resolution = if self.list_has(&m.columns, &column) {
+        Some(self.attributed_write(&table, column))
+    }
+
+    /// A write of `column` attributed to `table` (canonical — the DML root
+    /// or a joined relation's resolved reference). Re-matching reproduces
+    /// that scan's catalog match: its `resolution` is the table-level write
+    /// resolution, and whether `column` is in its catalog column list is the
+    /// column-level one (`Cataloged` if listed, else `Inferred` — mirroring
+    /// a base read).
+    fn attributed_write(
+        &self,
+        table: &TableReference,
+        column: Ident,
+    ) -> (ColumnWrite, ResolutionKind) {
+        let m = self.table_match(table);
+        let resolution = if self.list_has(&m.columns, &column) {
             ResolutionKind::Cataloged
         } else {
             ResolutionKind::Inferred
         };
-        Some((
+        (
             ColumnWrite {
                 reference: crate::reference::ColumnReference {
-                    table: Some(table),
+                    table: Some(m.table),
                     name: column,
                 },
-                resolution: column_resolution,
+                resolution,
             },
             m.resolution,
-        ))
+        )
     }
 
     /// A SET target whose qualifier names no writable relation. In a
@@ -1485,34 +1487,8 @@ impl<'a> Binder<'a> {
             None
         };
         match column {
-            Some(column) => {
-                let m = self.table_match(root);
-                let resolution = if self.list_has(&m.columns, &column) {
-                    ResolutionKind::Cataloged
-                } else {
-                    ResolutionKind::Inferred
-                };
-                (
-                    ColumnWrite {
-                        reference: crate::reference::ColumnReference {
-                            table: Some(m.table),
-                            name: column,
-                        },
-                        resolution,
-                    },
-                    m.resolution,
-                )
-            }
-            None => (
-                ColumnWrite {
-                    reference: crate::reference::ColumnReference {
-                        table: None,
-                        name: parts[parts.len() - 1].clone(),
-                    },
-                    resolution: ResolutionKind::Unresolved,
-                },
-                ResolutionKind::Unresolved,
-            ),
+            Some(column) => self.attributed_write(root, column),
+            None => unattributed_write(parts[parts.len() - 1].clone(), ResolutionKind::Unresolved),
         }
     }
 
@@ -1729,6 +1705,30 @@ impl<'a> Binder<'a> {
         let targets = written.iter().map(|w| self.table_write(w)).collect();
         LogicalPlan::Drop(Drop { targets })
     }
+}
+
+/// The FROM tables of an UPDATE, wherever the dialect parsed the clause —
+/// before or after SET, the position doesn't change their role.
+fn update_from_tables(from: &UpdateTableFromKind) -> &[TableWithJoins] {
+    match from {
+        UpdateTableFromKind::BeforeSet(t) | UpdateTableFromKind::AfterSet(t) => t,
+    }
+}
+
+/// A SET-target write kept alive without a table attribution (`table: None`,
+/// `kind` = `Ambiguous` / `Unresolved`) — it contributes no table-level
+/// write, like an unattributed read contributes no scan.
+fn unattributed_write(column: Ident, kind: ResolutionKind) -> (ColumnWrite, ResolutionKind) {
+    (
+        ColumnWrite {
+            reference: crate::reference::ColumnReference {
+                table: None,
+                name: column,
+            },
+            resolution: kind,
+        },
+        kind,
+    )
 }
 
 /// Flatten a DML target's `TableWithJoins` through any parenthesised
