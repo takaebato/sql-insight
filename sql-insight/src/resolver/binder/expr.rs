@@ -565,6 +565,7 @@ impl<'a> Binder<'a> {
             // resolves its own columns first, the enclosing query last.
             SqlExpr::Lambda(lambda) => self.in_lambda(
                 scope.relations.clone(),
+                scope.merge_columns.clone(),
                 // A lambda param is now a `LambdaFunctionParameter` (name +
                 // optional type); the binder only tracks the bound name.
                 lambda.params.iter().map(|p| p.name.clone()),
@@ -617,8 +618,40 @@ impl<'a> Binder<'a> {
     /// (`Expr::Fanin`); everything else is a single `Expr::Column`.
     pub(super) fn resolve_expr(&self, parts: &[Ident], scope: &Scope) -> Expr {
         if parts.len() == 1 {
-            if let Some(fanin) = self.merge_fanin(&parts[0], scope) {
+            let name = &parts[0];
+            if let Some(fanin) = self.merge_fanin(name, scope) {
                 return fanin;
+            }
+            // A name the current scope can't own falls through the enclosing
+            // stack (correlation) — mirroring `resolve`'s walk — and a merge
+            // column there fans in exactly as it would in that query itself.
+            // The first level to claim the name stops the walk either way (a
+            // level that owns it singly resolves below; a lambda parameter
+            // shadows it as a `Local`).
+            if self.resolve_in(parts, &scope.relations).is_none() {
+                for level in self.context.outer.iter().rev() {
+                    match level {
+                        Level::Relations {
+                            relations,
+                            merge_columns,
+                        } => {
+                            if let Some(fanin) = self.fanin_in(name, relations, merge_columns) {
+                                return fanin;
+                            }
+                            if self.resolve_in(parts, relations).is_some() {
+                                break;
+                            }
+                        }
+                        Level::Lambda(params) => {
+                            if params
+                                .iter()
+                                .any(|p| self.eq(self.style.casing.column, p, name))
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
         Expr::Column(Box::new(self.resolve(parts, scope)))
@@ -630,15 +663,24 @@ impl<'a> Binder<'a> {
     /// relations that declare the column (`Cataloged`), catalog-free reaches
     /// every joined relation (`Inferred`).
     pub(super) fn merge_fanin(&self, name: &Ident, scope: &Scope) -> Option<Expr> {
-        if !scope
-            .merge_columns
+        self.fanin_in(name, &scope.relations, &scope.merge_columns)
+    }
+
+    /// [`merge_fanin`](Self::merge_fanin) over one resolution frame's raw
+    /// parts — the current [`Scope`] or an enclosing [`Level::Relations`].
+    fn fanin_in(
+        &self,
+        name: &Ident,
+        relations: &[Relation],
+        merge_columns: &[Ident],
+    ) -> Option<Expr> {
+        if !merge_columns
             .iter()
             .any(|m| self.eq(self.style.casing.column, m, name))
         {
             return None;
         }
-        let refs: Vec<BoundColumn> = scope
-            .relations
+        let refs: Vec<BoundColumn> = relations
             .iter()
             .filter_map(|rel| self.fanin_owner(rel, name))
             .collect();
@@ -843,8 +885,10 @@ impl<'a> Binder<'a> {
     /// its own FROM plus the containing scope's relations (pushed onto the
     /// correlation stack), so a correlated reference reaches outward.
     pub(super) fn bind_subquery(&mut self, query: &Query, scope: &Scope) -> LogicalPlan {
-        self.in_outer(scope.relations.clone(), |b| b.bind_query(query))
-            .0
+        self.in_outer(scope.relations.clone(), scope.merge_columns.clone(), |b| {
+            b.bind_query(query)
+        })
+        .0
     }
 
     pub(super) fn bind_function_args(&mut self, function: &Function, scope: &Scope) -> Vec<Expr> {

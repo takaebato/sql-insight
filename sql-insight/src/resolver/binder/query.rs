@@ -605,7 +605,7 @@ impl<'a> Binder<'a> {
                 // — so push the visible relations as an enclosing level for
                 // the whole factor (a derived body and a table function's
                 // arguments both correlate to the left rows).
-                self.in_outer(visible.clone(), |b| {
+                self.in_outer(visible.clone(), scope.merge_columns.clone(), |b| {
                     b.bind_table_factor(&j.relation, &visible)
                 })
             } else {
@@ -833,7 +833,11 @@ impl<'a> Binder<'a> {
                 ..
             } => {
                 let (mut op, sub_scope) = if *lateral {
-                    self.in_outer(left.to_vec(), |b| b.bind_query(subquery))
+                    // Only the sibling relations are in hand here (the
+                    // enclosing scope's merge columns don't thread through
+                    // `bind_table_factor`), so a LATERAL body sees them
+                    // without any fan-in — a pre-existing limit.
+                    self.in_outer(left.to_vec(), Vec::new(), |b| b.bind_query(subquery))
                 } else {
                     self.bind_query(subquery)
                 };

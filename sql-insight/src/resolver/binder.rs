@@ -140,21 +140,33 @@ impl<'a> Binder<'a> {
     }
 
     /// Bind `f` with `relations` pushed as an enclosing correlation level (a
-    /// subquery in an expression / a LATERAL derived table).
-    fn in_outer<R>(&mut self, relations: Vec<Relation>, f: impl FnOnce(&mut Self) -> R) -> R {
-        let child = self.context.with_outer(relations);
+    /// subquery in an expression / a LATERAL derived table). `merge_columns`
+    /// carries the level's `USING` / NATURAL merge names, so a correlated
+    /// reference to one fans in like it would in the enclosing query (pass
+    /// empty when the caller has only bare relations in hand).
+    fn in_outer<R>(
+        &mut self,
+        relations: Vec<Relation>,
+        merge_columns: Vec<Ident>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let child = self.context.with_outer(relations, merge_columns);
         self.in_scope(child, f)
     }
 
-    /// Bind `f` (a lambda body) with `relations` as an enclosing level and the
-    /// lambda `params` as a `Lambda` level on top.
+    /// Bind `f` (a lambda body) with `relations` (+ their merge columns) as an
+    /// enclosing level and the lambda `params` as a `Lambda` level on top.
     fn in_lambda<R>(
         &mut self,
         relations: Vec<Relation>,
+        merge_columns: Vec<Ident>,
         params: impl IntoIterator<Item = Ident>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let child = self.context.with_outer(relations).with_lambda(params);
+        let child = self
+            .context
+            .with_outer(relations, merge_columns)
+            .with_lambda(params);
         self.in_scope(child, f)
     }
 

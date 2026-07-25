@@ -53,7 +53,7 @@ impl<'a> Binder<'a> {
                     .iter()
                     .rev()
                     .find_map(|level| match level {
-                        Level::Relations(relations) => self.resolve_in(parts, relations),
+                        Level::Relations { relations, .. } => self.resolve_in(parts, relations),
                         Level::Lambda(params) => (parts.len() == 1
                             && params
                                 .iter()
@@ -73,7 +73,7 @@ impl<'a> Binder<'a> {
     /// could own the column (so the caller falls through to an enclosing
     /// scope) and `Some(binding)` once at least one is a candidate (even if
     /// that collapses to `Ambiguous` — a name owned here doesn't escape).
-    fn resolve_in(&self, parts: &[Ident], relations: &[Relation]) -> Option<Binding> {
+    pub(super) fn resolve_in(&self, parts: &[Ident], relations: &[Relation]) -> Option<Binding> {
         let name = parts.last()?;
         let candidates: Vec<Binding> = if parts.len() == 1 {
             relations
