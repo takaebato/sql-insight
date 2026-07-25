@@ -599,6 +599,15 @@ impl<'a> Binder<'a> {
             // relations so it reads a column, not a table.
             let (right, right_scope) = if is_array_join(&j.join_operator) {
                 self.bind_array_join(&j.relation, &visible)
+            } else if is_apply(&j.join_operator) {
+                // A T-SQL `CROSS / OUTER APPLY` factor is lateral by
+                // construction, but sqlparser parses it with `lateral: false`
+                // — so push the visible relations as an enclosing level for
+                // the whole factor (a derived body and a table function's
+                // arguments both correlate to the left rows).
+                self.in_outer(visible.clone(), |b| {
+                    b.bind_table_factor(&j.relation, &visible)
+                })
             } else {
                 self.bind_table_factor(&j.relation, &visible)
             };

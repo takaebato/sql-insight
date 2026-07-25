@@ -814,6 +814,14 @@ fn join_is_natural(op: &JoinOperator) -> bool {
     matches!(join_constraint(op), Some(JoinConstraint::Natural))
 }
 
+/// Whether a join operator is a T-SQL `CROSS APPLY` / `OUTER APPLY` — lateral
+/// by construction (the right side is evaluated per left row and references
+/// its columns), though sqlparser parses the applied factor with
+/// `lateral: false`.
+fn is_apply(op: &JoinOperator) -> bool {
+    matches!(op, JoinOperator::CrossApply | JoinOperator::OuterApply)
+}
+
 /// Whether a join operator is a ClickHouse `ARRAY JOIN` / `LEFT ARRAY JOIN` /
 /// `INNER ARRAY JOIN` — which unnests an array expression inline rather than
 /// joining a relation, so its operand is a column expression, not a scanned
