@@ -698,6 +698,10 @@ fn collect_operands<'a>(op: &'a LogicalPlan, ctes: &[&'a Cte], out: &mut Vec<Ope
             collect_operands(&so.left, ctes, out);
             collect_operands(&so.right, ctes, out);
         }
+        // An aliasing boundary renames the *relation*, not the columns — the
+        // input's outputs are exposed unchanged (a pipe `|> AS u` sits right
+        // on the statement's output path).
+        LogicalPlan::SubqueryAlias(sa) => collect_operands(&sa.input, ctes, out),
         // No projection at this level — a relation that doesn't carry a
         // SELECT list (a `Scan`, a join below a projection, a DML / DDL root,
         // …) yields no operands. Listed explicitly so a new operator that
@@ -705,7 +709,6 @@ fn collect_operands<'a>(op: &'a LogicalPlan, ctes: &[&'a Cte], out: &mut Vec<Ope
         LogicalPlan::Scan(_)
         | LogicalPlan::Join(_)
         | LogicalPlan::Aggregate(_)
-        | LogicalPlan::SubqueryAlias(_)
         | LogicalPlan::TableFunction(_)
         | LogicalPlan::CteRef(_)
         | LogicalPlan::Values(_)

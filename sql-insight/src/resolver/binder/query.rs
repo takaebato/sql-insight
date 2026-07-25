@@ -147,9 +147,11 @@ impl<'a> Binder<'a> {
     /// it reshapes the output. An output-producing operator (SELECT / EXTEND /
     /// SET / AGGREGATE) layers a [`Projection`] whose value expressions feed
     /// `QueryOutput` lineage; a filter operator (WHERE / ORDER BY / LIMIT /
-    /// CALL / PIVOT / set-op / JOIN) wraps a non-feeding read [`Filter`]; the
-    /// rest (sampling / rename / drop / unpivot) pass through. The match is
-    /// exhaustive so a new pipe operator is reviewed here.
+    /// CALL / PIVOT / set-op / JOIN) wraps a non-feeding read [`Filter`];
+    /// RENAME / DROP / AS reshape the running outputs (a positional
+    /// re-projection / an aliasing boundary); the rest (sampling / unpivot)
+    /// pass through. The match is exhaustive so a new pipe operator is
+    /// reviewed here.
     pub(super) fn bind_pipe(
         &mut self,
         op: &PipeOperator,
@@ -258,13 +260,94 @@ impl<'a> Binder<'a> {
                     .collect();
                 join(input, right, on)
             }
-            // No inspectable column expressions: a sampling clause, rename,
-            // drop, or unpivot.
-            PipeOperator::TableSample { .. }
-            | PipeOperator::Drop { .. }
-            | PipeOperator::As { .. }
-            | PipeOperator::Rename { .. }
-            | PipeOperator::Unpivot { .. } => input,
+            // `|> RENAME old AS new, …`: re-project the running outputs with
+            // the mapped slots renamed. The new name is an introduced alias,
+            // not the physical column, so its identity drops — a later
+            // reference to it traces through the projection instead of
+            // falling to the base relation (which fabricated a phantom
+            // read). With incomplete outputs the slot list is unknown, so
+            // the operator passes through unchanged (the unexpanded-`*`
+            // diagnostic already flags the gap); a mapping naming no known
+            // output is ignored, best-effort.
+            PipeOperator::Rename { mappings } => {
+                if !scope.outputs_complete {
+                    return input;
+                }
+                let mut outputs = std::mem::take(&mut scope.query_outputs);
+                for m in mappings {
+                    if let Some(o) = outputs.iter_mut().find(|o| {
+                        o.name
+                            .as_ref()
+                            .is_some_and(|n| self.eq(self.style.casing.column, n, &m.ident))
+                    }) {
+                        *o = OutputCol {
+                            name: Some(m.alias.clone()),
+                            identity: false,
+                        };
+                    }
+                }
+                let node = LogicalPlan::Projection(Projection {
+                    input: Box::new(input),
+                    exprs: passthrough_exprs(&outputs),
+                });
+                scope.query_outputs = outputs;
+                node
+            }
+            // `|> DROP col, …`: re-project without the dropped slots. Each
+            // kept slot's `DerivedSlot` keeps its *base* position (the slot
+            // indices below the projection don't move); only the exposed
+            // positions compact. Incomplete outputs pass through, as above.
+            PipeOperator::Drop { columns } => {
+                if !scope.outputs_complete {
+                    return input;
+                }
+                let kept: Vec<(usize, OutputCol)> = std::mem::take(&mut scope.query_outputs)
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, o)| {
+                        !columns.iter().any(|c| {
+                            o.name
+                                .as_ref()
+                                .is_some_and(|n| self.eq(self.style.casing.column, n, c))
+                        })
+                    })
+                    .collect();
+                let exprs = kept
+                    .iter()
+                    .map(|(index, o)| NamedExpr {
+                        names: OutputNames::Single(o.name.clone()),
+                        expr: Expr::DerivedSlot {
+                            qualifier: None,
+                            index: *index,
+                        },
+                    })
+                    .collect();
+                scope.query_outputs = kept.into_iter().map(|(_, o)| o).collect();
+                LogicalPlan::Projection(Projection {
+                    input: Box::new(input),
+                    exprs,
+                })
+            }
+            // `|> AS u`: alias the whole running result, like a derived
+            // table's alias — the original relation qualifiers stop
+            // resolving (BigQuery drops them) and `u.col` addresses the
+            // running outputs through the `SubqueryAlias` boundary.
+            PipeOperator::As { alias } => {
+                scope.relations = vec![Relation::Derived {
+                    alias: Some(alias.clone()),
+                    columns: Exposed {
+                        slots: scope.query_outputs.iter().map(|o| o.name.clone()).collect(),
+                        complete: scope.outputs_complete,
+                    },
+                }];
+                LogicalPlan::SubqueryAlias(SubqueryAlias {
+                    alias: alias.clone(),
+                    input: Box::new(input),
+                })
+            }
+            // No inspectable column expressions: a sampling clause or
+            // unpivot.
+            PipeOperator::TableSample { .. } | PipeOperator::Unpivot { .. } => input,
         }
     }
 

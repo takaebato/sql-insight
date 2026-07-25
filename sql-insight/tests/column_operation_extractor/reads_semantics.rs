@@ -1253,3 +1253,107 @@ mod pipe_passthrough {
         );
     }
 }
+
+mod pipe_reshape {
+    //! `|> RENAME` / `|> DROP` / `|> AS` reshape the running outputs (they
+    //! used to pass through untouched, so a renamed / dropped name fell to
+    //! the base relation as a phantom read). With incomplete running
+    //! outputs (a catalog-free `FROM t` base) RENAME / DROP still pass
+    //! through — the slot list is unknown — under the existing
+    //! `WildcardSuppressed` flag.
+    use super::*;
+
+    #[test]
+    fn rename_redirects_a_later_reference_to_the_renamed_slot() {
+        // `b` after the RENAME is the renamed `a` slot — a Derived
+        // reference traced to `t.a` — not a phantom base column `t.b`.
+        assert_column_ops(
+            "FROM t |> SELECT a, c |> RENAME a AS b |> SELECT b",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "c")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("b", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn drop_removes_the_slot_and_compacts_the_positions() {
+        // After `DROP a` the running outputs are (b), so the EXTENDed `y`
+        // lands at position 1 and only `b` carries output lineage; `a`'s
+        // SELECT read survives (occurrence-based).
+        assert_column_ops(
+            "FROM t |> SELECT a, b |> DROP a |> EXTEND 1 AS y",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "b"), out("b", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn as_aliases_the_running_result_and_retires_the_base_qualifiers() {
+        // `u.a` addresses the aliased running result (a Derived reference,
+        // traced through the boundary — the output lineage survives it).
+        assert_column_ops(
+            "FROM t |> SELECT a |> AS u |> WHERE u.a > 0",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+        // The original relation's qualifier stops resolving past the alias
+        // (BigQuery drops it) — surfaced unresolved, not silently bound.
+        assert_column_ops(
+            "FROM t |> SELECT a |> AS u |> WHERE t.a > 0",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), unresolved("a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn rename_over_incomplete_outputs_passes_through() {
+        // Catalog-free `FROM t` leaves the running outputs unknown, so the
+        // RENAME can't re-project — the reference still falls to the base
+        // relation, best-effort, under the unexpanded-`*` flag.
+        assert_column_ops(
+            "FROM t |> RENAME a AS b |> SELECT b",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "b")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "b"), out("b", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn insert_pairs_through_a_pipe_alias() {
+        // The aliasing boundary renames the relation, not the columns — the
+        // INSERT still pairs the running output to its target column.
+        assert_column_ops(
+            "INSERT INTO dst (x) FROM t |> SELECT a |> AS u",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("t", "a")],
+                writes: vec![write("dst", "x")],
+                lineage: vec![passthrough(col("t", "a"), relation("dst", "x"))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+}
