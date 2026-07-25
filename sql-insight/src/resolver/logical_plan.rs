@@ -432,15 +432,17 @@ pub(crate) enum Expr {
     /// — each a `Passthrough` read / origin (one per side, not an ambiguous
     /// `table: None`).
     Fanin(Vec<BoundColumn>),
-    /// A wildcard-expansion-synthesized reference to the `index`-th output
-    /// slot of the derived relation exposed as `qualifier` — **positional by
-    /// construction** (the expansion enumerates the producer's slots), so a
-    /// duplicate output name (`SELECT o.id, c.id` in the producer) or an
-    /// anonymous one can't misattribute the trace the way a name-keyed
-    /// `Derived` lookup would. Never minted for written SQL: a *written*
-    /// reference resolves by name (`Expr::Column`). Like any `Derived` ref it
-    /// is not a read (the physical read is counted at the inner producer);
-    /// `origins` traces it to the producer's `index`-th output.
+    /// A synthesized reference to the `index`-th output slot of the producer
+    /// exposed as `qualifier` (`None` = the inline / running one) —
+    /// **positional by construction**, so a duplicate output name
+    /// (`SELECT o.id, c.id` in the producer) or an anonymous one can't
+    /// misattribute the trace the way a name-keyed `Derived` lookup would.
+    /// Minted by wildcard expansion (one per expanded column) and by the
+    /// pipe-operator passthrough (one per carried-forward running output);
+    /// never for written SQL — a *written* reference resolves by name
+    /// (`Expr::Column`). Like any `Derived` ref it is not a read (the
+    /// physical read is counted at the inner producer); `origins` traces it
+    /// to the producer's `index`-th output.
     DerivedSlot {
         qualifier: Option<Ident>,
         index: usize,

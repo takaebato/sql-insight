@@ -1170,3 +1170,86 @@ mod output_alias_visibility {
         );
     }
 }
+
+mod pipe_passthrough {
+    //! An output-producing pipe stage carries the running outputs forward as
+    //! *positional* passthroughs: not re-reads (reads stay occurrence-based
+    //! — the physical read was counted at the producing stage), position-
+    //! preserving (an anonymous output keeps its slot), traced by position.
+    //! The catalog-free `FROM t` base leaves the implicit `*` unexpanded,
+    //! hence the `WildcardSuppressed` flag on each case.
+    use super::*;
+
+    #[test]
+    fn extend_does_not_reread_the_carried_identity_output() {
+        // `a` is written once; the EXTEND passthrough must not mint a second
+        // `t.a` read at the same span (it used to re-resolve by name).
+        assert_column_ops(
+            "FROM t |> SELECT a |> EXTEND 1 AS y",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn anonymous_output_keeps_its_slot_through_a_later_stage() {
+        // The unaliased `t.a + t.b` used to be dropped from the passthrough,
+        // shifting `y` into its position and losing its lineage; it now
+        // keeps slot #0 (traced positionally) with `y` after it.
+        assert_column_ops(
+            "FROM t |> SELECT t.a + t.b |> EXTEND 1 AS y",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "a"), out_anon(0)),
+                    transformation(col("t", "b"), out_anon(0)),
+                ],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn a_written_clause_reference_to_an_identity_output_still_reads() {
+        // The passthrough carries the base output's *identity* flag, so a
+        // later written occurrence (`WHERE a > 0`) still re-reads the real
+        // column — only the synthesized passthrough is read-free.
+        assert_column_ops(
+            "FROM t |> SELECT a |> EXTEND 1 AS y |> WHERE a > 0",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn set_replaces_the_slot_without_rereading_the_others() {
+        // `SET b = a + 1` rewrites `b`'s slot in place: the carried `a`
+        // isn't re-read, the RHS `a` is (a written occurrence), and `b`'s
+        // only read is its SELECT occurrence.
+        assert_column_ops(
+            "FROM t |> SELECT a, b |> SET b = a + 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b"), read("t", "a")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    transformation(col("t", "a"), out("b", 1)),
+                ],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+}

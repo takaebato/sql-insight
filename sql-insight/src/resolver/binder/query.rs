@@ -159,7 +159,7 @@ impl<'a> Binder<'a> {
         match op {
             PipeOperator::Select { exprs } => {
                 let (new, complete) = self.bind_output_items(exprs, scope);
-                let (node, query_outputs) = self.pipe_project(input, &[], new, &scope.relations);
+                let (node, query_outputs) = self.pipe_project(input, &[], new);
                 scope.query_outputs = query_outputs;
                 // A pipe SELECT replaces the outputs wholesale.
                 scope.outputs_complete = complete;
@@ -169,7 +169,7 @@ impl<'a> Binder<'a> {
                 // The new columns see the running outputs; then they append.
                 let (new, complete) = self.bind_output_items(exprs, scope);
                 let base = std::mem::take(&mut scope.query_outputs);
-                let (node, query_outputs) = self.pipe_project(input, &base, new, &scope.relations);
+                let (node, query_outputs) = self.pipe_project(input, &base, new);
                 scope.query_outputs = query_outputs;
                 // EXTEND appends to the running outputs, so both must be
                 // determinate.
@@ -196,7 +196,7 @@ impl<'a> Binder<'a> {
                         expr: self.bind_expr(&e.expr.expr, scope),
                     })
                     .collect();
-                let (node, query_outputs) = self.pipe_project(input, &[], new, &scope.relations);
+                let (node, query_outputs) = self.pipe_project(input, &[], new);
                 scope.query_outputs = query_outputs;
                 // AGGREGATE replaces the outputs with its own (wildcard-free)
                 // items.
@@ -286,20 +286,21 @@ impl<'a> Binder<'a> {
         (exprs, complete)
     }
 
-    /// Build an output-producing pipe `Projection`: the passthrough of `base`
-    /// outputs (each re-resolved by name against the base — an identity output
-    /// re-reads its real column, a computed output is `Derived` and traced)
-    /// plus the `new` value columns.
+    /// Build an output-producing pipe `Projection`: the positional passthrough
+    /// of the `base` outputs plus the `new` value columns. The passthrough
+    /// keeps each base `OutputCol` verbatim (name *and* identity — so a later
+    /// clause reference to an identity output still re-reads its real
+    /// column); only the `new` items mint fresh output metadata.
     pub(super) fn pipe_project(
         &mut self,
         input: LogicalPlan,
         base: &[OutputCol],
         new: Vec<NamedExpr>,
-        relations: &[Relation],
     ) -> (LogicalPlan, Vec<OutputCol>) {
-        let mut exprs = self.passthrough_exprs(base, relations);
+        let mut query_outputs = base.to_vec();
+        query_outputs.extend(self.output_cols(&new));
+        let mut exprs = passthrough_exprs(base);
         exprs.extend(new);
-        let query_outputs = self.output_cols(&exprs);
         (
             LogicalPlan::Projection(Projection {
                 input: Box::new(input),
@@ -307,31 +308,6 @@ impl<'a> Binder<'a> {
             }),
             query_outputs,
         )
-    }
-
-    /// Re-resolve each named `base` output as a passthrough projection item
-    /// (clause-alias resolution against the base, so an identity output
-    /// re-reads its real column while a computed output stays `Derived`).
-    pub(super) fn passthrough_exprs(
-        &self,
-        base: &[OutputCol],
-        relations: &[Relation],
-    ) -> Vec<NamedExpr> {
-        let pass_scope = Scope {
-            relations: relations.to_vec(),
-            query_outputs: base.to_vec(),
-            outputs_complete: false,
-            merge_columns: Vec::new(),
-        };
-        base.iter()
-            .filter_map(|o| o.name.clone())
-            .map(|name| NamedExpr {
-                expr: Expr::Column(Box::new(
-                    self.resolve(std::slice::from_ref(&name), &pass_scope),
-                )),
-                names: OutputNames::Single(Some(name)),
-            })
-            .collect()
     }
 
     /// `|> SET col = expr`: each assignment replaces a same-named base output in
@@ -343,24 +319,31 @@ impl<'a> Binder<'a> {
         assignments: &[sqlparser::ast::Assignment],
         scope: &Scope,
     ) -> (LogicalPlan, Vec<OutputCol>) {
-        let mut exprs = self.passthrough_exprs(&base, &scope.relations);
+        let mut exprs = passthrough_exprs(&base);
+        let mut query_outputs = base;
         for a in assignments {
             for column in assignment_target_columns(&a.target) {
                 let ne = NamedExpr {
                     names: OutputNames::Single(Some(column.clone())),
                     expr: self.bind_expr(&a.value, scope),
                 };
+                let replaced = self.output_cols(std::slice::from_ref(&ne)).remove(0);
                 // Pipe outputs are always single-named passthroughs.
-                match exprs.iter_mut().find(|e| {
+                match exprs.iter_mut().position(|e| {
                     matches!(&e.names, OutputNames::Single(Some(n))
                         if self.eq(self.style.casing.column, n, &column))
                 }) {
-                    Some(slot) => *slot = ne,
-                    None => exprs.push(ne),
+                    Some(i) => {
+                        exprs[i] = ne;
+                        query_outputs[i] = replaced;
+                    }
+                    None => {
+                        exprs.push(ne);
+                        query_outputs.push(replaced);
+                    }
                 }
             }
         }
-        let query_outputs = self.output_cols(&exprs);
         (
             LogicalPlan::Projection(Projection {
                 input: Box::new(input),
@@ -1044,4 +1027,24 @@ impl<'a> Binder<'a> {
             }
         }
     }
+}
+
+/// The positional passthrough of the running pipe outputs: one
+/// [`Expr::DerivedSlot`] per base output — **not** a read (the physical read
+/// is already counted at the producing stage, keeping reads
+/// occurrence-based), traced by position (so an anonymous output keeps its
+/// slot instead of being dropped and shifting the ones after it). The output
+/// name rides on the item; the base `OutputCol` itself is carried forward by
+/// the callers.
+fn passthrough_exprs(base: &[OutputCol]) -> Vec<NamedExpr> {
+    base.iter()
+        .enumerate()
+        .map(|(index, o)| NamedExpr {
+            names: OutputNames::Single(o.name.clone()),
+            expr: Expr::DerivedSlot {
+                qualifier: None,
+                index,
+            },
+        })
+        .collect()
 }
