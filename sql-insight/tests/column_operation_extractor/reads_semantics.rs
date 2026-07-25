@@ -1357,3 +1357,51 @@ mod pipe_reshape {
         );
     }
 }
+
+mod pipe_join {
+    //! `|> JOIN` brings the joined relation into the running scope: the ON
+    //! predicate and every later stage resolve it, and its USING merge
+    //! columns fan in like a FROM-clause join. (It used to stay out of
+    //! scope — the ON's right-side references fell unresolved — and the
+    //! `Join` node blocked the output-operand walk, dropping all output
+    //! lineage.)
+    use super::*;
+
+    #[test]
+    fn join_right_side_resolves_and_output_lineage_survives() {
+        assert_column_ops(
+            "FROM t |> SELECT t.a |> JOIN u ON t.a = u.id",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "a"), read("u", "id")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn join_using_merge_column_fans_in_downstream() {
+        // The WHERE's `k` fans in to both sides of the pipe join, exactly
+        // like the same USING join written in a FROM clause.
+        assert_column_ops(
+            "FROM t |> SELECT a, k |> JOIN u USING (k) |> WHERE k > 0",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("t", "a"),
+                    read("t", "k"),
+                    read("t", "k"),
+                    read("u", "k"),
+                ],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("t", "k"), out("k", 1)),
+                ],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+}

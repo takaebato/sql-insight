@@ -702,12 +702,18 @@ fn collect_operands<'a>(op: &'a LogicalPlan, ctes: &[&'a Cte], out: &mut Vec<Ope
         // input's outputs are exposed unchanged (a pipe `|> AS u` sits right
         // on the statement's output path).
         LogicalPlan::SubqueryAlias(sa) => collect_operands(&sa.input, ctes, out),
+        // A join on the output path is a pipe `|> JOIN` above the running
+        // projection: the join's output keeps the left block's slots first
+        // (the right side's columns follow it), so the left branch carries
+        // the positional operands — a right-side slot has no operand and
+        // stays edge-less, best-effort. (A join *below* a projection never
+        // reaches here — the projection claims the walk first.)
+        LogicalPlan::Join(jn) => collect_operands(&jn.left, ctes, out),
         // No projection at this level — a relation that doesn't carry a
         // SELECT list (a `Scan`, a join below a projection, a DML / DDL root,
         // …) yields no operands. Listed explicitly so a new operator that
         // *does* expose columns positionally forces an explicit handler.
         LogicalPlan::Scan(_)
-        | LogicalPlan::Join(_)
         | LogicalPlan::Aggregate(_)
         | LogicalPlan::TableFunction(_)
         | LogicalPlan::CteRef(_)

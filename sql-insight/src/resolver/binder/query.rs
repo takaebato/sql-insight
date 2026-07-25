@@ -248,12 +248,27 @@ impl<'a> Binder<'a> {
                     .collect();
                 self.pipe_filter(input, reads)
             }
-            // `|> JOIN t ON …`: the joined table's scan surfaces (a table read),
-            // but — matching the resolver's loose pipe scoping — it is NOT added
-            // to the scope, so the ON predicate's references to it are
-            // unresolved (only the running relations resolve).
+            // `|> JOIN t ON … / USING (…)`: the joined relation enters the
+            // scope — the ON predicate and every later stage resolve it, and
+            // its `USING` / NATURAL merge columns fan in like a FROM-clause
+            // join (it used to stay out of scope, leaving the ON's right-side
+            // references unresolved). The running outputs gain the right
+            // side's columns after the left block (identity: they're base
+            // columns a later reference re-reads); a right side whose
+            // columns can't be enumerated makes the outputs incomplete.
             PipeOperator::Join(j) => {
-                let (right, _scope) = self.bind_table_factor(&j.relation, &scope.relations);
+                let (right, right_scope) = self.bind_table_factor(&j.relation, &scope.relations);
+                let merge = if join_is_natural(&j.join_operator) {
+                    self.natural_merge_columns(scope, &right_scope)
+                } else {
+                    join_using(&j.join_operator)
+                };
+                match pipe_join_output_cols(&right_scope.relations) {
+                    Some(cols) => scope.query_outputs.extend(cols),
+                    None => scope.outputs_complete = false,
+                }
+                scope.absorb(right_scope);
+                scope.add_merge_columns(merge);
                 let on = join_on(&j.join_operator)
                     .map(|e| self.bind_expr(e, scope))
                     .into_iter()
@@ -1130,4 +1145,42 @@ fn passthrough_exprs(base: &[OutputCol]) -> Vec<NamedExpr> {
             },
         })
         .collect()
+}
+
+/// The output columns a pipe `|> JOIN`'s right side appends to the running
+/// outputs — `None` when they can't be enumerated (an `Unknown` catalog-free
+/// table, an opaque table function, an incompletely-known derived relation),
+/// which makes the running outputs incomplete instead of presenting a
+/// partial list as the whole one.
+fn pipe_join_output_cols(relations: &[Relation]) -> Option<Vec<OutputCol>> {
+    let mut out = Vec::new();
+    for rel in relations {
+        match rel {
+            Relation::Table {
+                columns: Columns::Cataloged(cols),
+                ..
+            } => out.extend(cols.iter().map(|c| OutputCol {
+                name: Some(c.clone()),
+                identity: true,
+            })),
+            Relation::Derived {
+                columns:
+                    Exposed {
+                        slots,
+                        complete: true,
+                    },
+                ..
+            } => out.extend(slots.iter().map(|n| OutputCol {
+                name: n.clone(),
+                identity: false,
+            })),
+            Relation::Table {
+                columns: Columns::Unknown,
+                ..
+            }
+            | Relation::Derived { .. }
+            | Relation::TableFunction { .. } => return None,
+        }
+    }
+    Some(out)
 }
