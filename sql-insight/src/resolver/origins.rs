@@ -366,6 +366,16 @@ fn origins_into<'a>(
 ) -> Vec<(ColumnRead, ColumnLineageKind)> {
     match op {
         LogicalPlan::Projection(p) => {
+            // An inline producer is an *unaliased* derived table (no relation
+            // boundary to match a qualifier against), so a qualified
+            // reference never claims it by name — its producer sits behind a
+            // `SubqueryAlias` / `CteRef` boundary (the slot trace has the
+            // same guard). Without this, `x.a` over `(SELECT a FROM s),
+            // (SELECT a FROM u) AS x` also traced into the unaliased `s`
+            // producer.
+            if qualifier.is_some() {
+                return Vec::new();
+            }
             // Resolve by name to a position, then through any multi-alias
             // back-reference — `d.v` over `explode(arr) AS (k, v)` traces the
             // head expression, reaching `arr`.
@@ -427,6 +437,11 @@ fn origins_into<'a>(
         // `conflict_value_origins`, and `output_operands` flattens nested
         // set-ops so an N-way `A UNION B UNION C` traces all branches at once.
         LogicalPlan::SetOp(_) => {
+            // Inline like the `Projection` arm above: a qualified reference
+            // never claims an unaliased set-operation producer by name.
+            if qualifier.is_some() {
+                return Vec::new();
+            }
             let operands = output_operands(op);
             let Some(i) = operands.first().and_then(|o| {
                 output_slots(o.outputs)
