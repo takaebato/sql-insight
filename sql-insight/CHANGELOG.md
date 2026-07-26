@@ -13,7 +13,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### trace statement-materialized relations into their inputs ([#69](https://github.com/takaebato/sql-insight/pull/69)) by @takaebato
 
+Previously, a reference through a statement-local relation (a `VALUES`
+derived table, or a table function such as `UNNEST`) stopped at a
+synthetic lineage source named after the relation's alias (`v.x` for
+`(VALUES (1)) AS v(x)`). The trace now continues into the relation's
+inputs: a `VALUES`-backed column traces to the referenced cell's own
+sources, and a table function's outputs trace to the function's argument
+columns at function granularity (`Transformation`). Lineage sources are
+now always *written* references, and a constant cell contributes no
+edge. Consumers keying on the old alias-named sources will instead see
+the underlying columns, or no edge where only constants flow.
+
 #### expand wildcards when the covered columns are fully known ([#67](https://github.com/takaebato/sql-insight/pull/67)) by @takaebato
+
+Previously, every `*` / `t.*` stayed unexpanded and surfaced only a
+`WildcardSuppressed` diagnostic. A wildcard now expands into per-column
+outputs whenever the columns it covers are completely known, from the
+catalog for base tables or from the SQL itself for derived tables and
+CTEs: each expanded column surfaces as a read (one per wildcard
+occurrence, anchored at the `*` token) and in lineage with determinate
+positions, which also unlocks positional DML pairing through the
+projection. Expansion is all-or-nothing per wildcard: one that can't be
+expanded completely (unknown columns, dialect modifiers such as
+`EXCLUDE`, a merged `USING` scope) stays suppressed and flagged exactly
+as before. Consumers that treated `WildcardSuppressed` as the universal
+wildcard marker will now receive concrete columns whenever expansion
+succeeds.
 
 ### Added
 
