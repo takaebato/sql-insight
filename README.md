@@ -35,7 +35,7 @@ across every SQL dialect sqlparser-rs supports.
 
 ```toml
 [dependencies]
-sql-insight = "0.4"
+sql-insight = "0.5"
 ```
 
 ## Usage
@@ -181,7 +181,7 @@ serde format:
 
 ```toml
 [dependencies]
-sql-insight = { version = "0.4", features = ["serde"] }
+sql-insight = { version = "0.5", features = ["serde"] }
 ```
 
 ```rust,ignore
