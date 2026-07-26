@@ -100,6 +100,15 @@ pub(crate) struct Join {
     pub(crate) left: Box<LogicalPlan>,
     pub(crate) right: Box<LogicalPlan>,
     pub(crate) on: Vec<Expr>,
+    /// A positionally-consumed join's output split: the left side's slot
+    /// count, recorded at bind time. Set on a pipe `|> JOIN` — the only
+    /// join whose output later stages reference *by position* (passthrough
+    /// / star slots) — from the binder's running output count, so a
+    /// positional trace splits left-vs-right by reading it instead of
+    /// re-deriving the width from the tree (the re-derivation misrouted
+    /// stacked joins). `None` = the projection above owns the output shape
+    /// (every FROM-clause join).
+    pub(crate) left_width: Option<usize>,
 }
 
 /// Aggregate (Γ): the `GROUP BY` grouping over its input, sitting below the

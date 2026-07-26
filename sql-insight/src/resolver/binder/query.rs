@@ -257,6 +257,12 @@ impl<'a> Binder<'a> {
             // columns a later reference re-reads); a right side whose
             // columns can't be enumerated makes the outputs incomplete.
             PipeOperator::Join(j) => {
+                // The running slot count *before* the join — the bind-time
+                // truth a positional trace above the join splits at
+                // ([`Join::left_width`]). Unknowable when the running
+                // outputs are incomplete (a suppressed wildcard may hide
+                // slots), so record nothing and let the trace refuse.
+                let left_width = scope.outputs_complete.then(|| scope.query_outputs.len());
                 let (right, right_scope) = self.bind_table_factor(&j.relation, &scope.relations);
                 // The NATURAL branch mirrors `bind_table_with_joins` for
                 // future-proofing, but is unreachable today: sqlparser 0.62
@@ -282,7 +288,7 @@ impl<'a> Binder<'a> {
                     .map(|e| self.bind_expr(e, scope))
                     .into_iter()
                     .collect();
-                join(input, right, on)
+                pipe_join(input, right, on, left_width)
             }
             // `|> RENAME old AS new, …`: re-project the running outputs with
             // the mapped slots renamed. The new name is an introduced alias,
