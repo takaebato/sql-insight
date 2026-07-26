@@ -195,10 +195,11 @@ fn test_alphabetize_insert_columns_through_a_parenthesized_values() {
     // two rewrites half-applied.
     let sql = "INSERT INTO t1 (c, b, a) (VALUES (1, 2, 3))";
     let expected = vec!["INSERT INTO t1 (a, b, c) (VALUES (...))".into()];
+    // GenericDialect only: not every dialect parses the parenthesized form.
     assert_normalize(
         sql,
         expected,
-        all_dialects(),
+        vec![Box::new(sql_insight::sqlparser::dialect::GenericDialect {})],
         NormalizerOptions::new()
             .with_unify_values(true)
             .with_alphabetize_insert_columns(true),
