@@ -155,6 +155,61 @@ mod with_in_dml {
     }
 
     #[test]
+    fn every_dml_kind_exposes_returning_on_both_trace_paths() {
+        // The named path (a reference by name) and the positional path (a
+        // star consumer) each have a per-DML-kind arm — INSERT and UPDATE
+        // are pinned above, DELETE and MERGE (`OUTPUT` family) here, with a
+        // star over DELETE / UPDATE covering the positional operands.
+        assert_column_ops(
+            "WITH c AS (DELETE FROM t WHERE f = 1 RETURNING id, x) \
+             SELECT * FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "f"), read("t", "id"), read("t", "x")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "id"), out("id", 0)),
+                    passthrough(col("t", "x"), out("x", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops(
+            "WITH c AS (MERGE INTO t USING s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.a = s.a RETURNING s.b) \
+             SELECT b FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("t", "id"),
+                    read("s", "id"),
+                    read("s", "a"),
+                    read("s", "b"),
+                ],
+                writes: vec![write("t", "a")],
+                lineage: vec![
+                    passthrough(col("s", "a"), relation("t", "a")),
+                    passthrough(col("s", "b"), out("b", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops(
+            "WITH c AS (UPDATE t SET a = 1 RETURNING a, b) SELECT * FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![write("t", "a")],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("t", "b"), out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn dml_cte_referenced_twice_traces_per_reference() {
         // PostgreSQL runs a data-modifying CTE once however often it is
         // referenced; each reference still traces its own output position
