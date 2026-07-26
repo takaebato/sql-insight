@@ -949,11 +949,6 @@ impl<'a> Binder<'a> {
                                 .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
                                 .collect();
                             let catalog_cols = self.catalog_columns(&target);
-                            let columns = if explicit.is_empty() {
-                                catalog_cols.clone()
-                            } else {
-                                explicit
-                            };
                             // A MERGE INSERT is a single VALUES row. Each row is
                             // now a `Parens<Vec<Expr>>`; flatten through its
                             // inner expressions (via `Deref`).
@@ -963,6 +958,17 @@ impl<'a> Binder<'a> {
                                 .flat_map(|row| row.iter())
                                 .map(|e| self.bind_expr(e, &scope))
                                 .collect();
+                            let columns = if explicit.is_empty() {
+                                // The catalog fill truncates to the row's
+                                // arity (mirroring `bind_insert`): a column
+                                // no value reaches is not written — filling
+                                // all catalog columns fabricated writes for
+                                // the surplus (the overflow direction is
+                                // still flagged below).
+                                catalog_cols.iter().take(row.len()).cloned().collect()
+                            } else {
+                                explicit
+                            };
                             // Column-list-less and no catalog to fill the target
                             // columns: the values can't be paired (see `bind_insert`).
                             // A MERGE INSERT VALUES has no wildcard, so the cause
