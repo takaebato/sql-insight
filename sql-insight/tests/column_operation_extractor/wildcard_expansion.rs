@@ -1283,6 +1283,56 @@ mod implicit_star {
     }
 
     #[test]
+    fn pipe_select_star_after_a_pipe_join_covers_both_sides() {
+        // A pipe JOIN appends the right side's cataloged columns to the
+        // running outputs, so the trailing `|> SELECT *` stays complete (no
+        // suppression): slots (a, id, v). Only the left block's slots have
+        // positional operands under the `Join` node — the right-side slots
+        // surface positionally without lineage edges, best-effort.
+        let catalog = TestCatalog::default()
+            .with("t", vec!["a"])
+            .with("u", vec!["id", "v"]);
+        assert_column_ops_with_catalog(
+            "FROM t |> JOIN u ON t.a = u.id |> SELECT *",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    expanded_read("t", "a"),
+                    read_with_ref(cataloged_table("t"), "a", ResolutionKind::Cataloged),
+                    read_with_ref(cataloged_table("u"), "id", ResolutionKind::Cataloged),
+                ],
+                writes: vec![],
+                lineage: vec![passthrough(expanded_read("t", "a"), expanded_out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn pipe_select_star_after_a_using_pipe_join_stays_suppressed() {
+        // `USING` coalesces the merge column into a join-structure-dependent
+        // position (the standard puts it first) that a flat left-then-right
+        // concatenation would misstate — the join marks the running outputs
+        // incomplete, so the trailing star stays suppressed: the same
+        // refusal a bare `*` over a merged FROM scope makes.
+        let catalog = TestCatalog::default()
+            .with("t", vec!["a", "k"])
+            .with("u", vec!["k", "v"]);
+        assert_column_ops_with_catalog(
+            "FROM t |> JOIN u USING (k) |> SELECT *",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![expanded_read("t", "a"), expanded_read("t", "k")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
     fn outer_wildcard_expands_through_a_from_first_derived_body() {
         // The derived body's implicit `*` expands (catalog), completing the
         // slot view — so the outer `*` expands through it. Previously the

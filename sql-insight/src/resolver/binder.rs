@@ -570,6 +570,25 @@ fn join(left: LogicalPlan, right: LogicalPlan, on: Vec<Expr>) -> LogicalPlan {
         left: Box::new(left),
         right: Box::new(right),
         on,
+        left_width: None,
+    })
+}
+
+/// [`join`], annotated with the left side's slot count — a pipe `|> JOIN`,
+/// whose output the later stages consume by position (see
+/// [`Join::left_width`]; `None` when the running outputs were already
+/// incomplete, so a positional trace refuses rather than guesses).
+fn pipe_join(
+    left: LogicalPlan,
+    right: LogicalPlan,
+    on: Vec<Expr>,
+    left_width: Option<usize>,
+) -> LogicalPlan {
+    LogicalPlan::Join(Join {
+        left: Box::new(left),
+        right: Box::new(right),
+        on,
+        left_width,
     })
 }
 

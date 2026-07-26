@@ -228,6 +228,27 @@ fn origins_of_slot<'a>(
         LogicalPlan::Filter(f) => origins_of_slot(&f.input, qualifier, index, context),
         LogicalPlan::Sort(s) => origins_of_slot(&s.input, qualifier, index, context),
         LogicalPlan::Join(j) => {
+            // An *unqualified* slot over a join is a pipe passthrough / star
+            // slot above a `|> JOIN`, whose output concatenates the left
+            // block's slots then the right side's columns — the index
+            // belongs to exactly one side, split at the bind-time recorded
+            // left width ([`Join::left_width`]: the binder's running slot
+            // count, so a stacked join carries its own truth instead of the
+            // walk re-deriving it). Letting both sides answer at the same
+            // index — the qualified behaviour below — would misclaim: a
+            // derived right side has no qualifier guard to stop it from
+            // answering for a left slot. An unannotated join (a FROM-clause
+            // join, or a pipe join over already-incomplete outputs) claims
+            // nothing rather than guessing.
+            if qualifier.is_none() {
+                return match j.left_width {
+                    Some(n) if index < n => origins_of_slot(&j.left, qualifier, index, context),
+                    Some(n) => origins_of_slot(&j.right, qualifier, index - n, context),
+                    None => Vec::new(),
+                };
+            }
+            // A qualified slot resolves by relation boundary: each side's
+            // `SubqueryAlias` / `CteRef` guard admits exactly one owner.
             let mut o = origins_of_slot(&j.left, qualifier, index, context);
             o.extend(origins_of_slot(&j.right, qualifier, index, context));
             o
@@ -698,14 +719,23 @@ fn collect_operands<'a>(op: &'a LogicalPlan, ctes: &[&'a Cte], out: &mut Vec<Ope
             collect_operands(&so.left, ctes, out);
             collect_operands(&so.right, ctes, out);
         }
+        // An aliasing boundary renames the *relation*, not the columns — the
+        // input's outputs are exposed unchanged (a pipe `|> AS u` sits right
+        // on the statement's output path).
+        LogicalPlan::SubqueryAlias(sa) => collect_operands(&sa.input, ctes, out),
+        // A join on the output path is a pipe `|> JOIN` above the running
+        // projection: the join's output keeps the left block's slots first
+        // (the right side's columns follow it), so the left branch carries
+        // the positional operands — a right-side slot has no operand and
+        // stays edge-less, best-effort. (A join *below* a projection never
+        // reaches here — the projection claims the walk first.)
+        LogicalPlan::Join(jn) => collect_operands(&jn.left, ctes, out),
         // No projection at this level — a relation that doesn't carry a
         // SELECT list (a `Scan`, a join below a projection, a DML / DDL root,
         // …) yields no operands. Listed explicitly so a new operator that
         // *does* expose columns positionally forces an explicit handler.
         LogicalPlan::Scan(_)
-        | LogicalPlan::Join(_)
         | LogicalPlan::Aggregate(_)
-        | LogicalPlan::SubqueryAlias(_)
         | LogicalPlan::TableFunction(_)
         | LogicalPlan::CteRef(_)
         | LogicalPlan::Values(_)

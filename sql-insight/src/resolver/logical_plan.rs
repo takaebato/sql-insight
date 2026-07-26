@@ -100,6 +100,15 @@ pub(crate) struct Join {
     pub(crate) left: Box<LogicalPlan>,
     pub(crate) right: Box<LogicalPlan>,
     pub(crate) on: Vec<Expr>,
+    /// A positionally-consumed join's output split: the left side's slot
+    /// count, recorded at bind time. Set on a pipe `|> JOIN` — the only
+    /// join whose output later stages reference *by position* (passthrough
+    /// / star slots) — from the binder's running output count, so a
+    /// positional trace splits left-vs-right by reading it instead of
+    /// re-deriving the width from the tree (the re-derivation misrouted
+    /// stacked joins). `None` = the projection above owns the output shape
+    /// (every FROM-clause join).
+    pub(crate) left_width: Option<usize>,
 }
 
 /// Aggregate (Γ): the `GROUP BY` grouping over its input, sitting below the
@@ -432,15 +441,17 @@ pub(crate) enum Expr {
     /// — each a `Passthrough` read / origin (one per side, not an ambiguous
     /// `table: None`).
     Fanin(Vec<BoundColumn>),
-    /// A wildcard-expansion-synthesized reference to the `index`-th output
-    /// slot of the derived relation exposed as `qualifier` — **positional by
-    /// construction** (the expansion enumerates the producer's slots), so a
-    /// duplicate output name (`SELECT o.id, c.id` in the producer) or an
-    /// anonymous one can't misattribute the trace the way a name-keyed
-    /// `Derived` lookup would. Never minted for written SQL: a *written*
-    /// reference resolves by name (`Expr::Column`). Like any `Derived` ref it
-    /// is not a read (the physical read is counted at the inner producer);
-    /// `origins` traces it to the producer's `index`-th output.
+    /// A synthesized reference to the `index`-th output slot of the producer
+    /// exposed as `qualifier` (`None` = the inline / running one) —
+    /// **positional by construction**, so a duplicate output name
+    /// (`SELECT o.id, c.id` in the producer) or an anonymous one can't
+    /// misattribute the trace the way a name-keyed `Derived` lookup would.
+    /// Minted by wildcard expansion (one per expanded column) and by the
+    /// pipe-operator passthrough (one per carried-forward running output);
+    /// never for written SQL — a *written* reference resolves by name
+    /// (`Expr::Column`). Like any `Derived` ref it is not a read (the
+    /// physical read is counted at the inner producer); `origins` traces it
+    /// to the producer's `index`-th output.
     DerivedSlot {
         qualifier: Option<Ident>,
         index: usize,

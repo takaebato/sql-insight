@@ -147,9 +147,11 @@ impl<'a> Binder<'a> {
     /// it reshapes the output. An output-producing operator (SELECT / EXTEND /
     /// SET / AGGREGATE) layers a [`Projection`] whose value expressions feed
     /// `QueryOutput` lineage; a filter operator (WHERE / ORDER BY / LIMIT /
-    /// CALL / PIVOT / set-op / JOIN) wraps a non-feeding read [`Filter`]; the
-    /// rest (sampling / rename / drop / unpivot) pass through. The match is
-    /// exhaustive so a new pipe operator is reviewed here.
+    /// CALL / PIVOT / set-op / JOIN) wraps a non-feeding read [`Filter`];
+    /// RENAME / DROP / AS reshape the running outputs (a positional
+    /// re-projection / an aliasing boundary); the rest (sampling / unpivot)
+    /// pass through. The match is exhaustive so a new pipe operator is
+    /// reviewed here.
     pub(super) fn bind_pipe(
         &mut self,
         op: &PipeOperator,
@@ -159,7 +161,7 @@ impl<'a> Binder<'a> {
         match op {
             PipeOperator::Select { exprs } => {
                 let (new, complete) = self.bind_output_items(exprs, scope);
-                let (node, query_outputs) = self.pipe_project(input, &[], new, &scope.relations);
+                let (node, query_outputs) = self.pipe_project(input, &[], new);
                 scope.query_outputs = query_outputs;
                 // A pipe SELECT replaces the outputs wholesale.
                 scope.outputs_complete = complete;
@@ -169,7 +171,7 @@ impl<'a> Binder<'a> {
                 // The new columns see the running outputs; then they append.
                 let (new, complete) = self.bind_output_items(exprs, scope);
                 let base = std::mem::take(&mut scope.query_outputs);
-                let (node, query_outputs) = self.pipe_project(input, &base, new, &scope.relations);
+                let (node, query_outputs) = self.pipe_project(input, &base, new);
                 scope.query_outputs = query_outputs;
                 // EXTEND appends to the running outputs, so both must be
                 // determinate.
@@ -196,7 +198,7 @@ impl<'a> Binder<'a> {
                         expr: self.bind_expr(&e.expr.expr, scope),
                     })
                     .collect();
-                let (node, query_outputs) = self.pipe_project(input, &[], new, &scope.relations);
+                let (node, query_outputs) = self.pipe_project(input, &[], new);
                 scope.query_outputs = query_outputs;
                 // AGGREGATE replaces the outputs with its own (wildcard-free)
                 // items.
@@ -246,25 +248,136 @@ impl<'a> Binder<'a> {
                     .collect();
                 self.pipe_filter(input, reads)
             }
-            // `|> JOIN t ON …`: the joined table's scan surfaces (a table read),
-            // but — matching the resolver's loose pipe scoping — it is NOT added
-            // to the scope, so the ON predicate's references to it are
-            // unresolved (only the running relations resolve).
+            // `|> JOIN t ON … / USING (…)`: the joined relation enters the
+            // scope — the ON predicate and every later stage resolve it, and
+            // its `USING` / NATURAL merge columns fan in like a FROM-clause
+            // join (it used to stay out of scope, leaving the ON's right-side
+            // references unresolved). The running outputs gain the right
+            // side's columns after the left block (identity: they're base
+            // columns a later reference re-reads); a right side whose
+            // columns can't be enumerated makes the outputs incomplete.
             PipeOperator::Join(j) => {
-                let (right, _scope) = self.bind_table_factor(&j.relation, &scope.relations);
+                // The running slot count *before* the join — the bind-time
+                // truth a positional trace above the join splits at
+                // ([`Join::left_width`]). Unknowable when the running
+                // outputs are incomplete (a suppressed wildcard may hide
+                // slots), so record nothing and let the trace refuse.
+                let left_width = scope.outputs_complete.then_some(scope.query_outputs.len());
+                let (right, right_scope) = self.bind_table_factor(&j.relation, &scope.relations);
+                // The NATURAL branch mirrors `bind_table_with_joins` for
+                // future-proofing, but is unreachable today: sqlparser 0.62
+                // rejects `|> NATURAL JOIN` at parse time (verified).
+                let merge = if join_is_natural(&j.join_operator) {
+                    self.natural_merge_columns(scope, &right_scope)
+                } else {
+                    join_using(&j.join_operator)
+                };
+                match pipe_join_output_cols(&right_scope.relations) {
+                    Some(cols) if merge.is_empty() => scope.query_outputs.extend(cols),
+                    // A `USING` / NATURAL join coalesces the merge columns
+                    // into join-structure-dependent positions (the standard
+                    // puts them first) that a flat left-then-right
+                    // concatenation misstates — mark the outputs incomplete
+                    // instead, the same refusal `scope_star_slots` makes for
+                    // a bare `*` over a merged scope.
+                    _ => scope.outputs_complete = false,
+                }
+                scope.absorb(right_scope);
+                scope.add_merge_columns(merge);
                 let on = join_on(&j.join_operator)
                     .map(|e| self.bind_expr(e, scope))
                     .into_iter()
                     .collect();
-                join(input, right, on)
+                pipe_join(input, right, on, left_width)
             }
-            // No inspectable column expressions: a sampling clause, rename,
-            // drop, or unpivot.
-            PipeOperator::TableSample { .. }
-            | PipeOperator::Drop { .. }
-            | PipeOperator::As { .. }
-            | PipeOperator::Rename { .. }
-            | PipeOperator::Unpivot { .. } => input,
+            // `|> RENAME old AS new, …`: re-project the running outputs with
+            // the mapped slots renamed. The new name is an introduced alias,
+            // not the physical column, so its identity drops — a later
+            // reference to it traces through the projection instead of
+            // falling to the base relation (which fabricated a phantom
+            // read). With incomplete outputs the slot list is unknown, so
+            // the operator passes through unchanged (the unexpanded-`*`
+            // diagnostic already flags the gap); a mapping naming no known
+            // output is ignored, best-effort.
+            PipeOperator::Rename { mappings } => {
+                if !scope.outputs_complete {
+                    return input;
+                }
+                let mut outputs = std::mem::take(&mut scope.query_outputs);
+                for m in mappings {
+                    if let Some(o) = outputs.iter_mut().find(|o| {
+                        o.name
+                            .as_ref()
+                            .is_some_and(|n| self.eq(self.style.casing.column, n, &m.ident))
+                    }) {
+                        *o = OutputCol {
+                            name: Some(m.alias.clone()),
+                            identity: false,
+                        };
+                    }
+                }
+                let node = LogicalPlan::Projection(Projection {
+                    input: Box::new(input),
+                    exprs: passthrough_exprs(&outputs),
+                });
+                scope.query_outputs = outputs;
+                node
+            }
+            // `|> DROP col, …`: re-project without the dropped slots. Each
+            // kept slot's `DerivedSlot` keeps its *base* position (the slot
+            // indices below the projection don't move); only the exposed
+            // positions compact. Incomplete outputs pass through, as above.
+            PipeOperator::Drop { columns } => {
+                if !scope.outputs_complete {
+                    return input;
+                }
+                let kept: Vec<(usize, OutputCol)> = std::mem::take(&mut scope.query_outputs)
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, o)| {
+                        !columns.iter().any(|c| {
+                            o.name
+                                .as_ref()
+                                .is_some_and(|n| self.eq(self.style.casing.column, n, c))
+                        })
+                    })
+                    .collect();
+                let exprs = kept
+                    .iter()
+                    .map(|(index, o)| NamedExpr {
+                        names: OutputNames::Single(o.name.clone()),
+                        expr: Expr::DerivedSlot {
+                            qualifier: None,
+                            index: *index,
+                        },
+                    })
+                    .collect();
+                scope.query_outputs = kept.into_iter().map(|(_, o)| o).collect();
+                LogicalPlan::Projection(Projection {
+                    input: Box::new(input),
+                    exprs,
+                })
+            }
+            // `|> AS u`: alias the whole running result, like a derived
+            // table's alias — the original relation qualifiers stop
+            // resolving (BigQuery drops them) and `u.col` addresses the
+            // running outputs through the `SubqueryAlias` boundary.
+            PipeOperator::As { alias } => {
+                scope.relations = vec![Relation::Derived {
+                    alias: Some(alias.clone()),
+                    columns: Exposed {
+                        slots: scope.query_outputs.iter().map(|o| o.name.clone()).collect(),
+                        complete: scope.outputs_complete,
+                    },
+                }];
+                LogicalPlan::SubqueryAlias(SubqueryAlias {
+                    alias: alias.clone(),
+                    input: Box::new(input),
+                })
+            }
+            // No inspectable column expressions: a sampling clause or
+            // unpivot.
+            PipeOperator::TableSample { .. } | PipeOperator::Unpivot { .. } => input,
         }
     }
 
@@ -286,20 +399,21 @@ impl<'a> Binder<'a> {
         (exprs, complete)
     }
 
-    /// Build an output-producing pipe `Projection`: the passthrough of `base`
-    /// outputs (each re-resolved by name against the base — an identity output
-    /// re-reads its real column, a computed output is `Derived` and traced)
-    /// plus the `new` value columns.
+    /// Build an output-producing pipe `Projection`: the positional passthrough
+    /// of the `base` outputs plus the `new` value columns. The passthrough
+    /// keeps each base `OutputCol` verbatim (name *and* identity — so a later
+    /// clause reference to an identity output still re-reads its real
+    /// column); only the `new` items mint fresh output metadata.
     pub(super) fn pipe_project(
         &mut self,
         input: LogicalPlan,
         base: &[OutputCol],
         new: Vec<NamedExpr>,
-        relations: &[Relation],
     ) -> (LogicalPlan, Vec<OutputCol>) {
-        let mut exprs = self.passthrough_exprs(base, relations);
+        let mut query_outputs = base.to_vec();
+        query_outputs.extend(self.output_cols(&new));
+        let mut exprs = passthrough_exprs(base);
         exprs.extend(new);
-        let query_outputs = self.output_cols(&exprs);
         (
             LogicalPlan::Projection(Projection {
                 input: Box::new(input),
@@ -307,31 +421,6 @@ impl<'a> Binder<'a> {
             }),
             query_outputs,
         )
-    }
-
-    /// Re-resolve each named `base` output as a passthrough projection item
-    /// (clause-alias resolution against the base, so an identity output
-    /// re-reads its real column while a computed output stays `Derived`).
-    pub(super) fn passthrough_exprs(
-        &self,
-        base: &[OutputCol],
-        relations: &[Relation],
-    ) -> Vec<NamedExpr> {
-        let pass_scope = Scope {
-            relations: relations.to_vec(),
-            query_outputs: base.to_vec(),
-            outputs_complete: false,
-            merge_columns: Vec::new(),
-        };
-        base.iter()
-            .filter_map(|o| o.name.clone())
-            .map(|name| NamedExpr {
-                expr: Expr::Column(Box::new(
-                    self.resolve(std::slice::from_ref(&name), &pass_scope),
-                )),
-                names: OutputNames::Single(Some(name)),
-            })
-            .collect()
     }
 
     /// `|> SET col = expr`: each assignment replaces a same-named base output in
@@ -343,24 +432,31 @@ impl<'a> Binder<'a> {
         assignments: &[sqlparser::ast::Assignment],
         scope: &Scope,
     ) -> (LogicalPlan, Vec<OutputCol>) {
-        let mut exprs = self.passthrough_exprs(&base, &scope.relations);
+        let mut exprs = passthrough_exprs(&base);
+        let mut query_outputs = base;
         for a in assignments {
             for column in assignment_target_columns(&a.target) {
                 let ne = NamedExpr {
                     names: OutputNames::Single(Some(column.clone())),
                     expr: self.bind_expr(&a.value, scope),
                 };
+                let replaced = self.output_cols(std::slice::from_ref(&ne)).remove(0);
                 // Pipe outputs are always single-named passthroughs.
-                match exprs.iter_mut().find(|e| {
+                match exprs.iter_mut().position(|e| {
                     matches!(&e.names, OutputNames::Single(Some(n))
                         if self.eq(self.style.casing.column, n, &column))
                 }) {
-                    Some(slot) => *slot = ne,
-                    None => exprs.push(ne),
+                    Some(i) => {
+                        exprs[i] = ne;
+                        query_outputs[i] = replaced;
+                    }
+                    None => {
+                        exprs.push(ne);
+                        query_outputs.push(replaced);
+                    }
                 }
             }
         }
-        let query_outputs = self.output_cols(&exprs);
         (
             LogicalPlan::Projection(Projection {
                 input: Box::new(input),
@@ -1044,4 +1140,62 @@ impl<'a> Binder<'a> {
             }
         }
     }
+}
+
+/// The positional passthrough of the running pipe outputs: one
+/// [`Expr::DerivedSlot`] per base output — **not** a read (the physical read
+/// is already counted at the producing stage, keeping reads
+/// occurrence-based), traced by position (so an anonymous output keeps its
+/// slot instead of being dropped and shifting the ones after it). The output
+/// name rides on the item; the base `OutputCol` itself is carried forward by
+/// the callers.
+fn passthrough_exprs(base: &[OutputCol]) -> Vec<NamedExpr> {
+    base.iter()
+        .enumerate()
+        .map(|(index, o)| NamedExpr {
+            names: OutputNames::Single(o.name.clone()),
+            expr: Expr::DerivedSlot {
+                qualifier: None,
+                index,
+            },
+        })
+        .collect()
+}
+
+/// The output columns a pipe `|> JOIN`'s right side appends to the running
+/// outputs — `None` when they can't be enumerated (an `Unknown` catalog-free
+/// table, an opaque table function, an incompletely-known derived relation),
+/// which makes the running outputs incomplete instead of presenting a
+/// partial list as the whole one.
+fn pipe_join_output_cols(relations: &[Relation]) -> Option<Vec<OutputCol>> {
+    let mut out = Vec::new();
+    for rel in relations {
+        match rel {
+            Relation::Table {
+                columns: Columns::Cataloged(cols),
+                ..
+            } => out.extend(cols.iter().map(|c| OutputCol {
+                name: Some(c.clone()),
+                identity: true,
+            })),
+            Relation::Derived {
+                columns:
+                    Exposed {
+                        slots,
+                        complete: true,
+                    },
+                ..
+            } => out.extend(slots.iter().map(|n| OutputCol {
+                name: n.clone(),
+                identity: false,
+            })),
+            Relation::Table {
+                columns: Columns::Unknown,
+                ..
+            }
+            | Relation::Derived { .. }
+            | Relation::TableFunction { .. } => return None,
+        }
+    }
+    Some(out)
 }
