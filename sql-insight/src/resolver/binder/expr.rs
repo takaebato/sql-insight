@@ -1074,17 +1074,23 @@ impl<'a> Binder<'a> {
         exprs
             .iter()
             .flat_map(|ne| {
-                // An identity output re-reads a real base column (so a later
-                // clause-alias / pipe reference to it reads that column). Only a
-                // `Base` column qualifies: a `Derived` passthrough (a pipe-
-                // carried alias, a derived-table column) traces back through the
-                // projection chain, not to a base table — marking it identity
-                // would let a later stage fall through to the base relation and
-                // fabricate a phantom read. A fan's names are always introduced
-                // aliases (never the column itself), so never identity.
+                // An identity output re-reads its column (so a later
+                // clause-alias / pipe reference to it reads that column
+                // again, occurrence-based). Any *physical* occurrence
+                // qualifies — `Base`, and equally an `Ambiguous` /
+                // `Unresolved` one, whose clause re-reference re-resolves to
+                // the same contested / unresolved read (`SELECT a FROM t1,
+                // t2 GROUP BY a` counts two ambiguous occurrences, like the
+                // single-table form counts two base reads). A `Derived`
+                // passthrough (a pipe-carried alias, a derived-table column)
+                // traces back through the projection chain, not to a base
+                // table — marking it identity would let a later stage fall
+                // through to the base relation and fabricate a phantom read.
+                // A fan's names are always introduced aliases (never the
+                // column itself), so never identity.
                 let identity = match (&ne.names, &ne.expr) {
                     (OutputNames::Single(Some(name)), Expr::Column(c)) => {
-                        matches!(c.binding, Binding::Base { .. })
+                        !matches!(c.binding, Binding::Derived | Binding::Local)
                             && self.eq(self.style.casing.column, name, &c.name)
                     }
                     _ => false,

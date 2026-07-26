@@ -1043,6 +1043,24 @@ mod output_alias_visibility {
     }
 
     #[test]
+    fn ambiguous_identity_output_still_counts_its_clause_occurrence() {
+        // `a` is contested between t1 and t2, but the GROUP BY occurrence is
+        // still a written physical reference — it re-resolves to the same
+        // `Ambiguous` read (two occurrences, like the single-table form
+        // counts two base reads; it used to vanish, undercounting).
+        assert_column_ops(
+            "SELECT a FROM t1, t2 GROUP BY a",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![ambiguous("a"), ambiguous("a")],
+                writes: vec![],
+                lineage: vec![passthrough(ambiguous("a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn group_by_ordinal_of_introduced_alias_is_suppressed() {
         // `GROUP BY 1` here is `a + b AS x` (an introduced alias) — like
         // `GROUP BY x`, it binds Derived and adds no read; the dependency on
