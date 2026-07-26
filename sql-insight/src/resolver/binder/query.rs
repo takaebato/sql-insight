@@ -759,7 +759,9 @@ impl<'a> Binder<'a> {
         // parses each further operand as an independent FROM item, which
         // surfaced `arr2` in `ARRAY JOIN arr1 AS a, arr2 AS b` as a phantom
         // table read. A join-carrying or non-table item can't be an operand
-        // and binds as usual.
+        // and binds as usual — deliberately conservative: in the doubtful
+        // `ARRAY JOIN a, b JOIN u ON …` shape, `b` stays a table rather
+        // than risk demoting a real table to a column.
         let mut in_array_join = ends_with_array_join(first);
         for twj in iter {
             if in_array_join

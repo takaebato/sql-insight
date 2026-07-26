@@ -1126,6 +1126,33 @@ mod join_arm_coverage {
     }
 
     #[test]
+    fn array_join_comma_operand_can_be_an_expression() {
+        // A continued operand can be an array-producing expression too —
+        // its argument columns read, the function name stays phantom-free.
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT a, m FROM t ARRAY JOIN arr AS a, arrayConcat(x, y) AS m",
+                &GenericDialect {}
+            ),
+            vec![read("t", "arr"), read("t", "x"), read("t", "y")]
+        );
+    }
+
+    #[test]
+    fn array_join_continuation_stops_at_a_join_carrying_item() {
+        // Deliberately conservative: in the doubtful `ARRAY JOIN a, b JOIN u`
+        // shape, `b` binds as a table (the old behavior) rather than risk
+        // demoting a real table to a column.
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT 1 FROM t ARRAY JOIN a, b JOIN u ON u.id = 1",
+                &GenericDialect {}
+            ),
+            vec![read("t", "a"), read("u", "id")]
+        );
+    }
+
+    #[test]
     fn array_join_expression_operand_reads_its_arguments() {
         // `ARRAY JOIN f(args)` is an array-producing *expression*: its argument
         // columns are the reads. The function name is neither a table nor a
