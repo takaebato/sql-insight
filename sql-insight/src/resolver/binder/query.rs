@@ -514,12 +514,20 @@ impl<'a> Binder<'a> {
                 None => (LogicalPlan::Empty, Scope::default()),
             },
             // `WITH … INSERT/UPDATE/DELETE/MERGE …`: the DML statement is the
-            // query body (the parser wraps a CTE-prefixed DML this way). Bind it
-            // to its DML root; it exposes no output scope to an enclosing query.
+            // query body (the parser wraps a CTE-prefixed DML this way). Bind
+            // it to its DML root. Its RETURNING projection is the output the
+            // body exposes — a data-modifying CTE's consumer reads exactly
+            // those columns (`WITH c AS (INSERT … RETURNING a) SELECT a FROM
+            // c`) — so the scope carries them like a SELECT's outputs; with
+            // no RETURNING the body exposes nothing.
             SetExpr::Insert(statement)
             | SetExpr::Update(statement)
             | SetExpr::Delete(statement)
-            | SetExpr::Merge(statement) => (self.bind_statement(statement), Scope::default()),
+            | SetExpr::Merge(statement) => {
+                let plan = self.bind_statement(statement);
+                let scope = self.dml_returning_scope(statement, &plan);
+                (plan, scope)
+            }
             // A set operation: result columns are the left operand's (names
             // from the left, positional merge). The result is positionally
             // determinate only when *every* branch is — a right branch with an
@@ -907,6 +915,44 @@ impl<'a> Binder<'a> {
             }
         }
         common
+    }
+
+    /// The output scope a DML query body (a data-modifying CTE) exposes:
+    /// its RETURNING projection's columns, empty without one. Completeness
+    /// is conservative — a RETURNING *wildcard written in the SQL* marks the
+    /// outputs incomplete even when it expanded (the expansion flag isn't
+    /// carried on the plan), so a positional consumer (an outer `SELECT *`
+    /// over the CTE) suppresses rather than trusts a possibly-partial list.
+    fn dml_returning_scope(&self, statement: &Statement, plan: &LogicalPlan) -> Scope {
+        let returning = match plan {
+            LogicalPlan::Insert(i) => &i.returning,
+            LogicalPlan::Update(u) => &u.returning,
+            LogicalPlan::Delete(d) => &d.returning,
+            LogicalPlan::Merge(m) => &m.returning,
+            _ => return Scope::default(),
+        };
+        if returning.is_empty() {
+            return Scope::default();
+        }
+        let ast_items = match statement {
+            Statement::Insert(i) => i.returning.as_deref(),
+            Statement::Update(u) => u.returning.as_deref(),
+            Statement::Delete(d) => d.returning.as_deref(),
+            Statement::Merge(m) => m.output.as_ref().map(|o| match o {
+                sqlparser::ast::OutputClause::Output { select_items, .. }
+                | sqlparser::ast::OutputClause::Returning { select_items, .. } => {
+                    select_items.as_slice()
+                }
+            }),
+            _ => None,
+        };
+        let has_wildcard = ast_items.into_iter().flatten().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+            )
+        });
+        Scope::default().with_query_outputs(self.output_cols(returning), !has_wildcard)
     }
 
     /// Bind a bare named table into a read `Scan` plus a single-relation scope

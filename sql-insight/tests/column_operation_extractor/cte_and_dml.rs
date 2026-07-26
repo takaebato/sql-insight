@@ -71,16 +71,212 @@ mod with_in_dml {
         // *statement's* WITH, so it must stay outermost — wrapping the create
         // around it buried the CTE's INSERT inside the root's input, where
         // the write-root collection never descends, and `t1`'s write vanished
-        // from every surface. (The unresolved outer `a` is a separate known
-        // gap: a DML CTE's RETURNING columns aren't exposed to references.)
+        // from every surface. The outer `a` resolves through the CTE's
+        // RETURNING (its exposed output), so the flow reaches `t2` end to
+        // end: `t1.a → t2.a`.
         assert_column_ops(
             "WITH c AS (INSERT INTO t1 (a) VALUES (1) RETURNING a) \
              SELECT a INTO t2 FROM c",
             ColumnOperation {
                 statement_kind: StatementKind::CreateTable,
-                reads: vec![read("t1", "a"), unresolved("a")],
+                reads: vec![read("t1", "a")],
                 writes: vec![write("t1", "a"), write("t2", "a")],
-                lineage: vec![passthrough(unresolved("a"), relation("t2", "a"))],
+                lineage: vec![passthrough(col("t1", "a"), relation("t2", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn dml_cte_returning_is_the_ctes_exposed_output() {
+        // A data-modifying CTE exposes its RETURNING projection: the outer
+        // reference resolves through it (it used to dangle `Unresolved`)
+        // and traces to the returning expression's sources — a rename
+        // (`a AS x`) and an UPDATE body included.
+        assert_column_ops(
+            "WITH c AS (INSERT INTO t1 (a) VALUES (1) RETURNING a) \
+             SELECT a FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a")],
+                writes: vec![write("t1", "a")],
+                lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops(
+            "WITH c AS (UPDATE t SET a = a + 1 RETURNING a AS x) \
+             SELECT x FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "a")],
+                writes: vec![write("t", "a")],
+                lineage: vec![
+                    transformation(col("t", "a"), relation("t", "a")),
+                    passthrough(col("t", "a"), out("x", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn dml_cte_returning_completes_a_wildcard_consumer() {
+        // The exposed outputs are positionally complete (named RETURNING
+        // items), so an outer `SELECT *` over the CTE expands; a written
+        // `RETURNING *` stays conservative — the expansion flag isn't
+        // carried, so the outputs mark incomplete and the outer reference
+        // dangles under the existing suppression diagnostic.
+        assert_column_ops(
+            "WITH c AS (INSERT INTO t1 (a, b) VALUES (1, 2) RETURNING a, b) \
+             SELECT * FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a"), read("t1", "b")],
+                writes: vec![write("t1", "a"), write("t1", "b")],
+                lineage: vec![
+                    passthrough(col("t1", "a"), out("a", 0)),
+                    passthrough(col("t1", "b"), out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops(
+            "WITH c AS (INSERT INTO t1 (a) VALUES (1) RETURNING *) \
+             SELECT a FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![unresolved("a")],
+                writes: vec![write("t1", "a")],
+                lineage: vec![passthrough(unresolved("a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn every_dml_kind_exposes_returning_on_both_trace_paths() {
+        // The named path (a reference by name) and the positional path (a
+        // star consumer) each have a per-DML-kind arm — INSERT and UPDATE
+        // are pinned above, DELETE and MERGE (`OUTPUT` family) here, with a
+        // star over DELETE / UPDATE covering the positional operands.
+        assert_column_ops(
+            "WITH c AS (DELETE FROM t WHERE f = 1 RETURNING id, x) \
+             SELECT * FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "f"), read("t", "id"), read("t", "x")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "id"), out("id", 0)),
+                    passthrough(col("t", "x"), out("x", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops(
+            "WITH c AS (MERGE INTO t USING s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.a = s.a RETURNING s.b) \
+             SELECT b FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("t", "id"),
+                    read("s", "id"),
+                    read("s", "a"),
+                    read("s", "b"),
+                ],
+                writes: vec![write("t", "a")],
+                lineage: vec![
+                    passthrough(col("s", "a"), relation("t", "a")),
+                    passthrough(col("s", "b"), out("b", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops(
+            "WITH c AS (UPDATE t SET a = 1 RETURNING a, b) SELECT * FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![write("t", "a")],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("t", "b"), out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+        // The DELETE named path, and the `OUTPUT` spelling of the MERGE
+        // clause under a star consumer (positional path).
+        assert_column_ops(
+            "WITH c AS (DELETE FROM t WHERE f = 1 RETURNING id) SELECT id FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "f"), read("t", "id")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "id"), out("id", 0))],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops(
+            "WITH c AS (MERGE INTO t USING s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.a = s.a OUTPUT s.b, s.k) \
+             SELECT * FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("t", "id"),
+                    read("s", "id"),
+                    read("s", "a"),
+                    read("s", "b"),
+                    read("s", "k"),
+                ],
+                writes: vec![write("t", "a")],
+                lineage: vec![
+                    passthrough(col("s", "a"), relation("t", "a")),
+                    passthrough(col("s", "b"), out("b", 0)),
+                    passthrough(col("s", "k"), out("k", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn dml_cte_referenced_twice_traces_per_reference() {
+        // PostgreSQL runs a data-modifying CTE once however often it is
+        // referenced; each reference still traces its own output position
+        // (like a plain CTE's double reference).
+        assert_column_ops(
+            "WITH c AS (INSERT INTO t1 (a) VALUES (1) RETURNING a) \
+             SELECT c1.a, c2.a FROM c AS c1, c AS c2",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a")],
+                writes: vec![write("t1", "a")],
+                lineage: vec![
+                    passthrough(col("t1", "a"), out("a", 0)),
+                    passthrough(col("t1", "a"), out("a", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn anonymous_returning_item_keeps_its_slot_for_a_star_consumer() {
+        // `RETURNING a + 1` has no name — it can't be referenced by name,
+        // but it holds its position, so the outer star's slot traces to it
+        // positionally (a nameless output target).
+        assert_column_ops(
+            "WITH c AS (INSERT INTO t1 (a) VALUES (1) RETURNING a + 1) \
+             SELECT * FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a")],
+                writes: vec![write("t1", "a")],
+                lineage: vec![transformation(col("t1", "a"), out_anon(0))],
                 diagnostics: vec![],
             },
         );
