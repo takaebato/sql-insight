@@ -752,6 +752,39 @@ mod on_conflict {
     }
 
     #[test]
+    fn pg_on_conflict_contest_reaches_into_a_subquery() {
+        // The contest is a resolution rule, not an expression post-pass, so
+        // a *correlated* reference inside a subquery of the action demotes
+        // the same way — it used to keep the EXCLUDED claim and vanish from
+        // the surfaces entirely. A reference the subquery's own FROM
+        // resolves (`s.a` below) is untouched.
+        assert_column_ops_with_dialect(
+            "INSERT INTO t (a) VALUES (1) \
+             ON CONFLICT (a) DO UPDATE SET a = (SELECT a + 1)",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![ambiguous("a")],
+                writes: vec![write("t", "a"), write("t", "a")],
+                lineage: vec![transformation(ambiguous("a"), relation("t", "a"))],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops_with_dialect(
+            "INSERT INTO t (a) VALUES (1) \
+             ON CONFLICT (a) DO UPDATE SET a = (SELECT s.a FROM s)",
+            &PostgreSqlDialect {},
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "a")],
+                writes: vec![write("t", "a"), write("t", "a")],
+                lineage: vec![transformation(col("s", "a"), relation("t", "a"))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn pg_on_conflict_excluded_mapping_is_gated_by_an_unexpanded_wildcard() {
         // The source projection kept an unexpanded `*`, so its positions are
         // indeterminate — the `EXCLUDED.a` positional mapping must yield no

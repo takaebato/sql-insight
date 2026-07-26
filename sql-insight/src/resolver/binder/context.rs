@@ -45,6 +45,15 @@ pub(super) struct Context {
     /// enclosing query relations (correlation) and lambda parameters, each at
     /// its lexical depth. See [`Level`].
     pub(super) outer: Vec<Level>,
+    /// The `EXCLUDED` pseudo-relation's columns while binding a conflict
+    /// action (`ON CONFLICT DO UPDATE` / `ON DUPLICATE KEY UPDATE`), else
+    /// empty. An unqualified reference to one is contested between the
+    /// existing target row and `EXCLUDED` (PostgreSQL rejects it as
+    /// ambiguous), so resolution demotes it — a *rule*, not a post-pass, so
+    /// it reaches a correlated reference inside a subquery of the action
+    /// too. Carried into child contexts like the stack (a subquery stays
+    /// inside the conflict action).
+    pub(super) excluded_columns: Vec<Ident>,
 }
 
 impl Context {
@@ -53,7 +62,7 @@ impl Context {
     pub(super) fn with_ctes(&self, ctes: Vec<CteDecl>) -> Context {
         Context {
             ctes,
-            outer: self.outer.clone(),
+            ..self.clone()
         }
     }
 
@@ -77,6 +86,14 @@ impl Context {
     /// outside any subquery in the body.
     pub(super) fn with_lambda(&self, params: impl IntoIterator<Item = Ident>) -> Context {
         self.pushing(Level::Lambda(params.into_iter().collect()))
+    }
+
+    /// A child context marked as binding a conflict action whose `EXCLUDED`
+    /// pseudo-relation exposes `columns`.
+    pub(super) fn with_excluded(&self, columns: Vec<Ident>) -> Context {
+        let mut child = self.clone();
+        child.excluded_columns = columns;
+        child
     }
 
     fn pushing(&self, level: Level) -> Context {

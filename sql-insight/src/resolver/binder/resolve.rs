@@ -62,6 +62,29 @@ impl<'a> Binder<'a> {
                     })
             })
             .unwrap_or(Binding::Unresolved);
+        // Conflict-action contest (PostgreSQL parity): while binding an
+        // `ON CONFLICT DO UPDATE` action, an unqualified reference to an
+        // `EXCLUDED` column is contested between the existing target row and
+        // `EXCLUDED` — PG rejects it as ambiguous — so a `Derived` claim
+        // (the `EXCLUDED` exposure winning over the catalog-free target)
+        // demotes to `Ambiguous`. As a resolution rule it reaches a
+        // correlated reference inside a subquery of the action too (the
+        // post-pass it replaces stopped at the subquery boundary, and the
+        // reference vanished from the surfaces entirely). Best-effort limit:
+        // a subquery's *own* derived relation exposing the same contested
+        // name demotes as well.
+        let binding = if parts.len() == 1
+            && matches!(binding, Binding::Derived)
+            && self
+                .context
+                .excluded_columns
+                .iter()
+                .any(|c| self.eq(self.style.casing.column, c, name))
+        {
+            Binding::Ambiguous
+        } else {
+            binding
+        };
         BoundColumn {
             qualifier: (parts.len() >= 2).then(|| parts[parts.len() - 2].clone()),
             name: name.clone(),
