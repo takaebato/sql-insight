@@ -166,7 +166,14 @@ impl VisitorMut for Normalizer {
             }) = stmt
             {
                 if let Some(Query { body, .. }) = source.as_deref() {
-                    if let SetExpr::Values(v) = body.deref() {
+                    // A parenthesized source (`INSERT … (VALUES …)`) nests
+                    // the VALUES under a `SetExpr::Query` — peel to it, so
+                    // both spellings alphabetize alike.
+                    let mut body = body.deref();
+                    while let SetExpr::Query(q) = body {
+                        body = q.body.deref();
+                    }
+                    if let SetExpr::Values(v) = body {
                         // `Parens` equality ignores its parenthesis tokens
                         // (their `PartialEq` is always-equal), so this compares
                         // the row content alone — matching the sentinel above.
