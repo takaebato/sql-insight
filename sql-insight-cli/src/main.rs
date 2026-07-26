@@ -300,48 +300,33 @@ impl Commands {
             "Entering interactive mode. Type sql statement end with `;` to execute. \
              Type `exit` or `quit` to exit."
         );
-        let mut editor =
-            rustyline::DefaultEditor::new().map_err(|e| Error::IOError(e.to_string()))?;
-
-        let mut input_buffer = String::new();
+        // Statement continuation is rustyline's multiline mechanism: the
+        // helper's `Validator` answers `Incomplete` until the buffer ends a
+        // statement, so Enter inserts a newline and editing continues across
+        // lines — one history entry per whole statement, content (a string
+        // literal's indentation) kept verbatim.
+        let mut editor: rustyline::Editor<SqlHelper, rustyline::history::DefaultHistory> =
+            rustyline::Editor::new().map_err(|e| Error::IOError(e.to_string()))?;
+        editor.set_helper(Some(SqlHelper));
         loop {
-            let prompt = if input_buffer.is_empty() {
-                "sql> "
-            } else {
-                "  -> "
-            };
-            let line = match editor.readline(prompt) {
-                Ok(line) => line,
-                // Ctrl-C clears the in-progress statement; Ctrl-D / EOF exits.
-                Err(rustyline::error::ReadlineError::Interrupted) => {
-                    input_buffer.clear();
-                    continue;
-                }
+            let input = match editor.readline("sql> ") {
+                Ok(input) => input,
+                // Ctrl-C discards the in-progress statement; Ctrl-D / EOF exits.
+                Err(rustyline::error::ReadlineError::Interrupted) => continue,
                 Err(rustyline::error::ReadlineError::Eof) => break,
                 Err(e) => return Err(Error::IOError(e.to_string())),
             };
-            let trimmed = line.trim();
-            if input_buffer.is_empty() {
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
-                    break;
-                }
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                continue;
             }
-            if !trimmed.is_empty() {
-                let _ = editor.add_history_entry(trimmed);
+            let _ = editor.add_history_entry(&input);
+            if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
+                break;
             }
-            // Keep the line verbatim: a statement may continue a string
-            // literal from the previous line, whose leading / trailing
-            // whitespace is content (trimming destroyed it).
-            input_buffer.push_str(&line);
-            input_buffer.push('\n');
-            if statement_complete(&input_buffer) {
-                match self.executor(std::mem::take(&mut input_buffer)).execute() {
-                    Ok(result) => result.iter().for_each(|r| println!("{r}")),
-                    Err(e) => eprintln!("Error: {e}"),
-                }
+            match self.executor(input).execute() {
+                Ok(result) => result.iter().for_each(|r| println!("{r}")),
+                Err(e) => eprintln!("Error: {e}"),
             }
         }
 
@@ -406,6 +391,31 @@ fn main() -> ExitCode {
             eprintln!("Error: {}", e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The rustyline helper: everything defaulted except the [`Validator`],
+/// which drives multiline editing — `Incomplete` until the input ends a
+/// statement (or is an `exit` / `quit` command, or blank), so Enter
+/// continues the same edit buffer instead of submitting.
+#[derive(rustyline::Completer, rustyline::Helper, rustyline::Highlighter, rustyline::Hinter)]
+struct SqlHelper;
+
+impl rustyline::validate::Validator for SqlHelper {
+    fn validate(
+        &self,
+        ctx: &mut rustyline::validate::ValidationContext,
+    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
+        let trimmed = ctx.input().trim();
+        let complete = trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("exit")
+            || trimmed.eq_ignore_ascii_case("quit")
+            || statement_complete(ctx.input());
+        Ok(if complete {
+            rustyline::validate::ValidationResult::Valid(None)
+        } else {
+            rustyline::validate::ValidationResult::Incomplete
+        })
     }
 }
 
