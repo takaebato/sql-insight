@@ -228,6 +228,27 @@ fn origins_of_slot<'a>(
         LogicalPlan::Filter(f) => origins_of_slot(&f.input, qualifier, index, context),
         LogicalPlan::Sort(s) => origins_of_slot(&s.input, qualifier, index, context),
         LogicalPlan::Join(j) => {
+            // An *unqualified* slot over a join is a pipe passthrough / star
+            // slot above a `|> JOIN`, whose output concatenates the left
+            // block's slots then the right side's columns — the index
+            // belongs to exactly one side, split at the left side's full
+            // width ([`slot_width`], which sums a stacked join's both sides
+            // — the first-operand count undercounted there and misrouted a
+            // middle join's slots to the outer right side). Letting both
+            // sides answer at the same index — the qualified behaviour
+            // below — would misclaim: a derived right side has no qualifier
+            // guard to stop it from answering for a left slot. An
+            // uncountable left side can't locate the split, so nothing is
+            // claimed rather than guessed.
+            if qualifier.is_none() {
+                return match slot_width(&j.left) {
+                    Some(n) if index < n => origins_of_slot(&j.left, qualifier, index, context),
+                    Some(n) => origins_of_slot(&j.right, qualifier, index - n, context),
+                    None => Vec::new(),
+                };
+            }
+            // A qualified slot resolves by relation boundary: each side's
+            // `SubqueryAlias` / `CteRef` guard admits exactly one owner.
             let mut o = origins_of_slot(&j.left, qualifier, index, context);
             o.extend(origins_of_slot(&j.right, qualifier, index, context));
             o
@@ -727,6 +748,37 @@ fn collect_operands<'a>(op: &'a LogicalPlan, ctes: &[&'a Cte], out: &mut Vec<Ope
         | LogicalPlan::CreateView(_)
         | LogicalPlan::AlterTable(_)
         | LogicalPlan::Drop(_) => {}
+    }
+}
+
+/// The number of output slots `op` exposes, when statically knowable: a
+/// projection's slot count, a set operation's first branch, a join's two
+/// sides summed, VALUES rows' width — through the transparent wrappers.
+/// `None` when a side exposes no positional producer (a raw scan, an opaque
+/// table function, a CTE reference), where a count would be a guess.
+fn slot_width(op: &LogicalPlan) -> Option<usize> {
+    match op {
+        LogicalPlan::Projection(p) => Some(output_slots(&p.exprs).count()),
+        LogicalPlan::SetOp(so) => slot_width(&so.left),
+        LogicalPlan::SubqueryAlias(sa) => slot_width(&sa.input),
+        LogicalPlan::Filter(f) => slot_width(&f.input),
+        LogicalPlan::Sort(s) => slot_width(&s.input),
+        LogicalPlan::Aggregate(a) => slot_width(&a.input),
+        LogicalPlan::With(w) => slot_width(&w.body),
+        LogicalPlan::Join(j) => Some(slot_width(&j.left)? + slot_width(&j.right)?),
+        LogicalPlan::Values(v) => v.rows.first().map(Vec::len),
+        LogicalPlan::Scan(_)
+        | LogicalPlan::TableFunction(_)
+        | LogicalPlan::CteRef(_)
+        | LogicalPlan::Empty
+        | LogicalPlan::Insert(_)
+        | LogicalPlan::Update(_)
+        | LogicalPlan::Delete(_)
+        | LogicalPlan::Merge(_)
+        | LogicalPlan::CreateTableAs(_)
+        | LogicalPlan::CreateView(_)
+        | LogicalPlan::AlterTable(_)
+        | LogicalPlan::Drop(_) => None,
     }
 }
 

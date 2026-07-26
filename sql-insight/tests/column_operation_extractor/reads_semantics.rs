@@ -1325,6 +1325,38 @@ mod pipe_reshape {
     }
 
     #[test]
+    fn drop_over_incomplete_outputs_passes_through() {
+        // Same rule as RENAME below: with unknown running outputs the DROP
+        // can't re-project, so the dropped name still resolves best-effort.
+        assert_column_ops(
+            "FROM t |> DROP a |> SELECT a",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn tablesample_passes_through() {
+        // A sampling clause has no column expressions — the chain continues
+        // over the same scope.
+        assert_column_ops(
+            "FROM t |> TABLESAMPLE SYSTEM (10 PERCENT) |> SELECT a",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
     fn rename_over_incomplete_outputs_passes_through() {
         // Catalog-free `FROM t` leaves the running outputs unknown, so the
         // RENAME can't re-project — the reference still falls to the base
@@ -1377,6 +1409,76 @@ mod pipe_join {
                 writes: vec![],
                 lineage: vec![passthrough(col("t", "a"), out("a", 0))],
                 diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn join_derived_right_side_slots_split_positionally() {
+        // The trailing star's slots split at the left block's width: slot 0
+        // is the running `a` (left), slot 1 the derived side's `id` (right,
+        // at its own offset). Both sides answering at the same index used
+        // to let the derived right side misclaim slot 0 (`u.id -> a`).
+        assert_column_ops(
+            "FROM t |> SELECT a |> JOIN (SELECT id FROM u) v ON a = v.id |> SELECT *",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("u", "id"), read("t", "a")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("u", "id"), out("id", 1)),
+                ],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn stacked_derived_joins_split_at_the_full_left_width() {
+        // The split point is the left side's *full* width — a stacked join
+        // sums both of its sides — so each derived side's slot routes to its
+        // own producer (the first-operand count undercounted the middle
+        // join's width and misrouted `p`'s slot to `q`).
+        assert_column_ops(
+            "FROM t |> SELECT a              |> JOIN (SELECT x FROM u) p ON a = p.x              |> JOIN (SELECT y FROM w) q ON a = q.y              |> SELECT *",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("t", "a"),
+                    read("u", "x"),
+                    read("t", "a"),
+                    read("w", "y"),
+                    read("t", "a"),
+                ],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("u", "x"), out("x", 1)),
+                    passthrough(col("w", "y"), out("y", 2)),
+                ],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn fan_output_passthrough_keeps_both_slots() {
+        // A multi-alias fan (`explode(arr) AS (k, v)`) occupies two slots
+        // with one expression; the EXTEND passthrough carries both
+        // positionally (the slot view expands the fan), so each fan output
+        // still traces to the argument.
+        assert_column_ops(
+            "SELECT explode(arr) AS (k, v) FROM t |> EXTEND 1 AS y",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "arr")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "arr"), out("k", 0)),
+                    transformation(col("t", "arr"), out("v", 1)),
+                ],
+                diagnostics: vec![],
             },
         );
     }

@@ -258,14 +258,23 @@ impl<'a> Binder<'a> {
             // columns can't be enumerated makes the outputs incomplete.
             PipeOperator::Join(j) => {
                 let (right, right_scope) = self.bind_table_factor(&j.relation, &scope.relations);
+                // The NATURAL branch mirrors `bind_table_with_joins` for
+                // future-proofing, but is unreachable today: sqlparser 0.62
+                // rejects `|> NATURAL JOIN` at parse time (verified).
                 let merge = if join_is_natural(&j.join_operator) {
                     self.natural_merge_columns(scope, &right_scope)
                 } else {
                     join_using(&j.join_operator)
                 };
                 match pipe_join_output_cols(&right_scope.relations) {
-                    Some(cols) => scope.query_outputs.extend(cols),
-                    None => scope.outputs_complete = false,
+                    Some(cols) if merge.is_empty() => scope.query_outputs.extend(cols),
+                    // A `USING` / NATURAL join coalesces the merge columns
+                    // into join-structure-dependent positions (the standard
+                    // puts them first) that a flat left-then-right
+                    // concatenation misstates — mark the outputs incomplete
+                    // instead, the same refusal `scope_star_slots` makes for
+                    // a bare `*` over a merged scope.
+                    _ => scope.outputs_complete = false,
                 }
                 scope.absorb(right_scope);
                 scope.add_merge_columns(merge);
