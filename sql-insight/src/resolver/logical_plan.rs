@@ -379,6 +379,10 @@ pub(crate) struct CreateView {
 pub(crate) struct AlterTable {
     pub(crate) target: TableWrite,
     pub(crate) columns: Vec<Ident>,
+    /// `RENAME TO`'s new table name, surfaced as a write alongside the
+    /// old one — the table-level mirror of RENAME COLUMN surfacing both
+    /// column names.
+    pub(crate) rename_to: Option<TableWrite>,
 }
 
 /// `DROP TABLE/VIEW` / `TRUNCATE`: names relations as write targets; no

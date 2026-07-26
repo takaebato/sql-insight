@@ -658,6 +658,23 @@ mod ddl {
     }
 
     #[test]
+    fn alter_table_rename_to_surfaces_both_names() {
+        // `RENAME TO` writes both the old and the new table name — the
+        // table-level mirror of RENAME COLUMN surfacing both column names
+        // (the new name used to be invisible on every surface).
+        assert_ops(
+            "ALTER TABLE t1 RENAME TO t2",
+            TableOperation {
+                statement_kind: StatementKind::AlterTable,
+                reads: vec![],
+                writes: vec![twrite("t1"), twrite("t2")],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn alter_view_emits_write_and_read_with_lineage() {
         // ALTER VIEW ... AS SELECT replaces the view definition with
         // a new SELECT body — semantically the same shape as CREATE

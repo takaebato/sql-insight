@@ -1657,8 +1657,10 @@ impl<'a> Binder<'a> {
 
     /// `ALTER TABLE t <ops>`: the altered table is a write target; each
     /// column-naming operation contributes its column(s) as writes (RENAME /
-    /// CHANGE surface both names). Schema-level ops name no columns. No reads
-    /// or lineage — ALTER restructures, it doesn't move row data.
+    /// CHANGE surface both names), and a `RENAME TO` surfaces the new table
+    /// name as a write beside the old (the table-level mirror of that rule).
+    /// Schema-level ops name no columns. No reads or lineage — ALTER
+    /// restructures, it doesn't move row data.
     pub(super) fn bind_alter_table(&mut self, alter: &SqlAlterTable) -> LogicalPlan {
         let Some(written) = self.table_ref(&alter.name) else {
             return LogicalPlan::Empty;
@@ -1669,12 +1671,25 @@ impl<'a> Binder<'a> {
             .iter()
             .flat_map(alter_table_op_target_columns)
             .collect();
+        let rename_to = alter
+            .operations
+            .iter()
+            .find_map(|op| match op {
+                AlterTableOperation::RenameTable { table_name } => Some(match table_name {
+                    sqlparser::ast::RenameTableNameKind::As(name)
+                    | sqlparser::ast::RenameTableNameKind::To(name) => name,
+                }),
+                _ => None,
+            })
+            .and_then(|name| self.table_ref(name))
+            .map(|written| self.table_write(&written));
         LogicalPlan::AlterTable(AlterTable {
             target: TableWrite {
                 reference: m.table,
                 resolution: m.resolution,
             },
             columns,
+            rename_to,
         })
     }
 
