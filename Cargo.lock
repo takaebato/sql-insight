@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "sql-insight"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "sqlparser",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "sql-insight-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "assert_cmd",
  "clap",

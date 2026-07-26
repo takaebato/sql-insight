@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/takaebato/sql-insight/compare/sql-insight-v0.4.0...sql-insight-v0.5.0) - 2026-07-26
+
+### ⚠️ Breaking Changes
+
+#### trace statement-materialized relations into their inputs ([#69](https://github.com/takaebato/sql-insight/pull/69)) by @takaebato
+
+#### expand wildcards when the covered columns are fully known ([#67](https://github.com/takaebato/sql-insight/pull/67)) by @takaebato
+
+### Added
+
+- expose a data-modifying CTE's RETURNING as its output columns ([#79](https://github.com/takaebato/sql-insight/pull/79)) by @takaebato
+
+### Fixed
+
+- scope DISTINCT ON keys over the projection outputs ([#77](https://github.com/takaebato/sql-insight/pull/77)) by @takaebato
+- close the remaining audited correctness gaps across dialect corners ([#76](https://github.com/takaebato/sql-insight/pull/76)) by @takaebato
+- make pipe operators evolve the running scope correctly ([#75](https://github.com/takaebato/sql-insight/pull/75)) by @takaebato
+- close resolution and trace gaps across CTE, APPLY, USING, and derived tables ([#74](https://github.com/takaebato/sql-insight/pull/74)) by @takaebato
+- stop DML binder paths from silently losing writes and reads ([#72](https://github.com/takaebato/sql-insight/pull/72)) by @takaebato
+- correct wildcard handling in FROM-first selects, pipe SELECT *, and ON CONFLICT lineage ([#71](https://github.com/takaebato/sql-insight/pull/71)) by @takaebato
+- resolve an unqualified conflict-action reference as ambiguous ([#68](https://github.com/takaebato/sql-insight/pull/68)) by @takaebato
+
+### Other Changes
+
+- rename the security-audit workflow to cargo-deny and add its badge ([#64](https://github.com/takaebato/sql-insight/pull/64)) by @takaebato
+
 ## [0.4.0](https://github.com/takaebato/sql-insight/compare/sql-insight-v0.3.0...sql-insight-v0.4.0) - 2026-07-05
 
 ### ⚠️ Breaking Changes

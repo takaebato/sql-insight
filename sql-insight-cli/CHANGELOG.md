@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/takaebato/sql-insight/compare/sql-insight-cli-v0.3.0...sql-insight-cli-v0.3.1) - 2026-07-26
+
+### Fixed
+
+- track quote and comment state when splitting interactive CLI statements ([#78](https://github.com/takaebato/sql-insight/pull/78)) by @takaebato
+
+### Other Changes
+
+- rename the security-audit workflow to cargo-deny and add its badge ([#64](https://github.com/takaebato/sql-insight/pull/64)) by @takaebato
+
 ## [0.3.0](https://github.com/takaebato/sql-insight/compare/sql-insight-cli-v0.2.1...sql-insight-cli-v0.3.0) - 2026-07-05
 
 ### ⚠️ Breaking Changes
