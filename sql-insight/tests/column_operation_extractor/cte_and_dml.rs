@@ -207,6 +207,40 @@ mod with_in_dml {
                 diagnostics: vec![],
             },
         );
+        // The DELETE named path, and the `OUTPUT` spelling of the MERGE
+        // clause under a star consumer (positional path).
+        assert_column_ops(
+            "WITH c AS (DELETE FROM t WHERE f = 1 RETURNING id) SELECT id FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "f"), read("t", "id")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "id"), out("id", 0))],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops(
+            "WITH c AS (MERGE INTO t USING s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.a = s.a OUTPUT s.b, s.k) \
+             SELECT * FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("t", "id"),
+                    read("s", "id"),
+                    read("s", "a"),
+                    read("s", "b"),
+                    read("s", "k"),
+                ],
+                writes: vec![write("t", "a")],
+                lineage: vec![
+                    passthrough(col("s", "a"), relation("t", "a")),
+                    passthrough(col("s", "b"), out("b", 0)),
+                    passthrough(col("s", "k"), out("k", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
     }
 
     #[test]
