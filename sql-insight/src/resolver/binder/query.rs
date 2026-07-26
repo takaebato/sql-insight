@@ -711,6 +711,18 @@ impl<'a> Binder<'a> {
                 predicate: vec![self.bind_expr(qualify, &clause_scope)],
             });
         }
+        // `DISTINCT ON (keys)` picks one row per key group over the
+        // *projected* rows — PostgreSQL 18 (verified): an output alias is
+        // visible to the keys and *shadows* a same-named base column, like
+        // ORDER BY — so the keys bind against `clause_scope`: an identity
+        // output re-reads its column, an introduced alias binds `Derived`
+        // (the dependency is at the projection). Filter-position reads.
+        if let Some(Distinct::On(on)) = &select.distinct {
+            node = LogicalPlan::Filter(Filter {
+                input: Box::new(node),
+                predicate: self.bind_exprs(on, &clause_scope),
+            });
+        }
         // SORT BY (Hive) sees the outputs, like a trailing ORDER BY.
         let sort_keys = self.order_by_expr_keys(&select.sort_by, &clause_scope);
         if !sort_keys.is_empty() {

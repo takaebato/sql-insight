@@ -943,19 +943,18 @@ impl<'a> Binder<'a> {
         exprs.iter().map(|e| self.bind_expr(e, scope)).collect()
     }
 
-    /// Filter-position reads from a SELECT's auxiliary clauses (`DISTINCT ON`
-    /// keys, `TOP n`, `PREWHERE`, `CONNECT BY` / `START WITH`, `CLUSTER BY` /
+    /// Filter-position reads from a SELECT's auxiliary clauses (`TOP n`,
+    /// `PREWHERE`, `CONNECT BY` / `START WITH`, `CLUSTER BY` /
     /// `DISTRIBUTE BY`, named `WINDOW` specs), resolved against the FROM
-    /// scope. None feed values. Hive `LATERAL VIEW` is *not* here — it is a
+    /// scope. None feed values. `DISTINCT ON` is *not* here — its keys see
+    /// the output aliases (PostgreSQL scopes them like ORDER BY), so they
+    /// bind post-projection in [`bind_select`](Self::bind_select). Hive `LATERAL VIEW` is *not* here — it is a
     /// value-feeding lateral table function, joined into the FROM by
     /// [`bind_select`](Self::bind_select). `QUALIFY` is *not* here — it
     /// filters on window / projection outputs (post-projection), so it binds
     /// against the output-aware scope in [`bind_select`](Self::bind_select).
     pub(super) fn select_clause_reads(&mut self, select: &Select, scope: &Scope) -> Vec<Expr> {
         let mut reads = Vec::new();
-        if let Some(Distinct::On(exprs)) = &select.distinct {
-            reads.extend(self.bind_exprs(exprs, scope));
-        }
         if let Some(top) = &select.top {
             if let Some(TopQuantity::Expr(expr)) = &top.quantity {
                 reads.push(self.bind_expr(expr, scope));
