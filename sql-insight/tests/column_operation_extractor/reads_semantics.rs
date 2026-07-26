@@ -391,7 +391,6 @@ mod reads {
 // kept) and the lineage they produce.
 mod reads_by_clause {
     use super::*;
-    use sql_insight::sqlparser::dialect::ClickHouseDialect;
 
     #[test]
     fn same_column_in_projection_and_where_is_two_reads() {
@@ -1032,7 +1031,7 @@ mod output_alias_visibility {
         // dropped entirely); the interpolate *target* designator names an
         // output, not an occurrence.
         assert_column_ops_with_dialect(
-            &ClickHouseDialect {},
+            &sql_insight::sqlparser::dialect::ClickHouseDialect {},
             "SELECT a FROM t ORDER BY a WITH FILL FROM t.lo TO t.hi STEP 1 \
              INTERPOLATE (a AS a + t.b)",
             ColumnOperation {
