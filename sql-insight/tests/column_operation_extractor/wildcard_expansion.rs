@@ -115,6 +115,39 @@ mod catalog_tables {
     }
 
     #[test]
+    fn wildcard_expands_over_a_lateral_view_and_traces_its_slot() {
+        // The scope is `t` plus the view's closed Derived relation, so the
+        // `*` expands to (a, arr, c); the view's slot traces to the
+        // function's argument at function granularity (`arr -> c`, a
+        // Transformation) — the slot used to be edge-less.
+        let catalog = TestCatalog::default().with("t", vec!["a", "arr"]);
+        let options = ExtractorOptions::new().with_catalog(&catalog.catalog);
+        let op = extract_column_operations_with_options(
+            &sql_insight::sqlparser::dialect::HiveDialect {},
+            "SELECT * FROM t LATERAL VIEW explode(arr) x AS c",
+            options,
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        let edges: Vec<(&str, String)> = op
+            .lineage
+            .iter()
+            .map(|e| {
+                (
+                    e.source.reference.name.value.as_str(),
+                    format!("{:?}", e.target),
+                )
+            })
+            .collect();
+        assert_eq!(edges.len(), 3, "a, arr, and the view's c: {edges:#?}");
+        assert!(
+            edges[2].0 == "arr" && edges[2].1.contains("\"c\""),
+            "the view slot traces to the argument: {edges:#?}"
+        );
+    }
+
+    #[test]
     fn select_level_exclude_suppresses_expansion() {
         // Redshift's select-level `EXCLUDE` filters the projected set after
         // the items — expanding the `*` while ignoring it fabricated a read
