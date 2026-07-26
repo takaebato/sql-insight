@@ -307,7 +307,8 @@ impl Commands {
         // literal's indentation) kept verbatim.
         let mut editor: rustyline::Editor<SqlHelper, rustyline::history::DefaultHistory> =
             rustyline::Editor::new().map_err(|e| Error::IOError(e.to_string()))?;
-        editor.set_helper(Some(SqlHelper));
+        let dialect = crate::executor::get_dialect(self.common().dialect.as_deref())?;
+        editor.set_helper(Some(SqlHelper { dialect }));
         loop {
             let input = match editor.readline("sql> ") {
                 Ok(input) => input,
@@ -397,9 +398,13 @@ fn main() -> ExitCode {
 /// The rustyline helper: everything defaulted except the [`Validator`],
 /// which drives multiline editing — `Incomplete` until the input ends a
 /// statement (or is an `exit` / `quit` command, or blank), so Enter
-/// continues the same edit buffer instead of submitting.
+/// continues the same edit buffer instead of submitting. Holds the session
+/// dialect so completeness is judged by the same lexical rules the
+/// executor parses with.
 #[derive(rustyline::Completer, rustyline::Helper, rustyline::Highlighter, rustyline::Hinter)]
-struct SqlHelper;
+struct SqlHelper {
+    dialect: Box<dyn sql_insight::sqlparser::dialect::Dialect>,
+}
 
 impl rustyline::validate::Validator for SqlHelper {
     fn validate(
@@ -410,7 +415,7 @@ impl rustyline::validate::Validator for SqlHelper {
         let complete = trimmed.is_empty()
             || trimmed.eq_ignore_ascii_case("exit")
             || trimmed.eq_ignore_ascii_case("quit")
-            || statement_complete(ctx.input());
+            || statement_complete(self.dialect.as_ref(), ctx.input());
         Ok(if complete {
             rustyline::validate::ValidationResult::Valid(None)
         } else {
@@ -419,112 +424,100 @@ impl rustyline::validate::Validator for SqlHelper {
     }
 }
 
-/// Whether the buffered input ends a statement: its last significant
-/// character *outside* any string literal, quoted identifier, or comment is
-/// `;`. The scan tracks the SQL-standard quote forms — `'…'` strings and
-/// `"…"` / `` `…` `` quoted identifiers, each escaping its own quote by
-/// doubling (a doubled quote toggles the state out and straight back in, so
-/// plain toggling handles it) — plus `--` line comments and nesting
-/// `/* … */` block comments (PostgreSQL nests them). Not modelled:
-/// dollar-quoted strings (`$tag$…$tag$`) and dialect-specific backslash
-/// escapes — a `;` inside those may still split early, best-effort.
-fn statement_complete(input: &str) -> bool {
-    #[derive(PartialEq)]
-    enum State {
-        Top,
-        Single,
-        Double,
-        Backtick,
-        LineComment,
-        BlockComment(u32),
-    }
-    let mut state = State::Top;
-    let mut last_significant = None;
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        match state {
-            State::Top => match c {
-                '\'' => state = State::Single,
-                '"' => state = State::Double,
-                '`' => state = State::Backtick,
-                '-' if chars.peek() == Some(&'-') => {
-                    chars.next();
-                    state = State::LineComment;
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    chars.next();
-                    state = State::BlockComment(1);
-                }
-                _ => {
-                    if !c.is_whitespace() {
-                        last_significant = Some(c);
-                    }
-                }
-            },
-            State::Single if c == '\'' => state = State::Top,
-            State::Double if c == '"' => state = State::Top,
-            State::Backtick if c == '`' => state = State::Top,
-            State::LineComment if c == '\n' => state = State::Top,
-            State::BlockComment(depth) => {
-                if c == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    state = if depth == 1 {
-                        State::Top
-                    } else {
-                        State::BlockComment(depth - 1)
-                    };
-                } else if c == '/' && chars.peek() == Some(&'*') {
-                    chars.next();
-                    state = State::BlockComment(depth + 1);
-                }
-            }
-            State::Single | State::Double | State::Backtick | State::LineComment => {}
+/// Whether the buffered input ends a statement: its last token outside
+/// whitespace and comments is `;`, judged by **sqlparser's own tokenizer**
+/// under the session dialect — the same lexical rules the executor will
+/// parse with, so string / identifier quoting (dialect escapes included),
+/// dollar quoting, brackets, and every comment form can't diverge from the
+/// real parse. An "unterminated / EOF" tokenizer error means the input is
+/// still inside a literal or comment — incomplete, keep editing; any other
+/// tokenizer error won't be fixed by more input, so the statement counts as
+/// complete and the executor surfaces the real error visibly instead of
+/// trapping the prompt.
+fn statement_complete(dialect: &dyn sql_insight::sqlparser::dialect::Dialect, input: &str) -> bool {
+    use sql_insight::sqlparser::tokenizer::{Token, Tokenizer};
+    match Tokenizer::new(dialect, input).tokenize() {
+        Err(e) => {
+            let message = e.to_string();
+            !(message.contains("Unterminated") || message.contains("EOF"))
         }
+        Ok(tokens) => matches!(
+            tokens
+                .iter()
+                .rev()
+                .find(|t| !matches!(t, Token::Whitespace(_))),
+            Some(Token::SemiColon)
+        ),
     }
-    // End of input closes a line comment (a newline would); an open string
-    // or block comment keeps the statement incomplete.
-    matches!(state, State::Top | State::LineComment) && last_significant == Some(';')
 }
 
 #[cfg(test)]
 mod tests {
     use super::statement_complete;
+    use sql_insight::sqlparser::dialect::{
+        Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect,
+    };
+
+    fn complete(dialect: &dyn Dialect, input: &str) -> bool {
+        statement_complete(dialect, input)
+    }
 
     #[test]
     fn splits_on_a_top_level_semicolon_only() {
-        assert!(statement_complete("SELECT 1;"));
-        assert!(statement_complete("SELECT 1 ;  "));
-        assert!(!statement_complete("SELECT 1"));
-        // A trailing comment after the terminator doesn't hide it.
-        assert!(statement_complete("SELECT 1; -- done"));
-        assert!(statement_complete("SELECT 1; /* done */"));
+        let g = GenericDialect {};
+        assert!(complete(&g, "SELECT 1;"));
+        assert!(complete(&g, "SELECT 1 ;  "));
+        assert!(!complete(&g, "SELECT 1"));
+        // A trailing comment after the terminator doesn't hide it (comments
+        // are whitespace tokens).
+        assert!(complete(&g, "SELECT 1; -- done"));
+        assert!(complete(&g, "SELECT 1; /* done */"));
     }
 
     #[test]
     fn a_semicolon_inside_a_literal_does_not_terminate() {
+        let g = GenericDialect {};
         // The literal continues on the next line — the old line-suffix check
         // executed the unterminated statement here.
-        assert!(!statement_complete("SELECT 'a;\n"));
-        assert!(statement_complete("SELECT 'a;\nb';"));
-        // Quoted identifiers likewise.
-        assert!(!statement_complete("SELECT \"a;\n"));
-        assert!(!statement_complete("SELECT `a;\n"));
-    }
-
-    #[test]
-    fn doubled_quotes_stay_inside_the_literal() {
+        assert!(!complete(&g, "SELECT 'a;\n"));
+        assert!(complete(&g, "SELECT 'a;\nb';"));
+        // Quoted identifiers likewise ("…" and MySQL `…`).
+        assert!(!complete(&g, "SELECT \"a;\n"));
+        assert!(!complete(&MySqlDialect {}, "SELECT `a;\n"));
         // `''` is an escaped quote: `'a'';'` is one literal containing `a';`.
-        assert!(!statement_complete("SELECT 'a'';'"));
-        assert!(statement_complete("SELECT 'a'';';"));
+        assert!(!complete(&g, "SELECT 'a'';'"));
+        assert!(complete(&g, "SELECT 'a'';';"));
     }
 
     #[test]
     fn comments_hide_their_semicolons() {
-        assert!(!statement_complete("SELECT 1 -- ;\n"));
-        assert!(statement_complete("SELECT 1 -- ;\n;"));
-        assert!(!statement_complete("SELECT 1 /* ; */"));
-        // PostgreSQL nests block comments.
-        assert!(!statement_complete("SELECT 1 /* /* ; */ ; */"));
-        assert!(statement_complete("SELECT 1 /* /* ; */ */;"));
+        let g = GenericDialect {};
+        assert!(!complete(&g, "SELECT 1 -- ;\n"));
+        assert!(complete(&g, "SELECT 1 -- ;\n;"));
+        assert!(!complete(&g, "SELECT 1 /* ; */"));
+        // An unterminated block comment keeps the statement open.
+        assert!(!complete(&g, "SELECT 1; /* ;"));
+    }
+
+    #[test]
+    fn dialect_lexing_is_the_executors() {
+        // PostgreSQL dollar quoting — the everyday CREATE FUNCTION shape —
+        // and a `$1` placeholder, which is not an opener.
+        let pg = PostgreSqlDialect {};
+        assert!(!complete(&pg, "SELECT $$a;$$"));
+        assert!(complete(&pg, "SELECT $$a;$$;"));
+        assert!(complete(&pg, "SELECT $body$ x; y; $body$;"));
+        assert!(complete(&pg, "SELECT $1;"));
+        // MySQL: `\'` escapes inside the literal, and `#` starts a comment —
+        // both judged by the dialect's own lexer (the hand-rolled scanner
+        // this replaced had to punt on both).
+        let my = MySqlDialect {};
+        assert!(!complete(&my, "SELECT 'a\\';"));
+        assert!(complete(&my, "SELECT 'a\\'';"));
+        assert!(complete(&my, "SELECT 1; # done"));
+        // MSSQL bracket identifiers hide their `;`.
+        let ms = MsSqlDialect {};
+        assert!(!complete(&ms, "SELECT [a;b"));
+        assert!(complete(&ms, "SELECT [a;b] FROM t;"));
     }
 }
