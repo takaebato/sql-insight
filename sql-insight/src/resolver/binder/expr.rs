@@ -14,6 +14,20 @@ impl<'a> Binder<'a> {
         item: &SelectItem,
         scope: &Scope,
     ) -> (Vec<NamedExpr>, bool) {
+        self.bind_select_item_inner(item, scope, true)
+    }
+
+    /// [`bind_select_item`](Self::bind_select_item) with wildcard expansion
+    /// switched off (`expand = false`) — for a projection under a
+    /// select-level `EXCLUDE`, which filters the projected set after the
+    /// items, so an expansion would read the excluded columns. The wildcard
+    /// then takes its suppression path (flagged, `REPLACE` outputs kept).
+    pub(super) fn bind_select_item_inner(
+        &mut self,
+        item: &SelectItem,
+        scope: &Scope,
+        expand: bool,
+    ) -> (Vec<NamedExpr>, bool) {
         match item {
             SelectItem::UnnamedExpr(expr) => (
                 vec![NamedExpr {
@@ -53,14 +67,16 @@ impl<'a> Binder<'a> {
             // exactly a standalone `expr AS col`; only the output position is
             // best-effort, since the wildcard's own columns aren't enumerated).
             SelectItem::Wildcard(options) => {
-                if let Some(items) = self.expand_wildcard(None, options, scope) {
-                    return (items, true);
+                if expand {
+                    if let Some(items) = self.expand_wildcard(None, options, scope) {
+                        return (items, true);
+                    }
                 }
                 self.record_wildcard_suppressed("wildcard `*`", options.wildcard_token.0.span);
                 (self.replace_outputs(options, scope), false)
             }
             SelectItem::QualifiedWildcard(kind, options) => {
-                if let SelectItemQualifiedWildcardKind::ObjectName(name) = kind {
+                if let (true, SelectItemQualifiedWildcardKind::ObjectName(name)) = (expand, kind) {
                     if let Some(items) = self.expand_wildcard(Some(name), options, scope) {
                         return (items, true);
                     }

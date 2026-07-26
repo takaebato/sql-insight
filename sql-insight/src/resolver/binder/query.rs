@@ -399,6 +399,24 @@ impl<'a> Binder<'a> {
         (exprs, complete)
     }
 
+    /// [`bind_output_items`](Self::bind_output_items) with wildcard expansion
+    /// suppressed — see
+    /// [`bind_select_item_inner`](Self::bind_select_item_inner).
+    pub(super) fn bind_output_items_unexpanded(
+        &mut self,
+        items: &[SelectItem],
+        scope: &Scope,
+    ) -> (Vec<NamedExpr>, bool) {
+        let mut exprs = Vec::new();
+        let mut complete = true;
+        for item in items {
+            let (bound, determinate) = self.bind_select_item_inner(item, scope, false);
+            complete &= determinate;
+            exprs.extend(bound);
+        }
+        (exprs, complete)
+    }
+
     /// Build an output-producing pipe `Projection`: the positional passthrough
     /// of the `base` outputs plus the `new` value columns. The passthrough
     /// keeps each base `OutputCol` verbatim (name *and* identity — so a later
@@ -650,6 +668,14 @@ impl<'a> Binder<'a> {
                     (Vec::new(), false)
                 }
             }
+        } else if select.exclude.is_some() {
+            // Redshift's select-level `EXCLUDE` filters the projected set
+            // *after* the items — expanding a wildcard while ignoring it
+            // would read the excluded columns, so expansion is suppressed
+            // and flagged (all-or-nothing, exactly like the per-wildcard
+            // `EXCLUDE` modifier); written items bind as usual.
+            let (exprs, _) = self.bind_output_items_unexpanded(&select.projection, &scope);
+            (exprs, false)
         } else {
             self.bind_output_items(&select.projection, &scope)
         };
