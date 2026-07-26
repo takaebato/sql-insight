@@ -101,7 +101,7 @@ pub struct TableOperation {
     pub lineage: Vec<TableLineageEdge>,
     /// Non-fatal diagnostics from the walk — the table-granularity kinds:
     /// `UnsupportedStatement` and `TooManyTableQualifiers` (see
-    /// [`TableLevelDiagnosticKind`](crate::diagnostic::TableLevelDiagnosticKind)).
+    /// [`TableLevelDiagnosticKind`]).
     pub diagnostics: Vec<TableLevelDiagnostic>,
 }
 
