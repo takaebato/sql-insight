@@ -297,7 +297,8 @@ impl Commands {
 
     fn entering_interactive_mode(&self) -> Result<(), Error> {
         println!(
-            "Entering interactive mode. Type sql statement end with `;` to execute. \
+            "Entering interactive mode. End each statement with `;` to execute — \
+             Enter continues a statement across lines until then. \
              Type `exit` or `quit` to exit."
         );
         // Statement continuation is rustyline's multiline mechanism: the
@@ -429,17 +430,25 @@ impl rustyline::validate::Validator for SqlHelper {
 /// under the session dialect — the same lexical rules the executor will
 /// parse with, so string / identifier quoting (dialect escapes included),
 /// dollar quoting, brackets, and every comment form can't diverge from the
-/// real parse. An "unterminated / EOF" tokenizer error means the input is
-/// still inside a literal or comment — incomplete, keep editing; any other
-/// tokenizer error won't be fixed by more input, so the statement counts as
-/// complete and the executor surfaces the real error visibly instead of
-/// trapping the prompt.
+/// real parse. A *recoverable* tokenizer error — the input is still inside
+/// a literal or comment, so more input can fix it — means incomplete, keep
+/// editing; any other tokenizer error won't be fixed by more input, so the
+/// statement counts as complete and the executor surfaces the real error
+/// visibly instead of trapping the prompt. `TokenizerError` carries no
+/// error kind, so recoverability is read off the message: the three
+/// signatures below cover every unterminated-construct site in sqlparser
+/// 0.62, and deliberately exclude mixed messages like `"Invalid space,
+/// tab, newline, or EOF after 'q''"` (an Oracle `q'` followed by a
+/// newline is *not* fixable by more input — matching its "EOF" would trap
+/// the prompt).
 fn statement_complete(dialect: &dyn sql_insight::sqlparser::dialect::Dialect, input: &str) -> bool {
     use sql_insight::sqlparser::tokenizer::{Token, Tokenizer};
     match Tokenizer::new(dialect, input).tokenize() {
         Err(e) => {
-            let message = e.to_string();
-            !(message.contains("Unterminated") || message.contains("EOF"))
+            let recoverable = e.message.contains("Unterminated")
+                || e.message.contains("before EOF")
+                || e.message.contains("Unexpected EOF");
+            !recoverable
         }
         Ok(tokens) => matches!(
             tokens
@@ -519,5 +528,16 @@ mod tests {
         let ms = MsSqlDialect {};
         assert!(!complete(&ms, "SELECT [a;b"));
         assert!(complete(&ms, "SELECT [a;b] FROM t;"));
+    }
+
+    #[test]
+    fn an_unrecoverable_tokenizer_error_submits_instead_of_trapping() {
+        // An Oracle `q'` followed by a newline is a lexical error no amount
+        // of further input can fix — its message mentions "EOF" as one of
+        // several causes, but it must count as complete so the executor
+        // surfaces the real error instead of the prompt swallowing Enter
+        // forever.
+        use sql_insight::sqlparser::dialect::GenericDialect;
+        assert!(complete(&GenericDialect {}, "SELECT q'\n"));
     }
 }
