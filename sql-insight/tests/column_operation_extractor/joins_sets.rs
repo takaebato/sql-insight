@@ -1098,6 +1098,34 @@ mod join_arm_coverage {
     }
 
     #[test]
+    fn array_join_comma_continues_the_operand_list() {
+        // ClickHouse's comma after an ARRAY JOIN continues its *operand
+        // list* (a table can't follow), but sqlparser parses each further
+        // operand as an independent FROM item — `arr2` surfaced as a
+        // phantom table read. Every operand now reads as a column of the
+        // left relation; the alias outputs trace to the operands at
+        // function granularity (the zip pairing is a per-function
+        // refinement, like UNNEST's).
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT a, b FROM t ARRAY JOIN arr1 AS a, arr2 AS b",
+                &GenericDialect {}
+            ),
+            vec![read("t", "arr1"), read("t", "arr2")]
+        );
+        // Three operands chain; an ordinary comma cross join elsewhere is
+        // untouched (`u` stays a table read — pinned at the table level in
+        // `table_operation_extractor`).
+        assert_unordered_eq!(
+            join_reads(
+                "SELECT a, b, c FROM t ARRAY JOIN x AS a, y AS b, z AS c",
+                &GenericDialect {}
+            ),
+            vec![read("t", "x"), read("t", "y"), read("t", "z")]
+        );
+    }
+
+    #[test]
     fn array_join_expression_operand_reads_its_arguments() {
         // `ARRAY JOIN f(args)` is an array-producing *expression*: its argument
         // columns are the reads. The function name is neither a table nor a

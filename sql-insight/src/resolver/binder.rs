@@ -859,6 +859,15 @@ fn is_apply(op: &JoinOperator) -> bool {
     matches!(op, JoinOperator::CrossApply | JoinOperator::OuterApply)
 }
 
+/// Whether a `FROM` item's join chain ends in an `ARRAY JOIN` — a following
+/// comma item then continues the operand list, not the cross join (see
+/// [`Binder::bind_from`]).
+fn ends_with_array_join(twj: &TableWithJoins) -> bool {
+    twj.joins
+        .last()
+        .is_some_and(|j| is_array_join(&j.join_operator))
+}
+
 /// Whether a join operator is a ClickHouse `ARRAY JOIN` / `LEFT ARRAY JOIN` /
 /// `INNER ARRAY JOIN` — which unnests an array expression inline rather than
 /// joining a relation, so its operand is a column expression, not a scanned
