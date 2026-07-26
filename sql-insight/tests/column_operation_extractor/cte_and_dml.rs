@@ -155,6 +155,45 @@ mod with_in_dml {
     }
 
     #[test]
+    fn dml_cte_referenced_twice_traces_per_reference() {
+        // PostgreSQL runs a data-modifying CTE once however often it is
+        // referenced; each reference still traces its own output position
+        // (like a plain CTE's double reference).
+        assert_column_ops(
+            "WITH c AS (INSERT INTO t1 (a) VALUES (1) RETURNING a) \
+             SELECT c1.a, c2.a FROM c AS c1, c AS c2",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a")],
+                writes: vec![write("t1", "a")],
+                lineage: vec![
+                    passthrough(col("t1", "a"), out("a", 0)),
+                    passthrough(col("t1", "a"), out("a", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn anonymous_returning_item_keeps_its_slot_for_a_star_consumer() {
+        // `RETURNING a + 1` has no name — it can't be referenced by name,
+        // but it holds its position, so the outer star's slot traces to it
+        // positionally (a nameless output target).
+        assert_column_ops(
+            "WITH c AS (INSERT INTO t1 (a) VALUES (1) RETURNING a + 1) \
+             SELECT * FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a")],
+                writes: vec![write("t1", "a")],
+                lineage: vec![transformation(col("t1", "a"), out_anon(0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn with_multiple_ctes_chained_into_insert() {
         // Two CTEs where `b` references `a`. INSERT then pulls
         // from `b`. Composition walks back through both layers
