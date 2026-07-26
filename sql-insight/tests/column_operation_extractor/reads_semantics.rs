@@ -1574,3 +1574,58 @@ mod pipe_join {
         );
     }
 }
+
+mod lateral_view {
+    //! Hive `LATERAL VIEW`: a lateral table function joined onto the FROM.
+    //! The declared column aliases are the view's closed column list, so a
+    //! generated column resolves to the view — traced to the function's
+    //! arguments at function granularity — never to a base relation as a
+    //! phantom read.
+    use super::*;
+    use sql_insight::sqlparser::dialect::HiveDialect;
+
+    #[test]
+    fn generated_column_resolves_to_the_view_not_the_base_table() {
+        // `c` is explode's output: no `t.c` read (it used to be a phantom),
+        // a Transformation from the argument instead — for the bare, the
+        // qualified, and the filter-position reference alike.
+        assert_column_ops_with_dialect(
+            &HiveDialect {},
+            "SELECT x.c, t.a FROM t LATERAL VIEW explode(arr) x AS c WHERE c > 0",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "arr")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "arr"), out("c", 0)),
+                    passthrough(col("t", "a"), out("a", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn several_views_fan_at_function_granularity() {
+        // Each generated column resolves to the view listing it, but the
+        // name-keyed trace reaches every view's arguments — the usual
+        // function-granularity coarseness, fanned rather than dropped.
+        assert_column_ops_with_dialect(
+            &HiveDialect {},
+            "SELECT k, v FROM t LATERAL VIEW explode(a) x AS k \
+             LATERAL VIEW explode(b) y AS v",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "a"), out("k", 0)),
+                    transformation(col("t", "a"), out("v", 1)),
+                    transformation(col("t", "b"), out("k", 0)),
+                    transformation(col("t", "b"), out("v", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+}

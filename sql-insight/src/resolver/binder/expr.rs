@@ -928,9 +928,11 @@ impl<'a> Binder<'a> {
     }
 
     /// Filter-position reads from a SELECT's auxiliary clauses (`DISTINCT ON`
-    /// keys, `TOP n`, Hive `LATERAL VIEW`, `PREWHERE`, `CONNECT BY` / `START
-    /// WITH`, `CLUSTER BY` / `DISTRIBUTE BY`, named `WINDOW` specs), resolved
-    /// against the FROM scope. None feed values. `QUALIFY` is *not* here — it
+    /// keys, `TOP n`, `PREWHERE`, `CONNECT BY` / `START WITH`, `CLUSTER BY` /
+    /// `DISTRIBUTE BY`, named `WINDOW` specs), resolved against the FROM
+    /// scope. None feed values. Hive `LATERAL VIEW` is *not* here — it is a
+    /// value-feeding lateral table function, joined into the FROM by
+    /// [`bind_select`](Self::bind_select). `QUALIFY` is *not* here — it
     /// filters on window / projection outputs (post-projection), so it binds
     /// against the output-aware scope in [`bind_select`](Self::bind_select).
     pub(super) fn select_clause_reads(&mut self, select: &Select, scope: &Scope) -> Vec<Expr> {
@@ -942,9 +944,6 @@ impl<'a> Binder<'a> {
             if let Some(TopQuantity::Expr(expr)) = &top.quantity {
                 reads.push(self.bind_expr(expr, scope));
             }
-        }
-        for lateral_view in &select.lateral_views {
-            reads.push(self.bind_expr(&lateral_view.lateral_view, scope));
         }
         reads.extend(select.prewhere.iter().map(|e| self.bind_expr(e, scope)));
         for connect_by in &select.connect_by {

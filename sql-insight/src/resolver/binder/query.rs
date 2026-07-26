@@ -576,7 +576,44 @@ impl<'a> Binder<'a> {
     /// outputs (clause-alias visibility) — a resolution-scope rule, independent
     /// of tree position.
     pub(super) fn bind_select(&mut self, select: &Select) -> (LogicalPlan, Scope) {
-        let (from, scope) = self.bind_from(&select.from);
+        let (mut from, mut scope) = self.bind_from(&select.from);
+        // Hive `LATERAL VIEW explode(arr) v [AS c, …]`: each view is a
+        // lateral table function joined onto the FROM. Its argument reads
+        // against the relations so far (the FROM plus the earlier views),
+        // and it joins in as a table-function relation — with a declared
+        // column-alias list, a *closed* one (`Derived`), so a reference to
+        // a generated column resolves to the view and traces to the
+        // function's arguments at function granularity, instead of falling
+        // to a base relation as a phantom read. (With several views, a
+        // bare generated column still resolves to the one view listing it,
+        // but the name-keyed trace reaches every view's arguments — the
+        // usual function-granularity coarseness.)
+        for lv in &select.lateral_views {
+            let args = vec![self.bind_expr(&lv.lateral_view, &scope)];
+            let alias = lv
+                .lateral_view_name
+                .0
+                .last()
+                .and_then(|p| p.as_ident().cloned());
+            let node = LogicalPlan::TableFunction(TableFunction {
+                alias: alias.clone(),
+                input: Box::new(LogicalPlan::Empty),
+                args,
+            });
+            let relation = if lv.lateral_col_alias.is_empty() {
+                Relation::TableFunction { alias }
+            } else {
+                Relation::Derived {
+                    alias,
+                    columns: Exposed {
+                        slots: lv.lateral_col_alias.iter().cloned().map(Some).collect(),
+                        complete: true,
+                    },
+                }
+            };
+            scope.relations.push(relation);
+            from = combine(from, node);
+        }
         // WHERE + the WHERE-family auxiliary clauses (DISTINCT ON / TOP /
         // LATERAL VIEW / PREWHERE / CONNECT BY / CLUSTER BY / named WINDOW)
         // filter rows before grouping — a filter over the FROM (no output
