@@ -262,7 +262,7 @@ impl<'a> Binder<'a> {
                 // ([`Join::left_width`]). Unknowable when the running
                 // outputs are incomplete (a suppressed wildcard may hide
                 // slots), so record nothing and let the trace refuse.
-                let left_width = scope.outputs_complete.then(|| scope.query_outputs.len());
+                let left_width = scope.outputs_complete.then_some(scope.query_outputs.len());
                 let (right, right_scope) = self.bind_table_factor(&j.relation, &scope.relations);
                 // The NATURAL branch mirrors `bind_table_with_joins` for
                 // future-proofing, but is unreachable today: sqlparser 0.62
