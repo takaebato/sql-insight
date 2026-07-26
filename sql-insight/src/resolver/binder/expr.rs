@@ -1043,21 +1043,41 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// The ORDER BY key expressions (a trailing `query.order_by`).
+    /// The ORDER BY key expressions (a trailing `query.order_by`), plus the
+    /// ClickHouse `INTERPOLATE (col AS expr, …)` fill expressions — clause
+    /// reads over the same scope (the `col` designator names an output like
+    /// an alias target, so it is not itself an occurrence).
     pub(super) fn order_by_keys(&mut self, order_by: &OrderBy, scope: &Scope) -> Vec<Expr> {
-        let OrderByKind::Expressions(exprs) = &order_by.kind else {
-            return Vec::new();
+        let mut keys = match &order_by.kind {
+            OrderByKind::Expressions(exprs) => self.order_by_expr_keys(exprs, scope),
+            OrderByKind::All(_) => Vec::new(),
         };
-        self.order_by_expr_keys(exprs, scope)
+        for ie in order_by
+            .interpolate
+            .iter()
+            .flat_map(|i| i.exprs.iter().flatten())
+        {
+            if let Some(e) = &ie.expr {
+                keys.push(self.bind_expr(e, scope));
+            }
+        }
+        keys
     }
 
     /// Bind a list of order-by expressions (`query.order_by` members or a
-    /// `SELECT … SORT BY` list) as clause reads.
+    /// `SELECT … SORT BY` list) as clause reads, including each key's
+    /// ClickHouse `WITH FILL FROM … TO … STEP …` bound expressions.
     pub(super) fn order_by_expr_keys(&mut self, exprs: &[OrderByExpr], scope: &Scope) -> Vec<Expr> {
-        exprs
-            .iter()
-            .map(|e| self.bind_clause_key(&e.expr, scope))
-            .collect()
+        let mut keys = Vec::new();
+        for e in exprs {
+            keys.push(self.bind_clause_key(&e.expr, scope));
+            if let Some(wf) = &e.with_fill {
+                for bound in [&wf.from, &wf.to, &wf.step].into_iter().flatten() {
+                    keys.push(self.bind_expr(bound, scope));
+                }
+            }
+        }
+        keys
     }
 
     /// Summarise the projection outputs for clause-alias resolution. An output

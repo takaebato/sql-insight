@@ -391,6 +391,7 @@ mod reads {
 // kept) and the lineage they produce.
 mod reads_by_clause {
     use super::*;
+    use sql_insight::sqlparser::dialect::ClickHouseDialect;
 
     #[test]
     fn same_column_in_projection_and_where_is_two_reads() {
@@ -1017,6 +1018,33 @@ mod output_alias_visibility {
             ColumnOperation {
                 statement_kind: StatementKind::Select,
                 reads: vec![read("t", "a"), read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn with_fill_and_interpolate_expressions_read() {
+        // ClickHouse `WITH FILL FROM … TO … STEP` bounds and `INTERPOLATE
+        // (col AS expr)` fill expressions are clause reads (they used to be
+        // dropped entirely); the interpolate *target* designator names an
+        // output, not an occurrence.
+        assert_column_ops_with_dialect(
+            &ClickHouseDialect {},
+            "SELECT a FROM t ORDER BY a WITH FILL FROM t.lo TO t.hi STEP 1 \
+             INTERPOLATE (a AS a + t.b)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("t", "a"),
+                    read("t", "a"),
+                    read("t", "lo"),
+                    read("t", "hi"),
+                    read("t", "a"),
+                    read("t", "b"),
+                ],
                 writes: vec![],
                 lineage: vec![passthrough(col("t", "a"), out("a", 0))],
                 diagnostics: vec![],
