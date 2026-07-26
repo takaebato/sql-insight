@@ -1484,6 +1484,55 @@ mod pipe_join {
     }
 
     #[test]
+    fn fan_slots_and_a_derived_right_side_split_consistently() {
+        // The bind-time width counts fan slots the same way the slot view
+        // does (2 for `AS (k, v)`), so the star's slots 0-1 trace the fan's
+        // argument and slot 2 lands on the derived right side.
+        assert_column_ops(
+            "SELECT explode(arr) AS (k, v) FROM t              |> JOIN (SELECT id FROM u) x ON 1 = 1 |> SELECT *",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "arr"), read("u", "id")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "arr"), out("k", 0)),
+                    transformation(col("t", "arr"), out("v", 1)),
+                    passthrough(col("u", "id"), out("id", 2)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn unqualified_ref_after_a_join_is_open_world_ambiguous() {
+        // After the join, an unqualified `a` has two catalog-free suspects
+        // (the base `t` and the joined `u`), so it surfaces `Ambiguous` —
+        // the same open-world rule as `SELECT a FROM t, u`. A catalog that
+        // rules `u` out would pin it back to `t`.
+        assert_column_ops(
+            "FROM t |> SELECT a, b |> JOIN u ON a = u.id |> EXTEND a + 1 AS c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("t", "a"),
+                    read("t", "b"),
+                    ambiguous("a"),
+                    read("u", "id"),
+                    ambiguous("a"),
+                ],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("t", "b"), out("b", 1)),
+                    transformation(ambiguous("a"), out("c", 2)),
+                ],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
     fn join_using_merge_column_fans_in_downstream() {
         // The WHERE's `k` fans in to both sides of the pipe join, exactly
         // like the same USING join written in a FROM clause.
