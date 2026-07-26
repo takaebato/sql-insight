@@ -27,7 +27,7 @@ use crate::diagnostic::TableLevelDiagnostic;
 use crate::error::Error;
 use crate::extractor::{ExtractorOptions, StatementKind, TableOperationExtractor};
 use crate::reference::{TableRead, TableReference, TableWrite};
-use sqlparser::ast::{Insert, SetExpr, Statement};
+use sqlparser::ast::{Insert, SetExpr, SqliteOnConflict, Statement};
 use sqlparser::dialect::Dialect;
 
 /// Parse `sql` under `dialect` and return one [`CrudTables`] per
@@ -78,8 +78,10 @@ pub struct CrudTables {
     /// Tables deleted (`DELETE` / `DROP` / `TRUNCATE` / a MERGE DELETE action).
     pub delete_tables: Vec<TableWrite>,
     /// Non-fatal diagnostics, forwarded from the underlying table-level
-    /// extraction (only [`UnsupportedStatement`](crate::diagnostic::TableLevelDiagnosticKind::UnsupportedStatement)
-    /// arises at this granularity).
+    /// extraction — the table-granularity kinds:
+    /// [`UnsupportedStatement`](crate::diagnostic::TableLevelDiagnosticKind::UnsupportedStatement)
+    /// and
+    /// [`TooManyTableQualifiers`](crate::diagnostic::TableLevelDiagnosticKind::TooManyTableQualifiers).
     pub diagnostics: Vec<TableLevelDiagnostic>,
 }
 
@@ -169,10 +171,14 @@ impl CrudTableExtractor {
                 }
                 // `REPLACE INTO` / `INSERT OVERWRITE` delete the conflicting /
                 // existing rows of the target before inserting, so the target is
-                // also a delete (unlike an upsert, which updates in place). Peel
-                // a `WITH … INSERT OVERWRITE …` wrapper (parsed as a Query-
+                // also a delete (unlike an upsert, which updates in place).
+                // SQLite spells it `INSERT OR REPLACE` (its bare `REPLACE INTO`
+                // parses to the same `or` field, not `replace_into`). Peel a
+                // `WITH … INSERT OVERWRITE …` wrapper (parsed as a Query-
                 // wrapped Insert) so the flags are read off the real insert.
-                if peel_to_insert(statement).is_some_and(|i| i.replace_into || i.overwrite) {
+                if peel_to_insert(statement).is_some_and(|i| {
+                    i.replace_into || i.overwrite || i.or == Some(SqliteOnConflict::Replace)
+                }) {
                     crud.delete_tables = writes.clone();
                 }
                 crud.create_tables = writes;

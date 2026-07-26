@@ -577,6 +577,40 @@ mod insert_statement {
     }
 
     #[test]
+    fn test_sqlite_replace_buckets_target_as_create_and_delete() {
+        use sql_insight::sqlparser::dialect::SQLiteDialect;
+        // SQLite's REPLACE deletes the conflicting rows before inserting,
+        // like MySQL's — but its `REPLACE INTO` / `INSERT OR REPLACE` parse
+        // to the `or` conflict clause, not the `replace_into` flag. A
+        // non-replacing `OR` clause (IGNORE) stays create-only.
+        for sql in [
+            "REPLACE INTO t1 (a) VALUES (1)",
+            "INSERT OR REPLACE INTO t1 (a) VALUES (1)",
+        ] {
+            let expected = vec![Ok(CrudTables {
+                create_tables: vec![cwrite(table("t1"))],
+                read_tables: vec![],
+                update_tables: vec![],
+                delete_tables: vec![cwrite(table("t1"))],
+                diagnostics: vec![],
+            })];
+            assert_crud_table_extraction(sql, expected, vec![Box::new(SQLiteDialect {})]);
+        }
+        let expected = vec![Ok(CrudTables {
+            create_tables: vec![cwrite(table("t1"))],
+            read_tables: vec![],
+            update_tables: vec![],
+            delete_tables: vec![],
+            diagnostics: vec![],
+        })];
+        assert_crud_table_extraction(
+            "INSERT OR IGNORE INTO t1 (a) VALUES (1)",
+            expected,
+            vec![Box::new(SQLiteDialect {})],
+        );
+    }
+
+    #[test]
     fn test_insert_overwrite_buckets_target_as_create_and_delete() {
         use sql_insight::sqlparser::dialect::GenericDialect;
         // `INSERT OVERWRITE` replaces the target's existing data, so `t1` lands

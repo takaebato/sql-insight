@@ -14,6 +14,20 @@ impl<'a> Binder<'a> {
         item: &SelectItem,
         scope: &Scope,
     ) -> (Vec<NamedExpr>, bool) {
+        self.bind_select_item_inner(item, scope, true)
+    }
+
+    /// [`bind_select_item`](Self::bind_select_item) with wildcard expansion
+    /// switched off (`expand = false`) — for a projection under a
+    /// select-level `EXCLUDE`, which filters the projected set after the
+    /// items, so an expansion would read the excluded columns. The wildcard
+    /// then takes its suppression path (flagged, `REPLACE` outputs kept).
+    pub(super) fn bind_select_item_inner(
+        &mut self,
+        item: &SelectItem,
+        scope: &Scope,
+        expand: bool,
+    ) -> (Vec<NamedExpr>, bool) {
         match item {
             SelectItem::UnnamedExpr(expr) => (
                 vec![NamedExpr {
@@ -53,14 +67,16 @@ impl<'a> Binder<'a> {
             // exactly a standalone `expr AS col`; only the output position is
             // best-effort, since the wildcard's own columns aren't enumerated).
             SelectItem::Wildcard(options) => {
-                if let Some(items) = self.expand_wildcard(None, options, scope) {
-                    return (items, true);
+                if expand {
+                    if let Some(items) = self.expand_wildcard(None, options, scope) {
+                        return (items, true);
+                    }
                 }
                 self.record_wildcard_suppressed("wildcard `*`", options.wildcard_token.0.span);
                 (self.replace_outputs(options, scope), false)
             }
             SelectItem::QualifiedWildcard(kind, options) => {
-                if let SelectItemQualifiedWildcardKind::ObjectName(name) = kind {
+                if let (true, SelectItemQualifiedWildcardKind::ObjectName(name)) = (expand, kind) {
                     if let Some(items) = self.expand_wildcard(Some(name), options, scope) {
                         return (items, true);
                     }
@@ -928,9 +944,11 @@ impl<'a> Binder<'a> {
     }
 
     /// Filter-position reads from a SELECT's auxiliary clauses (`DISTINCT ON`
-    /// keys, `TOP n`, Hive `LATERAL VIEW`, `PREWHERE`, `CONNECT BY` / `START
-    /// WITH`, `CLUSTER BY` / `DISTRIBUTE BY`, named `WINDOW` specs), resolved
-    /// against the FROM scope. None feed values. `QUALIFY` is *not* here — it
+    /// keys, `TOP n`, `PREWHERE`, `CONNECT BY` / `START WITH`, `CLUSTER BY` /
+    /// `DISTRIBUTE BY`, named `WINDOW` specs), resolved against the FROM
+    /// scope. None feed values. Hive `LATERAL VIEW` is *not* here — it is a
+    /// value-feeding lateral table function, joined into the FROM by
+    /// [`bind_select`](Self::bind_select). `QUALIFY` is *not* here — it
     /// filters on window / projection outputs (post-projection), so it binds
     /// against the output-aware scope in [`bind_select`](Self::bind_select).
     pub(super) fn select_clause_reads(&mut self, select: &Select, scope: &Scope) -> Vec<Expr> {
@@ -942,9 +960,6 @@ impl<'a> Binder<'a> {
             if let Some(TopQuantity::Expr(expr)) = &top.quantity {
                 reads.push(self.bind_expr(expr, scope));
             }
-        }
-        for lateral_view in &select.lateral_views {
-            reads.push(self.bind_expr(&lateral_view.lateral_view, scope));
         }
         reads.extend(select.prewhere.iter().map(|e| self.bind_expr(e, scope)));
         for connect_by in &select.connect_by {
@@ -1044,21 +1059,41 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// The ORDER BY key expressions (a trailing `query.order_by`).
+    /// The ORDER BY key expressions (a trailing `query.order_by`), plus the
+    /// ClickHouse `INTERPOLATE (col AS expr, …)` fill expressions — clause
+    /// reads over the same scope (the `col` designator names an output like
+    /// an alias target, so it is not itself an occurrence).
     pub(super) fn order_by_keys(&mut self, order_by: &OrderBy, scope: &Scope) -> Vec<Expr> {
-        let OrderByKind::Expressions(exprs) = &order_by.kind else {
-            return Vec::new();
+        let mut keys = match &order_by.kind {
+            OrderByKind::Expressions(exprs) => self.order_by_expr_keys(exprs, scope),
+            OrderByKind::All(_) => Vec::new(),
         };
-        self.order_by_expr_keys(exprs, scope)
+        for ie in order_by
+            .interpolate
+            .iter()
+            .flat_map(|i| i.exprs.iter().flatten())
+        {
+            if let Some(e) = &ie.expr {
+                keys.push(self.bind_expr(e, scope));
+            }
+        }
+        keys
     }
 
     /// Bind a list of order-by expressions (`query.order_by` members or a
-    /// `SELECT … SORT BY` list) as clause reads.
+    /// `SELECT … SORT BY` list) as clause reads, including each key's
+    /// ClickHouse `WITH FILL FROM … TO … STEP …` bound expressions.
     pub(super) fn order_by_expr_keys(&mut self, exprs: &[OrderByExpr], scope: &Scope) -> Vec<Expr> {
-        exprs
-            .iter()
-            .map(|e| self.bind_clause_key(&e.expr, scope))
-            .collect()
+        let mut keys = Vec::new();
+        for e in exprs {
+            keys.push(self.bind_clause_key(&e.expr, scope));
+            if let Some(wf) = &e.with_fill {
+                for bound in [&wf.from, &wf.to, &wf.step].into_iter().flatten() {
+                    keys.push(self.bind_expr(bound, scope));
+                }
+            }
+        }
+        keys
     }
 
     /// Summarise the projection outputs for clause-alias resolution. An output
@@ -1075,17 +1110,23 @@ impl<'a> Binder<'a> {
         exprs
             .iter()
             .flat_map(|ne| {
-                // An identity output re-reads a real base column (so a later
-                // clause-alias / pipe reference to it reads that column). Only a
-                // `Base` column qualifies: a `Derived` passthrough (a pipe-
-                // carried alias, a derived-table column) traces back through the
-                // projection chain, not to a base table — marking it identity
-                // would let a later stage fall through to the base relation and
-                // fabricate a phantom read. A fan's names are always introduced
-                // aliases (never the column itself), so never identity.
+                // An identity output re-reads its column (so a later
+                // clause-alias / pipe reference to it reads that column
+                // again, occurrence-based). Any *physical* occurrence
+                // qualifies — `Base`, and equally an `Ambiguous` /
+                // `Unresolved` one, whose clause re-reference re-resolves to
+                // the same contested / unresolved read (`SELECT a FROM t1,
+                // t2 GROUP BY a` counts two ambiguous occurrences, like the
+                // single-table form counts two base reads). A `Derived`
+                // passthrough (a pipe-carried alias, a derived-table column)
+                // traces back through the projection chain, not to a base
+                // table — marking it identity would let a later stage fall
+                // through to the base relation and fabricate a phantom read.
+                // A fan's names are always introduced aliases (never the
+                // column itself), so never identity.
                 let identity = match (&ne.names, &ne.expr) {
                     (OutputNames::Single(Some(name)), Expr::Column(c)) => {
-                        matches!(c.binding, Binding::Base { .. })
+                        !matches!(c.binding, Binding::Derived | Binding::Local)
                             && self.eq(self.style.casing.column, name, &c.name)
                     }
                     _ => false,

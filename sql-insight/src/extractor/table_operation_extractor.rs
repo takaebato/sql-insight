@@ -99,8 +99,9 @@ pub struct TableOperation {
     /// two edges — but a CTE body, the one declaration shared by every
     /// `CteRef`, contributes once (it materializes once, so it feeds once).
     pub lineage: Vec<TableLineageEdge>,
-    /// Non-fatal diagnostics from the walk; only
-    /// `UnsupportedStatement` arises at this granularity.
+    /// Non-fatal diagnostics from the walk — the table-granularity kinds:
+    /// `UnsupportedStatement` and `TooManyTableQualifiers` (see
+    /// [`TableLevelDiagnosticKind`]).
     pub diagnostics: Vec<TableLevelDiagnostic>,
 }
 

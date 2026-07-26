@@ -1388,9 +1388,9 @@ mod relation_arm_coverage {
 
     #[test]
     fn lateral_view() {
-        // `select.lateral_views` walks each `lateral_view` expression
-        // (here `EXPLODE(t.arr)`); the `v` alias is not bound as a real
-        // table, so we read against `t` to keep the assertion stable.
+        // A LATERAL VIEW joins in as a table function: its argument
+        // (`EXPLODE(t.arr)`) reads, its alias is a synthetic relation (not
+        // a real table), and its generated column resolves to the view.
         assert_unordered_eq!(
             reads("SELECT t.a FROM t LATERAL VIEW EXPLODE(t.arr) v AS x"),
             vec![c("t", "a"), c("t", "arr")]

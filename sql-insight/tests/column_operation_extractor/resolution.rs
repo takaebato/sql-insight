@@ -461,6 +461,36 @@ mod catalog_strict {
     }
 
     #[test]
+    fn catalog_merge_insert_fill_truncates_to_the_row_arity() {
+        // A narrower VALUES row fills only the leading catalog columns
+        // (mirroring the plain-INSERT fill): `b` receives no value, so it
+        // is not written — filling all catalog columns used to fabricate a
+        // `t.b` write. The undersupply is a shape the arity diagnostic
+        // deliberately tolerates for a column-less fill (overflow flags).
+        let catalog = TestCatalog::default().with("t", vec!["id", "a", "b"]);
+        assert_column_ops_with_catalog(
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.a)",
+            &catalog,
+            ColumnOperation {
+                statement_kind: StatementKind::Merge,
+                reads: vec![
+                    read_confirmed("t", "id"),
+                    read("s", "id"),
+                    read("s", "id"),
+                    read("s", "a"),
+                ],
+                writes: vec![filled_write("t", "id"), filled_write("t", "a")],
+                lineage: vec![
+                    passthrough(col("s", "id"), filled_relation("t", "id")),
+                    passthrough(col("s", "a"), filled_relation("t", "a")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn catalog_using_merge_column_fans_in_cataloged() {
         // A USING merge column fans in to both joined tables; with a
         // catalog confirming `id` on each, both sides resolve Cataloged.

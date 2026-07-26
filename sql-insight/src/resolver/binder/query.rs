@@ -399,6 +399,24 @@ impl<'a> Binder<'a> {
         (exprs, complete)
     }
 
+    /// [`bind_output_items`](Self::bind_output_items) with wildcard expansion
+    /// suppressed — see
+    /// [`bind_select_item_inner`](Self::bind_select_item_inner).
+    pub(super) fn bind_output_items_unexpanded(
+        &mut self,
+        items: &[SelectItem],
+        scope: &Scope,
+    ) -> (Vec<NamedExpr>, bool) {
+        let mut exprs = Vec::new();
+        let mut complete = true;
+        for item in items {
+            let (bound, determinate) = self.bind_select_item_inner(item, scope, false);
+            complete &= determinate;
+            exprs.extend(bound);
+        }
+        (exprs, complete)
+    }
+
     /// Build an output-producing pipe `Projection`: the positional passthrough
     /// of the `base` outputs plus the `new` value columns. The passthrough
     /// keeps each base `OutputCol` verbatim (name *and* identity — so a later
@@ -576,7 +594,44 @@ impl<'a> Binder<'a> {
     /// outputs (clause-alias visibility) — a resolution-scope rule, independent
     /// of tree position.
     pub(super) fn bind_select(&mut self, select: &Select) -> (LogicalPlan, Scope) {
-        let (from, scope) = self.bind_from(&select.from);
+        let (mut from, mut scope) = self.bind_from(&select.from);
+        // Hive `LATERAL VIEW explode(arr) v [AS c, …]`: each view is a
+        // lateral table function joined onto the FROM. Its argument reads
+        // against the relations so far (the FROM plus the earlier views),
+        // and it joins in as a table-function relation — with a declared
+        // column-alias list, a *closed* one (`Derived`), so a reference to
+        // a generated column resolves to the view and traces to the
+        // function's arguments at function granularity, instead of falling
+        // to a base relation as a phantom read. (With several views, a
+        // bare generated column still resolves to the one view listing it,
+        // but the name-keyed trace reaches every view's arguments — the
+        // usual function-granularity coarseness.)
+        for lv in &select.lateral_views {
+            let args = vec![self.bind_expr(&lv.lateral_view, &scope)];
+            let alias = lv
+                .lateral_view_name
+                .0
+                .last()
+                .and_then(|p| p.as_ident().cloned());
+            let node = LogicalPlan::TableFunction(TableFunction {
+                alias: alias.clone(),
+                input: Box::new(LogicalPlan::Empty),
+                args,
+            });
+            let relation = if lv.lateral_col_alias.is_empty() {
+                Relation::TableFunction { alias }
+            } else {
+                Relation::Derived {
+                    alias,
+                    columns: Exposed {
+                        slots: lv.lateral_col_alias.iter().cloned().map(Some).collect(),
+                        complete: true,
+                    },
+                }
+            };
+            scope.relations.push(relation);
+            from = combine(from, node);
+        }
         // WHERE + the WHERE-family auxiliary clauses (DISTINCT ON / TOP /
         // LATERAL VIEW / PREWHERE / CONNECT BY / CLUSTER BY / named WINDOW)
         // filter rows before grouping — a filter over the FROM (no output
@@ -613,6 +668,14 @@ impl<'a> Binder<'a> {
                     (Vec::new(), false)
                 }
             }
+        } else if select.exclude.is_some() {
+            // Redshift's select-level `EXCLUDE` filters the projected set
+            // *after* the items — expanding a wildcard while ignoring it
+            // would read the excluded columns, so expansion is suppressed
+            // and flagged (all-or-nothing, exactly like the per-wildcard
+            // `EXCLUDE` modifier); written items bind as usual.
+            let (exprs, _) = self.bind_output_items_unexpanded(&select.projection, &scope);
+            (exprs, false)
         } else {
             self.bind_output_items(&select.projection, &scope)
         };

@@ -284,13 +284,24 @@ fn origins_of_slot<'a>(
                 })
                 .unwrap_or_default()
         }
-        // A table function reached here is always a walked-past join side:
-        // expansion never mints a slot over one (its shape is unknown), and a
-        // qualifier naming both it and the slot's own derived relation would
-        // have failed the unique-match guard at expansion. Nothing to claim.
+        // A table function claims a slot minted against *its* relation — a
+        // Hive LATERAL VIEW with a column-alias list exposes a closed
+        // Derived relation over a `TableFunction` node, so a wildcard can
+        // enumerate its slots — tracing to the function's arguments at
+        // function granularity, exactly like the named trace's arm. The
+        // slot is always qualified by the view alias (the relation is
+        // aliased by construction); an unqualified slot is some other
+        // producer's, and a bare (alias-less) function's shape is unknown
+        // (expansion never mints over it), so both claim nothing.
+        LogicalPlan::TableFunction(tf) => match (&tf.alias, qualifier) {
+            (Some(alias), Some(q)) if context.eq_alias(q, alias) => {
+                transform(table_function_output_origins(tf, context))
+            }
+            _ => Vec::new(),
+        },
         // Not positional producers otherwise: a raw scan on a walked-past
         // join side, and DML / DDL roots.
-        LogicalPlan::TableFunction(_) | LogicalPlan::Scan(_) | LogicalPlan::Empty => Vec::new(),
+        LogicalPlan::Scan(_) | LogicalPlan::Empty => Vec::new(),
         LogicalPlan::Insert(_)
         | LogicalPlan::Update(_)
         | LogicalPlan::Delete(_)

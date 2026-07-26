@@ -233,6 +233,11 @@ impl<'a> Binder<'a> {
                 .iter()
                 .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
                 .collect()
+        } else if !insert.after_columns.is_empty() {
+            // The Hive placement: `INSERT INTO t PARTITION (…) (a, b)` puts
+            // the column list *after* the partition clause — the same
+            // explicit list, previously dropped as if none were written.
+            insert.after_columns.clone()
         } else {
             view_columns
         };
@@ -577,34 +582,30 @@ impl<'a> Binder<'a> {
             // `OnInsert` is non-exhaustive; an unmodelled action is a no-op.
             _ => return (Vec::new(), Vec::new()),
         };
-        // A conflict-action SET always targets the insert target's own columns
-        // (no other writable relations, hence the empty candidate set).
-        let mut bound: Vec<Assignment> = assignments
-            .iter()
-            .flat_map(|a| self.bind_assignment(a, &scope, target, &[]))
-            .collect();
-        let mut predicate: Vec<Expr> = selection
-            .map(|s| self.bind_expr(s, &scope))
-            .into_iter()
-            .collect();
-        // PostgreSQL parity: an *unqualified* reference in the conflict action
-        // is contested between the existing target row and `EXCLUDED` — PG 17 / 18
-        // reject it (`column reference "b" is ambiguous`; SQLite instead reads
-        // the target), so no single attribution is right and it surfaces
-        // `Ambiguous`, matching what the catalog-aware bind already produces
-        // (target + EXCLUDED are then two confirming witnesses). The generic
-        // scope resolution instead lets the `EXCLUDED` exposure win as the sole
-        // witness over a catalog-free (`Unknown`) target — demote exactly those
-        // bindings: in this scope an unqualified `Derived` can only be
-        // `EXCLUDED` (the sole derived relation). Qualified references
-        // (`EXCLUDED.b` / `t.b`) keep their binding.
-        for a in &mut bound {
-            demote_unqualified_excluded(&mut a.value);
-        }
-        for p in &mut predicate {
-            demote_unqualified_excluded(p);
-        }
-        (bound, predicate)
+        // The action binds under the conflict-contest rule
+        // ([`Context::excluded_columns`]): an unqualified reference to an
+        // `EXCLUDED` column is contested between the existing target row and
+        // `EXCLUDED` — PG 17 / 18 reject it (`column reference "b" is
+        // ambiguous`; SQLite instead reads the target) — so resolution
+        // demotes it to `Ambiguous`, including a correlated reference inside
+        // a subquery of the action (the old expression post-pass stopped at
+        // the subquery boundary, and the reference vanished from the
+        // surfaces). Qualified references (`EXCLUDED.b` / `t.b`) keep their
+        // binding. A conflict-action SET always targets the insert target's
+        // own columns (no other writable relations, hence the empty
+        // candidate set).
+        let child = self.context.with_excluded(columns.to_vec());
+        self.in_scope(child, |b| {
+            let bound: Vec<Assignment> = assignments
+                .iter()
+                .flat_map(|a| b.bind_assignment(a, &scope, target, &[]))
+                .collect();
+            let predicate: Vec<Expr> = selection
+                .map(|s| b.bind_expr(s, &scope))
+                .into_iter()
+                .collect();
+            (bound, predicate)
+        })
     }
 
     /// `UPDATE target SET col = expr [FROM src] WHERE pred`: the target is in
@@ -948,11 +949,6 @@ impl<'a> Binder<'a> {
                                 .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
                                 .collect();
                             let catalog_cols = self.catalog_columns(&target);
-                            let columns = if explicit.is_empty() {
-                                catalog_cols.clone()
-                            } else {
-                                explicit
-                            };
                             // A MERGE INSERT is a single VALUES row. Each row is
                             // now a `Parens<Vec<Expr>>`; flatten through its
                             // inner expressions (via `Deref`).
@@ -962,6 +958,17 @@ impl<'a> Binder<'a> {
                                 .flat_map(|row| row.iter())
                                 .map(|e| self.bind_expr(e, &scope))
                                 .collect();
+                            let columns = if explicit.is_empty() {
+                                // The catalog fill truncates to the row's
+                                // arity (mirroring `bind_insert`): a column
+                                // no value reaches is not written — filling
+                                // all catalog columns fabricated writes for
+                                // the surplus (the overflow direction is
+                                // still flagged below).
+                                catalog_cols.iter().take(row.len()).cloned().collect()
+                            } else {
+                                explicit
+                            };
                             // Column-list-less and no catalog to fill the target
                             // columns: the values can't be paired (see `bind_insert`).
                             // A MERGE INSERT VALUES has no wildcard, so the cause
@@ -1661,8 +1668,10 @@ impl<'a> Binder<'a> {
 
     /// `ALTER TABLE t <ops>`: the altered table is a write target; each
     /// column-naming operation contributes its column(s) as writes (RENAME /
-    /// CHANGE surface both names). Schema-level ops name no columns. No reads
-    /// or lineage — ALTER restructures, it doesn't move row data.
+    /// CHANGE surface both names), and a `RENAME TO` surfaces the new table
+    /// name as a write beside the old (the table-level mirror of that rule).
+    /// Schema-level ops name no columns. No reads or lineage — ALTER
+    /// restructures, it doesn't move row data.
     pub(super) fn bind_alter_table(&mut self, alter: &SqlAlterTable) -> LogicalPlan {
         let Some(written) = self.table_ref(&alter.name) else {
             return LogicalPlan::Empty;
@@ -1673,12 +1682,25 @@ impl<'a> Binder<'a> {
             .iter()
             .flat_map(alter_table_op_target_columns)
             .collect();
+        let rename_to = alter
+            .operations
+            .iter()
+            .find_map(|op| match op {
+                AlterTableOperation::RenameTable { table_name } => Some(match table_name {
+                    sqlparser::ast::RenameTableNameKind::As(name)
+                    | sqlparser::ast::RenameTableNameKind::To(name) => name,
+                }),
+                _ => None,
+            })
+            .and_then(|name| self.table_ref(name))
+            .map(|written| self.table_write(&written));
         LogicalPlan::AlterTable(AlterTable {
             target: TableWrite {
                 reference: m.table,
                 resolution: m.resolution,
             },
             columns,
+            rename_to,
         })
     }
 
@@ -1784,53 +1806,6 @@ fn view_target_columns(projection: &[SelectItem]) -> Vec<Ident> {
         }
     }
     columns
-}
-
-/// Demote an unqualified conflict-scope reference that resolved to `EXCLUDED`
-/// (an unqualified `Binding::Derived` — `EXCLUDED` is the scope's sole derived
-/// relation) to [`Binding::Ambiguous`] — see the call in
-/// [`Binder::bind_conflict`] for the engine-verified rationale. The walk stays
-/// on the expression's **own** operands: a nested subquery owns its own scope,
-/// so its bindings are left alone. The `Expr` match is exhaustive so a new
-/// variant forces a decision here.
-fn demote_unqualified_excluded(expr: &mut Expr) {
-    match expr {
-        Expr::Column(c) => {
-            if c.qualifier.is_none() && matches!(c.binding, Binding::Derived) {
-                c.binding = Binding::Ambiguous;
-            }
-        }
-        Expr::Call { args } => args.iter_mut().for_each(demote_unqualified_excluded),
-        Expr::Case {
-            when,
-            then,
-            else_result,
-        } => {
-            when.iter_mut()
-                .chain(then.iter_mut())
-                .for_each(demote_unqualified_excluded);
-            if let Some(e) = else_result {
-                demote_unqualified_excluded(e);
-            }
-        }
-        Expr::Window {
-            arg,
-            partition,
-            order,
-        } => {
-            demote_unqualified_excluded(arg);
-            partition
-                .iter_mut()
-                .chain(order.iter_mut())
-                .for_each(demote_unqualified_excluded);
-        }
-        Expr::InSubquery { expr, .. } => demote_unqualified_excluded(expr),
-        Expr::Filter(exprs) => exprs.iter_mut().for_each(demote_unqualified_excluded),
-        // A merge fan-in can't arise (no USING join in a conflict scope) and
-        // neither can an expanded slot (no projection); a subquery's plan owns
-        // its own scope.
-        Expr::Fanin(_) | Expr::DerivedSlot { .. } | Expr::Subquery { .. } | Expr::Exists(_) => {}
-    }
 }
 
 /// The target table of a query's leading `SELECT … INTO t`, if any. `INTO`

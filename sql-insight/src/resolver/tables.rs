@@ -129,7 +129,11 @@ pub(super) fn write_root_tables(root: &LogicalPlan) -> Vec<TableWrite> {
         LogicalPlan::Delete(d) => d.targets.clone(),
         LogicalPlan::CreateTableAs(c) => vec![c.target.clone()],
         LogicalPlan::CreateView(c) => vec![c.target.clone()],
-        LogicalPlan::AlterTable(a) => vec![a.target.clone()],
+        LogicalPlan::AlterTable(a) => {
+            let mut w = vec![a.target.clone()];
+            w.extend(a.rename_to.clone());
+            w
+        }
         LogicalPlan::Merge(m) => vec![m.target.clone()],
         // DROP / TRUNCATE name their relations directly as write targets.
         LogicalPlan::Drop(d) => d.targets.clone(),

@@ -19,6 +19,27 @@ mod writes {
     }
 
     #[test]
+    fn hive_partition_placed_column_list_pairs_like_the_normal_one() {
+        // Hive puts the explicit column list *after* the PARTITION clause
+        // (`Insert::after_columns`); it used to be dropped as if no list
+        // were written, losing the writes and the positional pairing.
+        assert_column_ops_with_dialect(
+            &sql_insight::sqlparser::dialect::HiveDialect {},
+            "INSERT INTO TABLE t PARTITION (p = 1) (a, b) SELECT x, y FROM s",
+            ColumnOperation {
+                statement_kind: StatementKind::Insert,
+                reads: vec![read("s", "x"), read("s", "y")],
+                writes: vec![write("t", "a"), write("t", "b")],
+                lineage: vec![
+                    passthrough(col("s", "x"), relation("t", "a")),
+                    passthrough(col("s", "y"), relation("t", "b")),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn insert_select_records_target_writes_and_qualified_source_reads() {
         assert_column_ops(
             "INSERT INTO t1 (a) SELECT t2.b FROM t2",

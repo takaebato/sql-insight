@@ -1025,6 +1025,69 @@ mod output_alias_visibility {
     }
 
     #[test]
+    fn with_fill_and_interpolate_expressions_read() {
+        // ClickHouse `WITH FILL FROM … TO … STEP` bounds and `INTERPOLATE
+        // (col AS expr)` fill expressions are clause reads (they used to be
+        // dropped entirely); the interpolate *target* designator names an
+        // output, not an occurrence.
+        assert_column_ops_with_dialect(
+            &sql_insight::sqlparser::dialect::ClickHouseDialect {},
+            "SELECT a FROM t ORDER BY a WITH FILL FROM t.lo TO t.hi STEP 1 \
+             INTERPOLATE (a AS a + t.b)",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![
+                    read("t", "a"),
+                    read("t", "a"),
+                    read("t", "lo"),
+                    read("t", "hi"),
+                    read("t", "a"),
+                    read("t", "b"),
+                ],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn ordinal_over_incomplete_outputs_binds_as_a_literal() {
+        // The unexpanded `*` hides slots, so position 1 is *not* the written
+        // `a` — the ordinal must not bind to it (it used to, minting a
+        // phantom second `t.a` read). It falls back to the literal, which
+        // reads nothing; expansion (a catalog) re-enables the ordinal.
+        assert_column_ops(
+            "SELECT *, a FROM t ORDER BY 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
+    fn ambiguous_identity_output_still_counts_its_clause_occurrence() {
+        // `a` is contested between t1 and t2, but the GROUP BY occurrence is
+        // still a written physical reference — it re-resolves to the same
+        // `Ambiguous` read (two occurrences, like the single-table form
+        // counts two base reads; it used to vanish, undercounting).
+        assert_column_ops(
+            "SELECT a FROM t1, t2 GROUP BY a",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![ambiguous("a"), ambiguous("a")],
+                writes: vec![],
+                lineage: vec![passthrough(ambiguous("a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn group_by_ordinal_of_introduced_alias_is_suppressed() {
         // `GROUP BY 1` here is `a + b AS x` (an introduced alias) — like
         // `GROUP BY x`, it binds Derived and adds no read; the dependency on
@@ -1552,6 +1615,61 @@ mod pipe_join {
                     passthrough(col("t", "k"), out("k", 1)),
                 ],
                 diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+}
+
+mod lateral_view {
+    //! Hive `LATERAL VIEW`: a lateral table function joined onto the FROM.
+    //! The declared column aliases are the view's closed column list, so a
+    //! generated column resolves to the view — traced to the function's
+    //! arguments at function granularity — never to a base relation as a
+    //! phantom read.
+    use super::*;
+    use sql_insight::sqlparser::dialect::HiveDialect;
+
+    #[test]
+    fn generated_column_resolves_to_the_view_not_the_base_table() {
+        // `c` is explode's output: no `t.c` read (it used to be a phantom),
+        // a Transformation from the argument instead — for the bare, the
+        // qualified, and the filter-position reference alike.
+        assert_column_ops_with_dialect(
+            &HiveDialect {},
+            "SELECT x.c, t.a FROM t LATERAL VIEW explode(arr) x AS c WHERE c > 0",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "arr")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "arr"), out("c", 0)),
+                    passthrough(col("t", "a"), out("a", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn several_views_fan_at_function_granularity() {
+        // Each generated column resolves to the view listing it, but the
+        // name-keyed trace reaches every view's arguments — the usual
+        // function-granularity coarseness, fanned rather than dropped.
+        assert_column_ops_with_dialect(
+            &HiveDialect {},
+            "SELECT k, v FROM t LATERAL VIEW explode(a) x AS k \
+             LATERAL VIEW explode(b) y AS v",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b")],
+                writes: vec![],
+                lineage: vec![
+                    transformation(col("t", "a"), out("k", 0)),
+                    transformation(col("t", "a"), out("v", 1)),
+                    transformation(col("t", "b"), out("k", 0)),
+                    transformation(col("t", "b"), out("v", 1)),
+                ],
+                diagnostics: vec![],
             },
         );
     }
