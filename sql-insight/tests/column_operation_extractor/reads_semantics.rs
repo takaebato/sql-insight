@@ -1025,6 +1025,24 @@ mod output_alias_visibility {
     }
 
     #[test]
+    fn ordinal_over_incomplete_outputs_binds_as_a_literal() {
+        // The unexpanded `*` hides slots, so position 1 is *not* the written
+        // `a` — the ordinal must not bind to it (it used to, minting a
+        // phantom second `t.a` read). It falls back to the literal, which
+        // reads nothing; expansion (a catalog) re-enables the ordinal.
+        assert_column_ops(
+            "SELECT *, a FROM t ORDER BY 1",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
+            },
+        );
+    }
+
+    #[test]
     fn group_by_ordinal_of_introduced_alias_is_suppressed() {
         // `GROUP BY 1` here is `a + b AS x` (an introduced alias) — like
         // `GROUP BY x`, it binds Derived and adds no read; the dependency on

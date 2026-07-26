@@ -764,9 +764,15 @@ fn inferred_name(expr: &SqlExpr) -> Option<Ident> {
 
 /// The name of the query output a positional ordinal key (`GROUP BY 1` /
 /// `ORDER BY 1`) refers to — the 1-based n-th [`Scope::query_outputs`] entry,
-/// if it has one. `None` for a non-integer / zero / out-of-range position, or
-/// an anonymous output: the caller then binds the literal as written.
+/// if it has one. `None` for a non-integer / zero / out-of-range position, an
+/// anonymous output, or **incomplete** outputs (an unexpanded wildcard hides
+/// slots, so the n-th entry isn't the n-th output — `SELECT *, a … ORDER BY
+/// 1` must not bind the ordinal to `a`): the caller then binds the literal
+/// as written.
 fn ordinal_output_name(expr: &SqlExpr, scope: &Scope) -> Option<Ident> {
+    if !scope.outputs_complete {
+        return None;
+    }
     let SqlExpr::Value(v) = expr else {
         return None;
     };
