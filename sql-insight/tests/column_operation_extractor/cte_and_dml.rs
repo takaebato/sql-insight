@@ -71,17 +71,85 @@ mod with_in_dml {
         // *statement's* WITH, so it must stay outermost — wrapping the create
         // around it buried the CTE's INSERT inside the root's input, where
         // the write-root collection never descends, and `t1`'s write vanished
-        // from every surface. (The unresolved outer `a` is a separate known
-        // gap: a DML CTE's RETURNING columns aren't exposed to references.)
+        // from every surface. The outer `a` resolves through the CTE's
+        // RETURNING (its exposed output), so the flow reaches `t2` end to
+        // end: `t1.a → t2.a`.
         assert_column_ops(
             "WITH c AS (INSERT INTO t1 (a) VALUES (1) RETURNING a) \
              SELECT a INTO t2 FROM c",
             ColumnOperation {
                 statement_kind: StatementKind::CreateTable,
-                reads: vec![read("t1", "a"), unresolved("a")],
+                reads: vec![read("t1", "a")],
                 writes: vec![write("t1", "a"), write("t2", "a")],
-                lineage: vec![passthrough(unresolved("a"), relation("t2", "a"))],
+                lineage: vec![passthrough(col("t1", "a"), relation("t2", "a"))],
                 diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn dml_cte_returning_is_the_ctes_exposed_output() {
+        // A data-modifying CTE exposes its RETURNING projection: the outer
+        // reference resolves through it (it used to dangle `Unresolved`)
+        // and traces to the returning expression's sources — a rename
+        // (`a AS x`) and an UPDATE body included.
+        assert_column_ops(
+            "WITH c AS (INSERT INTO t1 (a) VALUES (1) RETURNING a) \
+             SELECT a FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a")],
+                writes: vec![write("t1", "a")],
+                lineage: vec![passthrough(col("t1", "a"), out("a", 0))],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops(
+            "WITH c AS (UPDATE t SET a = a + 1 RETURNING a AS x) \
+             SELECT x FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "a")],
+                writes: vec![write("t", "a")],
+                lineage: vec![
+                    transformation(col("t", "a"), relation("t", "a")),
+                    passthrough(col("t", "a"), out("x", 0)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn dml_cte_returning_completes_a_wildcard_consumer() {
+        // The exposed outputs are positionally complete (named RETURNING
+        // items), so an outer `SELECT *` over the CTE expands; a written
+        // `RETURNING *` stays conservative — the expansion flag isn't
+        // carried, so the outputs mark incomplete and the outer reference
+        // dangles under the existing suppression diagnostic.
+        assert_column_ops(
+            "WITH c AS (INSERT INTO t1 (a, b) VALUES (1, 2) RETURNING a, b) \
+             SELECT * FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t1", "a"), read("t1", "b")],
+                writes: vec![write("t1", "a"), write("t1", "b")],
+                lineage: vec![
+                    passthrough(col("t1", "a"), out("a", 0)),
+                    passthrough(col("t1", "b"), out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops(
+            "WITH c AS (INSERT INTO t1 (a) VALUES (1) RETURNING *) \
+             SELECT a FROM c",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![unresolved("a")],
+                writes: vec![write("t1", "a")],
+                lineage: vec![passthrough(unresolved("a"), out("a", 0))],
+                diagnostics: vec![diag(ColumnLevelDiagnosticKind::WildcardSuppressed)],
             },
         );
     }

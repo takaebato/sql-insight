@@ -520,15 +520,36 @@ fn origins_into<'a>(
         // traversal. So a `Scan` reached here (e.g. the other side of a join
         // the qualified name doesn't own) contributes nothing.
         LogicalPlan::Scan(_) | LogicalPlan::Values(_) | LogicalPlan::Empty => Vec::new(),
-        // DML/DDL roots are not column producers traced into here.
-        LogicalPlan::Insert(_)
-        | LogicalPlan::Update(_)
-        | LogicalPlan::Delete(_)
-        | LogicalPlan::Merge(_)
-        | LogicalPlan::CreateTableAs(_)
+        // A DML root's RETURNING projection is the output a data-modifying
+        // CTE body exposes — a named reference through the CTE traces into
+        // it like a SELECT's projection (the returning expressions resolve
+        // against the write target / source, so their refs are mostly
+        // `Base`, traced over the DML's read input).
+        LogicalPlan::Insert(i) => returning_origins(&i.returning, &i.input, name, context),
+        LogicalPlan::Update(u) => returning_origins(&u.returning, &u.input, name, context),
+        LogicalPlan::Delete(d) => returning_origins(&d.returning, &d.input, name, context),
+        LogicalPlan::Merge(m) => returning_origins(&m.returning, &m.source, name, context),
+        LogicalPlan::CreateTableAs(_)
         | LogicalPlan::CreateView(_)
         | LogicalPlan::AlterTable(_)
         | LogicalPlan::Drop(_) => Vec::new(),
+    }
+}
+
+/// The named output of a DML root's RETURNING projection, traced to its
+/// origins over the DML's read input — the output a data-modifying CTE
+/// body exposes (empty without a RETURNING).
+fn returning_origins<'a>(
+    returning: &'a [NamedExpr],
+    input: &'a LogicalPlan,
+    name: &Ident,
+    context: &mut TraceContext<'a>,
+) -> Vec<(ColumnRead, ColumnLineageKind)> {
+    match named_position(returning, name, context.casing.column)
+        .and_then(|i| resolved_output_expr(returning, i))
+    {
+        Some(expr) => origins_of_expr(expr, input, context),
+        None => Vec::new(),
     }
 }
 
@@ -741,6 +762,29 @@ fn collect_operands<'a>(op: &'a LogicalPlan, ctes: &[&'a Cte], out: &mut Vec<Ope
         // stays edge-less, best-effort. (A join *below* a projection never
         // reaches here — the projection claims the walk first.)
         LogicalPlan::Join(jn) => collect_operands(&jn.left, ctes, out),
+        // A DML root's RETURNING projection is its positional output (a
+        // data-modifying CTE's exposed columns — empty outputs claim
+        // nothing).
+        LogicalPlan::Insert(i) => out.push(Operand {
+            outputs: &i.returning,
+            input: &i.input,
+            ctes: ctes.to_vec(),
+        }),
+        LogicalPlan::Update(u) => out.push(Operand {
+            outputs: &u.returning,
+            input: &u.input,
+            ctes: ctes.to_vec(),
+        }),
+        LogicalPlan::Delete(d) => out.push(Operand {
+            outputs: &d.returning,
+            input: &d.input,
+            ctes: ctes.to_vec(),
+        }),
+        LogicalPlan::Merge(m) => out.push(Operand {
+            outputs: &m.returning,
+            input: &m.source,
+            ctes: ctes.to_vec(),
+        }),
         // No projection at this level — a relation that doesn't carry a
         // SELECT list (a `Scan`, a join below a projection, a DML / DDL root,
         // …) yields no operands. Listed explicitly so a new operator that
@@ -751,10 +795,6 @@ fn collect_operands<'a>(op: &'a LogicalPlan, ctes: &[&'a Cte], out: &mut Vec<Ope
         | LogicalPlan::CteRef(_)
         | LogicalPlan::Values(_)
         | LogicalPlan::Empty
-        | LogicalPlan::Insert(_)
-        | LogicalPlan::Update(_)
-        | LogicalPlan::Delete(_)
-        | LogicalPlan::Merge(_)
         | LogicalPlan::CreateTableAs(_)
         | LogicalPlan::CreateView(_)
         | LogicalPlan::AlterTable(_)
