@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/takaebato/sql-insight/compare/sql-insight-cli-v0.3.0...sql-insight-cli-v0.4.0) - 2026-07-26
+
+### ⚠️ Breaking Changes
+
+#### inherit sql-insight 0.5.0's analysis changes
+
+The bundled library moves to sql-insight 0.5.0, so the `extract`
+output changes for the same SQL: wildcards now expand into per-column
+reads and lineage when their columns are fully known, and lineage no
+longer emits synthetic alias-named sources for `VALUES` / table-function
+relations. See the
+[sql-insight 0.5.0 changelog](https://github.com/takaebato/sql-insight/blob/master/sql-insight/CHANGELOG.md)
+for the details and the long list of correctness fixes it also brings.
+
+### Fixed
+
+- track quote and comment state when splitting interactive CLI statements ([#78](https://github.com/takaebato/sql-insight/pull/78)) by @takaebato
+
+### Other Changes
+
+- rename the security-audit workflow to cargo-deny and add its badge ([#64](https://github.com/takaebato/sql-insight/pull/64)) by @takaebato
+
 ## [0.3.0](https://github.com/takaebato/sql-insight/compare/sql-insight-cli-v0.2.1...sql-insight-cli-v0.3.0) - 2026-07-05
 
 ### ⚠️ Breaking Changes
