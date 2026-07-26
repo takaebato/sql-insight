@@ -233,6 +233,11 @@ impl<'a> Binder<'a> {
                 .iter()
                 .filter_map(|n| n.0.last().and_then(|p| p.as_ident().cloned()))
                 .collect()
+        } else if !insert.after_columns.is_empty() {
+            // The Hive placement: `INSERT INTO t PARTITION (…) (a, b)` puts
+            // the column list *after* the partition clause — the same
+            // explicit list, previously dropped as if none were written.
+            insert.after_columns.clone()
         } else {
             view_columns
         };
