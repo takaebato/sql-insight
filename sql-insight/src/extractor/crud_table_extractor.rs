@@ -78,8 +78,10 @@ pub struct CrudTables {
     /// Tables deleted (`DELETE` / `DROP` / `TRUNCATE` / a MERGE DELETE action).
     pub delete_tables: Vec<TableWrite>,
     /// Non-fatal diagnostics, forwarded from the underlying table-level
-    /// extraction (only [`UnsupportedStatement`](crate::diagnostic::TableLevelDiagnosticKind::UnsupportedStatement)
-    /// arises at this granularity).
+    /// extraction — the table-granularity kinds:
+    /// [`UnsupportedStatement`](crate::diagnostic::TableLevelDiagnosticKind::UnsupportedStatement)
+    /// and
+    /// [`TooManyTableQualifiers`](crate::diagnostic::TableLevelDiagnosticKind::TooManyTableQualifiers).
     pub diagnostics: Vec<TableLevelDiagnostic>,
 }
 
