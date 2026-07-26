@@ -1070,6 +1070,54 @@ mod output_alias_visibility {
     }
 
     #[test]
+    fn distinct_on_keys_see_the_output_aliases() {
+        // PostgreSQL 18 (verified): DISTINCT ON keys are scoped like ORDER
+        // BY — an output alias is visible, so `x` binds to the projection
+        // (`Derived`, no read; it used to surface a phantom `t.x`), while an
+        // identity key re-reads its column, occurrence-based.
+        assert_column_ops(
+            "SELECT DISTINCT ON (x) a AS x FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("x", 0))],
+                diagnostics: vec![],
+            },
+        );
+        assert_column_ops(
+            "SELECT DISTINCT ON (a) a, b FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a"), read("t", "b"), read("t", "a")],
+                writes: vec![],
+                lineage: vec![
+                    passthrough(col("t", "a"), out("a", 0)),
+                    passthrough(col("t", "b"), out("b", 1)),
+                ],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn distinct_on_alias_shadows_a_same_named_base_column() {
+        // PostgreSQL 18 (verified): with `a AS b` projected, DISTINCT ON (b)
+        // groups by the alias — the real column `b` is shadowed and not
+        // read.
+        assert_column_ops(
+            "SELECT DISTINCT ON (b) a AS b FROM t",
+            ColumnOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t", "a")],
+                writes: vec![],
+                lineage: vec![passthrough(col("t", "a"), out("b", 0))],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn ambiguous_identity_output_still_counts_its_clause_occurrence() {
         // `a` is contested between t1 and t2, but the GROUP BY occurrence is
         // still a written physical reference — it re-resolves to the same
