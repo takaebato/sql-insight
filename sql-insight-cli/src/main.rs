@@ -321,16 +321,23 @@ impl Commands {
                 Err(e) => return Err(Error::IOError(e.to_string())),
             };
             let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+            if input_buffer.is_empty() {
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
+                    break;
+                }
             }
-            let _ = editor.add_history_entry(trimmed);
-            if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
-                break;
+            if !trimmed.is_empty() {
+                let _ = editor.add_history_entry(trimmed);
             }
-            input_buffer.push_str(trimmed);
+            // Keep the line verbatim: a statement may continue a string
+            // literal from the previous line, whose leading / trailing
+            // whitespace is content (trimming destroyed it).
+            input_buffer.push_str(&line);
             input_buffer.push('\n');
-            if trimmed.ends_with(';') {
+            if statement_complete(&input_buffer) {
                 match self.executor(std::mem::take(&mut input_buffer)).execute() {
                     Ok(result) => result.iter().for_each(|r| println!("{r}")),
                     Err(e) => eprintln!("Error: {e}"),
@@ -399,5 +406,115 @@ fn main() -> ExitCode {
             eprintln!("Error: {}", e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Whether the buffered input ends a statement: its last significant
+/// character *outside* any string literal, quoted identifier, or comment is
+/// `;`. The scan tracks the SQL-standard quote forms — `'…'` strings and
+/// `"…"` / `` `…` `` quoted identifiers, each escaping its own quote by
+/// doubling (a doubled quote toggles the state out and straight back in, so
+/// plain toggling handles it) — plus `--` line comments and nesting
+/// `/* … */` block comments (PostgreSQL nests them). Not modelled:
+/// dollar-quoted strings (`$tag$…$tag$`) and dialect-specific backslash
+/// escapes — a `;` inside those may still split early, best-effort.
+fn statement_complete(input: &str) -> bool {
+    #[derive(PartialEq)]
+    enum State {
+        Top,
+        Single,
+        Double,
+        Backtick,
+        LineComment,
+        BlockComment(u32),
+    }
+    let mut state = State::Top;
+    let mut last_significant = None;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match state {
+            State::Top => match c {
+                '\'' => state = State::Single,
+                '"' => state = State::Double,
+                '`' => state = State::Backtick,
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    state = State::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    state = State::BlockComment(1);
+                }
+                _ => {
+                    if !c.is_whitespace() {
+                        last_significant = Some(c);
+                    }
+                }
+            },
+            State::Single if c == '\'' => state = State::Top,
+            State::Double if c == '"' => state = State::Top,
+            State::Backtick if c == '`' => state = State::Top,
+            State::LineComment if c == '\n' => state = State::Top,
+            State::BlockComment(depth) => {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    state = if depth == 1 {
+                        State::Top
+                    } else {
+                        State::BlockComment(depth - 1)
+                    };
+                } else if c == '/' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    state = State::BlockComment(depth + 1);
+                }
+            }
+            State::Single | State::Double | State::Backtick | State::LineComment => {}
+        }
+    }
+    // End of input closes a line comment (a newline would); an open string
+    // or block comment keeps the statement incomplete.
+    matches!(state, State::Top | State::LineComment) && last_significant == Some(';')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::statement_complete;
+
+    #[test]
+    fn splits_on_a_top_level_semicolon_only() {
+        assert!(statement_complete("SELECT 1;"));
+        assert!(statement_complete("SELECT 1 ;  "));
+        assert!(!statement_complete("SELECT 1"));
+        // A trailing comment after the terminator doesn't hide it.
+        assert!(statement_complete("SELECT 1; -- done"));
+        assert!(statement_complete("SELECT 1; /* done */"));
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_literal_does_not_terminate() {
+        // The literal continues on the next line — the old line-suffix check
+        // executed the unterminated statement here.
+        assert!(!statement_complete("SELECT 'a;\n"));
+        assert!(statement_complete("SELECT 'a;\nb';"));
+        // Quoted identifiers likewise.
+        assert!(!statement_complete("SELECT \"a;\n"));
+        assert!(!statement_complete("SELECT `a;\n"));
+    }
+
+    #[test]
+    fn doubled_quotes_stay_inside_the_literal() {
+        // `''` is an escaped quote: `'a'';'` is one literal containing `a';`.
+        assert!(!statement_complete("SELECT 'a'';'"));
+        assert!(statement_complete("SELECT 'a'';';"));
+    }
+
+    #[test]
+    fn comments_hide_their_semicolons() {
+        assert!(!statement_complete("SELECT 1 -- ;\n"));
+        assert!(statement_complete("SELECT 1 -- ;\n;"));
+        assert!(!statement_complete("SELECT 1 /* ; */"));
+        // PostgreSQL nests block comments.
+        assert!(!statement_complete("SELECT 1 /* /* ; */ ; */"));
+        assert!(statement_complete("SELECT 1 /* /* ; */ */;"));
     }
 }
