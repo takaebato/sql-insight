@@ -752,8 +752,28 @@ impl<'a> Binder<'a> {
         };
         let (mut node, mut scope) = self.bind_table_with_joins(first, &[]);
         // Comma-separated FROM items are a cross join; a later item sees the
-        // earlier ones only if it is LATERAL.
+        // earlier ones only if it is LATERAL. Exception: after an item whose
+        // join chain ends in an `ARRAY JOIN`, a comma continues the ARRAY
+        // JOIN's *operand list* (ClickHouse grammar — a table can't follow;
+        // the construct itself pins the dialect family), but sqlparser
+        // parses each further operand as an independent FROM item, which
+        // surfaced `arr2` in `ARRAY JOIN arr1 AS a, arr2 AS b` as a phantom
+        // table read. A join-carrying or non-table item can't be an operand
+        // and binds as usual — deliberately conservative: in the doubtful
+        // `ARRAY JOIN a, b JOIN u ON …` shape, `b` stays a table rather
+        // than risk demoting a real table to a column.
+        let mut in_array_join = ends_with_array_join(first);
         for twj in iter {
+            if in_array_join
+                && twj.joins.is_empty()
+                && matches!(twj.relation, TableFactor::Table { .. })
+            {
+                let (right, right_scope) = self.bind_array_join(&twj.relation, &scope.relations);
+                scope.absorb(right_scope);
+                node = join(node, right, Vec::new());
+                continue;
+            }
+            in_array_join = ends_with_array_join(twj);
             let (right, right_scope) = self.bind_table_with_joins(twj, &scope.relations);
             scope.absorb(right_scope);
             node = join(node, right, Vec::new());
