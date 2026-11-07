@@ -10,7 +10,7 @@ include = [
     "LICENSE.txt",
 ]
 readme = "README.md"
-version = "0.5.0"
+version = "0.5.1"
 edition = { workspace = true }
 rust-version = "1.89.0"
 homepage = { workspace = true }
