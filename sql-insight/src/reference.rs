@@ -511,8 +511,8 @@ impl TableReference {
     pub fn identity_key(&self, casing: &IdentifierCasing) -> TableIdentityKey {
         let fold = |ident: &Ident| casing.table.normalize(ident);
         TableIdentityKey {
-            catalog: self.catalog.as_ref().map(&fold),
-            schema: self.schema.as_ref().map(&fold),
+            catalog: self.catalog.as_ref().map(fold),
+            schema: self.schema.as_ref().map(fold),
             name: fold(&self.name),
         }
     }
