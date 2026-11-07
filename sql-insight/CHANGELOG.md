@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/takaebato/sql-insight/compare/sql-insight-v0.5.0...sql-insight-v0.5.1) - 2026-11-07
+
+### Other Changes
+
+- *(deps)* bump tokio and clipboard-win to clear cargo-deny advisories ([#91](https://github.com/takaebato/sql-insight/pull/91)) by @takaebato
+
 ## [0.5.0](https://github.com/takaebato/sql-insight/compare/sql-insight-v0.4.0...sql-insight-v0.5.0) - 2026-07-26
 
 ### ⚠️ Breaking Changes
