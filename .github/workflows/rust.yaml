@@ -50,7 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Install cargo-msrv
-        uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2
+        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
         with:
           tool: cargo-msrv
       - name: Verify sql-insight MSRV
@@ -91,7 +91,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2
+        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
         with:
           tool: cargo-llvm-cov
           fallback: none
