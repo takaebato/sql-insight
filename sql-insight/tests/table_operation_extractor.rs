@@ -246,6 +246,33 @@ mod select {
     }
 
     #[test]
+    fn array_join_operands_are_not_table_reads() {
+        // The comma continues the ARRAY JOIN operand list (ClickHouse
+        // grammar) — `arr2` used to surface as a phantom table read; an
+        // ordinary comma join stays a cross join of table reads.
+        assert_ops(
+            "SELECT a, b FROM t ARRAY JOIN arr1 AS a, arr2 AS b",
+            TableOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+        assert_ops(
+            "SELECT 1 FROM t, u",
+            TableOperation {
+                statement_kind: StatementKind::Select,
+                reads: vec![read("t"), read("u")],
+                writes: vec![],
+                lineage: vec![],
+                diagnostics: vec![],
+            },
+        );
+    }
+
+    #[test]
     fn bare_values_emits_nothing() {
         // `VALUES (1, 2)` parses as a query whose body is a VALUES
         // clause — no table references, no writes, no lineage.
